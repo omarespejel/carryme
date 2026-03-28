@@ -94,6 +94,11 @@ def test_normalize_hyperliquid_funding_rate() -> None:
     assert normalized.daily_rate == pytest.approx(0.0012)
 
 
+def test_reject_unsupported_funding_venue() -> None:
+    with pytest.raises(ValueError, match="Unsupported venue"):
+        normalize_funding_rate("unknown", 0.001)
+
+
 def test_normalize_funding_rate_none_preserves_metadata() -> None:
     normalized = normalize_funding_rate("extended", None)
 
