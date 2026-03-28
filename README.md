@@ -9,6 +9,8 @@ The initial workspace is intentionally narrow:
 - `packages/connectors`: public REST connectors for market data
 - `packages/normalizers`: venue-specific symbol, funding, and fee normalization
 - `packages/scoring`: funding-arb opportunity scoring and capacity estimation
+- `packages/runtime`: shared live fetch/normalize/score orchestration
+- `packages/storage`: watchlist loading and persisted opportunity history
 
 ## Local development
 

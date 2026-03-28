@@ -1,0 +1,22 @@
+{
+  "pairs": [
+    {
+      "label": "strk_extended_hyperliquid",
+      "left_venue": "extended",
+      "left_symbol": "STRK-USD",
+      "left_fee_profile": "default",
+      "right_venue": "hyperliquid",
+      "right_symbol": "STRK",
+      "right_fee_profile": "tier0"
+    },
+    {
+      "label": "arb_extended_paradex",
+      "left_venue": "extended",
+      "left_symbol": "ARB-USD",
+      "left_fee_profile": "default",
+      "right_venue": "paradex",
+      "right_symbol": "ARB-USD-PERP",
+      "right_fee_profile": "pro"
+    }
+  ]
+}

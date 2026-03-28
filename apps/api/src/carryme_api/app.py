@@ -3,11 +3,19 @@
 from typing import Annotated
 
 import httpx
-from carryme_models import AppDescriptor, FundingArbOpportunity, ServiceHealth, TradingFeeProfile
+from carryme_models import (
+    AppDescriptor,
+    FundingArbOpportunity,
+    OpportunityRecord,
+    ServiceHealth,
+    TradingFeeProfile,
+)
 from carryme_normalizers import list_fee_profiles
+from carryme_runtime import ConnectorError, OpportunityService
+from carryme_storage import OpportunityHistoryStore
 from fastapi import Depends, FastAPI, HTTPException
 
-from carryme_api.opportunities import ConnectorError, OpportunityService
+from carryme_api.config import ApiSettings, get_api_settings
 
 APP_NAME = "carryme-api"
 APP_VERSION = "0.1.0"
@@ -18,6 +26,14 @@ def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
     return OpportunityService()
+
+
+def get_history_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> OpportunityHistoryStore:
+    """Return the shared opportunity history store."""
+
+    return OpportunityHistoryStore(settings.database_path)
 
 
 def create_app() -> FastAPI:
@@ -43,6 +59,17 @@ def create_app() -> FastAPI:
     def fee_profiles(venue: str) -> list[TradingFeeProfile]:
         try:
             return list_fee_profiles(venue)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/history/funding-pairs", response_model=list[OpportunityRecord])
+    def history(
+        store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[OpportunityRecord]:
+        try:
+            return store.list_recent(limit=limit, label=label)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

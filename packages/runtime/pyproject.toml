@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carryme-runtime"
+version = "0.1.0"
+description = "Shared live fetch/normalize/score orchestration for carryme."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "carryme-connectors",
+  "carryme-models",
+  "carryme-normalizers",
+  "carryme-scoring",
+  "httpx>=0.28,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryme_runtime"]
+
+[tool.uv.sources]
+carryme-connectors = { workspace = true }
+carryme-models = { workspace = true }
+carryme-normalizers = { workspace = true }
+carryme-scoring = { workspace = true }

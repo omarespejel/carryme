@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "carryme-models",
-  "httpx>=0.28,<1",
+  "carryme-runtime",
+  "carryme-storage",
   "pydantic-settings>=2.11,<3",
 ]
 
@@ -22,3 +23,5 @@ packages = ["src/carryme_worker"]
 
 [tool.uv.sources]
 carryme-models = { workspace = true }
+carryme-runtime = { workspace = true }
+carryme-storage = { workspace = true }

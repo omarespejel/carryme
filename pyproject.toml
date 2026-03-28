@@ -14,7 +14,9 @@ dependencies = [
   "carryme-models",
   "carryme-connectors",
   "carryme-normalizers",
+  "carryme-runtime",
   "carryme-scoring",
+  "carryme-storage",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -27,7 +29,9 @@ members = [
   "packages/connectors",
   "packages/models",
   "packages/normalizers",
+  "packages/runtime",
   "packages/scoring",
+  "packages/storage",
 ]
 
 [tool.uv.sources]
@@ -36,7 +40,9 @@ carryme-worker = { workspace = true }
 carryme-models = { workspace = true }
 carryme-connectors = { workspace = true }
 carryme-normalizers = { workspace = true }
+carryme-runtime = { workspace = true }
 carryme-scoring = { workspace = true }
+carryme-storage = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -75,6 +81,8 @@ mypy_path = [
   "packages/models/src",
   "packages/connectors/src",
   "packages/normalizers/src",
+  "packages/runtime/src",
   "packages/scoring/src",
+  "packages/storage/src",
   "src",
 ]

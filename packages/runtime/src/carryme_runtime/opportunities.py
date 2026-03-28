@@ -1,4 +1,4 @@
-"""Live opportunity scoring service for the operator API."""
+"""Live opportunity scoring services shared by the API and worker."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from typing import Protocol
 
 import httpx
 from carryme_connectors import (
-    ConnectorError,
     ExtendedPublicConnector,
     HyperliquidPublicConnector,
     ParadexPublicConnector,
@@ -41,7 +40,6 @@ async def fetch_live_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapsh
 
     async with httpx.AsyncClient(base_url=base_url, timeout=15.0) as client:
         connector = _build_connector(key, client)
-
         stats = await connector.fetch_market_stats(symbol)
         book = await connector.fetch_top_of_book(symbol)
 
@@ -83,6 +81,3 @@ def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnec
     if venue == "paradex":
         return ParadexPublicConnector(client)
     raise ValueError(f"Unsupported venue: {venue}")
-
-
-__all__ = ["ConnectorError", "OpportunityService", "fetch_live_snapshot"]

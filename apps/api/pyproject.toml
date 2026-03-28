@@ -9,12 +9,13 @@ description = "FastAPI application for the carryme operator/control plane."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-  "carryme-connectors",
   "carryme-models",
   "carryme-normalizers",
-  "carryme-scoring",
+  "carryme-runtime",
+  "carryme-storage",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  "pydantic-settings>=2.11,<3",
   "uvicorn>=0.35,<1",
 ]
 
@@ -25,7 +26,7 @@ carryme-api = "carryme_api.main:main"
 packages = ["src/carryme_api"]
 
 [tool.uv.sources]
-carryme-connectors = { workspace = true }
 carryme-models = { workspace = true }
 carryme-normalizers = { workspace = true }
-carryme-scoring = { workspace = true }
+carryme-runtime = { workspace = true }
+carryme-storage = { workspace = true }

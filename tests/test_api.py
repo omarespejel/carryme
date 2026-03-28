@@ -1,5 +1,14 @@
-from carryme_api.app import app, get_opportunity_service
-from carryme_models import CapacityEstimate, FundingArbOpportunity
+from datetime import UTC, datetime
+from pathlib import Path
+
+from carryme_api.app import app, get_history_store, get_opportunity_service
+from carryme_models import (
+    CapacityEstimate,
+    FundingArbOpportunity,
+    FundingPairSpec,
+    OpportunityRecord,
+)
+from carryme_storage import OpportunityHistoryStore
 from fastapi.testclient import TestClient
 
 
@@ -108,3 +117,53 @@ def test_funding_pair_endpoint_maps_value_errors_to_bad_request() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Unsupported venue: nope"
+
+
+def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            ),
+        )
+    )
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    client = TestClient(app)
+
+    response = client.get("/v1/history/funding-pairs")
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["pair"]["label"] == "strk_extended_hyperliquid"
