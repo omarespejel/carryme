@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carryme-api"
+version = "0.1.0"
+description = "FastAPI application for the carryme operator/control plane."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "carryme-models",
+  "fastapi>=0.116,<1",
+  "uvicorn>=0.35,<1",
+]
+
+[project.scripts]
+carryme-api = "carryme_api.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryme_api"]
+
+[tool.uv.sources]
+carryme-models = { workspace = true }
