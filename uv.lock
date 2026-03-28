@@ -48,15 +48,23 @@ name = "carryme-api"
 version = "0.1.0"
 source = { editable = "apps/api" }
 dependencies = [
+    { name = "carryme-connectors" },
     { name = "carryme-models" },
+    { name = "carryme-normalizers" },
+    { name = "carryme-scoring" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "carryme-connectors", editable = "packages/connectors" },
     { name = "carryme-models", editable = "packages/models" },
+    { name = "carryme-normalizers", editable = "packages/normalizers" },
+    { name = "carryme-scoring", editable = "packages/scoring" },
     { name = "fastapi", specifier = ">=0.116,<1" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "uvicorn", specifier = ">=0.35,<1" },
 ]
 
