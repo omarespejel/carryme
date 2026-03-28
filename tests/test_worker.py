@@ -1,8 +1,12 @@
+import pytest
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import build_health_payload
 
 
-def test_worker_defaults() -> None:
+def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CARRYME_WORKER_ENVIRONMENT", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_LOG_LEVEL", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_POLL_INTERVAL_SECONDS", raising=False)
     settings = WorkerSettings()
 
     assert settings.environment == "development"
