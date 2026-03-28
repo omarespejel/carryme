@@ -2,6 +2,9 @@
 
 `carryme` will be a fee-aware, capacity-aware funding arbitrage control plane.
 
+> **Status**: this repository currently contains only the workspace skeleton and
+> health endpoints.
+
 The current workspace is intentionally narrow:
 - `apps/api`: FastAPI control-plane skeleton with health endpoints
 - `apps/worker`: worker CLI skeleton that prints a deterministic health payload

@@ -14,7 +14,10 @@ APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
 def get_app_environment() -> str:
     """Return the runtime environment exposed by the API health endpoints."""
 
-    return os.getenv(APP_ENVIRONMENT_VARIABLE, DEFAULT_APP_ENVIRONMENT)
+    return (
+        os.getenv(APP_ENVIRONMENT_VARIABLE, DEFAULT_APP_ENVIRONMENT).strip()
+        or DEFAULT_APP_ENVIRONMENT
+    )
 
 
 def create_app() -> FastAPI:
