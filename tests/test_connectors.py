@@ -211,6 +211,42 @@ def test_extended_connector_retries_transient_server_errors() -> None:
     asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
 
 
+def test_extended_connector_retries_rate_limit_responses() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(
+                429,
+                request=request,
+                headers={"Retry-After": "0"},
+                json={"error": "slow down"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": {
+                    "markPrice": "0.03448",
+                    "fundingRate": "0.000013",
+                    "openInterest": "280337.789214",
+                    "dailyVolume": "157165.809800",
+                },
+            },
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ExtendedPublicConnector(client, base_backoff_seconds=0.0)
+        stats = await connector.fetch_market_stats("STRK-USD")
+
+        assert attempts == 3
+        assert stats.mark_price == pytest.approx(0.03448)
+
+    asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
+
+
 def test_extended_connector_raises_for_invalid_numeric_values() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -230,6 +266,22 @@ def test_extended_connector_raises_for_invalid_numeric_values() -> None:
         connector = ExtendedPublicConnector(client)
         with pytest.raises(ConnectorError, match="Cannot parse numeric value"):
             await connector.fetch_market_stats("STRK-USD")
+
+    asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
+
+
+def test_extended_connector_rejects_missing_data_object() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/stats"):
+            return httpx.Response(200, json={"status": "OK"})
+        return httpx.Response(200, json={"status": "OK", "data": "not-a-dict"})
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ExtendedPublicConnector(client)
+        with pytest.raises(ConnectorError, match="market stats missing data object"):
+            await connector.fetch_market_stats("STRK-USD")
+        with pytest.raises(ConnectorError, match="orderbook missing data object"):
+            await connector.fetch_top_of_book("STRK-USD")
 
     asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
 
@@ -281,5 +333,17 @@ def test_hyperliquid_connector_raises_for_misaligned_contexts() -> None:
         connector = HyperliquidPublicConnector(client)
         with pytest.raises(ConnectorError, match="contexts missing entry for STRK"):
             await connector.fetch_market_stats("STRK")
+
+    asyncio.run(_run_with_client("https://api.hyperliquid.xyz", handler, exercise))
+
+
+def test_hyperliquid_connector_rejects_malformed_orderbook_levels() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"levels": [123, []]})
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = HyperliquidPublicConnector(client)
+        with pytest.raises(ConnectorError, match="side levels must be lists"):
+            await connector.fetch_top_of_book("STRK")
 
     asyncio.run(_run_with_client("https://api.hyperliquid.xyz", handler, exercise))

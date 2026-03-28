@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
 import httpx
@@ -69,11 +71,13 @@ class BaseHttpConnector:
                     raise ConnectorError(f"{self.venue} returned an unexpected payload shape")
                 return payload
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code >= 500 and attempt < self._max_attempts:
-                    await self._sleep_before_retry(attempt)
+                status_code = exc.response.status_code
+                if self._is_retryable_status(status_code) and attempt < self._max_attempts:
+                    delay_seconds = self._retry_after_seconds(exc.response)
+                    await self._sleep_before_retry(attempt, delay_seconds=delay_seconds)
                     continue
                 raise ConnectorError(
-                    f"{self.venue} request failed with status {exc.response.status_code}"
+                    f"{self.venue} request failed with status {status_code}"
                 ) from exc
             except httpx.TransportError as exc:
                 if attempt < self._max_attempts:
@@ -87,10 +91,36 @@ class BaseHttpConnector:
 
         raise ConnectorError(f"{self.venue} request exhausted all retry attempts")
 
-    async def _sleep_before_retry(self, attempt: int) -> None:
+    def _is_retryable_status(self, status_code: int) -> bool:
+        """Return True for transient HTTP statuses that should be retried."""
+
+        return status_code == 429 or status_code >= 500
+
+    def _retry_after_seconds(self, response: httpx.Response) -> float | None:
+        """Parse Retry-After if present and usable."""
+
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is None:
+            return None
+        try:
+            delay_seconds = float(retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError, IndexError):
+                return None
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            delay_seconds = (retry_at - datetime.now(tz=UTC)).total_seconds()
+        return max(delay_seconds, 0.0)
+
+    async def _sleep_before_retry(
+        self, attempt: int, *, delay_seconds: float | None = None
+    ) -> None:
         """Back off exponentially between transient request failures."""
 
-        delay_seconds = self._base_backoff_seconds * (2 ** (attempt - 1))
+        if delay_seconds is None:
+            delay_seconds = self._base_backoff_seconds * (2 ** (attempt - 1))
         await asyncio.sleep(delay_seconds)
 
 

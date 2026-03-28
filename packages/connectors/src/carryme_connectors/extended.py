@@ -32,7 +32,7 @@ class ExtendedPublicConnector(BaseHttpConnector):
         payload = await self._request_json("GET", f"/api/v1/info/markets/{symbol}/stats")
         if not isinstance(payload, dict):
             raise ConnectorError("Extended market stats payload must be an object")
-        data = payload.get("data", {})
+        data = payload.get("data")
         if not isinstance(data, dict):
             raise ConnectorError("Extended market stats missing data object")
         return MarketStats(
@@ -49,7 +49,7 @@ class ExtendedPublicConnector(BaseHttpConnector):
         payload = await self._request_json("GET", f"/api/v1/info/markets/{symbol}/orderbook")
         if not isinstance(payload, dict):
             raise ConnectorError("Extended orderbook payload must be an object")
-        data = payload.get("data", {})
+        data = payload.get("data")
         if not isinstance(data, dict):
             raise ConnectorError("Extended orderbook missing data object")
         best_bid = _first_level(data.get("bid"))

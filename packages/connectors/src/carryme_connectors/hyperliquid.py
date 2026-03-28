@@ -52,7 +52,7 @@ class HyperliquidPublicConnector(BaseHttpConnector):
         )
         if not isinstance(payload, dict):
             raise ConnectorError("Hyperliquid l2Book payload must be an object")
-        levels = payload.get("levels", [])
+        levels = payload.get("levels")
         best_bid = _first_book_level(levels, 0)
         best_ask = _first_book_level(levels, 1)
         return TopOfBook(
@@ -81,12 +81,16 @@ def _find_context(universe: Any, contexts: Any, symbol: str) -> dict[str, Any]:
 
 
 def _first_book_level(levels: Any, side_index: int) -> dict[str, Any] | None:
-    if (
-        isinstance(levels, list)
-        and len(levels) > side_index
-        and isinstance(levels[side_index], list)
-    ):
-        side = levels[side_index]
-        if side and isinstance(side[0], dict):
-            return side[0]
-    return None
+    if not isinstance(levels, list):
+        raise ConnectorError("Hyperliquid orderbook levels must be a list")
+    if len(levels) <= side_index:
+        return None
+    side = levels[side_index]
+    if not isinstance(side, list):
+        raise ConnectorError("Hyperliquid orderbook side levels must be lists")
+    if not side:
+        return None
+    first_level = side[0]
+    if not isinstance(first_level, dict):
+        raise ConnectorError("Hyperliquid orderbook levels must contain objects")
+    return first_level
