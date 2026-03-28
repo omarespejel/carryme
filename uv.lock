@@ -8,6 +8,7 @@ members = [
     "carryme-connectors",
     "carryme-dev",
     "carryme-models",
+    "carryme-normalizers",
     "carryme-worker",
 ]
 
@@ -81,6 +82,7 @@ dependencies = [
     { name = "carryme-api" },
     { name = "carryme-connectors" },
     { name = "carryme-models" },
+    { name = "carryme-normalizers" },
     { name = "carryme-worker" },
 ]
 
@@ -97,6 +99,7 @@ requires-dist = [
     { name = "carryme-api", editable = "apps/api" },
     { name = "carryme-connectors", editable = "packages/connectors" },
     { name = "carryme-models", editable = "packages/models" },
+    { name = "carryme-normalizers", editable = "packages/normalizers" },
     { name = "carryme-worker", editable = "apps/worker" },
 ]
 
@@ -118,6 +121,17 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [{ name = "pydantic", specifier = ">=2.11,<3" }]
+
+[[package]]
+name = "carryme-normalizers"
+version = "0.1.0"
+source = { editable = "packages/normalizers" }
+dependencies = [
+    { name = "carryme-models" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "carryme-models", editable = "packages/models" }]
 
 [[package]]
 name = "carryme-worker"

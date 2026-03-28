@@ -10,6 +10,7 @@ The current workspace is intentionally narrow:
 - `apps/worker`: worker CLI skeleton that prints a deterministic health payload
 - `packages/models`: shared Pydantic models and settings
 - `packages/connectors`: public REST connectors for market data
+- `packages/normalizers`: venue-specific symbol, funding, and fee normalization
 
 ## Local development
 

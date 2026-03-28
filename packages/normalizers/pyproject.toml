@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carryme-normalizers"
+version = "0.1.0"
+description = "Venue-specific symbol, funding, and fee normalization for carryme."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "carryme-models",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryme_normalizers"]
+
+[tool.uv.sources]
+carryme-models = { workspace = true }
