@@ -7,6 +7,7 @@ The initial workspace is intentionally narrow:
 - `apps/worker`: async worker skeleton
 - `packages/models`: shared Pydantic models and settings
 - `packages/connectors`: public REST connectors for market data
+- `packages/normalizers`: venue-specific symbol, funding, and fee normalization
 
 ## Local development
 
