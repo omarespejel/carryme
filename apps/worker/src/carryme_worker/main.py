@@ -51,6 +51,7 @@ def build_loop_payload(summary: PollLoopSummary) -> dict[str, int | str]:
         "successful_cycles": summary.successful_cycles,
         "failures": summary.failures,
         "saved_records": summary.saved_records,
+        "alert_events": summary.alert_events,
         "database_path": summary.database_path,
     }
 

@@ -10,6 +10,7 @@ class ApiSettings(BaseSettings):
 
     environment: str = "development"
     database_path: str = "data/carryme.sqlite3"
+    watchlist_path: str = "config/watchlists/default.json"
 
     model_config = SettingsConfigDict(
         env_prefix="CARRYME_API_",

@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from carryme_models import (
+    CandidateAlertEvent,
     CapacityEstimate,
     FundingArbOpportunity,
     FundingPairSpec,
@@ -79,6 +80,7 @@ def test_worker_loop_payload() -> None:
         "successful_cycles": 2,
         "failures": 1,
         "saved_records": 2,
+        "alert_events": 0,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -394,7 +396,87 @@ def test_run_supervised_polling_loop_honors_max_iterations(tmp_path: Path) -> No
     assert summary.successful_cycles == 2
     assert summary.failures == 0
     assert summary.saved_records == 2
+    assert summary.alert_events == 2
     assert sleeps == [2.0]
+
+
+def test_run_supervised_polling_loop_emits_candidate_alert_events(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        """
+        {
+          "pairs": [
+            {
+              "label": "strk_extended_hyperliquid",
+              "left_venue": "extended",
+              "left_symbol": "STRK-USD",
+              "left_fee_profile": "default",
+              "right_venue": "hyperliquid",
+              "right_symbol": "STRK",
+              "right_fee_profile": "tier0"
+            }
+          ]
+        }
+        """
+    )
+
+    class StableScorer:
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            return FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            )
+
+    events: list[CandidateAlertEvent] = []
+
+    class StubAlertSink:
+        def append(self, event: CandidateAlertEvent) -> None:
+            events.append(event)
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        poll_interval_seconds=2,
+        min_candidate_entry_edge=0.0,
+        min_candidate_capacity_notional=2500.0,
+    )
+
+    import asyncio
+
+    summary = asyncio.run(
+        run_supervised_polling_loop(
+            settings,
+            scorer=StableScorer(),
+            store=OpportunityHistoryStore(settings.database_path),
+            alert_sink=StubAlertSink(),
+            sleep=fake_sleep,
+            max_iterations=1,
+        )
+    )
+
+    assert summary.attempts == 1
+    assert summary.alert_events == 1
+    assert len(events) == 1
+    assert events[0].record.pair.label == "strk_extended_hyperliquid"
 
 
 def test_install_signal_handlers_registers_expected_signals() -> None:

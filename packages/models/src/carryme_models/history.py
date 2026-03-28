@@ -1,6 +1,7 @@
-"""History and watchlist models."""
+"""History, watchlist, and alert models."""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -26,3 +27,18 @@ class OpportunityRecord(BaseModel):
     pair: FundingPairSpec
     opportunity: FundingArbOpportunity
 
+
+class WatchlistDocument(BaseModel):
+    """A persisted funding-pair watchlist document."""
+
+    pairs: list[FundingPairSpec] = Field(default_factory=list)
+
+
+class CandidateAlertEvent(BaseModel):
+    """A candidate event emitted when a saved record clears worker thresholds."""
+
+    emitted_at: datetime
+    alert_type: Literal["candidate_threshold_match"] = "candidate_threshold_match"
+    min_one_day_net_edge_after_entry: float | None = None
+    min_capacity_notional: float | None = None
+    record: OpportunityRecord
