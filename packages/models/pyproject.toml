@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carryme-models"
+version = "0.1.0"
+description = "Shared types and settings for the carryme workspace."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "pydantic>=2.11,<3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryme_models"]

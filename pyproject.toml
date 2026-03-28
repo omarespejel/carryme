@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carryme-dev"
+version = "0.1.0"
+description = "Development workspace for the carryme funding arbitrage control plane."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "carryme-api",
+  "carryme-worker",
+  "carryme-models",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryme_dev"]
+
+[tool.uv.workspace]
+members = ["apps/api", "apps/worker", "packages/models"]
+
+[tool.uv.sources]
+carryme-api = { workspace = true }
+carryme-worker = { workspace = true }
+carryme-models = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28,<1",
+  "mypy>=1.18,<2",
+  "pytest>=8.4,<9",
+  "ruff>=0.12,<0.13",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+strict_equality = true
+mypy_path = [
+  "apps/api/src",
+  "apps/worker/src",
+  "packages/models/src",
+  "src",
+]

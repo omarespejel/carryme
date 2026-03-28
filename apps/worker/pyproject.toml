@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carryme-worker"
+version = "0.1.0"
+description = "Async worker skeleton for market-data collection and scoring."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "carryme-models",
+  "pydantic-settings>=2.11,<3",
+]
+
+[project.scripts]
+carryme-worker = "carryme_worker.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryme_worker"]
+
+[tool.uv.sources]
+carryme-models = { workspace = true }
