@@ -11,6 +11,7 @@ The current workspace is intentionally narrow:
 - `packages/models`: shared Pydantic models and settings
 - `packages/connectors`: public REST connectors for market data
 - `packages/normalizers`: venue-specific symbol, funding, and fee normalization
+- `packages/scoring`: funding-arb opportunity scoring and capacity estimation
 
 ## Local development
 

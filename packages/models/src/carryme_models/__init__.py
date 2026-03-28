@@ -8,10 +8,13 @@ from carryme_models.normalization import (
     NormalizedMarketSnapshot,
     TradingFeeProfile,
 )
+from carryme_models.opportunity import CapacityEstimate, FundingArbOpportunity
 
 __all__ = [
     "AppDescriptor",
+    "CapacityEstimate",
     "FundingRateNormalization",
+    "FundingArbOpportunity",
     "MarketIdentity",
     "MarketStats",
     "NormalizedMarketSnapshot",
