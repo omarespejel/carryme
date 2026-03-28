@@ -5,6 +5,7 @@ requires-python = ">=3.13"
 [manifest]
 members = [
     "carryme-api",
+    "carryme-connectors",
     "carryme-dev",
     "carryme-models",
     "carryme-worker",
@@ -58,11 +59,27 @@ requires-dist = [
 ]
 
 [[package]]
+name = "carryme-connectors"
+version = "0.1.0"
+source = { editable = "packages/connectors" }
+dependencies = [
+    { name = "carryme-models" },
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "carryme-models", editable = "packages/models" },
+    { name = "httpx", specifier = ">=0.28,<1" },
+]
+
+[[package]]
 name = "carryme-dev"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "carryme-api" },
+    { name = "carryme-connectors" },
     { name = "carryme-models" },
     { name = "carryme-worker" },
 ]
@@ -78,6 +95,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "carryme-api", editable = "apps/api" },
+    { name = "carryme-connectors", editable = "packages/connectors" },
     { name = "carryme-models", editable = "packages/models" },
     { name = "carryme-worker", editable = "apps/worker" },
 ]

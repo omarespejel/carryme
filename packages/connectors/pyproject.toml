@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carryme-connectors"
+version = "0.1.0"
+description = "Public venue connectors for Extended, Paradex, and Hyperliquid."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "carryme-models",
+  "httpx>=0.28,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryme_connectors"]
+
+[tool.uv.sources]
+carryme-models = { workspace = true }
