@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -33,6 +36,17 @@ class PollCycleSummary:
     """Summary emitted after a watchlist poll cycle."""
 
     watched_pairs: int
+    saved_records: int
+    database_path: str
+
+
+@dataclass
+class PollLoopSummary:
+    """Summary emitted after a multi-iteration worker loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
     saved_records: int
     database_path: str
 
@@ -72,6 +86,67 @@ async def poll_watchlist_once(
 
     return PollCycleSummary(
         watched_pairs=len(pairs),
+        saved_records=saved_records,
+        database_path=settings.database_path,
+    )
+
+
+async def run_polling_loop(
+    settings: WorkerSettings,
+    *,
+    iterations: int,
+    scorer: PairScorer | None = None,
+    store: OpportunityHistoryStore | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+) -> PollLoopSummary:
+    """Run the worker for a fixed number of scheduled iterations."""
+
+    runtime = scorer or OpportunityService()
+    history_store = store or OpportunityHistoryStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+
+    successful_cycles = 0
+    failures = 0
+    saved_records = 0
+
+    for attempt in range(1, iterations + 1):
+        loop_logger.info("starting poll cycle %s of %s", attempt, iterations)
+        try:
+            summary = await poll_watchlist_once(
+                settings,
+                scorer=runtime,
+                store=history_store,
+            )
+            successful_cycles += 1
+            saved_records += summary.saved_records
+            loop_logger.info(
+                "completed poll cycle %s of %s with %s saved records",
+                attempt,
+                iterations,
+                summary.saved_records,
+            )
+            if attempt < iterations:
+                await sleep(settings.poll_interval_seconds)
+        except Exception:
+            failures += 1
+            backoff_seconds = min(
+                settings.max_backoff_seconds,
+                settings.poll_interval_seconds * (2 ** (failures - 1)),
+            )
+            loop_logger.exception(
+                "poll cycle %s of %s failed; backing off for %s seconds",
+                attempt,
+                iterations,
+                backoff_seconds,
+            )
+            if attempt < iterations:
+                await sleep(backoff_seconds)
+
+    return PollLoopSummary(
+        attempts=iterations,
+        successful_cycles=successful_cycles,
+        failures=failures,
         saved_records=saved_records,
         database_path=settings.database_path,
     )
