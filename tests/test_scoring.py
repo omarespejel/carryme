@@ -95,6 +95,47 @@ def test_score_funding_pair_rejects_mismatched_canonical_symbols() -> None:
         )
 
 
+def test_score_funding_pair_rejects_same_venue_pairs() -> None:
+    left = _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
+    right = _snapshot("extended", "STRK-USD", -0.0001, 0.0344, 90_000, 0.0345, 75_000)
+
+    with pytest.raises(ValueError, match="distinct venues"):
+        score_funding_pair(
+            left,
+            right,
+            get_fee_profile("extended", "default"),
+            get_fee_profile("extended", "maker_share_0_5pct"),
+        )
+
+
+def test_score_funding_pair_rejects_fee_profile_venue_mismatch() -> None:
+    extended = _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
+    hyperliquid = _snapshot("hyperliquid", "STRK", -0.00005, 0.0344, 90_000, 0.0345, 75_000)
+
+    with pytest.raises(ValueError, match="Left fee profile must match the left venue"):
+        score_funding_pair(
+            extended,
+            hyperliquid,
+            get_fee_profile("hyperliquid", "tier0"),
+            get_fee_profile("hyperliquid", "tier0"),
+        )
+
+
+def test_score_funding_pair_returns_none_capacity_when_book_data_missing() -> None:
+    extended = _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
+    hyperliquid = _snapshot("hyperliquid", "STRK", -0.00005, 0.0344, 90_000, 0.0345, 75_000)
+    hyperliquid.market.top_of_book = None
+
+    opportunity = score_funding_pair(
+        extended,
+        hyperliquid,
+        get_fee_profile("extended", "default"),
+        get_fee_profile("hyperliquid", "tier0"),
+    )
+
+    assert opportunity.capacity is None
+
+
 def test_rank_opportunities_sorts_by_round_trip_edge_then_capacity() -> None:
     better = score_funding_pair(
         _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000),
@@ -113,3 +154,24 @@ def test_rank_opportunities_sorts_by_round_trip_edge_then_capacity() -> None:
 
     assert ranked[0] == better
     assert ranked[1] == worse
+
+
+def test_rank_opportunities_treats_zero_capacity_as_better_than_missing_capacity() -> None:
+    zero_capacity = score_funding_pair(
+        _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 0.0, 0.0346, 80_000),
+        _snapshot("hyperliquid", "STRK", -0.00005, 0.0344, 90_000, 0.0345, 50_000),
+        get_fee_profile("extended", "default"),
+        get_fee_profile("hyperliquid", "tier0"),
+    )
+    missing_capacity = score_funding_pair(
+        _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000),
+        _snapshot("hyperliquid", "STRK", -0.00005, 0.0344, 90_000, 0.0345, 50_000),
+        get_fee_profile("extended", "default"),
+        get_fee_profile("hyperliquid", "tier0"),
+    )
+    missing_capacity.capacity = None
+
+    ranked = rank_opportunities([missing_capacity, zero_capacity])
+
+    assert ranked[0] == zero_capacity
+    assert ranked[1] == missing_capacity

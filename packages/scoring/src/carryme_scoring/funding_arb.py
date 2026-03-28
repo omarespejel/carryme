@@ -21,6 +21,12 @@ def score_funding_pair(
 
     if left.identity.canonical_symbol != right.identity.canonical_symbol:
         raise ValueError("Funding pairs must share the same canonical symbol")
+    if left.identity.venue == right.identity.venue:
+        raise ValueError("Funding pairs must come from distinct venues")
+    if left_fee.venue != left.identity.venue:
+        raise ValueError("Left fee profile must match the left venue")
+    if right_fee.venue != right.identity.venue:
+        raise ValueError("Right fee profile must match the right venue")
     if left.funding.daily_rate is None or right.funding.daily_rate is None:
         raise ValueError("Funding pairs require daily funding rates on both sides")
     left_daily_rate = left.funding.daily_rate
@@ -81,7 +87,7 @@ def rank_opportunities(
             item.one_day_net_edge_after_round_trip,
             (
                 item.capacity.max_entry_notional
-                if item.capacity and item.capacity.max_entry_notional
+                if item.capacity and item.capacity.max_entry_notional is not None
                 else -1.0
             ),
         ),
