@@ -1,0 +1,49 @@
+language: en-US
+tone_instructions: >-
+  Be concise and high-signal. Prioritize correctness, data integrity, execution risk,
+  async reliability, symbol mapping, fee-model accuracy, and funding-unit correctness.
+  Avoid style-only comments unless they hide a real bug or maintainability risk.
+
+reviews:
+  profile: assertive
+  high_level_summary: true
+  review_details: true
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  suggested_labels: false
+  suggested_reviewers: false
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    ignore_title_keywords:
+      - WIP
+      - "[skip review]"
+      - "do not review"
+  path_instructions:
+    - path: "**/*.py"
+      instructions: >-
+        Focus on async correctness, retries, stale-data handling, explicit numeric units,
+        fee-model accuracy, symbol normalization, and deterministic behavior.
+    - path: "**/tests/**/*.py"
+      instructions: >-
+        Focus on missing edge cases, replayability, deterministic assertions, and cases that
+        would catch unit-conversion or venue-mapping bugs.
+    - path: "**/*.md"
+      instructions: >-
+        Check that operational claims match the implemented system and do not overstate what
+        the software currently guarantees.
+  tools:
+    ruff:
+      enabled: true
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - REVIEWING.md
+  learnings:
+    scope: auto
+  pull_requests:
+    scope: auto

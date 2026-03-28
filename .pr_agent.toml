@@ -1,0 +1,11 @@
+[github_app]
+pr_commands = [
+  "/agentic_describe",
+  "/agentic_review"
+]
+
+[review_agent]
+comments_location_policy = "both"
+inline_comments_severity_threshold = 3
+issues_user_guidelines = "Prioritize correctness, data integrity, fee-model accuracy, funding-unit normalization, symbol mapping, and execution-risk issues. Avoid style-only comments unless they hide a real defect."
+compliance_user_guidelines = "Focus on deterministic behavior, explicit assumptions, official-API sourcing, and prevention of silent fallback or stale-data logic."

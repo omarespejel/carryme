@@ -1,0 +1,9 @@
+{
+  "strictness": 2,
+  "commentTypes": ["syntax", "logic", "info"],
+  "fileChangeLimit": 80,
+  "triggerOnUpdates": true,
+  "statusCheck": true,
+  "statusCommentsEnabled": true,
+  "ignorePatterns": "*.lock\nuv.lock\n.git/**\n.github/ISSUE_TEMPLATE/**\n**/__pycache__/**\n**/.pytest_cache/**\n**/.mypy_cache/**\n**/.ruff_cache/**\n**/dist/**\n**/build/**\n**/.venv/**\n**/*.png\n**/*.jpg\n**/*.svg"
+}
