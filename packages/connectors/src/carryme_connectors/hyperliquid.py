@@ -15,8 +15,18 @@ class HyperliquidPublicConnector(BaseHttpConnector):
 
     venue = "hyperliquid"
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        super().__init__(client)
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        max_attempts: int = 3,
+        base_backoff_seconds: float = 0.1,
+    ) -> None:
+        super().__init__(
+            client,
+            max_attempts=max_attempts,
+            base_backoff_seconds=base_backoff_seconds,
+        )
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         payload = await self._request_json("POST", "/info", json_body={"type": "metaAndAssetCtxs"})
@@ -31,7 +41,7 @@ class HyperliquidPublicConnector(BaseHttpConnector):
             funding_rate=parse_float(row.get("funding")),
             open_interest=parse_float(row.get("openInterest")),
             daily_volume=parse_float(row.get("dayNtlVlm")),
-            raw=row,
+            raw=payload,
         )
 
     async def fetch_top_of_book(self, symbol: str) -> TopOfBook:
@@ -61,6 +71,8 @@ def _find_context(universe: Any, contexts: Any, symbol: str) -> dict[str, Any]:
         raise ConnectorError("Hyperliquid universe/context payloads must be lists")
     for index, entry in enumerate(rows):
         if isinstance(entry, dict) and entry.get("name") == symbol:
+            if index >= len(contexts):
+                raise ConnectorError(f"Hyperliquid contexts missing entry for {symbol}")
             row = contexts[index]
             if isinstance(row, dict):
                 return row
