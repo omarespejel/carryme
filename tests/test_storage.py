@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from carryme_models import (
     CapacityEstimate,
     FundingArbOpportunity,
@@ -77,3 +78,10 @@ def test_history_store_appends_and_lists_recent(tmp_path: Path) -> None:
     assert len(results) == 1
     assert results[0].pair.label == "arb_extended_paradex"
     assert results[0].opportunity.canonical_symbol == "ARB-USD-PERP"
+
+
+def test_history_store_rejects_non_positive_limits(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        store.list_recent(limit=0)

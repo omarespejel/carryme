@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -63,13 +64,17 @@ class OpportunityService:
         right_symbol: str,
         right_fee_profile: str,
     ) -> FundingArbOpportunity:
-        left = await self.fetch_snapshot(left_venue, left_symbol)
-        right = await self.fetch_snapshot(right_venue, right_symbol)
+        left_fee = get_fee_profile(left_venue, left_fee_profile)
+        right_fee = get_fee_profile(right_venue, right_fee_profile)
+        left, right = await asyncio.gather(
+            self.fetch_snapshot(left_venue, left_symbol),
+            self.fetch_snapshot(right_venue, right_symbol),
+        )
         return score_funding_pair(
             left,
             right,
-            get_fee_profile(left_venue, left_fee_profile),
-            get_fee_profile(right_venue, right_fee_profile),
+            left_fee,
+            right_fee,
         )
 
 

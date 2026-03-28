@@ -72,15 +72,18 @@ class OpportunityHistoryStore:
     def list_recent(self, *, limit: int = 50, label: str | None = None) -> list[OpportunityRecord]:
         """Return recent opportunity history rows."""
 
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         self.initialize()
+        normalized_label = label.strip() if label is not None else None
         query = """
             SELECT recorded_at, pair_json, opportunity_json
             FROM opportunity_history
         """
         params: tuple[object, ...]
-        if label:
+        if normalized_label:
             query += " WHERE label = ?"
-            params = (label, limit)
+            params = (normalized_label, limit)
         else:
             params = (limit,)
         query += " ORDER BY recorded_at DESC LIMIT ?"

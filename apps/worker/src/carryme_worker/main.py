@@ -30,6 +30,7 @@ def build_cycle_payload(summary: PollCycleSummary) -> dict[str, int | str]:
     return {
         "watched_pairs": summary.watched_pairs,
         "saved_records": summary.saved_records,
+        "failed_records": summary.failed_records,
         "database_path": summary.database_path,
     }
 
