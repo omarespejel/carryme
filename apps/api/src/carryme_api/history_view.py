@@ -7,6 +7,37 @@ from html import escape
 from carryme_models import OpportunityRecord
 
 
+def filter_candidate_records(
+    records: list[OpportunityRecord],
+    *,
+    min_one_day_net_edge_after_entry: float | None = None,
+    min_capacity_notional: float | None = None,
+) -> list[OpportunityRecord]:
+    """Keep only records that satisfy the requested candidate thresholds."""
+
+    selected: list[OpportunityRecord] = []
+    for record in records:
+        if (
+            min_one_day_net_edge_after_entry is not None
+            and record.opportunity.one_day_net_edge_after_entry < min_one_day_net_edge_after_entry
+        ):
+            continue
+
+        capacity = (
+            record.opportunity.capacity.max_entry_notional
+            if record.opportunity.capacity is not None
+            else None
+        )
+        if (
+            min_capacity_notional is not None
+            and (capacity is None or capacity < min_capacity_notional)
+        ):
+            continue
+
+        selected.append(record)
+    return selected
+
+
 def latest_records_by_label(
     records: list[OpportunityRecord],
     *,
@@ -163,6 +194,162 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
   <body>
     <main>
       <h1>carryme operator view</h1>
+      <p>{subtitle}</p>
+      <section class="stats">
+        {stats_markup}
+      </section>
+      <table>
+        <thead>
+          <tr>
+            <th>Label</th>
+            <th>Symbol</th>
+            <th>Short</th>
+            <th>Long</th>
+            <th>Entry Edge</th>
+            <th>Round Trip</th>
+            <th>Break-even Days</th>
+            <th>Recorded</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows}
+        </tbody>
+      </table>
+    </main>
+  </body>
+</html>"""
+
+
+def render_candidate_dashboard(
+    records: list[OpportunityRecord],
+    *,
+    min_one_day_net_edge_after_entry: float | None,
+    min_capacity_notional: float | None,
+) -> str:
+    """Render a filtered dashboard focused on candidate opportunities."""
+
+    latest = latest_records_by_label(records, limit=200)
+    candidates = filter_candidate_records(
+        latest,
+        min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+        min_capacity_notional=min_capacity_notional,
+    )
+    ranked = rank_history_records(candidates, limit=20)
+    rows = "\n".join(_render_row(record) for record in ranked)
+    if not rows:
+        rows = (
+            '<tr><td colspan="8">'
+            "No candidate opportunities match the current thresholds."
+            "</td></tr>"
+        )
+
+    subtitle = (
+        "Filtered candidates from the latest saved row per label using explicit "
+        "minimum one-day entry edge and capacity thresholds."
+    )
+    stats_markup = "\n".join(
+        [
+            _render_stat_card("Candidates", str(len(ranked))),
+            _render_stat_card(
+                "Min Entry Edge",
+                (
+                    "-"
+                    if min_one_day_net_edge_after_entry is None
+                    else f"{min_one_day_net_edge_after_entry:.6f}"
+                ),
+            ),
+            _render_stat_card(
+                "Min Capacity",
+                "-" if min_capacity_notional is None else f"{min_capacity_notional:.2f}",
+            ),
+        ]
+    )
+
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>carryme candidates</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        --bg: #eff4ef;
+        --panel: #fefef9;
+        --ink: #0f1720;
+        --muted: #5e6e60;
+        --accent: #1d6b46;
+        --border: #c9d6c8;
+      }}
+      body {{
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", serif;
+        background: linear-gradient(135deg, #f7fce6, var(--bg));
+        color: var(--ink);
+      }}
+      main {{
+        max-width: 1120px;
+        margin: 0 auto;
+        padding: 32px 20px 64px;
+      }}
+      h1 {{
+        margin: 0 0 8px;
+        font-size: 2.6rem;
+      }}
+      p {{
+        color: var(--muted);
+        max-width: 760px;
+      }}
+      .stats {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+        margin: 24px 0;
+      }}
+      .card {{
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 16px;
+      }}
+      .label {{
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }}
+      .value {{
+        font-size: 1.6rem;
+        margin-top: 6px;
+      }}
+      table {{
+        width: 100%;
+        border-collapse: collapse;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        overflow: hidden;
+      }}
+      th, td {{
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--border);
+        text-align: left;
+        vertical-align: top;
+      }}
+      th {{
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }}
+      tr:last-child td {{
+        border-bottom: none;
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>carryme candidate view</h1>
       <p>{subtitle}</p>
       <section class="stats">
         {stats_markup}

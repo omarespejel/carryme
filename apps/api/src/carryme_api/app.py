@@ -20,8 +20,10 @@ from fastapi.responses import HTMLResponse
 
 from carryme_api.config import ApiSettings, get_api_settings
 from carryme_api.history_view import (
+    filter_candidate_records,
     latest_records_by_label,
     rank_history_records,
+    render_candidate_dashboard,
     render_dashboard,
 )
 
@@ -106,6 +108,26 @@ def create_app() -> FastAPI:
         latest = latest_records_by_label(records, limit=sample)
         return rank_history_records(latest, limit=limit)
 
+    @app.get("/v1/history/funding-pairs/candidates", response_model=list[OpportunityRecord])
+    def candidate_history(
+        store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        limit: int = 20,
+        sample: int = 200,
+        label: str | None = None,
+        min_one_day_net_edge_after_entry: float = 0.0,
+        min_capacity_notional: float = 0.0,
+    ) -> list[OpportunityRecord]:
+        if sample < limit:
+            sample = limit
+        records = store.list_recent(limit=sample, label=label)
+        latest = latest_records_by_label(records, limit=sample)
+        candidates = filter_candidate_records(
+            latest,
+            min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+            min_capacity_notional=min_capacity_notional,
+        )
+        return rank_history_records(candidates, limit=limit)
+
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(
         store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
@@ -114,6 +136,23 @@ def create_app() -> FastAPI:
     ) -> HTMLResponse:
         records = store.list_recent(limit=sample, label=label)
         return HTMLResponse(render_dashboard(records))
+
+    @app.get("/dashboard/candidates", response_class=HTMLResponse)
+    def candidate_dashboard(
+        store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        sample: int = 200,
+        label: str | None = None,
+        min_one_day_net_edge_after_entry: float = 0.0,
+        min_capacity_notional: float = 0.0,
+    ) -> HTMLResponse:
+        records = store.list_recent(limit=sample, label=label)
+        return HTMLResponse(
+            render_candidate_dashboard(
+                records,
+                min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+                min_capacity_notional=min_capacity_notional,
+            )
+        )
 
     @app.get("/v1/opportunities/funding-pair", response_model=FundingArbOpportunity)
     async def funding_pair(

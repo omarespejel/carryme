@@ -8,10 +8,13 @@ from carryme_models import AppDescriptor, ServiceHealth
 
 from carryme_worker.config import WorkerSettings
 from carryme_worker.poller import (
+    CandidateRecordSummary,
     PollCycleSummary,
     PollLoopSummary,
+    install_signal_handlers,
     poll_watchlist_once,
     run_polling_loop,
+    run_supervised_polling_loop,
 )
 
 APP_NAME = "carryme-worker"
@@ -52,6 +55,15 @@ def build_loop_payload(summary: PollLoopSummary) -> dict[str, int | str]:
     }
 
 
+def build_candidate_payload(summary: CandidateRecordSummary) -> dict[str, int]:
+    """Build a deterministic summary payload for candidate counts."""
+
+    return {
+        "total_records": summary.total_records,
+        "candidate_records": summary.candidate_records,
+    }
+
+
 def main() -> None:
     """Run one poll cycle or print worker health."""
 
@@ -62,6 +74,11 @@ def main() -> None:
         type=int,
         default=None,
         help="Run the worker loop for a fixed number of iterations",
+    )
+    parser.add_argument(
+        "--supervise",
+        action="store_true",
+        help="Run the signal-aware supervised worker loop",
     )
     args = parser.parse_args()
 
@@ -74,6 +91,18 @@ def main() -> None:
     if args.iterations is not None:
         loop_summary = asyncio.run(run_polling_loop(settings, iterations=args.iterations))
         print(build_loop_payload(loop_summary))
+        return
+    if args.supervise:
+        async def run_supervised() -> PollLoopSummary:
+            stop_event = asyncio.Event()
+            install_signal_handlers(
+                stop_event,
+                signals_to_handle=settings.stop_signals,
+            )
+            return await run_supervised_polling_loop(settings, stop_event=stop_event)
+
+        supervised_summary = asyncio.run(run_supervised())
+        print(build_loop_payload(supervised_summary))
         return
 
     payload = build_health_payload(settings)
