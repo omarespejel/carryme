@@ -12,18 +12,20 @@ dependencies = [
   "carryme-api",
   "carryme-worker",
   "carryme-models",
+  "carryme-connectors",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/carryme_dev"]
 
 [tool.uv.workspace]
-members = ["apps/api", "apps/worker", "packages/models"]
+members = ["apps/api", "apps/worker", "packages/connectors", "packages/models"]
 
 [tool.uv.sources]
 carryme-api = { workspace = true }
 carryme-worker = { workspace = true }
 carryme-models = { workspace = true }
+carryme-connectors = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -60,5 +62,6 @@ mypy_path = [
   "apps/api/src",
   "apps/worker/src",
   "packages/models/src",
+  "packages/connectors/src",
   "src",
 ]

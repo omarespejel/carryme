@@ -6,6 +6,7 @@ The initial workspace is intentionally narrow:
 - `apps/api`: FastAPI control-plane skeleton
 - `apps/worker`: async worker skeleton
 - `packages/models`: shared Pydantic models and settings
+- `packages/connectors`: public REST connectors for market data
 
 ## Local development
 
@@ -13,7 +14,7 @@ The initial workspace is intentionally narrow:
 uv sync --all-packages --group dev
 uv run pytest
 uv run ruff check .
-uv run mypy src apps packages tests
+uv run mypy $(find src apps packages tests -name '*.py' -type f)
 ```
 
 ## Run the skeleton services
