@@ -52,6 +52,7 @@ def build_signed_extended_order_payload(
     account_body = _unwrap_payload(account_payload, "Extended account")
     market_body = _unwrap_payload(market_payload, "Extended market")
     market_name = _require_string(market_body, "name")
+    trading_config = _optional_mapping(market_body, "tradingConfig")
     side = _normalize_side(_require_string(order_payload, "side"))
     order_type = _normalize_order_type(_require_string(order_payload, "type"))
     if order_type != "LIMIT":
@@ -67,6 +68,11 @@ def build_signed_extended_order_payload(
     post_only = bool(order_payload.get("post_only", False))
     order_external_id = _require_string(order_payload, "client_order_id")
     fee_rate = Decimal(str(taker_fee_rate))
+    quantity_places = _decimal_places(
+        _optional_decimal(trading_config, "minOrderSizeChange"),
+        fallback=_optional_int(market_body, "assetPrecision"),
+    )
+    price_places = _decimal_places(_optional_decimal(trading_config, "minPriceChange"))
     expiry = (expire_time or datetime.now(UTC) + timedelta(hours=1)).astimezone(UTC)
     nonce_value = secrets.randbelow(2**32) if nonce is None else nonce
 
@@ -134,8 +140,8 @@ def build_signed_extended_order_payload(
         "market": market_name,
         "type": order_type,
         "side": side,
-        "qty": _format_decimal(quantity),
-        "price": _format_decimal(price),
+        "qty": _format_decimal(quantity, places=quantity_places),
+        "price": _format_decimal(price, places=price_places),
         "reduceOnly": reduce_only,
         "postOnly": post_only,
         "timeInForce": time_in_force,
@@ -173,6 +179,11 @@ def _require_mapping(payload: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+def _optional_mapping(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    return value if isinstance(value, dict) else {}
+
+
 def _require_string(payload: dict[str, Any], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value:
@@ -187,6 +198,22 @@ def _require_int(payload: dict[str, Any], key: str) -> int:
     if isinstance(value, str) and value:
         return int(value)
     raise ConnectorError(f"Extended payload missing integer field {key!r}")
+
+
+def _optional_int(payload: dict[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value:
+        return int(value)
+    return None
+
+
+def _optional_decimal(payload: dict[str, Any], key: str) -> Decimal | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    return Decimal(str(value))
 
 
 def _normalize_side(value: str) -> str:
@@ -230,7 +257,26 @@ def _to_epoch_millis(value: datetime) -> int:
     return int(value.timestamp() * 1000)
 
 
-def _format_decimal(value: Decimal, *, normalize: bool = False) -> str:
+def _format_decimal(
+    value: Decimal,
+    *,
+    places: int | None = None,
+    normalize: bool = False,
+) -> str:
+    if places is not None:
+        quant = Decimal("1").scaleb(-places)
+        return format(value.quantize(quant), "f")
     if normalize:
         return format(value.normalize(), "f")
     return format(value, "f")
+
+
+def _decimal_places(value: Decimal | None, *, fallback: int | None = None) -> int | None:
+    if value is None:
+        return fallback
+    if value <= 0:
+        return fallback
+    exponent = value.normalize().as_tuple().exponent
+    if not isinstance(exponent, int):
+        return fallback
+    return max(-exponent, 0)

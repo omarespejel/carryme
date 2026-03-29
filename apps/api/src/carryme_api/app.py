@@ -11,6 +11,7 @@ from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
     ExecutionJournalEntry,
+    ExecutionOrderState,
     ExecutionReconciliation,
     FundingArbOpportunity,
     FundingPairTradeIntent,
@@ -33,13 +34,16 @@ from carryme_runtime import (
     AccountPreflightService,
     ConnectorError,
     ExecutionAdapter,
+    ExecutionOrderStateService,
     ExtendedLiveExecutionService,
+    ExtendedOrderStateObserver,
     InvalidTradeCandidateError,
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
     PairedLiveExecutionCoordinator,
     ParadexLiveExecutionService,
+    ParadexOrderStateObserver,
     UpstreamDataError,
     build_live_execution_configs,
     build_live_submission_readiness,
@@ -48,6 +52,7 @@ from carryme_runtime import (
     build_venue_execution_preflights,
     reconcile_execution,
 )
+from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
     CandidateAlertStore,
     ExecutionJournalStore,
@@ -271,6 +276,27 @@ def get_extended_live_execution_service(
         api_key=api_key,
         stark_private_key=stark_private_key,
     )
+
+
+def get_execution_order_state_service(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExecutionOrderStateService:
+    """Return the venue order-state observation service."""
+
+    observers: dict[str, ExecutionLegOrderObserver] = {}
+    if settings.extended_api_key:
+        observers["extended"] = ExtendedOrderStateObserver(
+            api_key=settings.extended_api_key,
+        )
+    if settings.paradex_account_address and (
+        settings.paradex_private_key or settings.paradex_bearer_token
+    ):
+        observers["paradex"] = ParadexOrderStateObserver(
+            account_address=settings.paradex_account_address,
+            private_key=settings.paradex_private_key,
+            bearer_token=settings.paradex_bearer_token,
+        )
+    return ExecutionOrderStateService(observers=observers)
 
 
 def get_paired_live_execution_coordinator(
@@ -765,6 +791,26 @@ def create_app() -> FastAPI:
             return store.list_recent(limit=limit, label=label)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/executions/order-state/latest/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionOrderState,
+    )
+    async def latest_execution_order_state_for_paper_trade(
+        paper_trade_id: int,
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+    ) -> ExecutionOrderState:
+        execution = execution_store.latest_for_paper_trade(paper_trade_id)
+        if execution is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No execution journal entry matched paper trade {paper_trade_id}",
+            )
+        return await service.observe_execution(execution)
 
     @app.get(
         "/v1/executions/reconciliation/latest/from-paper-trade/{paper_trade_id}",

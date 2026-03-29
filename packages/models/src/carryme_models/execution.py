@@ -70,3 +70,30 @@ class ExecutionReconciliation(BaseModel):
     matched_all_leg_symbols: bool
     venues: list[ExecutionVenueReconciliation] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+class ExecutionLegOrderState(BaseModel):
+    """Observed live order state for one execution leg."""
+
+    venue: str = Field(min_length=1)
+    supported: bool
+    external_reference: str | None = None
+    client_id: str | None = None
+    derived_state: Literal["open", "filled", "partial_fill", "unfilled", "unknown", "unsupported"]
+    order_status: str | None = None
+    cancel_reason: str | None = None
+    avg_fill_price: str | None = None
+    remaining_size: str | None = None
+    size: str | None = None
+    notes: list[str] = Field(default_factory=list)
+    raw_response: dict[str, Any] | None = None
+
+
+class ExecutionOrderState(BaseModel):
+    """Observed venue order-state view for a journaled execution."""
+
+    execution_entry_id: int | None = None
+    paper_trade_id: int | None = None
+    preview_hash: str | None = None
+    legs: list[ExecutionLegOrderState] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)

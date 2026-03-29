@@ -7,7 +7,9 @@ from carryme_models.account_preflight import (
 from carryme_models.confirmation import PreviewConfirmationEntry
 from carryme_models.execution import (
     ExecutionJournalEntry,
+    ExecutionLegOrderState,
     ExecutionLegResult,
+    ExecutionOrderState,
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
 )
@@ -42,6 +44,8 @@ __all__ = [
     "CredentialRequirementStatus",
     "ExecutionJournalEntry",
     "ExecutionLegResult",
+    "ExecutionLegOrderState",
+    "ExecutionOrderState",
     "ExecutionReconciliation",
     "ExecutionVenueReconciliation",
     "FundingPairSpec",

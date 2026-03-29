@@ -26,6 +26,10 @@ class PublicVenueConnector(Protocol):
 class ConnectorError(RuntimeError):
     """Raised when a connector cannot parse or find the requested market."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class BaseHttpConnector:
     """Shared async HTTP helper for public venue connectors.
@@ -77,7 +81,8 @@ class BaseHttpConnector:
                     await self._sleep_before_retry(attempt, delay_seconds=delay_seconds)
                     continue
                 raise ConnectorError(
-                    f"{self.venue} request failed with status {status_code}"
+                    f"{self.venue} request failed with status {status_code}",
+                    status_code=status_code,
                 ) from exc
             except httpx.TransportError as exc:
                 if attempt < self._max_attempts:

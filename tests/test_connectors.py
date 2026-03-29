@@ -350,6 +350,24 @@ def test_extended_connector_retries_rate_limit_responses() -> None:
     asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
 
 
+def test_extended_connector_preserves_http_status_on_non_retryable_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            request=request,
+            json={"error": "missing"},
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ExtendedPublicConnector(client, base_backoff_seconds=0.0)
+        with pytest.raises(ConnectorError, match="request failed with status 404") as exc_info:
+            await connector.fetch_market_stats("STRK-USD")
+
+        assert exc_info.value.status_code == 404
+
+    asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
+
+
 def test_extended_connector_raises_for_invalid_numeric_values() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

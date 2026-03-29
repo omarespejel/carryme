@@ -213,8 +213,16 @@ def _build_leg_preview(
             f"Venue {venue} preview order value for {symbol} exceeded maximum limit order value"
         )
 
-    quantity_text = _format_decimal(quantity)
-    worst_price_text = _format_decimal(worst_price)
+    quantity_text = _format_order_value(
+        venue=venue_key,
+        value=quantity,
+        increment=constraints.quantity_increment,
+    )
+    worst_price_text = _format_order_value(
+        venue=venue_key,
+        value=worst_price,
+        increment=constraints.price_increment,
+    )
     client_order_id = f"carryme-pt{paper_trade_id}-{venue_key}-{side}"
 
     payload = _build_payload(
@@ -292,9 +300,43 @@ def _build_payload(
     raise ValueError(f"Unsupported live order preview venue: {venue}")
 
 
+def _format_order_value(
+    *,
+    venue: str,
+    value: Decimal,
+    increment: Decimal | None,
+    places: int = 8,
+) -> str:
+    if venue == "extended":
+        return _format_decimal_to_increment(value, increment, fallback_places=places)
+    return _format_decimal(value, places=places)
+
+
 def _format_decimal(value: Decimal, places: int = 8) -> str:
     quant = Decimal("1").scaleb(-places)
     return format(value.quantize(quant, rounding=ROUND_HALF_UP), "f")
+
+
+def _format_decimal_to_increment(
+    value: Decimal,
+    increment: Decimal | None,
+    *,
+    fallback_places: int = 8,
+) -> str:
+    places = _decimal_places(increment)
+    if places is None:
+        return _format_decimal(value, places=fallback_places)
+    quant = Decimal("1").scaleb(-places)
+    return format(value.quantize(quant, rounding=ROUND_HALF_UP), "f")
+
+
+def _decimal_places(increment: Decimal | None) -> int | None:
+    if increment is None or increment <= 0:
+        return None
+    exponent = increment.normalize().as_tuple().exponent
+    if not isinstance(exponent, int):
+        return None
+    return max(-exponent, 0)
 
 
 def _bps_decimal(value: int) -> Decimal:
