@@ -5,6 +5,7 @@ from carryme_models import (
     PaperTradeAccountPreflight,
     PaperTradeExecutionPreflight,
     PreviewConfirmationEntry,
+    VenueAccountPreflight,
 )
 
 from carryme_runtime.confirmation import require_confirmed_preview
@@ -76,6 +77,11 @@ def _build_zero_collateral_blockers(
             continue
         usable_collateral = _usable_collateral(venue_status)
         if usable_collateral is None:
+            if venue_status.ready or venue_status.authenticated:
+                blockers.append(
+                    f"Venue {venue_status.venue} is missing collateral data for the "
+                    f"confirmed {preview_leg.target_notional:.2f} notional preview"
+                )
             continue
         if usable_collateral > 0:
             continue
@@ -86,16 +92,16 @@ def _build_zero_collateral_blockers(
     return blockers
 
 
-def _usable_collateral(venue_status: object) -> float | None:
-    available_to_trade = getattr(venue_status, "available_to_trade", None)
+def _usable_collateral(venue_status: VenueAccountPreflight) -> float | None:
+    available_to_trade = venue_status.available_to_trade
     if isinstance(available_to_trade, int | float):
         return float(available_to_trade)
 
-    free_collateral = getattr(venue_status, "free_collateral", None)
+    free_collateral = venue_status.free_collateral
     if isinstance(free_collateral, int | float):
         return float(free_collateral)
 
-    total_collateral = getattr(venue_status, "total_collateral", None)
+    total_collateral = venue_status.total_collateral
     if isinstance(total_collateral, int | float):
         return float(total_collateral)
 

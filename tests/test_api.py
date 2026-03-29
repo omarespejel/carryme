@@ -3125,6 +3125,14 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
                         total_collateral=0.0,
                         available_to_trade=0.0,
                         free_collateral=0.0,
+                    ),
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        free_collateral=25.0,
                     )
                 ],
                 blocking_reasons=[],
@@ -3143,6 +3151,9 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
         lambda: StubAccountPreflightService()
     )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
         hyperliquid_live_enabled=True,
         hyperliquid_account_address="0xhyper",
         hyperliquid_api_wallet_private_key="0xwallet",
@@ -3156,11 +3167,11 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["confirmed_preview"] is True
     assert payload["ready"] is False
-    assert (
+    assert payload["blocking_reasons"] == [
         "Venue hyperliquid has no usable collateral for the confirmed 11.00 notional preview"
-        in payload["blocking_reasons"]
-    )
+    ]
 
 
 def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Path) -> None:
@@ -3272,6 +3283,7 @@ def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pat
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                     ),
                     VenueAccountPreflight(
                         venue="paradex",
@@ -3279,6 +3291,7 @@ def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pat
                         authenticated=True,
                         ready=True,
                         credential_mode="subkey_jwt",
+                        available_to_trade=25.0,
                     ),
                 ],
                 blocking_reasons=[],
@@ -3470,6 +3483,7 @@ def test_extended_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pa
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                     )
                 ],
                 blocking_reasons=[],
@@ -3654,6 +3668,7 @@ def test_hyperliquid_live_execution_endpoint_submits_confirmed_preview(tmp_path:
                         authenticated=True,
                         ready=True,
                         credential_mode="api_wallet",
+                        available_to_trade=25.0,
                     ),
                     VenueAccountPreflight(
                         venue="extended",
@@ -3661,6 +3676,7 @@ def test_hyperliquid_live_execution_endpoint_submits_confirmed_preview(tmp_path:
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                     ),
                 ],
                 blocking_reasons=[],
@@ -3859,6 +3875,7 @@ def test_paired_live_execution_endpoint_submits_both_legs(tmp_path: Path) -> Non
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                     ),
                     VenueAccountPreflight(
                         venue="paradex",
@@ -3866,6 +3883,7 @@ def test_paired_live_execution_endpoint_submits_both_legs(tmp_path: Path) -> Non
                         authenticated=True,
                         ready=True,
                         credential_mode="subkey_jwt",
+                        available_to_trade=25.0,
                     ),
                 ],
                 blocking_reasons=[],
@@ -4079,6 +4097,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                         position_symbols=positions["extended"],
                     ),
                     VenueAccountPreflight(
@@ -4087,6 +4106,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
                         authenticated=True,
                         ready=True,
                         credential_mode="subkey_jwt",
+                        available_to_trade=25.0,
                         position_symbols=positions["paradex"],
                     ),
                 ],
@@ -4101,6 +4121,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
                     authenticated=True,
                     ready=True,
                     credential_mode="api_key",
+                    free_collateral=25.0,
                 ),
                 VenueAccountPreflight(
                     venue="paradex",
@@ -4108,6 +4129,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
                     authenticated=True,
                     ready=True,
                     credential_mode="subkey_jwt",
+                    available_to_trade=25.0,
                 ),
             ]
 
@@ -4487,6 +4509,7 @@ def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirma
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                         position_symbols=positions["extended"],
                     ),
                     VenueAccountPreflight(
@@ -4495,6 +4518,7 @@ def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirma
                         authenticated=True,
                         ready=True,
                         credential_mode="subkey_jwt",
+                        available_to_trade=25.0,
                         position_symbols=positions["paradex"],
                     ),
                 ],
@@ -4509,6 +4533,7 @@ def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirma
                     authenticated=True,
                     ready=True,
                     credential_mode="api_key",
+                    free_collateral=25.0,
                 ),
                 VenueAccountPreflight(
                     venue="paradex",
@@ -4516,6 +4541,7 @@ def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirma
                     authenticated=True,
                     ready=True,
                     credential_mode="subkey_jwt",
+                    available_to_trade=25.0,
                 ),
             ]
 
@@ -4877,6 +4903,7 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                         position_symbols=["ARB-USD"],
                     ),
                     VenueAccountPreflight(
@@ -4885,6 +4912,7 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
                         authenticated=True,
                         ready=True,
                         credential_mode="subkey_jwt",
+                        available_to_trade=25.0,
                         position_symbols=[],
                     ),
                 ],
@@ -4899,6 +4927,7 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
                     authenticated=True,
                     ready=True,
                     credential_mode="api_key",
+                    free_collateral=25.0,
                 ),
                 VenueAccountPreflight(
                     venue="paradex",
@@ -4906,6 +4935,7 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
                     authenticated=True,
                     ready=True,
                     credential_mode="subkey_jwt",
+                    available_to_trade=25.0,
                 ),
             ]
 
@@ -5184,6 +5214,7 @@ def test_guarded_paired_live_execution_endpoint_rejects_duplicate_retry(
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                     ),
                     VenueAccountPreflight(
                         venue="paradex",
@@ -5191,6 +5222,7 @@ def test_guarded_paired_live_execution_endpoint_rejects_duplicate_retry(
                         authenticated=True,
                         ready=True,
                         credential_mode="subkey_jwt",
+                        available_to_trade=25.0,
                     ),
                 ],
                 blocking_reasons=[],
