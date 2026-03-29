@@ -95,6 +95,7 @@ class OpportunityUniverseService:
         min_open_interest: float = 0.0,
         min_roundtrip_edge: float = 0.0,
         min_execution_quality_score: float = 0.0,
+        min_execution_samples: int = 0,
         include_symbols: list[str] | None = None,
         exclude_symbols: list[str] | None = None,
         exclude_tags: list[str] | None = None,
@@ -151,6 +152,7 @@ class OpportunityUniverseService:
                     min_roundtrip_edge=min_roundtrip_edge,
                     min_execution_quality_score=min_execution_quality_score,
                     default_execution_quality_score=execution_prior_score,
+                    min_execution_samples=min_execution_samples,
                 ):
                     continue
                 opportunities.append(scored)
@@ -386,6 +388,7 @@ def _passes_filters(
     min_roundtrip_edge: float,
     min_execution_quality_score: float,
     default_execution_quality_score: float,
+    min_execution_samples: int,
 ) -> bool:
     deployable_notional = opportunity.deployable_notional or 0.0
     if deployable_notional < min_capacity_notional:
@@ -401,7 +404,14 @@ def _passes_filters(
         if opportunity.execution_quality is not None
         else default_execution_quality_score
     )
-    return execution_quality_score >= min_execution_quality_score
+    execution_sample_size = (
+        opportunity.execution_quality.sample_size
+        if opportunity.execution_quality is not None
+        else 0
+    )
+    if execution_quality_score < min_execution_quality_score:
+        return False
+    return execution_sample_size >= min_execution_samples
 
 
 def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRanking) -> float:
@@ -463,6 +473,7 @@ def build_portfolio_plan(
     entries: list[FundingUniversePortfolioEntry] = []
     total_entry_pnl = 0.0
     total_round_trip_pnl = 0.0
+    total_execution_adjusted_round_trip_pnl = 0.0
 
     for opportunity in scan.opportunities:
         if remaining <= 0 or len(entries) >= max_positions:
@@ -479,6 +490,8 @@ def build_portfolio_plan(
         round_trip_edge = opportunity.opportunity.one_day_net_edge_after_round_trip
         entry_pnl = selected_notional * entry_edge
         round_trip_pnl = selected_notional * round_trip_edge
+        execution_weight = _execution_weight(opportunity)
+        execution_adjusted_round_trip_pnl = selected_notional * round_trip_edge * execution_weight
 
         entries.append(
             FundingUniversePortfolioEntry(
@@ -486,11 +499,15 @@ def build_portfolio_plan(
                 selected_notional=selected_notional,
                 estimated_one_day_pnl_after_entry=entry_pnl,
                 estimated_one_day_pnl_after_round_trip=round_trip_pnl,
+                execution_adjusted_estimated_one_day_pnl_after_round_trip=(
+                    execution_adjusted_round_trip_pnl
+                ),
             )
         )
         remaining -= selected_notional
         total_entry_pnl += entry_pnl
         total_round_trip_pnl += round_trip_pnl
+        total_execution_adjusted_round_trip_pnl += execution_adjusted_round_trip_pnl
         selected_symbols.add(canonical_symbol)
 
     allocated = target_notional - remaining
@@ -501,5 +518,22 @@ def build_portfolio_plan(
         unused_notional=max(remaining, 0.0),
         estimated_one_day_pnl_after_entry=total_entry_pnl,
         estimated_one_day_pnl_after_round_trip=total_round_trip_pnl,
+        execution_adjusted_estimated_one_day_pnl_after_round_trip=(
+            total_execution_adjusted_round_trip_pnl
+        ),
         entries=entries,
     )
+
+
+def _execution_weight(opportunity: FundingUniverseOpportunity) -> float:
+    if opportunity.execution_quality is not None:
+        return opportunity.execution_quality.weighted_score
+    raw_pnl = opportunity.estimated_one_day_pnl_after_round_trip
+    adjusted_pnl = opportunity.execution_adjusted_one_day_pnl_after_round_trip
+    if (
+        raw_pnl is not None
+        and adjusted_pnl is not None
+        and not math.isclose(raw_pnl, 0.0, rel_tol=0.0, abs_tol=1e-12)
+    ):
+        return adjusted_pnl / raw_pnl
+    return 1.0

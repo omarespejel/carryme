@@ -22,6 +22,7 @@ from carryme_models import (
     ExecutionOrderState,
     ExecutionPairClosePreview,
     ExecutionPairStatus,
+    ExecutionQualitySummary,
     ExecutionReconciliation,
     FundingArbOpportunity,
     FundingPairTradeIntent,
@@ -3188,6 +3189,7 @@ def create_app() -> FastAPI:
         min_open_interest: float = 0.0,
         min_roundtrip_edge: float = 0.0,
         min_execution_quality_score: float = 0.0,
+        min_execution_samples: int = 0,
         include_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_tags: Annotated[list[str] | None, Query()] = None,
@@ -3204,6 +3206,7 @@ def create_app() -> FastAPI:
                 min_open_interest=min_open_interest,
                 min_roundtrip_edge=min_roundtrip_edge,
                 min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
                 include_symbols=include_symbols,
                 exclude_symbols=exclude_symbols,
                 exclude_tags=exclude_tags,
@@ -3230,6 +3233,7 @@ def create_app() -> FastAPI:
         min_open_interest: float = 0.0,
         min_roundtrip_edge: float = 0.0,
         min_execution_quality_score: float = 0.0,
+        min_execution_samples: int = 0,
         include_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_tags: Annotated[list[str] | None, Query()] = None,
@@ -3247,6 +3251,7 @@ def create_app() -> FastAPI:
                 min_open_interest=min_open_interest,
                 min_roundtrip_edge=min_roundtrip_edge,
                 min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
                 include_symbols=include_symbols,
                 exclude_symbols=exclude_symbols,
                 exclude_tags=exclude_tags,
@@ -3262,6 +3267,35 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/opportunities/execution-quality",
+        response_model=list[ExecutionQualitySummary],
+    )
+    def execution_quality_routes(
+        service: Annotated[
+            ExecutionQualityService, Depends(get_execution_quality_service)
+        ],
+        canonical_symbol: str | None = None,
+        short_venue: str | None = None,
+        long_venue: str | None = None,
+        min_sample_size: int = 0,
+        limit: int = 50,
+    ) -> list[ExecutionQualitySummary]:
+        if min_sample_size < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="min_sample_size must be non-negative",
+            )
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return service.list_summaries(
+            canonical_symbol=canonical_symbol,
+            short_venue=short_venue,
+            long_venue=long_venue,
+            min_sample_size=min_sample_size,
+            limit=limit,
+        )
 
     return app
 

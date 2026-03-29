@@ -139,6 +139,47 @@ class ExecutionQualityService:
             )
         return result
 
+    def list_summaries(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        short_venue: str | None = None,
+        long_venue: str | None = None,
+        min_sample_size: int = 0,
+        limit: int = 50,
+    ) -> list[ExecutionQualitySummary]:
+        """Return ranked execution-quality summaries with optional filters."""
+
+        normalized_symbol = canonical_symbol.strip().upper() if canonical_symbol else None
+        normalized_short_venue = short_venue.strip().lower() if short_venue else None
+        normalized_long_venue = long_venue.strip().lower() if long_venue else None
+
+        summaries: list[ExecutionQualitySummary] = []
+        for summary in self.build_index().values():
+            if normalized_symbol and summary.canonical_symbol.upper() != normalized_symbol:
+                continue
+            if normalized_short_venue and summary.short_venue != normalized_short_venue:
+                continue
+            if normalized_long_venue and summary.long_venue != normalized_long_venue:
+                continue
+            if summary.sample_size < min_sample_size:
+                continue
+            summaries.append(summary)
+
+        ranked = sorted(
+            summaries,
+            key=lambda item: (
+                -item.weighted_score,
+                -item.sample_size,
+                item.canonical_symbol,
+                item.short_venue,
+                item.long_venue,
+            ),
+        )
+        if limit > 0:
+            return ranked[:limit]
+        return ranked
+
 
 def _observation_sort_key(observation: ExecutionObservationEntry) -> tuple[datetime, int]:
     return observation.observed_at, observation.entry_id or 0

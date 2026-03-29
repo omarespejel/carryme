@@ -27,6 +27,7 @@ from carryme_models import (
     ExecutionOrderState,
     ExecutionPairClosePreview,
     ExecutionPairStatus,
+    ExecutionQualitySummary,
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
     FundingArbOpportunity,
@@ -333,6 +334,39 @@ def test_funding_universe_endpoint_passes_policy_and_execution_filters() -> None
     assert captured["min_execution_quality_score"] == 0.7
 
 
+def test_funding_universe_endpoint_passes_min_execution_samples() -> None:
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan(self, **kwargs: object) -> FundingUniverseScan:
+            captured.update(kwargs)
+            return FundingUniverseScan(
+                venues=["extended", "paradex"],
+                ranking="execution_adjusted_quality_pnl",
+                target_notional=5000.0,
+                overlap_count=0,
+                overlaps=[],
+                opportunities=[],
+            )
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("min_execution_samples", "3"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["min_execution_samples"] == 3
+
+
 def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
     class StubUniverseService:
         async def scan(self, **_: object) -> FundingUniverseScan:
@@ -392,6 +426,49 @@ def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
     payload = response.json()
     assert payload["allocated_notional"] == 900.0
     assert payload["entries"][0]["opportunity"]["opportunity"]["canonical_symbol"] == "ARB-USD-PERP"
+
+
+def test_execution_quality_endpoint_uses_service_dependency() -> None:
+    captured: dict[str, object] = {}
+
+    class StubExecutionQualityService:
+        def list_summaries(self, **kwargs: object) -> list[ExecutionQualitySummary]:
+            captured.update(kwargs)
+            return [
+                ExecutionQualitySummary(
+                    canonical_symbol="ARB-USD-PERP",
+                    short_venue="extended",
+                    long_venue="paradex",
+                    sample_size=2,
+                    weighted_score=0.55,
+                    latest_outcome="unfilled",
+                    hedged_count=0,
+                    closed_count=0,
+                    unfilled_count=2,
+                    cleanup_needed_count=0,
+                    review_required_count=0,
+                    pending_count=0,
+                )
+            ]
+
+    app.dependency_overrides[get_execution_quality_service] = (
+        lambda: StubExecutionQualityService()
+    )
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/execution-quality",
+            params={"min_sample_size": 2},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["canonical_symbol"] == "ARB-USD-PERP"
+    assert payload[0]["weighted_score"] == 0.55
+    assert captured["min_sample_size"] == 2
 
 
 def test_execution_quality_service_provider_uses_shared_stores(tmp_path: Path) -> None:
