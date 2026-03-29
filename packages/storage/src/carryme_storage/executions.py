@@ -53,8 +53,19 @@ class ExecutionJournalStore:
         self.initialize()
         if entry.executed_at.tzinfo is None or entry.executed_at.utcoffset() is None:
             raise ValueError("executed_at must be timezone-aware")
+        normalized_label = entry.paper_trade.intent.label.strip()
+        normalized_paper_trade = entry.paper_trade.model_copy(
+            update={
+                "intent": entry.paper_trade.intent.model_copy(
+                    update={"label": normalized_label}
+                )
+            }
+        )
         normalized_entry = entry.model_copy(
-            update={"executed_at": entry.executed_at.astimezone(UTC)}
+            update={
+                "executed_at": entry.executed_at.astimezone(UTC),
+                "paper_trade": normalized_paper_trade,
+            }
         )
         with sqlite3.connect(self.database_path) as connection:
             cursor = connection.execute(
@@ -73,7 +84,7 @@ class ExecutionJournalStore:
                     normalized_entry.adapter,
                     normalized_entry.status,
                     normalized_entry.paper_trade_id,
-                    normalized_entry.paper_trade.intent.label,
+                    normalized_label,
                     normalized_entry.model_dump_json(),
                 ),
             )
