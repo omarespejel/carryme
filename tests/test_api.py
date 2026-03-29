@@ -1762,6 +1762,7 @@ def test_account_preflight_venues_endpoint_uses_service_dependency() -> None:
                     "credentials": {
                         "account_address": "0xabc",
                         "bearer_token": None,
+                        "private_key": "paradex-secret",
                     },
                 },
             }
@@ -1871,6 +1872,7 @@ def test_account_preflight_for_saved_paper_trade_uses_service_dependency(tmp_pat
                     "credentials": {
                         "account_address": "0xabc",
                         "bearer_token": None,
+                        "private_key": "paradex-secret",
                     },
                 },
             }
