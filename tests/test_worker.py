@@ -2217,6 +2217,7 @@ def test_run_supervised_execution_observation_loop_clamps_exponential_backoff(
             observed_executions=1,
             saved_observations=1,
             saved_alerts=0,
+            sent_notifications=0,
             database_path=settings.database_path,
         ),
     ]
@@ -2227,16 +2228,20 @@ def test_run_supervised_execution_observation_loop_clamps_exponential_backoff(
         execution_store: object | None = None,
         observation_store: object | None = None,
         alert_sink: object | None = None,
+        alert_notifier: object | None = None,
         account_service: object | None = None,
         order_state_service: object | None = None,
+        logger: object | None = None,
         now: datetime | None = None,
     ) -> ExecutionObservationSummary:
         assert settings_arg is settings
         _ = execution_store
         _ = observation_store
         _ = alert_sink
+        assert alert_notifier is not None
         assert account_service is stable_account_service
         assert order_state_service is stable_order_state_service
+        assert logger is not None
         assert now is None
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
