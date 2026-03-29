@@ -200,7 +200,9 @@ def _build_leg_preview(
     ):
         raise ValueError(f"Venue {venue} preview notional for {symbol} fell below minimum notional")
     if constraints.max_order_value is not None and limit_order_value > constraints.max_order_value:
-        raise ValueError(f"Venue {venue} preview notional for {symbol} exceeded max order value")
+        raise ValueError(
+            f"Venue {venue} preview order value for {symbol} exceeded maximum limit order value"
+        )
 
     quantity_text = _format_decimal(quantity)
     worst_price_text = _format_decimal(worst_price)

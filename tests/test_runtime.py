@@ -58,7 +58,7 @@ def _snapshot(
     ask_price: float,
     ask_size: float,
     *,
-    raw: dict[str, object] | None = None,
+    raw: dict[str, object] | list[object] | None = None,
 ) -> NormalizedMarketSnapshot:
     return normalize_market_snapshot(
         venue,
@@ -75,7 +75,7 @@ def _snapshot(
                 best_ask_price=ask_price,
                 best_ask_size=ask_size,
             ),
-            raw=raw or {},
+            raw={} if raw is None else raw,
         ),
     )
 
@@ -1026,6 +1026,177 @@ def test_order_preview_service_rejects_malformed_paradex_constraints() -> None:
         with pytest.raises(
             ValueError,
             match="Paradex order constraints field 'order_size_increment'",
+        ):
+            await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=10,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            )
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_rejects_extended_leg_below_minimum_order_size() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=12,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="tiny_extended_leg",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=0.5,
+            capacity_fraction=0.25,
+            max_target_notional=0.5,
+            long_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=0.5,
+            ),
+            short_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        with pytest.raises(
+            ValueError,
+            match=r"Venue extended preview quantity for ARB-USD fell below minimum order size",
+        ):
+            await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=10,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            )
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_rejects_order_value_above_venue_cap() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=13,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="oversized_extended_leg",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=2_000_000.0,
+            target_notional=1_300_000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1_300_000.0,
+            long_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=1_300_000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"Venue extended preview order value for ARB-USD "
+                r"exceeded maximum limit order value"
+            ),
         ):
             await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
                 paper_trade,
