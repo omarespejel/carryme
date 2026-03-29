@@ -114,6 +114,7 @@ class OpportunityUniverseService:
         *,
         venues: list[str],
         ranking: UniverseRanking = "execution_adjusted_quality_pnl",
+        fee_profile_overrides: dict[str, str] | None = None,
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
@@ -131,6 +132,11 @@ class OpportunityUniverseService:
     ) -> FundingUniverseScan:
         normalized_venues = _normalize_venues(venues)
         normalized_ranking = _normalize_ranking(ranking)
+        fee_profiles = _resolve_fee_profiles(
+            normalized_venues,
+            self.default_fee_profiles,
+            fee_profile_overrides,
+        )
         overlaps = await self.discover_overlaps(normalized_venues)
         snapshots = await self._fetch_overlapping_snapshots(overlaps)
         execution_quality_index = (
@@ -171,8 +177,8 @@ class OpportunityUniverseService:
                 scored = _build_universe_opportunity(
                     left=left,
                     right=right,
-                    left_fee_profile=self.default_fee_profiles[left_venue],
-                    right_fee_profile=self.default_fee_profiles[right_venue],
+                    left_fee_profile=fee_profiles[left_venue],
+                    right_fee_profile=fee_profiles[right_venue],
                     target_notional=target_notional,
                     execution_quality_index=execution_quality_index,
                     execution_prior_score=execution_prior_score,
@@ -204,6 +210,8 @@ class OpportunityUniverseService:
 
         return FundingUniverseScan(
             venues=normalized_venues,
+            ranking=normalized_ranking,
+            fee_profiles=fee_profiles,
             ranking=normalized_ranking,
             target_notional=target_notional,
             overlap_count=len(overlaps),
@@ -588,6 +596,24 @@ def _normalize_ranking(ranking: str) -> UniverseRanking:
         supported = ", ".join(UNIVERSE_RANKINGS)
         raise ValueError(f"Unsupported ranking: {ranking}. Expected one of: {supported}")
     return normalized  # type: ignore[return-value]
+
+
+def _resolve_fee_profiles(
+    venues: list[str],
+    default_fee_profiles: dict[str, str],
+    fee_profile_overrides: dict[str, str] | None,
+) -> dict[str, str]:
+    resolved = {venue: default_fee_profiles[venue] for venue in venues}
+    if not fee_profile_overrides:
+        return resolved
+    for venue, profile in fee_profile_overrides.items():
+        normalized_venue = venue.strip().lower()
+        if normalized_venue not in resolved:
+            raise ValueError(f"Unsupported fee-profile override venue: {venue}")
+        normalized_profile = profile.strip().lower()
+        get_fee_profile(normalized_venue, normalized_profile)
+        resolved[normalized_venue] = normalized_profile
+    return resolved
 
 
 def build_portfolio_plan(

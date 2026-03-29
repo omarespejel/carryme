@@ -203,6 +203,24 @@ def _execution_observation_store_for_path(database_path: str) -> ExecutionObserv
     return ExecutionObservationStore(database_path)
 
 
+def _build_fee_profile_overrides(
+    *,
+    extended_fee_profile: str | None,
+    paradex_fee_profile: str | None,
+    hyperliquid_fee_profile: str | None,
+) -> dict[str, str] | None:
+    overrides = {
+        venue: profile
+        for venue, profile in {
+            "extended": extended_fee_profile,
+            "paradex": paradex_fee_profile,
+            "hyperliquid": hyperliquid_fee_profile,
+        }.items()
+        if profile
+    }
+    return overrides or None
+
+
 def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
@@ -3228,6 +3246,9 @@ def create_app() -> FastAPI:
         ],
         venues: Annotated[list[str] | None, Query()] = None,
         ranking: str = "route_adjusted_quality_pnl",
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = None,
+        hyperliquid_fee_profile: str | None = None,
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
@@ -3253,6 +3274,11 @@ def create_app() -> FastAPI:
             return await service.scan(
                 venues=selected_venues,
                 ranking=ranking,  # type: ignore[arg-type]
+                fee_profile_overrides=_build_fee_profile_overrides(
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                ),
                 target_notional=target_notional,
                 min_capacity_notional=min_capacity_notional,
                 min_daily_volume=min_daily_volume,
@@ -3283,6 +3309,9 @@ def create_app() -> FastAPI:
         ],
         venues: Annotated[list[str] | None, Query()] = None,
         ranking: str = "route_adjusted_quality_pnl",
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = None,
+        hyperliquid_fee_profile: str | None = None,
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
@@ -3309,6 +3338,11 @@ def create_app() -> FastAPI:
             scan = await service.scan(
                 venues=selected_venues,
                 ranking=ranking,  # type: ignore[arg-type]
+                fee_profile_overrides=_build_fee_profile_overrides(
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                ),
                 target_notional=target_notional,
                 min_capacity_notional=min_capacity_notional,
                 min_daily_volume=min_daily_volume,

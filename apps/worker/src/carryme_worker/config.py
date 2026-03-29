@@ -39,6 +39,9 @@ class WorkerSettings(BaseSettings):
         "stability_adjusted_quality_pnl",
         "route_adjusted_quality_pnl",
     ] = "route_adjusted_quality_pnl"
+    universe_scan_extended_fee_profile: str | None = None
+    universe_scan_paradex_fee_profile: str | None = None
+    universe_scan_hyperliquid_fee_profile: str | None = None
     universe_scan_target_notional: float = Field(default=5_000.0, ge=0)
     universe_scan_min_capacity_notional: float = Field(default=250.0, ge=0)
     universe_scan_min_daily_volume: float = Field(default=10_000.0, ge=0)

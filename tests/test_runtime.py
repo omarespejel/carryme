@@ -370,6 +370,56 @@ def test_opportunity_universe_service_filters_thin_markets_for_quality_scan() ->
     asyncio.run(run())
 
 
+def test_opportunity_universe_service_applies_fee_profile_overrides() -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD"],
+        "paradex": ["ARB-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.09,
+            20_000,
+            0.0901,
+            18_000,
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0006,
+            0.09,
+            18_000,
+            0.0901,
+            17_000,
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            fee_profile_overrides={"paradex": "retail"},
+            target_notional=5_000,
+            limit=10,
+        )
+
+        assert scan.fee_profiles == {"extended": "default", "paradex": "retail"}
+        assert scan.opportunities[0].opportunity.long_fee_profile == "retail"
+
+    asyncio.run(run())
+
+
 def test_opportunity_universe_service_retries_retryable_snapshot_errors() -> None:
     symbol_lists = {
         "extended": ["ARB-USD"],

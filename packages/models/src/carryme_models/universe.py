@@ -104,6 +104,7 @@ class FundingUniverseScan(BaseModel):
     """A ranked scan across all overlapping perp markets for the selected venues."""
 
     venues: list[str] = Field(default_factory=list)
+    fee_profiles: dict[str, str] = Field(default_factory=dict)
     ranking: str = Field(min_length=1)
     target_notional: float = Field(ge=0)
     overlap_count: int = Field(ge=0)

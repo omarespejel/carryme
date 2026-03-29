@@ -322,6 +322,7 @@ def test_funding_universe_endpoint_passes_policy_and_execution_filters() -> None
                 ("exclude_tags", "meme"),
                 ("exclude_tags", "political"),
                 ("exclude_symbols", "TRUMP-USD-PERP"),
+                ("paradex_fee_profile", "retail"),
                 ("min_execution_quality_score", "0.7"),
             ],
         )
@@ -331,8 +332,10 @@ def test_funding_universe_endpoint_passes_policy_and_execution_filters() -> None
     assert response.status_code == 200
     assert captured["ranking"] == "route_adjusted_quality_pnl"
     assert captured["include_symbols"] == ["ARB-USD-PERP"]
+    assert captured["fee_profile_overrides"] == {"paradex": "retail"}
     assert captured["exclude_tags"] == ["meme", "political"]
     assert captured["exclude_symbols"] == ["TRUMP-USD-PERP"]
+    assert captured["fee_profile_overrides"] == {"paradex": "retail"}
     assert captured["min_execution_quality_score"] == 0.7
 
 
