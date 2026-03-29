@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from threading import Lock
 
 from carryme_models import OpportunityRecord
 
@@ -32,36 +33,45 @@ class OpportunityHistoryStore:
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
+        self._initialized = False
+        self._initialize_lock = Lock()
 
     def initialize(self) -> None:
         """Create the history table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS opportunity_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    recorded_at TEXT NOT NULL,
-                    label TEXT,
-                    canonical_symbol TEXT NOT NULL,
-                    pair_json TEXT NOT NULL,
-                    opportunity_json TEXT NOT NULL
+        if self._initialized:
+            return
+
+        with self._initialize_lock:
+            if self._initialized:
+                return
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(self.database_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS opportunity_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        recorded_at TEXT NOT NULL,
+                        label TEXT,
+                        canonical_symbol TEXT NOT NULL,
+                        pair_json TEXT NOT NULL,
+                        opportunity_json TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_opportunity_history_recorded_at
-                ON opportunity_history(recorded_at DESC)
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_opportunity_history_label
-                ON opportunity_history(label)
-                """
-            )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_opportunity_history_recorded_at
+                    ON opportunity_history(recorded_at DESC)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_opportunity_history_label
+                    ON opportunity_history(label)
+                    """
+                )
+            self._initialized = True
 
     def append(self, record: OpportunityRecord) -> None:
         """Append a scored opportunity to history."""

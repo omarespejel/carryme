@@ -354,3 +354,27 @@ def test_poll_watchlist_once_times_out_slow_pairs(
     assert summary.saved_records == 0
     assert summary.failed_records == 1
     assert "Failed to score pair extended/STRK-USD" in caplog.text
+
+
+def test_poll_watchlist_once_handles_empty_watchlist(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+    store = OpportunityHistoryStore(settings.database_path)
+
+    summary = asyncio.run(
+        poll_watchlist_once(
+            settings,
+            store=store,
+            now=datetime(2026, 3, 29, tzinfo=UTC),
+        )
+    )
+
+    assert summary.watched_pairs == 0
+    assert summary.saved_records == 0
+    assert summary.failed_records == 0
+    assert store.list_recent() == []
