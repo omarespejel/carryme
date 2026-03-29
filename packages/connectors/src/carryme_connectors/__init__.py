@@ -11,6 +11,12 @@ from carryme_connectors.extended_auth import (
 )
 from carryme_connectors.extended_private import ExtendedPrivateConnector
 from carryme_connectors.hyperliquid import HyperliquidPublicConnector
+from carryme_connectors.hyperliquid_auth import (
+    HYPERLIQUID_API_BASE_URL,
+    build_hyperliquid_exchange,
+    build_hyperliquid_info,
+    build_hyperliquid_wallet,
+)
 from carryme_connectors.paradex import ParadexPublicConnector
 from carryme_connectors.paradex_auth import (
     PARADEX_API_BASE_URL,
@@ -37,6 +43,7 @@ __all__ = [
     "ExtendedPrivateConnector",
     "ExtendedStarknetDomain",
     "HyperliquidPublicConnector",
+    "HYPERLIQUID_API_BASE_URL",
     "PARADEX_API_BASE_URL",
     "PARADEX_AUTH_PATH",
     "PARADEX_AUTH_TOKEN_LIFETIME_SECONDS",
@@ -48,6 +55,9 @@ __all__ = [
     "ParadexPrivateConnector",
     "ParadexSystemConfig",
     "PublicVenueConnector",
+    "build_hyperliquid_exchange",
+    "build_hyperliquid_info",
+    "build_hyperliquid_wallet",
     "build_signed_extended_order_payload",
     "build_paradex_auth_headers",
     "build_paradex_auth_request_path",

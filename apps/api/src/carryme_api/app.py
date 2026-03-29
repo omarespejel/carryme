@@ -425,6 +425,13 @@ def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightC
                 "private_key": settings.paradex_private_key,
             },
         },
+        "hyperliquid": {
+            "enabled": settings.hyperliquid_live_enabled,
+            "credentials": {
+                "account_address": settings.hyperliquid_account_address,
+                "api_wallet_private_key": settings.hyperliquid_api_wallet_private_key,
+            },
+        },
     }
 
 

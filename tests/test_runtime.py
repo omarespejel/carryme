@@ -67,6 +67,7 @@ from carryme_runtime import (
 )
 from carryme_runtime.account_preflight import (
     ExtendedAccountProbe,
+    HyperliquidAccountProbe,
     ParadexAccountProbe,
     _extract_balance_assets,
     _extract_position_symbols,
@@ -840,6 +841,82 @@ def test_account_preflight_service_filters_to_trade_venues() -> None:
         assert preflight.ready is False
         assert {item.venue for item in preflight.venues} == {"extended", "paradex"}
         assert any("paradex" in reason for reason in preflight.blocking_reasons)
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_account_probe_reports_missing_credentials() -> None:
+    async def run() -> None:
+        probe = HyperliquidAccountProbe()
+        result = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": None,
+                    "api_wallet_private_key": None,
+                },
+            }
+        )
+        assert result.venue == "hyperliquid"
+        assert result.authenticated is False
+        assert result.ready is False
+        assert result.credential_mode == "api_wallet"
+        assert set(result.missing_env_vars) == {
+            "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+            "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+        }
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_account_probe_reads_sdk_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubInfo:
+        def user_state(self, address: str) -> dict[str, object]:
+            assert address == "0xhyper"
+            return {
+                "marginSummary": {
+                    "accountValue": "9.80",
+                },
+                "withdrawable": "8.15",
+                "assetPositions": [
+                    {"position": {"coin": "ARB", "szi": "10"}},
+                    {"position": {"coin": "STRK", "szi": "-25"}},
+                ],
+            }
+
+        def open_orders(self, address: str) -> list[dict[str, object]]:
+            assert address == "0xhyper"
+            return [{"coin": "ARB", "oid": 123}]
+
+    monkeypatch.setattr(
+        "carryme_runtime.account_preflight.build_hyperliquid_info",
+        lambda *, base_url: StubInfo(),
+    )
+
+    async def run() -> None:
+        probe = HyperliquidAccountProbe()
+        result = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xhyper",
+                    "api_wallet_private_key": "0xwallet",
+                },
+            }
+        )
+        assert result.venue == "hyperliquid"
+        assert result.authenticated is True
+        assert result.ready is True
+        assert result.account_identifier == "0xhyper"
+        assert result.total_collateral == 9.8
+        assert result.available_to_trade == 8.15
+        assert result.free_collateral == 8.15
+        assert result.balance_assets == ["USDC"]
+        assert result.position_symbols == ["ARB", "STRK"]
+        assert result.position_count == 2
+        assert "Observed 1 currently open Hyperliquid orders." in result.notes
 
     asyncio.run(run())
 

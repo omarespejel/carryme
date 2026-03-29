@@ -9,10 +9,12 @@ from typing import Any, Protocol, TypedDict, cast
 
 import httpx
 from carryme_connectors import (
+    HYPERLIQUID_API_BASE_URL,
     ConnectorError,
     ExtendedPrivateConnector,
     ParadexJwtTokenProvider,
     ParadexPrivateConnector,
+    build_hyperliquid_info,
 )
 from carryme_connectors.base import parse_float
 from carryme_models import (
@@ -56,6 +58,7 @@ class ParadexJwtTokenIssuer(Protocol):
 
 ACCOUNT_CONNECTOR_BASE_URLS: dict[str, str] = {
     "extended": "https://api.starknet.extended.exchange",
+    "hyperliquid": HYPERLIQUID_API_BASE_URL,
     "paradex": "https://api.prod.paradex.trade",
 }
 
@@ -70,6 +73,7 @@ class AccountPreflightService:
         if not self.probes:
             self.probes = {
                 "extended": ExtendedAccountProbe(),
+                "hyperliquid": HyperliquidAccountProbe(),
                 "paradex": ParadexAccountProbe(),
             }
 
@@ -425,6 +429,95 @@ class ParadexAccountProbe:
             )
 
 
+class HyperliquidAccountProbe:
+    """Address-backed account probe for Hyperliquid live trading."""
+
+    venue = "hyperliquid"
+
+    async def probe(self, config: VenueAccountConfig) -> VenueAccountPreflight:
+        enabled = bool(config["enabled"])
+        account_address = config["credentials"].get("account_address")
+        api_wallet_private_key = config["credentials"].get("api_wallet_private_key")
+        missing = []
+        if not account_address:
+            missing.append("CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS")
+        if not api_wallet_private_key:
+            missing.append("CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY")
+        if not enabled or missing:
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=False,
+                ready=False,
+                credential_mode="api_wallet",
+                missing_env_vars=missing,
+                blocking_reasons=_blocking_reasons(enabled, missing, self.venue),
+                notes=[
+                    (
+                        "Hyperliquid live trading requires the trading account address and an "
+                        "authorized API wallet private key."
+                    )
+                ],
+            )
+
+        try:
+            state, open_orders = await asyncio.to_thread(
+                _fetch_hyperliquid_account_state,
+                cast(str, account_address),
+            )
+        except Exception as exc:
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=False,
+                ready=False,
+                credential_mode="api_wallet",
+                missing_env_vars=[],
+                blocking_reasons=[f"Hyperliquid account read failed: {exc}"],
+                notes=[
+                    (
+                        "Check the Hyperliquid account address and confirm the account is "
+                        "queryable on the configured network."
+                    )
+                ],
+            )
+
+        margin_summary = state.get("marginSummary")
+        if not isinstance(margin_summary, dict):
+            margin_summary = {}
+        positions = state.get("assetPositions")
+        if not isinstance(positions, list):
+            positions = []
+        withdrawable = _pick_float(state, "withdrawable")
+        total_collateral = (
+            _pick_float(margin_summary, "accountValue", "totalRawUsd")
+            or withdrawable
+        )
+        return VenueAccountPreflight(
+            venue=self.venue,
+            enabled=enabled,
+            authenticated=True,
+            ready=True,
+            credential_mode="api_wallet",
+            account_identifier=account_address,
+            total_collateral=total_collateral,
+            available_to_trade=withdrawable,
+            free_collateral=withdrawable,
+            balance_count=1 if total_collateral is not None else 0,
+            position_count=len([item for item in positions if isinstance(item, dict)]),
+            balance_assets=["USDC"] if total_collateral is not None else [],
+            position_symbols=_extract_hyperliquid_position_symbols(positions),
+            notes=[
+                (
+                    "Hyperliquid account preflight completed using the official SDK "
+                    "Info.user_state/open_orders flow. Account reads are address-based; the "
+                    "API wallet private key remains required for live submission."
+                ),
+                f"Observed {len(open_orders)} currently open Hyperliquid orders.",
+            ],
+        )
+
+
 async def _fetch_extended_optional_rows(
     fetcher: Callable[[], Awaitable[dict[str, Any] | list[Any]]],
     *,
@@ -574,3 +667,36 @@ def _pick_float(data: dict[str, Any], *keys: str, context: str) -> float | None:
         if value is not None:
             return value
     return None
+
+
+def _fetch_hyperliquid_account_state(
+    account_address: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    info = build_hyperliquid_info(base_url=ACCOUNT_CONNECTOR_BASE_URLS["hyperliquid"])
+    state = info.user_state(account_address)
+    open_orders = info.open_orders(account_address)
+    if not isinstance(state, dict):
+        raise ConnectorError("Hyperliquid user_state payload must be an object")
+    if not isinstance(open_orders, list):
+        raise ConnectorError("Hyperliquid open_orders payload must be a list")
+    return state, [item for item in open_orders if isinstance(item, dict)]
+
+
+def _extract_hyperliquid_position_symbols(positions: list[Any]) -> list[str]:
+    results: list[str] = []
+    seen: set[str] = set()
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        position = item.get("position")
+        if not isinstance(position, dict):
+            continue
+        symbol = position.get("coin")
+        if not isinstance(symbol, str):
+            continue
+        normalized = symbol.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        results.append(normalized)
+    return results

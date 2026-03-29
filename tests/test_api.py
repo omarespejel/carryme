@@ -2337,6 +2337,7 @@ def test_account_preflight_venues_endpoint_uses_service_dependency() -> None:
     class StubAccountPreflightService:
         async def probe_venues(self, configs: dict[str, object]) -> list[VenueAccountPreflight]:
             assert "extended" in configs
+            assert "hyperliquid" in configs
             return [
                 VenueAccountPreflight(
                     venue="extended",
@@ -2376,6 +2377,9 @@ def test_account_preflight_venues_endpoint_uses_service_dependency() -> None:
         paradex_account_address="0xabc",
         paradex_private_key="paradex-secret",
         paradex_bearer_token=None,
+        hyperliquid_live_enabled=True,
+        hyperliquid_account_address="0xhyper",
+        hyperliquid_api_wallet_private_key="0xwallet",
     )
     client = TestClient(app)
     response = client.get("/v1/executions/account-preflight/venues")

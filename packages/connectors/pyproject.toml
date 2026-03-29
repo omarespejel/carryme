@@ -13,6 +13,7 @@ dependencies = [
   "ecdsa>=0.19,<1",
   "fast-stark-crypto==0.3.8",
   "httpx>=0.28,<1",
+  "hyperliquid-python-sdk>=0.22,<0.23",
   "pycryptodome>=3.23,<4",
   "starknet-crypto-py>=0.3,<0.4",
 ]
