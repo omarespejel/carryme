@@ -89,6 +89,20 @@ class ParadexOrderStateObserver:
             notes: list[str] = []
             try:
                 payload = await connector.fetch_order(external_reference)
+            except ConnectorError as exc:
+                if exc.status_code not in {400, 404}:
+                    raise
+                history_match = await _lookup_paradex_order_history(
+                    connector=connector,
+                    leg=leg,
+                    external_reference=external_reference,
+                )
+                if history_match is None:
+                    raise
+                payload = history_match
+                notes.append(
+                    "Paradex direct order lookup missed the order; fell back to orders-history."
+                )
             except httpx.HTTPStatusError as exc:
                 response = exc.response
                 if response is None or response.status_code not in {400, 404}:
@@ -148,10 +162,7 @@ class ExtendedOrderStateObserver:
                 supported=True,
                 derived_state="unknown",
                 notes=[
-                    (
-                        "Execution leg is missing an Extended external reference and "
-                        "client order id."
-                    )
+                    ("Execution leg is missing an Extended external reference and client order id.")
                 ],
             )
 

@@ -1,10 +1,16 @@
 # carryme
 
-`carryme` is a fee-aware, capacity-aware funding arbitrage control plane.
+`carryme` will be a fee-aware, capacity-aware funding arbitrage control plane.
 
-The initial workspace is intentionally narrow:
-- `apps/api`: FastAPI control-plane skeleton
-- `apps/worker`: async worker skeleton
+> **Status**: this repository now provides live funding-opportunity scoring,
+> a bounded worker loop with persisted SQLite history, and API endpoints for
+> health, fee references, live funding opportunities, ranked/latest/candidate
+> history, operator dashboards, and a supervised worker loop for continuous
+> polling with signal-aware shutdown.
+
+The current workspace is intentionally narrow:
+- `apps/api`: FastAPI endpoints for health, fee references, live scoring, ranked/latest/candidate history, and operator dashboards
+- `apps/worker`: worker CLI for deterministic health output, one-shot polling, bounded scheduled loops, and supervised execution
 - `packages/models`: shared Pydantic models and settings
 - `packages/connectors`: public REST connectors for market data
 - `packages/normalizers`: venue-specific symbol, funding, and fee normalization
@@ -26,4 +32,12 @@ uv run mypy $(find src apps packages tests -name '*.py' -type f)
 ```bash
 uv run carryme-api
 uv run carryme-worker
+```
+
+Useful worker modes:
+
+```bash
+uv run carryme-worker --once
+uv run carryme-worker --iterations 3
+uv run carryme-worker --supervise
 ```
