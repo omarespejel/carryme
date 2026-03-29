@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict, cast
 
@@ -18,6 +19,9 @@ from carryme_models import (
     PaperTradeEntry,
     VenueAccountPreflight,
 )
+from pydantic import ValidationError
+
+from carryme_runtime.opportunities import UpstreamDataError
 
 
 class VenueAccountConfig(TypedDict):
@@ -62,7 +66,7 @@ class AccountPreflightService:
         """Probe all supported authenticated-read venues."""
 
         tasks = [
-            self.probes[venue].probe(configs.get(venue, {"enabled": False, "credentials": {}}))
+            self.probes[venue].probe(configs.get(venue, _disabled_config()))
             for venue in self.probes
         ]
         return list(await asyncio.gather(*tasks))
@@ -74,13 +78,33 @@ class AccountPreflightService:
     ) -> PaperTradeAccountPreflight:
         """Probe only the venues touched by one saved paper trade."""
 
-        all_statuses = {item.venue: item for item in await self.probe_venues(configs)}
         venue_names = [paper_trade.intent.long_leg.venue, paper_trade.intent.short_leg.venue]
         selected_names: list[str] = []
         for venue in venue_names:
             if venue not in selected_names:
                 selected_names.append(venue)
-        selected = [all_statuses[venue] for venue in selected_names]
+
+        supported_names: list[str] = []
+        supported_tasks: list[Awaitable[VenueAccountPreflight]] = []
+        selected_statuses: dict[str, VenueAccountPreflight] = {}
+        for venue in selected_names:
+            config = configs.get(venue, _disabled_config())
+            probe = self.probes.get(venue)
+            if probe is None:
+                selected_statuses[venue] = _unsupported_venue_status(venue, config)
+                continue
+            supported_names.append(venue)
+            supported_tasks.append(probe.probe(config))
+
+        if supported_tasks:
+            for venue, status in zip(
+                supported_names,
+                await asyncio.gather(*supported_tasks),
+                strict=True,
+            ):
+                selected_statuses[venue] = status
+
+        selected = [selected_statuses[venue] for venue in selected_names]
 
         blocking_reasons: list[str] = []
         for status in selected:
@@ -142,34 +166,53 @@ class ExtendedAccountProbe:
                     blocking_reasons=[f"Extended authenticated read failed: {exc}"],
                     notes=["Check the Extended API key and target subaccount."],
                 )
-
-        account_body = _unwrap_payload(account)
-        return VenueAccountPreflight(
-            venue=self.venue,
-            enabled=enabled,
-            authenticated=True,
-            ready=True,
-            credential_mode="api_key",
-            account_identifier=_pick_string(
-                account_body,
-                "subAccountId",
-                "subaccountId",
-                "accountId",
-                "id",
-                "address",
-            ),
-            account_status=_pick_string(account_body, "status", "accountStatus"),
-            total_collateral=_pick_float(account_body, "equity", "balance", "totalCollateral"),
-            available_to_trade=_pick_float(
-                account_body,
-                "availableForTrade",
-                "availableBalance",
-                "available_to_trade",
-            ),
-            balance_count=_count_rows(balances),
-            position_count=_count_rows(positions),
-            notes=["Extended account preflight completed using authenticated private GETs."],
-        )
+        try:
+            account_body = _unwrap_payload(account, context="Extended account")
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=True,
+                ready=True,
+                credential_mode="api_key",
+                account_identifier=_pick_string(
+                    account_body,
+                    "subAccountId",
+                    "subaccountId",
+                    "accountId",
+                    "id",
+                    "address",
+                ),
+                account_status=_pick_string(account_body, "status", "accountStatus"),
+                total_collateral=_pick_float(
+                    account_body,
+                    "equity",
+                    "balance",
+                    "totalCollateral",
+                    context="Extended account",
+                ),
+                available_to_trade=_pick_float(
+                    account_body,
+                    "availableForTrade",
+                    "availableBalance",
+                    "available_to_trade",
+                    context="Extended account",
+                ),
+                balance_count=_count_rows(balances, context="Extended balances"),
+                position_count=_count_rows(positions, context="Extended positions"),
+                notes=["Extended account preflight completed using authenticated private GETs."],
+            )
+        except (UpstreamDataError, ValidationError) as exc:
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=True,
+                ready=False,
+                credential_mode="api_key",
+                blocking_reasons=[f"Extended authenticated read returned malformed payload: {exc}"],
+                notes=[
+                    "Extended authenticated read succeeded but returned malformed account data."
+                ],
+            )
 
 
 class ParadexAccountProbe:
@@ -227,38 +270,52 @@ class ParadexAccountProbe:
                     blocking_reasons=[f"Paradex authenticated read failed: {exc}"],
                     notes=["Check the Paradex bearer token and account address."],
                 )
-
-        account_body = _unwrap_payload(account)
-        account_identifier = _pick_string(
-            account_body,
-            "account",
-            "account_address",
-            "starknet_account",
-            "id",
-        ) or account_address
-        return VenueAccountPreflight(
-            venue=self.venue,
-            enabled=enabled,
-            authenticated=True,
-            ready=True,
-            credential_mode="bearer_token",
-            account_identifier=account_identifier,
-            account_status=_pick_string(account_body, "status", "account_status"),
-            total_collateral=_pick_float(
+        try:
+            account_body = _unwrap_payload(account, context="Paradex account")
+            account_identifier = _pick_string(
                 account_body,
-                "account_value",
-                "equity",
-                "total_collateral",
-            ),
-            free_collateral=_pick_float(
-                account_body,
-                "free_collateral",
-                "freeCollateral",
-            ),
-            balance_count=_count_rows(balances),
-            position_count=_count_rows(positions),
-            notes=["Paradex account preflight completed using authenticated private GETs."],
-        )
+                "account",
+                "account_address",
+                "starknet_account",
+                "id",
+            ) or account_address
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=True,
+                ready=True,
+                credential_mode="bearer_token",
+                account_identifier=account_identifier,
+                account_status=_pick_string(account_body, "status", "account_status"),
+                total_collateral=_pick_float(
+                    account_body,
+                    "account_value",
+                    "equity",
+                    "total_collateral",
+                    context="Paradex account",
+                ),
+                free_collateral=_pick_float(
+                    account_body,
+                    "free_collateral",
+                    "freeCollateral",
+                    context="Paradex account",
+                ),
+                balance_count=_count_rows(balances, context="Paradex balances"),
+                position_count=_count_rows(positions, context="Paradex positions"),
+                notes=["Paradex account preflight completed using authenticated private GETs."],
+            )
+        except (UpstreamDataError, ValidationError) as exc:
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=True,
+                ready=False,
+                credential_mode="bearer_token",
+                blocking_reasons=[f"Paradex authenticated read returned malformed payload: {exc}"],
+                notes=[
+                    "Paradex authenticated read succeeded but returned malformed account data."
+                ],
+            )
 
 
 def _blocking_reasons(enabled: bool, missing_env_vars: list[str], venue: str) -> list[str]:
@@ -273,25 +330,50 @@ def _blocking_reasons(enabled: bool, missing_env_vars: list[str], venue: str) ->
     return reasons
 
 
-def _unwrap_payload(value: dict[str, Any] | list[Any]) -> dict[str, Any]:
+def _disabled_config() -> VenueAccountConfig:
+    return {"enabled": False, "credentials": {}}
+
+
+def _unsupported_venue_status(
+    venue: str,
+    config: VenueAccountConfig,
+) -> VenueAccountPreflight:
+    return VenueAccountPreflight(
+        venue=venue,
+        enabled=bool(config["enabled"]),
+        authenticated=False,
+        ready=False,
+        credential_mode="unsupported",
+        blocking_reasons=[f"Venue {venue} account preflight is not supported"],
+        notes=[f"No authenticated account probe is implemented for venue {venue}."],
+    )
+
+
+def _unwrap_payload(value: dict[str, Any] | list[Any], *, context: str) -> dict[str, Any]:
     if isinstance(value, dict):
         for key in ("data", "results", "result"):
+            if key not in value:
+                continue
             nested = value.get(key)
             if isinstance(nested, dict):
                 return nested
+            raise UpstreamDataError(f"{context} payload field {key!r} must be an object")
         return value
-    return {}
+    raise UpstreamDataError(f"{context} payload must be an object")
 
 
-def _count_rows(value: dict[str, Any] | list[Any]) -> int:
+def _count_rows(value: dict[str, Any] | list[Any], *, context: str) -> int:
     if isinstance(value, list):
         return len(value)
     if isinstance(value, dict):
         for key in ("data", "results", "result", "rows", "positions", "balances"):
+            if key not in value:
+                continue
             nested = value.get(key)
             if isinstance(nested, list):
                 return len(nested)
-    return 0
+            raise UpstreamDataError(f"{context} payload field {key!r} must be a list")
+    raise UpstreamDataError(f"{context} payload did not contain a row list")
 
 
 def _pick_string(data: dict[str, Any], *keys: str) -> str | None:
@@ -302,12 +384,19 @@ def _pick_string(data: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
-def _pick_float(data: dict[str, Any], *keys: str) -> float | None:
+def _pick_float(data: dict[str, Any], *keys: str, context: str) -> float | None:
     for key in keys:
+        if key not in data:
+            continue
+        raw_value = data.get(key)
+        if raw_value is None:
+            continue
         try:
-            value = parse_float(data.get(key))
-        except ConnectorError:
-            value = None
+            value = parse_float(raw_value)
+        except ConnectorError as exc:
+            raise UpstreamDataError(
+                f"{context} payload field {key!r} must be numeric"
+            ) from exc
         if value is not None:
             return value
     return None

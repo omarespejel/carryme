@@ -1,7 +1,9 @@
 import asyncio
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 
+import carryme_runtime.account_preflight as account_preflight_runtime
+import httpx
 import pytest
 from carryme_models import (
     CapacityEstimate,
@@ -36,6 +38,7 @@ from carryme_runtime import (
     build_venue_execution_preflights,
     require_confirmed_preview,
 )
+from carryme_runtime.account_preflight import ExtendedAccountProbe
 
 
 def _snapshot(
@@ -972,42 +975,57 @@ def test_account_preflight_service_filters_to_trade_venues() -> None:
     class StubProbe:
         def __init__(self, result: VenueAccountPreflight) -> None:
             self.result = result
+            self.calls: list[dict[str, object]] = []
 
         async def probe(self, config: dict[str, object]) -> VenueAccountPreflight:
+            self.calls.append(config)
             assert isinstance(config["enabled"], bool)
             return self.result
+
+    class UnusedProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def probe(self, config: dict[str, object]) -> VenueAccountPreflight:
+            self.calls += 1
+            raise AssertionError(f"unexpected probe for unused venue with config {config}")
+
+    extended_probe = StubProbe(
+        VenueAccountPreflight(
+            venue="extended",
+            enabled=True,
+            authenticated=True,
+            ready=True,
+            credential_mode="api_key",
+            account_identifier="ext-subaccount",
+            available_to_trade=1500.0,
+        )
+    )
+    paradex_probe = StubProbe(
+        VenueAccountPreflight(
+            venue="paradex",
+            enabled=True,
+            authenticated=False,
+            ready=False,
+            credential_mode="bearer_token",
+            missing_env_vars=["CARRYME_API_PARADEX_BEARER_TOKEN"],
+            blocking_reasons=[
+                (
+                    "Venue paradex is missing required account credentials: "
+                    "CARRYME_API_PARADEX_BEARER_TOKEN"
+                )
+            ],
+        )
+    )
+    unused_probe = UnusedProbe()
 
     service = AccountPreflightService(
         probes=cast(
             dict[str, VenueAccountProbe],
             {
-                "extended": StubProbe(
-                    VenueAccountPreflight(
-                        venue="extended",
-                        enabled=True,
-                        authenticated=True,
-                        ready=True,
-                        credential_mode="api_key",
-                        account_identifier="ext-subaccount",
-                        available_to_trade=1500.0,
-                    )
-                ),
-                "paradex": StubProbe(
-                    VenueAccountPreflight(
-                        venue="paradex",
-                        enabled=True,
-                        authenticated=False,
-                        ready=False,
-                        credential_mode="bearer_token",
-                        missing_env_vars=["CARRYME_API_PARADEX_BEARER_TOKEN"],
-                        blocking_reasons=[
-                            (
-                                "Venue paradex is missing required account credentials: "
-                                "CARRYME_API_PARADEX_BEARER_TOKEN"
-                            )
-                        ],
-                    )
-                ),
+                "extended": extended_probe,
+                "paradex": paradex_probe,
+                "hyperliquid": unused_probe,
             },
         ),
     )
@@ -1065,6 +1083,147 @@ def test_account_preflight_service_filters_to_trade_venues() -> None:
         assert preflight.ready is False
         assert {item.venue for item in preflight.venues} == {"extended", "paradex"}
         assert any("paradex" in reason for reason in preflight.blocking_reasons)
+        assert extended_probe.calls == [
+            {
+                "enabled": True,
+                "credentials": {"api_key": "extended-key"},
+            }
+        ]
+        assert paradex_probe.calls == [
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xabc",
+                    "bearer_token": None,
+                },
+            }
+        ]
+        assert unused_probe.calls == 0
+
+    asyncio.run(run())
+
+
+def test_account_preflight_service_blocks_unsupported_trade_venue() -> None:
+    service = AccountPreflightService(
+        probes=cast(
+            dict[str, VenueAccountProbe],
+            {
+                "extended": cast(
+                    VenueAccountProbe,
+                    type(
+                        "StubProbe",
+                        (),
+                        {
+                            "probe": lambda self, config: asyncio.sleep(
+                                0,
+                                result=VenueAccountPreflight(
+                                    venue="extended",
+                                    enabled=True,
+                                    authenticated=True,
+                                    ready=True,
+                                    credential_mode="api_key",
+                                ),
+                            )
+                        },
+                    )(),
+                )
+            },
+        )
+    )
+    paper_trade = PaperTradeEntry(
+        entry_id=11,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_unknown",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="unsupportedx",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    async def run() -> None:
+        preflight = await service.probe_paper_trade(
+            paper_trade,
+            {
+                "extended": {
+                    "enabled": True,
+                    "credentials": {"api_key": "extended-key"},
+                }
+            },
+        )
+
+        assert preflight.ready is False
+        assert [item.venue for item in preflight.venues] == ["unsupportedx", "extended"]
+        assert (
+            "Venue unsupportedx account preflight is not supported"
+            in preflight.blocking_reasons
+        )
+
+    asyncio.run(run())
+
+
+def test_extended_account_probe_blocks_malformed_balance_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/user/account/info":
+            return httpx.Response(
+                200,
+                json={"data": {"subAccountId": "ext-subaccount", "equity": "1250.5"}},
+            )
+        if request.url.path == "/api/v1/user/balance":
+            return httpx.Response(200, json={"data": "not-a-list"})
+        if request.url.path == "/api/v1/user/positions":
+            return httpx.Response(200, json={"data": []})
+        raise AssertionError(f"unexpected path: {request.url.path}")
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(
+            *args,
+            transport=httpx.MockTransport(handler),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(account_preflight_runtime.httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        status = await ExtendedAccountProbe().probe(
+            {
+                "enabled": True,
+                "credentials": {"api_key": "extended-key"},
+            }
+        )
+
+        assert status.authenticated is True
+        assert status.ready is False
+        assert status.blocking_reasons == [
+            (
+                "Extended authenticated read returned malformed payload: "
+                "Extended balances payload field 'data' must be a list"
+            )
+        ]
 
     asyncio.run(run())
 
