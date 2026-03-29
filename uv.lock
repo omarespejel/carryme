@@ -9,7 +9,9 @@ members = [
     "carryme-dev",
     "carryme-models",
     "carryme-normalizers",
+    "carryme-runtime",
     "carryme-scoring",
+    "carryme-storage",
     "carryme-worker",
 ]
 
@@ -48,23 +50,25 @@ name = "carryme-api"
 version = "0.1.0"
 source = { editable = "apps/api" }
 dependencies = [
-    { name = "carryme-connectors" },
     { name = "carryme-models" },
     { name = "carryme-normalizers" },
-    { name = "carryme-scoring" },
+    { name = "carryme-runtime" },
+    { name = "carryme-storage" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "pydantic-settings" },
     { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "carryme-connectors", editable = "packages/connectors" },
     { name = "carryme-models", editable = "packages/models" },
     { name = "carryme-normalizers", editable = "packages/normalizers" },
-    { name = "carryme-scoring", editable = "packages/scoring" },
+    { name = "carryme-runtime", editable = "packages/runtime" },
+    { name = "carryme-storage", editable = "packages/storage" },
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "pydantic-settings", specifier = ">=2.11,<3" },
     { name = "uvicorn", specifier = ">=0.35,<1" },
 ]
 
@@ -92,7 +96,9 @@ dependencies = [
     { name = "carryme-connectors" },
     { name = "carryme-models" },
     { name = "carryme-normalizers" },
+    { name = "carryme-runtime" },
     { name = "carryme-scoring" },
+    { name = "carryme-storage" },
     { name = "carryme-worker" },
 ]
 
@@ -110,7 +116,9 @@ requires-dist = [
     { name = "carryme-connectors", editable = "packages/connectors" },
     { name = "carryme-models", editable = "packages/models" },
     { name = "carryme-normalizers", editable = "packages/normalizers" },
+    { name = "carryme-runtime", editable = "packages/runtime" },
     { name = "carryme-scoring", editable = "packages/scoring" },
+    { name = "carryme-storage", editable = "packages/storage" },
     { name = "carryme-worker", editable = "apps/worker" },
 ]
 
@@ -145,9 +153,41 @@ dependencies = [
 requires-dist = [{ name = "carryme-models", editable = "packages/models" }]
 
 [[package]]
+name = "carryme-runtime"
+version = "0.1.0"
+source = { editable = "packages/runtime" }
+dependencies = [
+    { name = "carryme-connectors" },
+    { name = "carryme-models" },
+    { name = "carryme-normalizers" },
+    { name = "carryme-scoring" },
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "carryme-connectors", editable = "packages/connectors" },
+    { name = "carryme-models", editable = "packages/models" },
+    { name = "carryme-normalizers", editable = "packages/normalizers" },
+    { name = "carryme-scoring", editable = "packages/scoring" },
+    { name = "httpx", specifier = ">=0.28,<1" },
+]
+
+[[package]]
 name = "carryme-scoring"
 version = "0.1.0"
 source = { editable = "packages/scoring" }
+dependencies = [
+    { name = "carryme-models" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "carryme-models", editable = "packages/models" }]
+
+[[package]]
+name = "carryme-storage"
+version = "0.1.0"
+source = { editable = "packages/storage" }
 dependencies = [
     { name = "carryme-models" },
 ]
@@ -161,12 +201,18 @@ version = "0.1.0"
 source = { editable = "apps/worker" }
 dependencies = [
     { name = "carryme-models" },
+    { name = "carryme-runtime" },
+    { name = "carryme-storage" },
+    { name = "httpx" },
     { name = "pydantic-settings" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "carryme-models", editable = "packages/models" },
+    { name = "carryme-runtime", editable = "packages/runtime" },
+    { name = "carryme-storage", editable = "packages/storage" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "pydantic-settings", specifier = ">=2.11,<3" },
 ]
 

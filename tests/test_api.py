@@ -1,26 +1,31 @@
 import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import cast
 
 import httpx
 import pytest
-from carryme_api.app import app, get_opportunity_service
-from carryme_api.opportunities import (
-    ConnectorError,
-    OpportunityService,
-    SnapshotFetcher,
-    UpstreamDataError,
-    fetch_live_snapshot,
-)
+from carryme_api.app import app, get_history_store, get_opportunity_service
 from carryme_models import (
     CapacityEstimate,
     FundingArbOpportunity,
+    FundingPairSpec,
     MarketStats,
     NormalizedMarketSnapshot,
+    OpportunityRecord,
     TopOfBook,
 )
 from carryme_normalizers import NormalizationError, normalize_market_snapshot
+from carryme_runtime import (
+    ConnectorError,
+    OpportunityService,
+    UpstreamDataError,
+    fetch_live_snapshot,
+)
+from carryme_runtime.opportunities import SnapshotFetcher
+from carryme_storage import OpportunityHistoryStore
 from fastapi.testclient import TestClient
 
 
@@ -55,11 +60,16 @@ def _dependency_override(
     dependency: Callable[..., object],
     provider: Callable[..., object],
 ) -> Iterator[None]:
+    sentinel = object()
+    previous = app.dependency_overrides.get(dependency, sentinel)
     app.dependency_overrides[dependency] = provider
     try:
         yield
     finally:
-        app.dependency_overrides.clear()
+        if previous is sentinel:
+            app.dependency_overrides.pop(dependency, None)
+        else:
+            app.dependency_overrides[dependency] = cast(Callable[..., object], previous)
 
 
 def test_health_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,6 +123,114 @@ def test_fee_profiles_endpoint_rejects_unknown_venue() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Unsupported venue for fee normalization: unknown"
+
+
+def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["pair"]["label"] == "strk_extended_hyperliquid"
+
+
+def test_history_endpoint_rejects_non_positive_limit(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs", params={"limit": 0})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at least 1"
+
+
+def test_history_endpoint_rejects_excessive_limit(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs", params={"limit": 1001})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at most 1000"
+
+
+def test_history_endpoint_treats_blank_label_as_unfiltered(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs", params={"label": "   "})
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
 
 
 def test_funding_pair_endpoint_uses_service_dependency() -> None:
@@ -388,7 +506,7 @@ def test_fetch_live_snapshot_rejects_upstream_symbol_mismatch(
             )
 
     monkeypatch.setattr(
-        "carryme_api.opportunities._build_connector",
+        "carryme_runtime.opportunities._build_connector",
         lambda _venue, _client: FakeConnector(),
     )
 
@@ -422,11 +540,11 @@ def test_fetch_live_snapshot_wraps_normalization_errors_as_upstream_data_errors(
         raise NormalizationError("bad payload from upstream")
 
     monkeypatch.setattr(
-        "carryme_api.opportunities._build_connector",
+        "carryme_runtime.opportunities._build_connector",
         lambda _venue, _client: FakeConnector(),
     )
     monkeypatch.setattr(
-        "carryme_api.opportunities.normalize_market_snapshot",
+        "carryme_runtime.opportunities.normalize_market_snapshot",
         _raise_normalization_error,
     )
 
@@ -470,7 +588,7 @@ def test_fetch_live_snapshot_fetches_stats_and_book_concurrently(
 
     connector = CoordinatedConnector()
     monkeypatch.setattr(
-        "carryme_api.opportunities._build_connector",
+        "carryme_runtime.opportunities._build_connector",
         lambda _venue, _client: connector,
     )
 

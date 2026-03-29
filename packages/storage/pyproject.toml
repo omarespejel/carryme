@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "carryme-storage"
+version = "0.1.0"
+description = "Persistence helpers for carryme watchlists and opportunity history."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "carryme-models",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/carryme_storage"]
+
+[tool.uv.sources]
+carryme-models = { workspace = true }

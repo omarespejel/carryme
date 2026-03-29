@@ -1,4 +1,4 @@
-"""Live opportunity scoring service for the operator API."""
+"""Live opportunity scoring services shared by the API and worker."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Protocol
 
 import httpx
 from carryme_connectors import (
-    ConnectorError,
     ExtendedPublicConnector,
     HyperliquidPublicConnector,
     ParadexPublicConnector,
@@ -122,4 +121,4 @@ def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnec
     return connector_class(client)
 
 
-__all__ = ["ConnectorError", "OpportunityService", "UpstreamDataError", "fetch_live_snapshot"]
+__all__ = ["OpportunityService", "UpstreamDataError", "fetch_live_snapshot"]
