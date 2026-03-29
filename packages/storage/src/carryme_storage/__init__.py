@@ -2,6 +2,7 @@
 
 from carryme_storage.alerts import CandidateAlertStore
 from carryme_storage.cleanup_preview_confirmations import CleanupPreviewConfirmationStore
+from carryme_storage.execution_observations import ExecutionObservationStore
 from carryme_storage.executions import ExecutionJournalStore
 from carryme_storage.history import OpportunityHistoryStore
 from carryme_storage.paper_trades import PaperTradeStore
@@ -12,6 +13,7 @@ __all__ = [
     "CandidateAlertStore",
     "CleanupPreviewConfirmationStore",
     "ExecutionJournalStore",
+    "ExecutionObservationStore",
     "OpportunityHistoryStore",
     "PaperTradeStore",
     "PreviewConfirmationStore",

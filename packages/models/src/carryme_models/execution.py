@@ -109,6 +109,19 @@ class ExecutionOrderState(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class ExecutionObservationEntry(BaseModel):
+    """Append-only observation snapshot captured while monitoring a live execution."""
+
+    entry_id: int | None = None
+    observed_at: datetime
+    context: str = Field(min_length=1)
+    execution_entry_id: int | None = None
+    paper_trade_id: int | None = None
+    preview_hash: str | None = None
+    order_state: ExecutionOrderState
+    pair_status: "ExecutionPairStatus | None" = None
+
+
 class ExecutionPairStatus(BaseModel):
     """Combined pair-level execution status derived from orders and positions."""
 
@@ -130,3 +143,6 @@ class GuardedPairExecutionResult(BaseModel):
     primary_execution: ExecutionJournalEntry
     cleanup_execution: ExecutionJournalEntry | None = None
     pair_status: ExecutionPairStatus
+
+
+ExecutionObservationEntry.model_rebuild()

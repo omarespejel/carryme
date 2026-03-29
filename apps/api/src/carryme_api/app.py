@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from carryme_models import (
     CleanupPreviewConfirmationEntry,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
+    ExecutionObservationEntry,
     ExecutionOrderState,
     ExecutionPairStatus,
     ExecutionReconciliation,
@@ -59,6 +61,7 @@ from carryme_runtime import (
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
     UpstreamDataError,
+    build_account_preflight_configs,
     build_execution_pair_status,
     build_live_execution_configs,
     build_live_submission_readiness,
@@ -73,6 +76,7 @@ from carryme_storage import (
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionJournalStore,
+    ExecutionObservationStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     PreviewConfirmationStore,
@@ -97,6 +101,7 @@ DEFAULT_APP_ENVIRONMENT = "development"
 APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
 MAX_HISTORY_LIMIT = 1000
 PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
+logger = logging.getLogger(__name__)
 
 
 class ConfirmPreviewRequest(BaseModel):
@@ -167,6 +172,13 @@ def _cleanup_preview_confirmation_store_for_path(
     return CleanupPreviewConfirmationStore(database_path)
 
 
+@lru_cache
+def _execution_observation_store_for_path(database_path: str) -> ExecutionObservationStore:
+    """Return a shared execution observation store for the configured SQLite path."""
+
+    return ExecutionObservationStore(database_path)
+
+
 def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
@@ -187,6 +199,14 @@ def get_candidate_alert_store(
     """Return the shared candidate alert store."""
 
     return _candidate_alert_store_for_path(settings.database_path)
+
+
+def get_execution_observation_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExecutionObservationStore:
+    """Return the shared execution observation store."""
+
+    return _execution_observation_store_for_path(settings.database_path)
 
 
 def get_watchlist_store(
@@ -440,32 +460,21 @@ def get_order_preview_service() -> OrderPreviewService:
 
     return OrderPreviewService()
 
+
 def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightConfigMap:
     """Build the authenticated-read account probe config map from API settings."""
 
-    return {
-        "extended": {
-            "enabled": settings.extended_live_enabled,
-            "credentials": {
-                "api_key": settings.extended_api_key,
-            },
-        },
-        "paradex": {
-            "enabled": settings.paradex_live_enabled,
-            "credentials": {
-                "account_address": settings.paradex_account_address,
-                "bearer_token": settings.paradex_bearer_token,
-                "private_key": settings.paradex_private_key,
-            },
-        },
-        "hyperliquid": {
-            "enabled": settings.hyperliquid_live_enabled,
-            "credentials": {
-                "account_address": settings.hyperliquid_account_address,
-                "api_wallet_private_key": settings.hyperliquid_api_wallet_private_key,
-            },
-        },
-    }
+    return build_account_preflight_configs(
+        extended_live_enabled=settings.extended_live_enabled,
+        extended_api_key=settings.extended_api_key,
+        paradex_live_enabled=settings.paradex_live_enabled,
+        paradex_account_address=settings.paradex_account_address,
+        paradex_private_key=settings.paradex_private_key,
+        paradex_bearer_token=settings.paradex_bearer_token,
+        hyperliquid_live_enabled=settings.hyperliquid_live_enabled,
+        hyperliquid_account_address=settings.hyperliquid_account_address,
+        hyperliquid_api_wallet_private_key=settings.hyperliquid_api_wallet_private_key,
+    )
 
 
 async def _build_readiness_for_paper_trade(
@@ -702,6 +711,8 @@ async def _observe_pair_status_for_execution(
     settings: ApiSettings,
     account_service: AccountPreflightService,
     order_state_service: ExecutionOrderStateService,
+    observation_store: ExecutionObservationStore | None = None,
+    observation_context: str = "guarded_pair_poll",
     poll_attempts: int = 5,
     poll_interval_seconds: float = 2.0,
 ) -> ExecutionPairStatus:
@@ -730,6 +741,30 @@ async def _observe_pair_status_for_execution(
         except TimeoutError:
             continue
         last_status = build_execution_pair_status(execution, order_state, reconciliation)
+        if observation_store is not None:
+            try:
+                observation_store.append(
+                    ExecutionObservationEntry(
+                        observed_at=datetime.now(UTC),
+                        context=observation_context,
+                        execution_entry_id=execution.entry_id,
+                        paper_trade_id=execution.paper_trade_id,
+                        preview_hash=execution.preview_hash,
+                        order_state=order_state,
+                        pair_status=last_status,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    (
+                        "Failed to persist execution observation for "
+                        "entry_id=%s paper_trade_id=%s preview_hash=%s"
+                    ),
+                    execution.entry_id,
+                    execution.paper_trade_id,
+                    execution.preview_hash,
+                    exc_info=True,
+                )
         if last_status.derived_state in {
             "hedged",
             "unfilled",
@@ -1084,6 +1119,25 @@ def create_app() -> FastAPI:
                 detail=f"No execution journal entry matched paper trade {paper_trade_id}",
             )
         return await service.observe_execution(execution)
+
+    @app.get(
+        "/v1/executions/observations/latest/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionObservationEntry,
+    )
+    def latest_execution_observation_for_paper_trade(
+        paper_trade_id: int,
+        store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
+    ) -> ExecutionObservationEntry:
+        observation = store.latest_for_paper_trade(paper_trade_id)
+        if observation is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No execution observation matched paper trade {paper_trade_id}",
+            )
+        return observation
 
     @app.get(
         "/v1/executions/reconciliation/latest/from-paper-trade/{paper_trade_id}",
@@ -2208,6 +2262,10 @@ def create_app() -> FastAPI:
             Depends(get_cleanup_preview_confirmation_store),
         ],
         execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        observation_store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
         account_preflight_service: Annotated[
             AccountPreflightService,
             Depends(get_account_preflight_service),
@@ -2328,6 +2386,7 @@ def create_app() -> FastAPI:
                 settings=settings,
                 account_service=account_preflight_service,
                 order_state_service=order_state_service,
+                observation_store=observation_store,
                 poll_attempts=poll_attempts,
                 poll_interval_seconds=poll_interval_seconds,
             )
@@ -2443,10 +2502,11 @@ def create_app() -> FastAPI:
             try:
                 pair_status = await _observe_pair_status_for_execution(
                     paper_trade=paper_trade,
-                    execution=primary_execution,
+                    execution=cleanup_execution,
                     settings=settings,
                     account_service=account_preflight_service,
                     order_state_service=order_state_service,
+                    observation_store=observation_store,
                     poll_attempts=poll_attempts,
                     poll_interval_seconds=poll_interval_seconds,
                 )

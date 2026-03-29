@@ -12,13 +12,40 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 import httpx
-from carryme_models import CandidateAlertEvent, FundingArbOpportunity, OpportunityRecord
-from carryme_runtime import ConnectorError, OpportunityService, filter_candidate_records
-from carryme_storage import CandidateAlertStore, OpportunityHistoryStore, load_watchlist
+from carryme_models import (
+    CandidateAlertEvent,
+    ExecutionJournalEntry,
+    ExecutionObservationEntry,
+    FundingArbOpportunity,
+    OpportunityRecord,
+)
+from carryme_runtime import (
+    AccountPreflightConfigMap,
+    AccountPreflightService,
+    ConnectorError,
+    ExecutionOrderStateService,
+    ExtendedOrderStateObserver,
+    HyperliquidOrderStateObserver,
+    OpportunityService,
+    ParadexOrderStateObserver,
+    build_account_preflight_configs,
+    build_execution_pair_status,
+    filter_candidate_records,
+    reconcile_execution,
+)
+from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
+from carryme_storage import (
+    CandidateAlertStore,
+    ExecutionJournalStore,
+    ExecutionObservationStore,
+    OpportunityHistoryStore,
+    load_watchlist,
+)
 
 from carryme_worker.config import WorkerSettings
 
 logger = logging.getLogger(__name__)
+OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
 
 
 class PairScorer(Protocol):
@@ -71,6 +98,16 @@ class CandidateRecordSummary:
 
     total_records: int
     candidate_records: int
+
+
+@dataclass
+class ExecutionObservationSummary:
+    """Summary emitted after observing recent live executions."""
+
+    scanned_executions: int
+    observed_executions: int
+    saved_observations: int
+    database_path: str
 
 
 async def poll_watchlist_once(
@@ -150,6 +187,82 @@ def summarize_candidates(
     return CandidateRecordSummary(
         total_records=len(records),
         candidate_records=candidate_records,
+    )
+
+
+async def observe_live_executions_once(
+    settings: WorkerSettings,
+    *,
+    execution_store: ExecutionJournalStore | None = None,
+    observation_store: ExecutionObservationStore | None = None,
+    account_service: AccountPreflightService | None = None,
+    order_state_service: ExecutionOrderStateService | None = None,
+    now: datetime | None = None,
+) -> ExecutionObservationSummary:
+    """Observe recent live executions once and persist append-only snapshots."""
+
+    journal_store = execution_store or ExecutionJournalStore(settings.database_path)
+    history_store = observation_store or ExecutionObservationStore(settings.database_path)
+    account_probe_service = account_service or AccountPreflightService()
+    state_service = order_state_service or ExecutionOrderStateService(
+        observers=_build_order_state_observers(settings)
+    )
+    timestamp = now or datetime.now(UTC)
+    recent_live_executions = _list_recent_live_executions(
+        journal_store,
+        limit=settings.execution_observation_limit,
+    )
+
+    scanned_executions = 0
+    observed_executions = 0
+    saved_observations = 0
+    for execution in recent_live_executions:
+        scanned_executions += 1
+
+        try:
+            account_preflight = await asyncio.wait_for(
+                account_probe_service.probe_paper_trade(
+                    execution.paper_trade,
+                    _build_account_preflight_configs(settings),
+                ),
+                timeout=OBSERVATION_CALL_TIMEOUT_SECONDS,
+            )
+            order_state = await asyncio.wait_for(
+                state_service.observe_execution(execution),
+                timeout=OBSERVATION_CALL_TIMEOUT_SECONDS,
+            )
+            pair_status = build_execution_pair_status(
+                execution,
+                order_state,
+                reconcile_execution(execution, account_preflight),
+            )
+            history_store.append(
+                ExecutionObservationEntry(
+                    observed_at=timestamp,
+                    context="worker_execution_monitor",
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=execution.paper_trade_id,
+                    preview_hash=execution.preview_hash,
+                    order_state=order_state,
+                    pair_status=pair_status,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Failed to observe execution entry_id=%s paper_trade_id=%s",
+                execution.entry_id,
+                execution.paper_trade_id,
+                exc_info=True,
+            )
+            continue
+        observed_executions += 1
+        saved_observations += 1
+
+    return ExecutionObservationSummary(
+        scanned_executions=scanned_executions,
+        observed_executions=observed_executions,
+        saved_observations=saved_observations,
+        database_path=settings.database_path,
     )
 
 
@@ -393,6 +506,80 @@ async def run_supervised_polling_loop(
         database_path=settings.database_path,
         alert_events=alert_events,
     )
+
+
+def _build_account_preflight_configs(settings: WorkerSettings) -> AccountPreflightConfigMap:
+    return build_account_preflight_configs(
+        extended_live_enabled=settings.extended_live_enabled,
+        extended_api_key=settings.extended_api_key,
+        paradex_live_enabled=settings.paradex_live_enabled,
+        paradex_account_address=settings.paradex_account_address,
+        paradex_private_key=settings.paradex_private_key,
+        paradex_bearer_token=settings.paradex_bearer_token,
+        hyperliquid_live_enabled=settings.hyperliquid_live_enabled,
+        hyperliquid_account_address=settings.hyperliquid_account_address,
+        hyperliquid_api_wallet_private_key=settings.hyperliquid_api_wallet_private_key,
+    )
+
+
+def _build_order_state_observers(
+    settings: WorkerSettings,
+) -> dict[str, ExecutionLegOrderObserver]:
+    observers: dict[str, ExecutionLegOrderObserver] = {}
+    if settings.extended_live_enabled and settings.extended_api_key:
+        observers["extended"] = ExtendedOrderStateObserver(api_key=settings.extended_api_key)
+    if settings.paradex_live_enabled and settings.paradex_account_address and (
+        settings.paradex_private_key or settings.paradex_bearer_token
+    ):
+        observers["paradex"] = ParadexOrderStateObserver(
+            account_address=settings.paradex_account_address,
+            private_key=settings.paradex_private_key,
+            bearer_token=settings.paradex_bearer_token,
+        )
+    if (
+        settings.hyperliquid_live_enabled
+        and settings.hyperliquid_account_address
+        and settings.hyperliquid_api_wallet_private_key
+    ):
+        observers["hyperliquid"] = HyperliquidOrderStateObserver(
+            account_address=settings.hyperliquid_account_address,
+            vault_address=settings.hyperliquid_vault_address,
+        )
+    return observers
+
+
+def _list_recent_live_executions(
+    journal_store: ExecutionJournalStore,
+    *,
+    limit: int,
+) -> list[ExecutionJournalEntry]:
+    """Return recent unique live executions after filtering irrelevant journal rows."""
+
+    page_size = max(limit, 20)
+    offset = 0
+    seen_paper_trade_ids: set[int] = set()
+    selected: list[ExecutionJournalEntry] = []
+
+    while len(selected) < limit:
+        batch = journal_store.list_recent(limit=page_size, offset=offset)
+        if not batch:
+            break
+        offset += len(batch)
+
+        for execution in batch:
+            if execution.mode != "live" or execution.status not in {"submitted", "partial"}:
+                continue
+            if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
+                continue
+            seen_paper_trade_ids.add(execution.paper_trade_id)
+            selected.append(execution)
+            if len(selected) >= limit:
+                break
+
+        if len(batch) < page_size:
+            break
+
+    return selected
 
 
 def install_signal_handlers(

@@ -37,6 +37,45 @@ class VenueAccountConfig(TypedDict):
 AccountPreflightConfigMap = dict[str, VenueAccountConfig]
 
 
+def build_account_preflight_configs(
+    *,
+    extended_live_enabled: bool,
+    extended_api_key: str | None,
+    paradex_live_enabled: bool,
+    paradex_account_address: str | None,
+    paradex_private_key: str | None,
+    paradex_bearer_token: str | None,
+    hyperliquid_live_enabled: bool,
+    hyperliquid_account_address: str | None,
+    hyperliquid_api_wallet_private_key: str | None,
+) -> AccountPreflightConfigMap:
+    """Build the authenticated-read account probe config map."""
+
+    return {
+        "extended": {
+            "enabled": extended_live_enabled,
+            "credentials": {
+                "api_key": extended_api_key,
+            },
+        },
+        "paradex": {
+            "enabled": paradex_live_enabled,
+            "credentials": {
+                "account_address": paradex_account_address,
+                "bearer_token": paradex_bearer_token,
+                "private_key": paradex_private_key,
+            },
+        },
+        "hyperliquid": {
+            "enabled": hyperliquid_live_enabled,
+            "credentials": {
+                "account_address": hyperliquid_account_address,
+                "api_wallet_private_key": hyperliquid_api_wallet_private_key,
+            },
+        },
+    }
+
+
 class VenueAccountProbe(Protocol):
     """Protocol for one venue-specific authenticated account probe."""
 

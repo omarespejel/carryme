@@ -340,11 +340,14 @@ class ExecutionJournalStore:
         *,
         limit: int = 50,
         label: str | None = None,
+        offset: int = 0,
     ) -> list[ExecutionJournalEntry]:
         """Return recent execution journal entries."""
 
         if limit < 1:
             raise ValueError("limit must be at least 1")
+        if offset < 0:
+            raise ValueError("offset must be at least 0")
         self.initialize()
         normalized_label = label.strip() if label is not None else None
         query = """
@@ -354,10 +357,10 @@ class ExecutionJournalStore:
         params: tuple[object, ...]
         if normalized_label:
             query += " WHERE label = ?"
-            params = (normalized_label, limit)
+            params = (normalized_label, limit, offset)
         else:
-            params = (limit,)
-        query += " ORDER BY executed_at DESC, id DESC LIMIT ?"
+            params = (limit, offset)
+        query += " ORDER BY executed_at DESC, id DESC LIMIT ? OFFSET ?"
 
         with sqlite3.connect(self.database_path) as connection:
             rows = connection.execute(query, params).fetchall()

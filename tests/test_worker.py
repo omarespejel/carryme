@@ -2,21 +2,37 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
+    ExecutionJournalEntry,
+    ExecutionLegOrderState,
+    ExecutionLegResult,
+    ExecutionOrderState,
     FundingArbOpportunity,
     FundingPairSpec,
+    FundingPairTradeIntent,
     OpportunityRecord,
+    PaperTradeAccountPreflight,
+    PaperTradeEntry,
+    TradeLegIntent,
+    VenueAccountPreflight,
 )
-from carryme_storage import OpportunityHistoryStore
+from carryme_runtime import AccountPreflightService, ExecutionOrderStateService
+from carryme_storage import (
+    ExecutionJournalStore,
+    ExecutionObservationStore,
+    OpportunityHistoryStore,
+)
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
     build_candidate_payload,
     build_cycle_payload,
+    build_execution_observation_payload,
     build_health_payload,
     build_loop_payload,
 )
@@ -25,9 +41,12 @@ from carryme_worker.main import (
 )
 from carryme_worker.poller import (
     CandidateRecordSummary,
+    ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
+    _build_order_state_observers,
     install_signal_handlers,
+    observe_live_executions_once,
     poll_watchlist_once,
     run_polling_loop,
     run_supervised_polling_loop,
@@ -79,6 +98,31 @@ def test_worker_rejects_negative_candidate_thresholds(tmp_path: Path) -> None:
         WorkerSettings(
             watchlist_path=str(watchlist),
             min_candidate_entry_edge=-0.01,
+        )
+
+
+def test_worker_rejects_non_positive_execution_observation_limit(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text('{"pairs": []}')
+
+    with pytest.raises(ValidationError, match="execution_observation_limit"):
+        WorkerSettings(
+            watchlist_path=str(watchlist),
+            execution_observation_limit=0,
+        )
+
+
+def test_worker_rejects_enabled_live_mode_without_required_credentials(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text('{"pairs": []}')
+
+    with pytest.raises(
+        ValidationError,
+        match="extended_api_key",
+    ):
+        WorkerSettings(
+            watchlist_path=str(watchlist),
+            extended_live_enabled=True,
         )
 
 
@@ -141,6 +185,24 @@ def test_worker_candidate_payload() -> None:
     assert payload == {
         "total_records": 3,
         "candidate_records": 1,
+    }
+
+
+def test_worker_execution_observation_payload() -> None:
+    payload = build_execution_observation_payload(
+        ExecutionObservationSummary(
+            scanned_executions=2,
+            observed_executions=1,
+            saved_observations=1,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "scanned_executions": 2,
+        "observed_executions": 1,
+        "saved_observations": 1,
+        "database_path": "tmp/history.sqlite3",
     }
 
 
@@ -705,12 +767,474 @@ def test_run_polling_loop_rejects_non_positive_iterations(tmp_path: Path) -> Non
         asyncio.run(run_polling_loop(settings, iterations=0))
 
 
+def test_observe_live_executions_once_persists_latest_live_snapshots(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=9,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order-1",
+                )
+            ],
+        )
+    )
+
+    class StubAccountService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            config_map: object,
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id == 7
+            _ = config_map
+            return PaperTradeAccountPreflight(
+                paper_trade_id=7,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=[],
+                    )
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            assert entry.paper_trade_id == 7
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="extended",
+                        supported=True,
+                        observation_source="rest_poll",
+                        external_reference="ext-order-1",
+                        derived_state="unfilled",
+                        order_status="CLOSED",
+                    )
+                ],
+                notes=[],
+            )
+
+    summary = asyncio.run(
+        observe_live_executions_once(
+            settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            account_service=cast(AccountPreflightService, StubAccountService()),
+            order_state_service=cast(ExecutionOrderStateService, StubOrderStateService()),
+            now=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+        )
+    )
+
+    latest = observation_store.latest_for_paper_trade(7)
+
+    assert summary.scanned_executions == 1
+    assert summary.observed_executions == 1
+    assert summary.saved_observations == 1
+    assert latest is not None
+    assert latest.context == "worker_execution_monitor"
+    assert latest.order_state.legs[0].observation_source == "rest_poll"
+
+
+def test_observe_live_executions_once_skips_failed_observations(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    for paper_trade_id, external_reference in ((7, "order-1"), (8, "order-2")):
+        execution_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                adapter="paired_live:extended_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"preview-{paper_trade_id}",
+                confirmation_entry_id=paper_trade_id,
+                paper_trade=PaperTradeEntry(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                    note="operator accepted candidate",
+                    intent=FundingPairTradeIntent(
+                        label=f"arb-{paper_trade_id}",
+                        canonical_symbol="ARB-USD-PERP",
+                        source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                        one_day_net_edge_after_entry=0.00055,
+                        break_even_days_entry=0.45,
+                        capacity_limit_notional=4500.0,
+                        target_notional=11.0,
+                        capacity_fraction=0.25,
+                        max_target_notional=11.0,
+                        long_leg=TradeLegIntent(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                            fee_profile="pro",
+                            side="buy",
+                            target_notional=11.0,
+                        ),
+                        short_leg=TradeLegIntent(
+                            venue="extended",
+                            symbol="ARB-USD",
+                            fee_profile="default",
+                            side="sell",
+                            target_notional=11.0,
+                        ),
+                    ),
+                ),
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference=external_reference,
+                    )
+                ],
+            )
+        )
+
+    class StubAccountService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            config_map: object,
+        ) -> PaperTradeAccountPreflight:
+            _ = config_map
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[],
+                blocking_reasons=[],
+            )
+
+    class StubOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            if entry.paper_trade_id == 7:
+                raise RuntimeError("temporary venue failure")
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="extended",
+                        supported=True,
+                        observation_source="rest_poll",
+                        external_reference="order-2",
+                        derived_state="unfilled",
+                        order_status="CLOSED",
+                    )
+                ],
+                notes=[],
+            )
+
+    summary = asyncio.run(
+        observe_live_executions_once(
+            settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            account_service=cast(AccountPreflightService, StubAccountService()),
+            order_state_service=cast(ExecutionOrderStateService, StubOrderStateService()),
+            now=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+        )
+    )
+
+    results = observation_store.list_recent(limit=10)
+
+    assert summary.scanned_executions == 2
+    assert summary.observed_executions == 1
+    assert summary.saved_observations == 1
+    assert len(results) == 1
+    assert results[0].paper_trade_id == 8
+
+
+def test_observe_live_executions_once_pages_until_it_finds_live_entries(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_observation_limit=1,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
+            adapter="paired_mock:extended_then_paradex",
+            mode="mock",
+            status="submitted",
+            paper_trade_id=9,
+            preview_hash="paper-preview",
+            confirmation_entry_id=10,
+            paper_trade=PaperTradeEntry(
+                entry_id=9,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="paper trade",
+                intent=FundingPairTradeIntent(
+                    label="paper_pair",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=True,
+                    external_reference="mock-order-1",
+                )
+            ],
+        )
+    )
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=9,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order-1",
+                )
+            ],
+        )
+    )
+
+    class StubAccountService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            config_map: object,
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id == 7
+            _ = config_map
+            return PaperTradeAccountPreflight(
+                paper_trade_id=7,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=[],
+                    )
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            assert entry.paper_trade_id == 7
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="extended",
+                        supported=True,
+                        observation_source="rest_poll",
+                        external_reference="ext-order-1",
+                        derived_state="unfilled",
+                        order_status="CLOSED",
+                    )
+                ],
+                notes=[],
+            )
+
+    summary = asyncio.run(
+        observe_live_executions_once(
+            settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            account_service=cast(AccountPreflightService, StubAccountService()),
+            order_state_service=cast(ExecutionOrderStateService, StubOrderStateService()),
+            now=datetime(2026, 3, 29, 13, 8, tzinfo=UTC),
+        )
+    )
+
+    assert summary.scanned_executions == 1
+    assert summary.observed_executions == 1
+    assert summary.saved_observations == 1
+    assert observation_store.latest_for_paper_trade(7) is not None
+
+
+def test_build_order_state_observers_respects_live_enabled_flags(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        extended_live_enabled=False,
+        extended_api_key="extended-key",
+        paradex_live_enabled=False,
+        paradex_account_address="0xabc",
+        paradex_private_key="paradex-private",
+        hyperliquid_live_enabled=False,
+        hyperliquid_account_address="0xdef",
+        hyperliquid_api_wallet_private_key="hyperliquid-private",
+    )
+
+    assert _build_order_state_observers(settings) == {}
+
+
 def test_worker_main_rejects_mutually_exclusive_modes(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(
         "sys.argv",
         ["carryme-worker", "--once", "--iterations", "2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        worker_main()
+
+    _, stderr = capsys.readouterr()
+    assert "not allowed with argument" in stderr
+
+
+def test_worker_main_rejects_observation_mode_with_other_modes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--observe-executions-once", "--iterations", "2"],
     )
 
     with pytest.raises(SystemExit, match="2"):
@@ -1231,5 +1755,40 @@ def test_worker_main_prints_supervised_summary_as_json(
         "failures": 1,
         "saved_records": 1,
         "alert_events": 0,
+        "database_path": settings.database_path,
+    }
+
+
+def test_worker_main_prints_execution_observation_summary_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    async def fake_observe(settings: WorkerSettings) -> ExecutionObservationSummary:
+        return ExecutionObservationSummary(
+            scanned_executions=3,
+            observed_executions=2,
+            saved_observations=2,
+            database_path=settings.database_path,
+        )
+
+    monkeypatch.setattr("carryme_worker.main.WorkerSettings", lambda: settings)
+    monkeypatch.setattr("carryme_worker.main.observe_live_executions_once", fake_observe)
+    monkeypatch.setattr("sys.argv", ["carryme-worker", "--observe-executions-once"])
+
+    worker_main()
+
+    stdout, _ = capsys.readouterr()
+    assert json.loads(stdout) == {
+        "scanned_executions": 3,
+        "observed_executions": 2,
+        "saved_observations": 2,
         "database_path": settings.database_path,
     }

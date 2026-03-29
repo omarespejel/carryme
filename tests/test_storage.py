@@ -9,7 +9,13 @@ from carryme_models import (
     CleanupPreviewConfirmationEntry,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
+    ExecutionLegOrderState,
     ExecutionLegResult,
+    ExecutionObservationEntry,
+    ExecutionOrderState,
+    ExecutionPairStatus,
+    ExecutionReconciliation,
+    ExecutionVenueReconciliation,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -24,6 +30,7 @@ from carryme_storage import (
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionJournalStore,
+    ExecutionObservationStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     PreviewConfirmationStore,
@@ -1749,6 +1756,272 @@ def test_preview_confirmation_store_rejects_non_positive_limits(
     invalid_limit: int,
 ) -> None:
     store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        store.list_recent(limit=invalid_limit)
+
+
+def test_execution_observation_store_appends_and_lists_recent(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+    entry = ExecutionObservationEntry(
+        observed_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+        context="guarded_pair_poll",
+        execution_entry_id=12,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        order_state=ExecutionOrderState(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            legs=[
+                ExecutionLegOrderState(
+                    venue="paradex",
+                    supported=True,
+                    observation_source="rest_poll",
+                    external_reference="order-1",
+                    derived_state="unfilled",
+                    order_status="CLOSED",
+                )
+            ],
+            notes=[],
+        ),
+        pair_status=ExecutionPairStatus(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            derived_state="unfilled",
+            recommended_action="no_action",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                legs=[],
+                notes=[],
+            ),
+            reconciliation=ExecutionReconciliation(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                status="submitted",
+                recommended_action="verify_fill_status",
+                matched_all_leg_symbols=False,
+                venues=[
+                    ExecutionVenueReconciliation(
+                        venue="extended",
+                        authenticated=True,
+                        ready=True,
+                        position_symbols=[],
+                        matched_leg_symbols=[],
+                        unmatched_leg_symbols=["ARB-USD"],
+                    )
+                ],
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    saved = store.append(entry)
+    assert entry.pair_status is not None
+    pair_status = entry.pair_status
+    newer = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
+            context="worker_execution_monitor",
+            execution_entry_id=13,
+            paper_trade_id=7,
+            preview_hash="preview-hash-newer",
+            order_state=pair_status.order_state.model_copy(
+                update={
+                    "execution_entry_id": 13,
+                    "paper_trade_id": 7,
+                    "preview_hash": "preview-hash-newer",
+                }
+            ),
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=13,
+                paper_trade_id=7,
+                preview_hash="preview-hash-newer",
+                derived_state="review_required",
+                recommended_action="wait_for_fill",
+                order_state=pair_status.order_state.model_copy(
+                    update={
+                        "execution_entry_id": 13,
+                        "paper_trade_id": 7,
+                        "preview_hash": "preview-hash-newer",
+                    }
+                ),
+                reconciliation=pair_status.reconciliation.model_copy(
+                    update={
+                        "execution_entry_id": 13,
+                        "paper_trade_id": 7,
+                        "preview_hash": "preview-hash-newer",
+                    }
+                ),
+                notes=[],
+            ),
+        )
+    )
+    results = store.list_recent(limit=10)
+    latest = store.latest_for_paper_trade(7)
+
+    assert saved.entry_id is not None
+    assert newer.entry_id is not None
+    assert len(results) == 2
+    assert results[0].entry_id == newer.entry_id
+    assert results[0].context == "worker_execution_monitor"
+    assert results[0].pair_status is not None
+    assert results[0].pair_status.derived_state == "review_required"
+    assert latest is not None
+    assert latest.entry_id == newer.entry_id
+
+
+def test_execution_observation_store_rejects_naive_timestamps(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="observed_at must be timezone-aware"):
+        store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 3, 29, 13, 5),
+                context="worker_execution_monitor",
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=12,
+                    paper_trade_id=7,
+                    preview_hash="preview-hash",
+                    legs=[],
+                    notes=[],
+                ),
+            )
+        )
+
+
+def test_execution_observation_store_normalizes_timestamps_to_utc(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    saved = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 15, 5, tzinfo=timezone(timedelta(hours=2))),
+            context="worker_execution_monitor",
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+
+    latest = store.latest_for_paper_trade(7)
+
+    assert saved.observed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)
+    assert latest is not None
+    assert latest.observed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)
+
+
+def test_execution_observation_store_filters_by_paper_trade_id(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+    first = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+            context="trade-7",
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash-7",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash-7",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+    latest = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 8, tzinfo=UTC),
+            context="trade-7-latest",
+            execution_entry_id=14,
+            paper_trade_id=7,
+            preview_hash="preview-hash-7-newer",
+            order_state=ExecutionOrderState(
+                execution_entry_id=14,
+                paper_trade_id=7,
+                preview_hash="preview-hash-7-newer",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+    store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
+            context="trade-8",
+            execution_entry_id=13,
+            paper_trade_id=8,
+            preview_hash="preview-hash-8",
+            order_state=ExecutionOrderState(
+                execution_entry_id=13,
+                paper_trade_id=8,
+                preview_hash="preview-hash-8",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+
+    filtered = store.list_recent(limit=10, paper_trade_id=7)
+    latest_for_trade = store.latest_for_paper_trade(7)
+
+    assert first.entry_id is not None
+    assert latest.entry_id is not None
+    assert len(filtered) == 2
+    assert [entry.paper_trade_id for entry in filtered] == [7, 7]
+    assert [entry.entry_id for entry in filtered] == [latest.entry_id, first.entry_id]
+    assert [entry.context for entry in filtered] == ["trade-7-latest", "trade-7"]
+    assert latest_for_trade is not None
+    assert latest_for_trade.entry_id == latest.entry_id
+
+
+def test_execution_observation_store_orders_ties_deterministically(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+    observed_at = datetime(2026, 3, 29, 13, 6, tzinfo=UTC)
+
+    for index, context in enumerate(["first", "second"], start=12):
+        store.append(
+            ExecutionObservationEntry(
+                observed_at=observed_at,
+                context=context,
+                execution_entry_id=index,
+                paper_trade_id=7,
+                preview_hash=f"preview-hash-{context}",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=index,
+                    paper_trade_id=7,
+                    preview_hash=f"preview-hash-{context}",
+                    legs=[],
+                    notes=[],
+                ),
+            )
+        )
+
+    results = store.list_recent(limit=2)
+
+    assert [entry.context for entry in results] == ["second", "first"]
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1])
+def test_execution_observation_store_rejects_non_positive_limits(
+    tmp_path: Path,
+    invalid_limit: int,
+) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
 
     with pytest.raises(ValueError, match="limit must be at least 1"):
         store.list_recent(limit=invalid_limit)
