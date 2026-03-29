@@ -1457,12 +1457,11 @@ def test_mock_execution_endpoint_submits_saved_paper_trade(tmp_path: Path) -> No
     )
 
     client = TestClient(app)
-    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
-        get_execution_journal_store, lambda: execution_store
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(get_execution_journal_store, lambda: execution_store),
     ):
-        response = client.post(
-            f"/v1/executions/mock/from-paper-trade/{paper_trade.entry_id}"
-        )
+        response = client.post(f"/v1/executions/mock/from-paper-trade/{paper_trade.entry_id}")
 
     assert response.status_code == 200
     payload = response.json()
@@ -1478,8 +1477,9 @@ def test_mock_execution_endpoint_returns_404_for_missing_paper_trade(
     execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
 
     client = TestClient(app)
-    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
-        get_execution_journal_store, lambda: execution_store
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(get_execution_journal_store, lambda: execution_store),
     ):
         response = client.post("/v1/executions/mock/from-paper-trade/999999")
 
@@ -1530,12 +1530,12 @@ def test_mock_execution_endpoint_ignores_generic_execution_adapter_override(
     )
 
     client = TestClient(app)
-    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
-        get_execution_journal_store, lambda: execution_store
-    ), _dependency_override(get_execution_adapter, lambda: FailingAdapter()):
-        response = client.post(
-            f"/v1/executions/mock/from-paper-trade/{paper_trade.entry_id}"
-        )
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(get_execution_journal_store, lambda: execution_store),
+        _dependency_override(get_execution_adapter, lambda: FailingAdapter()),
+    ):
+        response = client.post(f"/v1/executions/mock/from-paper-trade/{paper_trade.entry_id}")
 
     assert response.status_code == 200
     assert execution_store.list_recent(limit=10)[0].paper_trade_id == paper_trade.entry_id
@@ -1641,17 +1641,17 @@ def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None
     client = TestClient(app)
     with _dependency_override(
         get_api_settings,
-            lambda: ApiSettings(
-                extended_live_enabled=True,
-                extended_api_key=None,
-                extended_stark_private_key=None,
-                paradex_live_enabled=True,
-                paradex_account_address="0xabc",
-                paradex_private_key="paradex-secret",
-                hyperliquid_live_enabled=False,
-                hyperliquid_account_address=None,
-                hyperliquid_api_wallet_private_key=None,
-            ),
+        lambda: ApiSettings(
+            extended_live_enabled=True,
+            extended_api_key=None,
+            extended_stark_private_key=None,
+            paradex_live_enabled=True,
+            paradex_account_address="0xabc",
+            paradex_private_key="paradex-secret",
+            hyperliquid_live_enabled=False,
+            hyperliquid_account_address=None,
+            hyperliquid_api_wallet_private_key=None,
+        ),
     ):
         response = client.get("/v1/executions/preflight/venues")
 
@@ -1698,22 +1698,23 @@ def test_live_execution_preflight_for_saved_paper_trade(tmp_path: Path) -> None:
     )
 
     client = TestClient(app)
-    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
-        get_api_settings,
-        lambda: ApiSettings(
-            extended_live_enabled=True,
-            extended_api_key="extended-key",
-            extended_stark_private_key="extended-stark",
-            paradex_live_enabled=False,
-            paradex_private_key=None,
-            hyperliquid_live_enabled=False,
-            hyperliquid_account_address=None,
-            hyperliquid_api_wallet_private_key=None,
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=False,
+                paradex_private_key=None,
+                hyperliquid_live_enabled=False,
+                hyperliquid_account_address=None,
+                hyperliquid_api_wallet_private_key=None,
+            ),
         ),
     ):
-        response = client.get(
-            f"/v1/executions/preflight/from-paper-trade/{paper_trade.entry_id}"
-        )
+        response = client.get(f"/v1/executions/preflight/from-paper-trade/{paper_trade.entry_id}")
 
     assert response.status_code == 200
     payload = response.json()
@@ -1730,17 +1731,20 @@ def test_live_execution_preflight_returns_404_for_missing_paper_trade(
 ) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     client = TestClient(app)
-    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
-        get_api_settings,
-        lambda: ApiSettings(
-            extended_live_enabled=True,
-            extended_api_key="extended-key",
-            extended_stark_private_key="extended-stark",
-            paradex_live_enabled=True,
-            paradex_private_key="paradex-secret",
-            hyperliquid_live_enabled=False,
-            hyperliquid_account_address=None,
-            hyperliquid_api_wallet_private_key=None,
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=True,
+                paradex_private_key="paradex-secret",
+                hyperliquid_live_enabled=False,
+                hyperliquid_account_address=None,
+                hyperliquid_api_wallet_private_key=None,
+            ),
         ),
     ):
         response = client.get("/v1/executions/preflight/from-paper-trade/999999")
@@ -2126,9 +2130,12 @@ def test_order_preview_endpoint_returns_saved_paper_trade_preview(tmp_path: Path
     from carryme_api.app import get_order_preview_service
 
     client = TestClient(app)
-    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
-        get_order_preview_service,
-        lambda: StubOrderPreviewService(),
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(
+            get_order_preview_service,
+            lambda: StubOrderPreviewService(),
+        ),
     ):
         response = client.get(
             f"/v1/executions/preview/from-paper-trade/{paper_trade.entry_id}",
@@ -2341,8 +2348,7 @@ def test_preview_confirmation_endpoint_rejects_hash_mismatch(tmp_path: Path) -> 
 
     assert response.status_code == 409
     assert (
-        response.json()["detail"]
-        == "Preview hash did not match the current unsigned order preview"
+        response.json()["detail"] == "Preview hash did not match the current unsigned order preview"
     )
     assert confirmation_store.list_recent(limit=10) == []
 
@@ -3074,7 +3080,6 @@ def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pat
     assert len(execution_store.list_recent(limit=10)) == 1
 
 
-
 def test_paradex_live_execution_endpoint_strips_preview_hash_for_lookup(tmp_path: Path) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
@@ -3740,6 +3745,511 @@ def test_extended_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pa
     assert payload["status"] == "submitted"
     assert payload["preview_hash"] == "preview-hash"
     assert len(execution_store.list_recent(limit=10)) == 1
+
+
+def test_paired_live_execution_endpoint_submits_both_legs(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+    confirmation_store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label=paper_trade.intent.label,
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        effective_notional=999.96,
+                        quantity=10881.0,
+                        quantity_text="10881.00000000",
+                        quantity_increment=1.0,
+                        minimum_order_size=10.0,
+                        minimum_notional=0.918,
+                        reference_price=0.0919,
+                        reference_price_source="best_bid",
+                        worst_acceptable_price=0.0918,
+                        worst_price_text="0.09180000",
+                        price_increment=0.0001,
+                        max_order_value=1_250_000.0,
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/api/v1/user/order",
+                        required_auth_env_vars=[
+                            "CARRYME_API_EXTENDED_API_KEY",
+                            "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
+                        ],
+                        auth_scheme="api key + Stark signing key",
+                        payload={
+                            "symbol": "ARB-USD",
+                            "side": "SELL",
+                            "type": "LIMIT",
+                            "size": "10881.00000000",
+                            "price": "0.09180000",
+                            "time_in_force": "IOC",
+                            "client_order_id": "carryme-pt55-extended-sell",
+                            "reduce_only": False,
+                        },
+                        notes=[],
+                    ),
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        effective_notional=999.99,
+                        quantity=10845.9,
+                        quantity_text="10845.90000000",
+                        quantity_increment=0.1,
+                        minimum_order_size=0.1,
+                        minimum_notional=10.0,
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.0923,
+                        worst_price_text="0.09230000",
+                        price_increment=0.0001,
+                        max_order_value=1_000_000.0,
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=[
+                            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                            "CARRYME_API_PARADEX_PRIVATE_KEY",
+                        ],
+                        auth_scheme="main account address + subkey private key",
+                        payload={
+                            "market": "ARB-USD-PERP",
+                            "side": "BUY",
+                            "type": "LIMIT",
+                            "size": "10845.90000000",
+                            "price": "0.09230000",
+                            "instruction": "IOC",
+                            "client_id": "carryme-pt55-paradex-buy",
+                        },
+                        notes=[],
+                    ),
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubPairedLiveExecutionCoordinator:
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            first_venue: str,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+                adapter=f"paired_live:{first_venue}_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="extended-1",
+                    ),
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="paradex-1",
+                    ),
+                ],
+            )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_execution_journal_store,
+        get_paired_live_execution_coordinator,
+        get_preview_confirmation_store,
+    )
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(get_preview_confirmation_store, lambda: confirmation_store),
+        _dependency_override(get_execution_journal_store, lambda: execution_store),
+        _dependency_override(
+            get_account_preflight_service,
+            lambda: StubAccountPreflightService(),
+        ),
+        _dependency_override(
+            get_paired_live_execution_coordinator,
+            lambda: StubPairedLiveExecutionCoordinator(),
+        ),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=True,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-private",
+                paradex_bearer_token=None,
+            ),
+        ),
+    ):
+        response = client.post(
+            f"/v1/executions/live/pair/from-paper-trade/{paper_trade.entry_id}",
+            params={"preview_hash": "preview-hash", "first_venue": "extended"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["adapter"] == "paired_live:extended_then_paradex"
+    assert payload["status"] == "submitted"
+    assert [leg["venue"] for leg in payload["legs"]] == ["extended", "paradex"]
+    assert len(execution_store.list_recent(limit=10)) == 1
+
+
+def test_paired_live_execution_endpoint_blocks_duplicate_submission(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+    confirmation_store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label=paper_trade.intent.label,
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        effective_notional=999.96,
+                        quantity=10881.0,
+                        quantity_text="10881.00000000",
+                        quantity_increment=1.0,
+                        minimum_order_size=10.0,
+                        minimum_notional=0.918,
+                        reference_price=0.0919,
+                        reference_price_source="best_bid",
+                        worst_acceptable_price=0.0918,
+                        worst_price_text="0.09180000",
+                        price_increment=0.0001,
+                        max_order_value=1_250_000.0,
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/api/v1/user/order",
+                        required_auth_env_vars=[
+                            "CARRYME_API_EXTENDED_API_KEY",
+                            "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
+                        ],
+                        auth_scheme="api key + Stark signing key",
+                        payload={
+                            "symbol": "ARB-USD",
+                            "side": "SELL",
+                            "type": "LIMIT",
+                            "size": "10881.00000000",
+                            "price": "0.09180000",
+                            "time_in_force": "IOC",
+                            "client_order_id": "carryme-pt55-extended-sell",
+                            "reduce_only": False,
+                        },
+                        notes=[],
+                    ),
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        effective_notional=999.99,
+                        quantity=10845.9,
+                        quantity_text="10845.90000000",
+                        quantity_increment=0.1,
+                        minimum_order_size=0.1,
+                        minimum_notional=10.0,
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.0923,
+                        worst_price_text="0.09230000",
+                        price_increment=0.0001,
+                        max_order_value=1_000_000.0,
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=[
+                            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                            "CARRYME_API_PARADEX_PRIVATE_KEY",
+                        ],
+                        auth_scheme="main account address + subkey private key",
+                        payload={
+                            "market": "ARB-USD-PERP",
+                            "side": "BUY",
+                            "type": "LIMIT",
+                            "size": "10845.90000000",
+                            "price": "0.09230000",
+                            "instruction": "IOC",
+                            "client_id": "carryme-pt55-paradex-buy",
+                        },
+                        notes=[],
+                    ),
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+
+    class ReadyAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    calls = 0
+
+    class StubPairedLiveExecutionCoordinator:
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            first_venue: str,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            nonlocal calls
+            calls += 1
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+                adapter=f"paired_live:{first_venue}_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="extended-1",
+                    ),
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="paradex-1",
+                    ),
+                ],
+            )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_execution_journal_store,
+        get_paired_live_execution_coordinator,
+        get_preview_confirmation_store,
+    )
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(get_preview_confirmation_store, lambda: confirmation_store),
+        _dependency_override(get_execution_journal_store, lambda: execution_store),
+        _dependency_override(
+            get_account_preflight_service,
+            lambda: ReadyAccountPreflightService(),
+        ),
+        _dependency_override(
+            get_paired_live_execution_coordinator,
+            lambda: StubPairedLiveExecutionCoordinator(),
+        ),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=True,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-private",
+                paradex_bearer_token=None,
+            ),
+        ),
+    ):
+        first = client.post(
+            f"/v1/executions/live/pair/from-paper-trade/{paper_trade.entry_id}",
+            params={"preview_hash": "preview-hash", "first_venue": "extended"},
+        )
+        second = client.post(
+            f"/v1/executions/live/pair/from-paper-trade/{paper_trade.entry_id}",
+            params={"preview_hash": "preview-hash", "first_venue": "extended"},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert calls == 1
+    assert len(execution_store.list_recent(limit=10)) == 1
+
+
 def test_live_submission_readiness_endpoint_maps_account_preflight_errors_to_bad_gateway(
     tmp_path: Path,
 ) -> None:

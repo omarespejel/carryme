@@ -14,6 +14,10 @@ from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
 from carryme_runtime.intents import InvalidTradeCandidateError, build_trade_intent
 from carryme_runtime.opportunities import OpportunityService, UpstreamDataError, fetch_live_snapshot
 from carryme_runtime.order_preview import OrderPreviewService
+from carryme_runtime.paired_live_execution import (
+    PairedLiveExecutionCoordinator,
+    SingleVenueLiveExecutionService,
+)
 from carryme_runtime.paradex_live_execution import ParadexLiveExecutionService
 from carryme_runtime.preflight import (
     LiveExecutionConfigMap,
@@ -31,7 +35,9 @@ __all__ = [
     "LiveExecutionConfigMap",
     "MockExecutionAdapter",
     "OrderPreviewService",
+    "PairedLiveExecutionCoordinator",
     "ParadexLiveExecutionService",
+    "SingleVenueLiveExecutionService",
     "VenueAccountProbe",
     "build_live_execution_configs",
     "build_live_submission_readiness",

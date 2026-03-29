@@ -33,7 +33,7 @@ class ExecutionJournalEntry(BaseModel):
     adapter: str = Field(min_length=1)
     mode: Literal["mock", "live"]
     submission_id: str | None = None
-    status: Literal["accepted", "rejected", "submitted"]
+    status: Literal["accepted", "rejected", "submitted", "partial"]
     paper_trade_id: int | None = None
     preview_hash: str | None = None
     confirmation_entry_id: int | None = None
