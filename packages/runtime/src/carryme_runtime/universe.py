@@ -16,6 +16,7 @@ from carryme_connectors import (
     PublicVenueConnector,
 )
 from carryme_models import (
+    ExecutionQualitySummary,
     FundingArbOpportunity,
     FundingUniverseOpportunity,
     FundingUniverseOverlap,
@@ -28,12 +29,14 @@ from carryme_models import (
 from carryme_normalizers import get_fee_profile, normalize_symbol
 from carryme_scoring import score_funding_pair
 
+from carryme_runtime.execution_quality import ExecutionQualityService
 from carryme_runtime.opportunities import (
     VENUE_REGISTRY,
     SnapshotFetcher,
     UpstreamDataError,
     fetch_live_snapshot,
 )
+from carryme_runtime.universe_policy import passes_symbol_policy, policy_tags_for_symbol
 
 UniverseRanking = Literal[
     "roundtrip_edge",
@@ -41,6 +44,8 @@ UniverseRanking = Literal[
     "roundtrip_pnl",
     "entry_pnl",
     "quality_adjusted_roundtrip_pnl",
+    "execution_adjusted_roundtrip_pnl",
+    "execution_adjusted_quality_pnl",
 ]
 
 
@@ -55,6 +60,15 @@ DEFAULT_FEE_PROFILES: dict[str, str] = {
     "hyperliquid": "tier0",
     "paradex": "pro",
 }
+UNIVERSE_RANKINGS: tuple[UniverseRanking, ...] = (
+    "roundtrip_edge",
+    "entry_edge",
+    "roundtrip_pnl",
+    "entry_pnl",
+    "quality_adjusted_roundtrip_pnl",
+    "execution_adjusted_roundtrip_pnl",
+    "execution_adjusted_quality_pnl",
+)
 
 
 def _default_universe_fee_profiles() -> dict[str, str]:
@@ -68,25 +82,48 @@ class OpportunityUniverseService:
     list_symbols: VenueSymbolLister = field(default_factory=lambda: list_live_symbols)
     fetch_snapshot: SnapshotFetcher = field(default_factory=lambda: fetch_live_snapshot)
     default_fee_profiles: dict[str, str] = field(default_factory=_default_universe_fee_profiles)
+    execution_quality_service: ExecutionQualityService | None = None
 
     async def scan(
         self,
         *,
         venues: list[str],
-        ranking: UniverseRanking = "quality_adjusted_roundtrip_pnl",
+        ranking: UniverseRanking = "execution_adjusted_quality_pnl",
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
         min_open_interest: float = 0.0,
         min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.0,
+        include_symbols: list[str] | None = None,
+        exclude_symbols: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
         limit: int = 20,
     ) -> FundingUniverseScan:
         normalized_venues = _normalize_venues(venues)
+        normalized_ranking = _normalize_ranking(ranking)
         overlaps = await self.discover_overlaps(normalized_venues)
         snapshots = await self._fetch_overlapping_snapshots(overlaps)
+        execution_quality_index = (
+            self.execution_quality_service.build_index()
+            if self.execution_quality_service is not None
+            else {}
+        )
+        execution_prior_score = (
+            self.execution_quality_service.prior_score
+            if self.execution_quality_service is not None
+            else 1.0
+        )
 
         opportunities: list[FundingUniverseOpportunity] = []
         for overlap in overlaps:
+            if not passes_symbol_policy(
+                overlap.canonical_symbol,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+            ):
+                continue
             entries = [
                 (venue, symbol, snapshots[(venue, symbol)])
                 for venue, symbol in overlap.venue_symbols.items()
@@ -103,6 +140,8 @@ class OpportunityUniverseService:
                     left_fee_profile=self.default_fee_profiles[left_venue],
                     right_fee_profile=self.default_fee_profiles[right_venue],
                     target_notional=target_notional,
+                    execution_quality_index=execution_quality_index,
+                    execution_prior_score=execution_prior_score,
                 )
                 if not _passes_filters(
                     scored,
@@ -110,13 +149,15 @@ class OpportunityUniverseService:
                     min_daily_volume=min_daily_volume,
                     min_open_interest=min_open_interest,
                     min_roundtrip_edge=min_roundtrip_edge,
+                    min_execution_quality_score=min_execution_quality_score,
+                    default_execution_quality_score=execution_prior_score,
                 ):
                     continue
                 opportunities.append(scored)
 
         ranked = sorted(
             opportunities,
-            key=lambda item: _ranking_value(item, ranking),
+            key=lambda item: _ranking_value(item, normalized_ranking),
             reverse=True,
         )
         if limit > 0:
@@ -124,7 +165,7 @@ class OpportunityUniverseService:
 
         return FundingUniverseScan(
             venues=normalized_venues,
-            ranking=ranking,
+            ranking=normalized_ranking,
             target_notional=target_notional,
             overlap_count=len(overlaps),
             overlaps=overlaps,
@@ -203,6 +244,8 @@ def _build_universe_opportunity(
     left_fee_profile: str,
     right_fee_profile: str,
     target_notional: float,
+    execution_quality_index: dict[tuple[str, str, str], ExecutionQualitySummary],
+    execution_prior_score: float,
 ) -> FundingUniverseOpportunity:
     opportunity = score_funding_pair(
         left,
@@ -233,8 +276,28 @@ def _build_universe_opportunity(
         min_daily_volume=min_daily_volume,
         min_open_interest=min_open_interest,
     )
+    policy_tags = policy_tags_for_symbol(opportunity.canonical_symbol)
+    execution_quality = execution_quality_index.get(
+        (opportunity.canonical_symbol, opportunity.short_venue, opportunity.long_venue)
+    )
+    execution_quality_score = (
+        execution_quality.weighted_score
+        if execution_quality is not None
+        else execution_prior_score
+    )
+    execution_adjusted_round_trip_pnl = (
+        pnl_after_round_trip * execution_quality_score
+        if pnl_after_round_trip is not None
+        else pnl_after_round_trip
+    )
+    execution_adjusted_quality_score = (
+        quality_score * execution_quality_score
+        if quality_score is not None
+        else quality_score
+    )
     return FundingUniverseOpportunity(
         opportunity=opportunity,
+        policy_tags=policy_tags,
         venue_markets=venue_markets,
         min_daily_volume=min_daily_volume,
         min_open_interest=min_open_interest,
@@ -243,6 +306,9 @@ def _build_universe_opportunity(
         estimated_one_day_pnl_after_entry=pnl_after_entry,
         estimated_one_day_pnl_after_round_trip=pnl_after_round_trip,
         quality_score=quality_score,
+        execution_quality=execution_quality,
+        execution_adjusted_one_day_pnl_after_round_trip=execution_adjusted_round_trip_pnl,
+        execution_adjusted_quality_score=execution_adjusted_quality_score,
     )
 
 
@@ -318,6 +384,8 @@ def _passes_filters(
     min_daily_volume: float,
     min_open_interest: float,
     min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    default_execution_quality_score: float,
 ) -> bool:
     deployable_notional = opportunity.deployable_notional or 0.0
     if deployable_notional < min_capacity_notional:
@@ -326,7 +394,14 @@ def _passes_filters(
         return False
     if (opportunity.min_open_interest or 0.0) < min_open_interest:
         return False
-    return opportunity.opportunity.one_day_net_edge_after_round_trip >= min_roundtrip_edge
+    if opportunity.opportunity.one_day_net_edge_after_round_trip < min_roundtrip_edge:
+        return False
+    execution_quality_score = (
+        opportunity.execution_quality.weighted_score
+        if opportunity.execution_quality is not None
+        else default_execution_quality_score
+    )
+    return execution_quality_score >= min_execution_quality_score
 
 
 def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRanking) -> float:
@@ -338,6 +413,10 @@ def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRan
         return opportunity.estimated_one_day_pnl_after_round_trip or float("-inf")
     if ranking == "entry_pnl":
         return opportunity.estimated_one_day_pnl_after_entry or float("-inf")
+    if ranking == "execution_adjusted_roundtrip_pnl":
+        return opportunity.execution_adjusted_one_day_pnl_after_round_trip or float("-inf")
+    if ranking == "execution_adjusted_quality_pnl":
+        return opportunity.execution_adjusted_quality_score or float("-inf")
     return opportunity.quality_score or float("-inf")
 
 
@@ -352,6 +431,14 @@ def _normalize_venues(venues: list[str]) -> list[str]:
         joined = ", ".join(sorted(unsupported))
         raise ValueError(f"Unsupported venue(s): {joined}")
     return normalized
+
+
+def _normalize_ranking(ranking: str) -> UniverseRanking:
+    normalized = ranking.strip()
+    if normalized not in UNIVERSE_RANKINGS:
+        supported = ", ".join(UNIVERSE_RANKINGS)
+        raise ValueError(f"Unsupported ranking: {ranking}. Expected one of: {supported}")
+    return normalized  # type: ignore[return-value]
 
 
 def build_portfolio_plan(

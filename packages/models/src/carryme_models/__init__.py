@@ -51,6 +51,7 @@ from carryme_models.preview import (
 )
 from carryme_models.readiness import LiveSubmissionReadiness
 from carryme_models.universe import (
+    ExecutionQualitySummary,
     FundingUniverseOpportunity,
     FundingUniverseOverlap,
     FundingUniversePortfolioEntry,
@@ -76,6 +77,7 @@ __all__ = [
     "ExecutionReconciliation",
     "ExecutionVenueReconciliation",
     "ObservationSource",
+    "ExecutionQualitySummary",
     "FundingPairSpec",
     "FundingRateNormalization",
     "FundingArbOpportunity",

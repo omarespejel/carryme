@@ -24,6 +24,7 @@ from carryme_runtime.execution_order_state import (
     ParadexOrderStateObserver,
 )
 from carryme_runtime.execution_pair_status import build_execution_pair_status
+from carryme_runtime.execution_quality import ExecutionQualityService
 from carryme_runtime.execution_reconciliation import reconcile_execution
 from carryme_runtime.extended_cleanup_preview import ExtendedCleanupPreviewService
 from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
@@ -60,6 +61,7 @@ __all__ = [
     "CleanupLiveExecutionRouter",
     "CleanupPreviewRouter",
     "ExecutionAdapter",
+    "ExecutionQualityService",
     "ExecutionOrderStateService",
     "build_execution_pair_status",
     "ExtendedCleanupPreviewService",
