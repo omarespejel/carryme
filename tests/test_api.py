@@ -9,6 +9,7 @@ import httpx
 import pytest
 from carryme_api.app import (
     app,
+    get_api_settings,
     get_candidate_alert_store,
     get_execution_adapter,
     get_execution_journal_store,
@@ -1631,8 +1632,6 @@ def test_executions_endpoint_rejects_limit_above_history_cap(tmp_path: Path) -> 
 
 
 def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None:
-    from carryme_api.app import get_api_settings
-
     client = TestClient(app)
     with _dependency_override(
         get_api_settings,
@@ -1653,12 +1652,11 @@ def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None
     payload = {item["venue"]: item for item in response.json()}
     assert payload["extended"]["ready"] is False
     assert "CARRYME_API_EXTENDED_API_KEY" in payload["extended"]["missing_env_vars"]
+    assert "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY" in payload["extended"]["missing_env_vars"]
     assert payload["paradex"]["ready"] is True
 
 
 def test_live_execution_preflight_for_saved_paper_trade(tmp_path: Path) -> None:
-    from carryme_api.app import get_api_settings
-
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     paper_trade = paper_store.append(
         PaperTradeEntry(
@@ -1715,13 +1713,12 @@ def test_live_execution_preflight_for_saved_paper_trade(tmp_path: Path) -> None:
     assert payload["paper_trade_id"] == paper_trade.entry_id
     assert payload["ready"] is False
     assert {item["venue"] for item in payload["venues"]} == {"extended", "paradex"}
+    assert "Venue paradex live execution is not enabled" in payload["blocking_reasons"]
 
 
 def test_live_execution_preflight_returns_404_for_missing_paper_trade(
     tmp_path: Path,
 ) -> None:
-    from carryme_api.app import get_api_settings
-
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     client = TestClient(app)
     with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
