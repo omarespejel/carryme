@@ -1071,6 +1071,142 @@ def test_create_paper_trade_from_intent_persists_entry(tmp_path: Path) -> None:
     assert len(paper_store.list_recent(limit=10)) == 1
 
 
+def test_trade_intents_endpoint_skips_invalid_zero_capacity_records(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    common_pair = FundingPairSpec(
+        label="arb_extended_paradex",
+        left_venue="extended",
+        left_symbol="ARB-USD",
+        left_fee_profile="default",
+        right_venue="paradex",
+        right_symbol="ARB-USD-PERP",
+        right_fee_profile="pro",
+    )
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            pair=common_pair,
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro",
+                short_fee_profile="default",
+                gross_daily_edge=0.0011,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.00085,
+                one_day_net_edge_after_round_trip=0.00055,
+                break_even_days_entry=0.45,
+                break_even_days_round_trip=0.9,
+                capacity=CapacityEstimate(
+                    short_bid_notional=0.0,
+                    long_ask_notional=0.0,
+                    max_entry_notional=0.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get(
+            "/v1/intents/funding-pairs",
+            params={"limit": 10, "min_capacity_notional": 0.0},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["label"] == "strk_extended_hyperliquid"
+
+
+def test_create_paper_trade_from_intent_returns_not_found_for_invalid_capacity(
+    tmp_path: Path,
+) -> None:
+    history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    history_store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="arb_extended_paradex",
+                left_venue="extended",
+                left_symbol="ARB-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="ARB-USD-PERP",
+                right_fee_profile="pro",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro",
+                short_fee_profile="default",
+                gross_daily_edge=0.001,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0008,
+                one_day_net_edge_after_round_trip=0.0005,
+                break_even_days_entry=0.5,
+                break_even_days_round_trip=1.0,
+                capacity=CapacityEstimate(
+                    short_bid_notional=0.0,
+                    long_ask_notional=0.0,
+                    max_entry_notional=0.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_history_store, lambda: history_store),
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+    ):
+        response = client.post("/v1/paper-trades/from-intent")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No paper trade intent matched the requested filters"
+
+
 def test_paper_trades_endpoint_lists_saved_entries(tmp_path: Path) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     paper_store.append(
