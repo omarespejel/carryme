@@ -36,6 +36,7 @@ from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
     AccountPreflightConfigMap,
     AccountPreflightService,
+    CleanupPreviewRouter,
     ConnectorError,
     ExecutionAdapter,
     ExecutionOrderStateService,
@@ -47,6 +48,7 @@ from carryme_runtime import (
     OpportunityService,
     OrderPreviewService,
     PairedLiveExecutionCoordinator,
+    ParadexCleanupPreviewService,
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
     build_execution_pair_status,
@@ -175,12 +177,21 @@ def get_extended_live_execution_service(
     )
 
 
-def get_extended_cleanup_preview_service(
+def get_cleanup_preview_service(
     settings: Annotated[ApiSettings, Depends(get_api_settings)],
-) -> ExtendedCleanupPreviewService:
-    """Return the Extended cleanup-preview service."""
+) -> CleanupPreviewRouter:
+    """Return the cleanup-preview router for all supported live venues."""
 
-    return ExtendedCleanupPreviewService(api_key=settings.extended_api_key or "")
+    return CleanupPreviewRouter(
+        services={
+            "extended": ExtendedCleanupPreviewService(api_key=settings.extended_api_key or ""),
+            "paradex": ParadexCleanupPreviewService(
+                account_address=settings.paradex_account_address or "",
+                private_key=settings.paradex_private_key,
+                bearer_token=settings.paradex_bearer_token,
+            ),
+        }
+    )
 
 
 def get_execution_order_state_service(
@@ -388,7 +399,7 @@ async def _build_cleanup_context_for_paper_trade(
     execution_store: ExecutionJournalStore,
     account_service: AccountPreflightService,
     order_state_service: ExecutionOrderStateService,
-    cleanup_service: ExtendedCleanupPreviewService,
+    cleanup_service: CleanupPreviewRouter,
 ) -> tuple[PaperTradeEntry, ExecutionJournalEntry, ExecutionPairStatus, ExecutionCleanupPreview]:
     paper_trade = paper_store.get(paper_trade_id)
     if paper_trade is None:
@@ -420,8 +431,9 @@ async def _build_cleanup_context_for_paper_trade(
     return paper_trade, execution, pair_status, cleanup_preview
 
 
-async def _ensure_extended_cleanup_live_ready(
+async def _ensure_cleanup_live_ready(
     *,
+    venue: str,
     settings: ApiSettings,
     account_service: AccountPreflightService,
 ) -> None:
@@ -429,23 +441,23 @@ async def _ensure_extended_cleanup_live_ready(
         item.venue: item
         for item in build_venue_execution_preflights(_build_live_execution_configs(settings))
     }
-    extended_execution = execution_statuses["extended"]
+    venue_execution = execution_statuses[venue]
     execution_blockers: list[str] = []
-    if not extended_execution.enabled:
-        execution_blockers.append("Venue extended live execution is not enabled")
-    if extended_execution.missing_env_vars:
+    if not venue_execution.enabled:
+        execution_blockers.append(f"Venue {venue} live execution is not enabled")
+    if venue_execution.missing_env_vars:
         execution_blockers.append(
-            "Venue extended is missing required credentials: "
-            + ", ".join(extended_execution.missing_env_vars)
+            f"Venue {venue} is missing required credentials: "
+            + ", ".join(venue_execution.missing_env_vars)
         )
     if execution_blockers:
         raise HTTPException(
             status_code=409,
             detail=PaperTradeExecutionPreflight(
                 paper_trade_id=0,
-                label="extended_cleanup",
+                label=f"{venue}_cleanup",
                 ready=False,
-                venues=[extended_execution],
+                venues=[venue_execution],
                 blocking_reasons=execution_blockers,
             ).model_dump(mode="json"),
         )
@@ -454,19 +466,19 @@ async def _ensure_extended_cleanup_live_ready(
         item.venue: item
         for item in await account_service.probe_venues(_build_account_preflight_configs(settings))
     }
-    extended_account = account_statuses["extended"]
+    venue_account = account_statuses[venue]
     account_blockers: list[str] = []
-    if not extended_account.enabled:
-        account_blockers.append("Venue extended account preflight is not enabled")
-    account_blockers.extend(extended_account.blocking_reasons)
+    if not venue_account.enabled:
+        account_blockers.append(f"Venue {venue} account preflight is not enabled")
+    account_blockers.extend(venue_account.blocking_reasons)
     if account_blockers:
         raise HTTPException(
             status_code=409,
             detail=PaperTradeAccountPreflight(
                 paper_trade_id=0,
-                label="extended_cleanup",
+                label=f"{venue}_cleanup",
                 ready=False,
-                venues=[extended_account],
+                venues=[venue_account],
                 blocking_reasons=account_blockers,
             ).model_dump(mode="json"),
         )
@@ -852,8 +864,8 @@ def create_app() -> FastAPI:
             Depends(get_execution_order_state_service),
         ],
         cleanup_service: Annotated[
-            ExtendedCleanupPreviewService,
-            Depends(get_extended_cleanup_preview_service),
+            CleanupPreviewRouter,
+            Depends(get_cleanup_preview_service),
         ],
     ) -> ExecutionCleanupPreview:
         _, _, _, cleanup_preview = await _build_cleanup_context_for_paper_trade(
@@ -901,8 +913,8 @@ def create_app() -> FastAPI:
             Depends(get_execution_order_state_service),
         ],
         cleanup_service: Annotated[
-            ExtendedCleanupPreviewService,
-            Depends(get_extended_cleanup_preview_service),
+            CleanupPreviewRouter,
+            Depends(get_cleanup_preview_service),
         ],
         confirmation_store: Annotated[
             CleanupPreviewConfirmationStore,
@@ -1286,8 +1298,8 @@ def create_app() -> FastAPI:
             Depends(get_execution_order_state_service),
         ],
         cleanup_service: Annotated[
-            ExtendedCleanupPreviewService,
-            Depends(get_extended_cleanup_preview_service),
+            CleanupPreviewRouter,
+            Depends(get_cleanup_preview_service),
         ],
         confirmation_store: Annotated[
             CleanupPreviewConfirmationStore,
@@ -1298,7 +1310,8 @@ def create_app() -> FastAPI:
             Depends(get_extended_live_execution_service),
         ],
     ) -> ExecutionJournalEntry:
-        await _ensure_extended_cleanup_live_ready(
+        await _ensure_cleanup_live_ready(
+            venue="extended",
             settings=settings,
             account_service=account_service,
         )
@@ -1311,6 +1324,89 @@ def create_app() -> FastAPI:
             order_state_service=order_state_service,
             cleanup_service=cleanup_service,
         )
+        if cleanup_preview.leg.venue != "extended":
+            raise HTTPException(
+                status_code=409,
+                detail="Current cleanup preview targets paradex, not extended",
+            )
+        if cleanup_preview.preview_hash != preview_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="Cleanup preview hash did not match the current cleanup preview",
+            )
+        confirmations = confirmation_store.list_recent(
+            limit=50,
+            paper_trade_id=paper_trade_id,
+        )
+        try:
+            confirmation = require_confirmed_cleanup_preview(
+                paper_trade_id=paper_trade_id,
+                preview_hash=preview_hash,
+                confirmations=confirmations,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
+            journal_entry = await live_service.submit_confirmed_cleanup_preview(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return execution_store.append(journal_entry)
+
+    @app.post(
+        "/v1/executions/live/paradex/cleanup/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionJournalEntry,
+    )
+    async def execute_paradex_cleanup_for_paper_trade(
+        paper_trade_id: int,
+        preview_hash: str,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        account_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        order_state_service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+        cleanup_service: Annotated[
+            CleanupPreviewRouter,
+            Depends(get_cleanup_preview_service),
+        ],
+        confirmation_store: Annotated[
+            CleanupPreviewConfirmationStore,
+            Depends(get_cleanup_preview_confirmation_store),
+        ],
+        live_service: Annotated[
+            ParadexLiveExecutionService,
+            Depends(get_paradex_live_execution_service),
+        ],
+    ) -> ExecutionJournalEntry:
+        await _ensure_cleanup_live_ready(
+            venue="paradex",
+            settings=settings,
+            account_service=account_service,
+        )
+        paper_trade, _, _, cleanup_preview = await _build_cleanup_context_for_paper_trade(
+            paper_trade_id=paper_trade_id,
+            settings=settings,
+            paper_store=paper_store,
+            execution_store=execution_store,
+            account_service=account_service,
+            order_state_service=order_state_service,
+            cleanup_service=cleanup_service,
+        )
+        if cleanup_preview.leg.venue != "paradex":
+            raise HTTPException(
+                status_code=409,
+                detail="Current cleanup preview targets extended, not paradex",
+            )
         if cleanup_preview.preview_hash != preview_hash:
             raise HTTPException(
                 status_code=409,
