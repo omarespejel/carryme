@@ -105,6 +105,8 @@ class PaperTradeStore:
     ) -> list[PaperTradeEntry]:
         """Return recent paper trade journal entries."""
 
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         self.initialize()
         query = """
             SELECT id, entry_json
