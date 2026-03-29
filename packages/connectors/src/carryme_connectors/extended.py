@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 from carryme_models.market import MarketStats, TopOfBook
 
 from carryme_connectors.base import BaseHttpConnector, ConnectorError, parse_float
+
+_logger = logging.getLogger(__name__)
 
 
 class ExtendedPublicConnector(BaseHttpConnector):
@@ -42,8 +45,14 @@ class ExtendedPublicConnector(BaseHttpConnector):
             if not isinstance(market_stats, dict):
                 raise ConnectorError("Extended market metadata missing marketStats object")
         elif isinstance(data, dict):
-            raw = payload
+            raw = data
             market_stats = data
+            if "tradingConfig" not in raw:
+                _logger.debug(
+                    "Extended stats payload for %s omitted tradingConfig; "
+                    "preview constraints may be unavailable",
+                    symbol,
+                )
         else:
             raise ConnectorError("Extended market stats missing data object")
 
@@ -72,6 +81,8 @@ class ExtendedPublicConnector(BaseHttpConnector):
             best_ask_price=parse_float(best_ask.get("price")) if best_ask else None,
             best_ask_size=parse_float(best_ask.get("qty")) if best_ask else None,
         )
+
+
 def _first_level(value: Any) -> dict[str, Any] | None:
     if isinstance(value, list) and value:
         item = value[0]

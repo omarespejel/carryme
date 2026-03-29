@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
@@ -18,6 +19,8 @@ from carryme_models import (
 )
 
 from carryme_runtime.opportunities import SnapshotFetcher, fetch_live_snapshot
+
+_logger = logging.getLogger(__name__)
 
 
 class VenueOrderSpec(NamedTuple):
@@ -296,10 +299,11 @@ def _extract_order_constraints(
     mark_price = Decimal(str(snapshot.market.mark_price)) if snapshot.market.mark_price else None
     if venue == "paradex":
         max_order_size = _dict_decimal(raw, "max_order_size")
+        minimum_notional = _dict_decimal(raw, "min_notional")
         return OrderConstraints(
             quantity_increment=_dict_decimal(raw, "order_size_increment"),
-            minimum_order_size=_dict_decimal(raw, "order_size_increment"),
-            minimum_notional=_dict_decimal(raw, "min_notional"),
+            minimum_order_size=None,
+            minimum_notional=minimum_notional,
             price_increment=_dict_decimal(raw, "price_tick_size"),
             max_order_value=max_order_size * mark_price
             if max_order_size is not None and mark_price is not None
@@ -319,6 +323,12 @@ def _extract_order_constraints(
             price_increment=_dict_decimal(trading_config, "minPriceChange"),
             max_order_value=_dict_decimal(trading_config, "maxLimitOrderValue"),
         )
+    _logger.debug(
+        "No order constraint extraction logic for venue %s; raw=%s mark_price=%s",
+        venue,
+        snapshot.market.raw,
+        snapshot.market.mark_price,
+    )
     return OrderConstraints()
 
 

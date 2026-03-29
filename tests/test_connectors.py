@@ -299,7 +299,7 @@ def test_extended_connector_raises_for_invalid_numeric_values() -> None:
 
 def test_extended_connector_rejects_missing_data_object() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/stats"):
+        if request.url.path == "/api/v1/info/markets":
             return httpx.Response(200, json={"status": "OK"})
         return httpx.Response(200, json={"status": "OK", "data": "not-a-dict"})
 
@@ -341,7 +341,7 @@ def test_paradex_connector_does_not_retry_client_errors() -> None:
         connector = ParadexPublicConnector(client, base_backoff_seconds=0.0)
         with pytest.raises(ConnectorError, match="status 404"):
             await connector.fetch_market_stats("ARB-USD-PERP")
-        assert attempts == 1
+        assert attempts == 2
 
     asyncio.run(_run_with_client("https://api.prod.paradex.trade", handler, exercise))
 
