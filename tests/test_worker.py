@@ -2300,6 +2300,7 @@ def test_worker_main_prints_supervised_execution_observation_summary_as_json(
             observed_executions=4,
             saved_observations=4,
             saved_alerts=1,
+            sent_notifications=1,
             database_path=settings.database_path,
         )
 
@@ -2325,6 +2326,7 @@ def test_worker_main_prints_supervised_execution_observation_summary_as_json(
         "observed_executions": 4,
         "saved_observations": 4,
         "saved_alerts": 1,
+        "sent_notifications": 1,
         "database_path": settings.database_path,
     }
 
@@ -2864,6 +2866,7 @@ def test_worker_main_prints_execution_observation_summary_as_json(
             observed_executions=2,
             saved_observations=2,
             saved_alerts=1,
+            sent_notifications=1,
             database_path=settings.database_path,
         )
 
@@ -2879,5 +2882,6 @@ def test_worker_main_prints_execution_observation_summary_as_json(
         "observed_executions": 2,
         "saved_observations": 2,
         "saved_alerts": 1,
+        "sent_notifications": 1,
         "database_path": settings.database_path,
     }

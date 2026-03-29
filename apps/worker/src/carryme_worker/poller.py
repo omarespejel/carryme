@@ -340,7 +340,7 @@ async def observe_live_executions_once(
                         execution.preview_hash,
                     )
         except Exception:
-            logger.warning(
+            loop_logger.warning(
                 "Failed to observe execution entry_id=%s paper_trade_id=%s",
                 execution.entry_id,
                 execution.paper_trade_id,
