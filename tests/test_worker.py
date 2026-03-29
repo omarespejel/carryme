@@ -880,6 +880,21 @@ def test_worker_main_rejects_mutually_exclusive_modes(
     assert "not allowed with argument" in stderr
 
 
+def test_worker_main_rejects_observation_mode_with_other_modes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--observe-executions-once", "--iterations", "2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        worker_main()
+
+    _, stderr = capsys.readouterr()
+    assert "not allowed with argument" in stderr
+
+
 def test_summarize_candidates_counts_only_threshold_matches() -> None:
     records = [
         OpportunityRecord(
@@ -1391,5 +1406,40 @@ def test_worker_main_prints_supervised_summary_as_json(
         "failures": 1,
         "saved_records": 1,
         "alert_events": 0,
+        "database_path": settings.database_path,
+    }
+
+
+def test_worker_main_prints_execution_observation_summary_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    async def fake_observe(settings: WorkerSettings) -> ExecutionObservationSummary:
+        return ExecutionObservationSummary(
+            scanned_executions=3,
+            observed_executions=2,
+            saved_observations=2,
+            database_path=settings.database_path,
+        )
+
+    monkeypatch.setattr("carryme_worker.main.WorkerSettings", lambda: settings)
+    monkeypatch.setattr("carryme_worker.main.observe_live_executions_once", fake_observe)
+    monkeypatch.setattr("sys.argv", ["carryme-worker", "--observe-executions-once"])
+
+    worker_main()
+
+    stdout, _ = capsys.readouterr()
+    assert json.loads(stdout) == {
+        "scanned_executions": 3,
+        "observed_executions": 2,
+        "saved_observations": 2,
         "database_path": settings.database_path,
     }

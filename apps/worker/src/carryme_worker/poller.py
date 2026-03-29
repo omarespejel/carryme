@@ -21,12 +21,12 @@ from carryme_models import (
 from carryme_runtime import (
     AccountPreflightConfigMap,
     AccountPreflightService,
+    ConnectorError,
     ExecutionOrderStateService,
     ExtendedOrderStateObserver,
     HyperliquidOrderStateObserver,
     OpportunityService,
     ParadexOrderStateObserver,
-    ConnectorError,
     build_execution_pair_status,
     filter_candidate_records,
     reconcile_execution,
