@@ -292,6 +292,9 @@ async def _build_readiness_for_paper_trade(
     confirmation_store: PreviewConfirmationStore,
     account_preflight_service: AccountPreflightService,
 ) -> LiveSubmissionReadiness:
+    normalized_preview_hash = preview_hash.strip()
+    if not normalized_preview_hash:
+        raise ValueError("preview_hash must be non-empty")
     execution_preflight = build_paper_trade_execution_preflight(
         paper_trade,
         build_live_execution_configs(settings),
@@ -300,9 +303,6 @@ async def _build_readiness_for_paper_trade(
         paper_trade,
         _build_account_preflight_configs(settings),
     )
-    normalized_preview_hash = preview_hash.strip()
-    if not normalized_preview_hash:
-        raise ValueError("preview_hash must be non-empty")
     confirmation = confirmation_store.find_latest_by_preview_hash(
         paper_trade_id=paper_trade.entry_id or 0,
         preview_hash=normalized_preview_hash,
@@ -314,6 +314,85 @@ async def _build_readiness_for_paper_trade(
         confirmations=[] if confirmation is None else [confirmation],
         execution_preflight=execution_preflight,
         account_preflight=account_preflight,
+    )
+
+
+async def _build_venue_scoped_readiness_for_paper_trade(
+    *,
+    paper_trade: PaperTradeEntry,
+    preview_hash: str,
+    venue: str,
+    settings: ApiSettings,
+    confirmation_store: PreviewConfirmationStore,
+    account_preflight_service: AccountPreflightService,
+) -> tuple[LiveSubmissionReadiness, PreviewConfirmationEntry | None]:
+    normalized_preview_hash = preview_hash.strip()
+    if not normalized_preview_hash:
+        raise ValueError("preview_hash must be non-empty")
+
+    execution_statuses = {
+        item.venue: item
+        for item in build_venue_execution_preflights(build_live_execution_configs(settings))
+    }
+    selected_execution = execution_statuses.get(venue)
+    execution_blockers: list[str] = []
+    execution_venues: list[VenueExecutionPreflight] = []
+    if selected_execution is None:
+        execution_blockers.append(f"Venue {venue} live execution is not configured")
+    else:
+        execution_venues.append(selected_execution)
+        if not selected_execution.enabled:
+            execution_blockers.append(f"Venue {venue} live execution is not enabled")
+        if selected_execution.missing_env_vars:
+            execution_blockers.append(
+                f"Venue {venue} is missing required credentials: "
+                + ", ".join(selected_execution.missing_env_vars)
+            )
+    execution_preflight = PaperTradeExecutionPreflight(
+        paper_trade_id=paper_trade.entry_id or 0,
+        label=paper_trade.intent.label,
+        ready=not execution_blockers,
+        venues=execution_venues,
+        blocking_reasons=execution_blockers,
+    )
+
+    account_preflight_all = await account_preflight_service.probe_paper_trade(
+        paper_trade,
+        _build_account_preflight_configs(settings),
+    )
+    account_statuses = {item.venue: item for item in account_preflight_all.venues}
+    selected_account = account_statuses.get(venue)
+    account_blockers: list[str] = []
+    account_venues: list[VenueAccountPreflight] = []
+    if selected_account is None:
+        account_blockers.append(f"Venue {venue} account preflight did not return a status")
+    else:
+        account_venues.append(selected_account)
+        if not selected_account.enabled:
+            account_blockers.append(f"Venue {venue} account preflight is not enabled")
+        account_blockers.extend(selected_account.blocking_reasons)
+    account_preflight = PaperTradeAccountPreflight(
+        paper_trade_id=paper_trade.entry_id or 0,
+        label=paper_trade.intent.label,
+        ready=not account_blockers,
+        venues=account_venues,
+        blocking_reasons=account_blockers,
+    )
+
+    confirmation = confirmation_store.find_latest_by_preview_hash(
+        paper_trade_id=paper_trade.entry_id or 0,
+        preview_hash=normalized_preview_hash,
+    )
+    return (
+        build_live_submission_readiness(
+            paper_trade_id=paper_trade.entry_id or 0,
+            label=paper_trade.intent.label,
+            preview_hash=normalized_preview_hash,
+            confirmations=[] if confirmation is None else [confirmation],
+            execution_preflight=execution_preflight,
+            account_preflight=account_preflight,
+        ),
+        confirmation,
     )
 
 
@@ -886,11 +965,11 @@ def create_app() -> FastAPI:
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
 
-        normalized_preview_hash = preview_hash.strip()
         try:
-            readiness = await _build_readiness_for_paper_trade(
+            readiness, confirmation = await _build_venue_scoped_readiness_for_paper_trade(
                 paper_trade=paper_trade,
-                preview_hash=normalized_preview_hash,
+                preview_hash=preview_hash,
+                venue="paradex",
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
@@ -902,15 +981,33 @@ def create_app() -> FastAPI:
         if not readiness.ready:
             raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
 
-        confirmation = confirmation_store.find_latest_by_preview_hash(
-            paper_trade_id=paper_trade_id,
-            preview_hash=normalized_preview_hash,
-        )
         if confirmation is None:
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "No preview confirmation matched the requested paper trade and preview hash"
+                ),
+            )
+        if confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Preview confirmation entry_id is required before live submission",
+            )
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            if existing_entry is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=existing_entry.model_dump(mode="json"),
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A live submission is already reserved for this confirmed preview; "
+                    "manual reconciliation is required before retrying"
                 ),
             )
 
@@ -924,7 +1021,17 @@ def create_app() -> FastAPI:
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-        return execution_store.append(journal_entry)
+        saved_entry = execution_store.append(journal_entry)
+        if saved_entry.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        execution_store.mark_live_submission_completed(
+            confirmation_entry_id=confirmation.entry_id,
+            execution_entry_id=saved_entry.entry_id,
+        )
+        return saved_entry
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(

@@ -19,8 +19,8 @@ class ExecutionLegResult(BaseModel):
     status: Literal["accepted", "rejected", "submitted"]
     simulated: bool = True
     external_reference: str | None = None
-    request_payload: dict[str, Any] | None = None
-    response_payload: dict[str, Any] | None = None
+    request_payload: Any | None = None
+    response_payload: Any | None = None
     signature_timestamp_ms: int | None = None
     raw_payload: Any | None = None
 

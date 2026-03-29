@@ -1421,6 +1421,70 @@ def test_build_signed_paradex_order_payload_rejects_over_precision() -> None:
         )
 
 
+def test_build_signed_paradex_order_payload_rejects_malformed_size() -> None:
+    with pytest.raises(
+        ConnectorError,
+        match="Paradex order payload field size must be a decimal",
+    ):
+        build_signed_paradex_order_payload(
+            account_address="0x123",
+            private_key="0x456",
+            starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+            order_payload={
+                "market": "ARB-USD-PERP",
+                "side": "BUY",
+                "type": "LIMIT",
+                "size": "not-a-number",
+                "price": "0.0923",
+                "instruction": "IOC",
+                "client_id": "carryme-pt5-paradex-buy",
+            },
+        )
+
+
+def test_build_signed_paradex_order_payload_rejects_non_positive_price() -> None:
+    with pytest.raises(
+        ConnectorError,
+        match="Paradex order payload field price must be greater than zero",
+    ):
+        build_signed_paradex_order_payload(
+            account_address="0x123",
+            private_key="0x456",
+            starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+            order_payload={
+                "market": "ARB-USD-PERP",
+                "side": "BUY",
+                "type": "LIMIT",
+                "size": "1.0",
+                "price": "0",
+                "instruction": "IOC",
+                "client_id": "carryme-pt5-paradex-buy",
+            },
+        )
+
+
+def test_build_signed_paradex_order_payload_rejects_non_boolean_reduce_only() -> None:
+    with pytest.raises(
+        ConnectorError,
+        match="Paradex order payload field reduce_only must be a boolean",
+    ):
+        build_signed_paradex_order_payload(
+            account_address="0x123",
+            private_key="0x456",
+            starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+            order_payload={
+                "market": "ARB-USD-PERP",
+                "side": "BUY",
+                "type": "LIMIT",
+                "size": "1.0",
+                "price": "0.0923",
+                "instruction": "IOC",
+                "client_id": "carryme-pt5-paradex-buy",
+                "reduce_only": "false",
+            },
+        )
+
+
 def test_paradex_live_coerce_int_handles_negative_strings() -> None:
     assert paradex_live_execution._coerce_int("-7") == -7
     assert paradex_live_execution._coerce_int("7") == 7

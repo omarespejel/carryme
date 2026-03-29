@@ -444,6 +444,85 @@ def test_execution_journal_store_appends_and_lists_recent(tmp_path: Path) -> Non
     assert results[0].legs[1].raw_payload == {"venue_order_id": "extended-7-sell"}
 
 
+def test_execution_journal_store_reserves_live_submission_once(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_live_submission(
+        confirmation_entry_id=11,
+        preview_hash="preview-hash",
+    )
+    assert not store.reserve_live_submission(
+        confirmation_entry_id=11,
+        preview_hash="preview-hash",
+    )
+
+
+def test_execution_journal_store_finds_entry_by_confirmation_entry_id(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    saved = store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="paradex_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=11,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    status="submitted",
+                    simulated=False,
+                    request_payload=["raw", "request"],
+                    response_payload=["raw", "response"],
+                )
+            ],
+        )
+    )
+
+    found = store.find_by_confirmation_entry_id(11)
+
+    assert found is not None
+    assert found.entry_id == saved.entry_id
+    assert found.confirmation_entry_id == 11
+    assert found.legs[0].request_payload == ["raw", "request"]
+    assert found.legs[0].response_payload == ["raw", "response"]
+
+
 def test_execution_journal_store_treats_blank_label_as_unfiltered(tmp_path: Path) -> None:
     store = ExecutionJournalStore(tmp_path / "history.sqlite3")
     store.append(
