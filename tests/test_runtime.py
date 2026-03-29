@@ -49,6 +49,7 @@ from carryme_runtime import (
     CleanupPreviewRouter,
     ExtendedCleanupPreviewService,
     ExtendedLiveExecutionService,
+    HyperliquidCleanupPreviewService,
     HyperliquidLiveExecutionService,
     HyperliquidOrderStateObserver,
     MockExecutionAdapter,
@@ -4694,6 +4695,149 @@ def test_paradex_cleanup_preview_service_logs_schema_fallbacks(
     assert "fallback container key" in caplog.text
     assert "fallback symbol key" in caplog.text
 
+
+def test_hyperliquid_cleanup_preview_service_builds_reduce_only_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=12,
+        executed_at=datetime(2026, 3, 29, 18, 0, tzinfo=UTC),
+        adapter="paired_live:extended_then_hyperliquid",
+        mode="live",
+        status="submitted",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        confirmation_entry_id=3,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 3, 29, 17, 59, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_hyperliquid",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 17, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0011,
+                break_even_days_entry=0.63,
+                capacity_limit_notional=126.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="hyperliquid",
+                symbol="ARB",
+                fee_profile="tier0",
+                side="buy",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="777",
+            )
+        ],
+    )
+    pair_status = ExecutionPairStatus(
+        execution_entry_id=12,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        derived_state="cleanup_needed",
+        recommended_action="close_open_leg",
+        order_state=ExecutionOrderState(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            legs=[
+                ExecutionLegOrderState(
+                    venue="hyperliquid",
+                    supported=True,
+                    external_reference="777",
+                    derived_state="unknown",
+                )
+            ],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            status="submitted",
+            recommended_action="verify_fill_status",
+            matched_all_leg_symbols=False,
+            venues=[
+                ExecutionVenueReconciliation(
+                    venue="hyperliquid",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=["ARB"],
+                    matched_leg_symbols=["ARB"],
+                    unmatched_leg_symbols=[],
+                )
+            ],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        assert venue == "hyperliquid"
+        assert symbol == "ARB"
+        return _snapshot(
+            "hyperliquid",
+            "ARB",
+            -0.0004,
+            0.0918,
+            500,
+            0.0922,
+            450,
+            raw={"szDecimals": 1},
+        )
+
+    class StubInfo:
+        def user_state(self, address: str) -> dict[str, object]:
+            assert address == "0xhyper"
+            return {
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "ARB",
+                            "szi": "119.3",
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(
+        "carryme_runtime.hyperliquid_cleanup_preview.build_hyperliquid_info",
+        lambda: StubInfo(),
+    )
+
+    async def run() -> None:
+        service = HyperliquidCleanupPreviewService(
+            account_address="0xhyper",
+            fetch_snapshot=fetch_snapshot,
+        )
+        preview = await service.preview_from_execution(entry=entry, pair_status=pair_status)
+        assert preview.reason == "close_open_leg"
+        assert preview.leg.symbol == "ARB"
+        assert preview.leg.side == "sell"
+        assert preview.leg.reduce_only is True
+        assert preview.leg.quantity_text == "119.3"
+        assert preview.leg.worst_price_text == "0.09171"
+
+    asyncio.run(run())
 
 def test_cleanup_preview_router_dispatches_to_paradex_when_paradex_leg_is_open() -> None:
     entry = ExecutionJournalEntry(

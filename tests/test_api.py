@@ -2246,6 +2246,264 @@ def test_executions_endpoint_rejects_limit_above_history_cap(tmp_path: Path) -> 
     assert response.json()["detail"] == "limit must be at most 1000"
 
 
+def test_execute_hyperliquid_cleanup_endpoint_submits_confirmed_cleanup_preview(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "paper.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 12, 50, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_hyperliquid",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 45, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0011,
+                break_even_days_entry=0.63,
+                capacity_limit_notional=126.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_hyperliquid",
+            mode="live",
+            status="partial",
+            paper_trade_id=paper_trade.entry_id,
+            preview_hash="preview-hash",
+            confirmation_entry_id=3,
+            paper_trade=paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="777",
+                    request_payload={"coin": "ARB"},
+                )
+            ],
+        )
+    )
+    cleanup_store = CleanupPreviewConfirmationStore(tmp_path / "history.sqlite3")
+    confirmation = cleanup_store.append(
+        CleanupPreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 2, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label="arb_extended_hyperliquid",
+            preview_hash="cleanup-hash",
+            preview=ExecutionCleanupPreview(
+                execution_entry_id=5,
+                paper_trade_id=paper_trade.entry_id or 0,
+                generated_at=datetime(2026, 3, 29, 13, 1, tzinfo=UTC),
+                preview_hash="cleanup-hash",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="sell",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=119.3,
+                    quantity_text="119.3",
+                    reference_price=0.0922,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.09171,
+                    worst_price_text="0.09171",
+                    reduce_only=True,
+                    endpoint_path_hint="/exchange",
+                    required_auth_env_vars=[],
+                    auth_scheme="account address + API wallet private key",
+                    payload={"coin": "ARB", "reduce_only": True},
+                    notes=[],
+                ),
+                notes=[],
+            ),
+            note="operator confirmed cleanup",
+        )
+    )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_api_settings,
+        get_cleanup_preview_confirmation_store,
+        get_cleanup_preview_service,
+        get_execution_journal_store,
+        get_execution_order_state_service,
+        get_hyperliquid_live_execution_service,
+        get_paper_trade_store,
+    )
+
+    class StubExecutionOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="hyperliquid",
+                        supported=True,
+                        external_reference="777",
+                        derived_state="unknown",
+                    )
+                ],
+            )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            entry: PaperTradeEntry,
+            configs: object,
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=entry.entry_id or 0,
+                label="arb_extended_hyperliquid",
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=[],
+                        free_collateral=25.0,
+                    ),
+                    VenueAccountPreflight(
+                        venue="hyperliquid",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_wallet",
+                        position_symbols=["ARB"],
+                        available_to_trade=25.0,
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+        async def probe_venues(self, configs: object) -> list[VenueAccountPreflight]:
+            return [
+                VenueAccountPreflight(
+                    venue="extended",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_key",
+                    free_collateral=25.0,
+                ),
+                VenueAccountPreflight(
+                    venue="hyperliquid",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_wallet",
+                    available_to_trade=25.0,
+                ),
+            ]
+
+    class StubCleanupPreviewService:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int = 10,
+            generated_at: datetime | None = None,
+        ) -> ExecutionCleanupPreview:
+            return confirmation.preview
+
+    class StubHyperliquidLiveExecutionService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            assert confirmation.entry_id is not None
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 3, tzinfo=UTC),
+                adapter="hyperliquid_cleanup_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="hyperliquid",
+                        symbol="ARB",
+                        fee_profile="tier0",
+                        side="sell",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="cleanup-order-3",
+                    )
+                ],
+            )
+
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        hyperliquid_live_enabled=True,
+        hyperliquid_account_address="0xhyper",
+        hyperliquid_api_wallet_private_key="0xwallet",
+    )
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_cleanup_preview_confirmation_store] = lambda: cleanup_store
+    app.dependency_overrides[get_execution_order_state_service] = (
+        lambda: StubExecutionOrderStateService()
+    )
+    app.dependency_overrides[get_account_preflight_service] = (
+        lambda: StubAccountPreflightService()
+    )
+    app.dependency_overrides[get_cleanup_preview_service] = (
+        lambda: StubCleanupPreviewService()
+    )
+    app.dependency_overrides[get_hyperliquid_live_execution_service] = (
+        lambda: StubHyperliquidLiveExecutionService()
+    )
+    client = TestClient(app)
+    assert paper_trade.entry_id is not None
+    response = client.post(
+        f"/v1/executions/live/hyperliquid/cleanup/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "cleanup-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["adapter"] == "hyperliquid_cleanup_live"
+    assert payload["confirmation_entry_id"] == confirmation.entry_id
+    assert payload["preview_hash"] == "cleanup-hash"
+    assert payload["legs"][0]["external_reference"] == "cleanup-order-3"
+
+
 def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None:
     from carryme_api.app import get_api_settings
 

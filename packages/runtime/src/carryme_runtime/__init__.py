@@ -25,6 +25,7 @@ from carryme_runtime.execution_pair_status import build_execution_pair_status
 from carryme_runtime.execution_reconciliation import reconcile_execution
 from carryme_runtime.extended_cleanup_preview import ExtendedCleanupPreviewService
 from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
+from carryme_runtime.hyperliquid_cleanup_preview import HyperliquidCleanupPreviewService
 from carryme_runtime.hyperliquid_live_execution import HyperliquidLiveExecutionService
 from carryme_runtime.intents import InvalidTradeCandidateError, build_trade_intent
 from carryme_runtime.opportunities import OpportunityService, UpstreamDataError, fetch_live_snapshot
@@ -54,6 +55,7 @@ __all__ = [
     "ExtendedCleanupPreviewService",
     "ExtendedOrderStateObserver",
     "ExtendedLiveExecutionService",
+    "HyperliquidCleanupPreviewService",
     "HyperliquidLiveExecutionService",
     "HyperliquidOrderStateObserver",
     "LiveExecutionConfigMap",
