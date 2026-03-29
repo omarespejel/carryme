@@ -92,6 +92,13 @@ def _paper_trade_store_for_path(database_path: str) -> PaperTradeStore:
     return PaperTradeStore(database_path)
 
 
+@lru_cache
+def _execution_journal_store_for_path(database_path: str) -> ExecutionJournalStore:
+    """Return a shared execution journal store for the configured SQLite path."""
+
+    return ExecutionJournalStore(database_path)
+
+
 def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
@@ -178,7 +185,7 @@ def get_execution_journal_store(
 ) -> ExecutionJournalStore:
     """Return the shared execution journal store."""
 
-    return ExecutionJournalStore(settings.database_path)
+    return _execution_journal_store_for_path(settings.database_path)
 
 
 def get_execution_adapter() -> ExecutionAdapter:
