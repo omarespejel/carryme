@@ -213,6 +213,352 @@ def test_build_live_submission_readiness_requires_confirmation_and_preflights() 
     assert "Venue paradex live execution is not enabled" in readiness.blocking_reasons
 
 
+def test_build_live_submission_readiness_blocks_zero_usable_collateral() -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=8,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=6,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                    quantity=119.3,
+                    quantity_text="119.3",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09229,
+                    worst_price_text="0.09229",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/exchange",
+                    required_auth_env_vars=[
+                        "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+                        "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+                    ],
+                    auth_scheme="account address + API wallet private key",
+                    payload={"coin": "ARB"},
+                    notes=[],
+                )
+            ],
+        ),
+    )
+
+    readiness = build_live_submission_readiness(
+        paper_trade_id=6,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        confirmations=[confirmation],
+        execution_preflight=PaperTradeExecutionPreflight(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            ready=True,
+            venues=[],
+            blocking_reasons=[],
+        ),
+        account_preflight=PaperTradeAccountPreflight(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            ready=True,
+            venues=[
+                VenueAccountPreflight(
+                    venue="hyperliquid",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_wallet",
+                    total_collateral=0.0,
+                    available_to_trade=0.0,
+                    free_collateral=0.0,
+                )
+            ],
+            blocking_reasons=[],
+        ),
+    )
+
+    assert readiness.ready is False
+    assert (
+        "Venue hyperliquid has no usable collateral for the confirmed 11.00 notional preview"
+        in readiness.blocking_reasons
+    )
+
+
+def test_build_live_submission_readiness_blocks_when_collateral_data_missing() -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=9,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=6,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                    quantity=119.3,
+                    quantity_text="119.3",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09229,
+                    worst_price_text="0.09229",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/exchange",
+                    required_auth_env_vars=[
+                        "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+                        "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+                    ],
+                    auth_scheme="account address + API wallet private key",
+                    payload={"coin": "ARB"},
+                    notes=[],
+                )
+            ],
+        ),
+    )
+
+    readiness = build_live_submission_readiness(
+        paper_trade_id=6,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        confirmations=[confirmation],
+        execution_preflight=PaperTradeExecutionPreflight(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            ready=True,
+            venues=[],
+            blocking_reasons=[],
+        ),
+        account_preflight=PaperTradeAccountPreflight(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            ready=True,
+            venues=[
+                VenueAccountPreflight(
+                    venue="hyperliquid",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_wallet",
+                )
+            ],
+            blocking_reasons=[],
+        ),
+    )
+
+    assert readiness.ready is False
+    assert readiness.blocking_reasons == [
+        "Venue hyperliquid is missing collateral data for the confirmed 11.00 notional preview"
+    ]
+
+
+def test_build_live_submission_readiness_allows_positive_collateral() -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=9,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=6,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                    quantity=119.3,
+                    quantity_text="119.3",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09229,
+                    worst_price_text="0.09229",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/exchange",
+                    required_auth_env_vars=[
+                        "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+                        "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+                    ],
+                    auth_scheme="account address + API wallet private key",
+                    payload={"coin": "ARB"},
+                    notes=[],
+                )
+            ],
+        ),
+    )
+
+    readiness = build_live_submission_readiness(
+        paper_trade_id=6,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        confirmations=[confirmation],
+        execution_preflight=PaperTradeExecutionPreflight(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            ready=True,
+            venues=[],
+            blocking_reasons=[],
+        ),
+        account_preflight=PaperTradeAccountPreflight(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            ready=True,
+            venues=[
+                VenueAccountPreflight(
+                    venue="hyperliquid",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_wallet",
+                    available_to_trade=25.0,
+                )
+            ],
+            blocking_reasons=[],
+        ),
+    )
+
+    assert readiness.ready is True
+    assert readiness.blocking_reasons == []
+
+
+def test_build_live_submission_readiness_blocks_only_zero_collateral_venues() -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=9,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=6,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                    quantity=119.3,
+                    quantity_text="119.3",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09229,
+                    worst_price_text="0.09229",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/exchange",
+                    required_auth_env_vars=[
+                        "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+                        "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+                    ],
+                    auth_scheme="account address + API wallet private key",
+                    payload={"coin": "ARB"},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    quantity=119.3,
+                    quantity_text="119.3",
+                    reference_price=0.0922,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0921,
+                    worst_price_text="0.0921",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[
+                        "CARRYME_API_EXTENDED_API_KEY",
+                        "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
+                    ],
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD"},
+                    notes=[],
+                ),
+            ],
+        ),
+    )
+
+    readiness = build_live_submission_readiness(
+        paper_trade_id=6,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        confirmations=[confirmation],
+        execution_preflight=PaperTradeExecutionPreflight(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            ready=True,
+            venues=[],
+            blocking_reasons=[],
+        ),
+        account_preflight=PaperTradeAccountPreflight(
+            paper_trade_id=6,
+            label="arb_extended_hyperliquid",
+            ready=True,
+            venues=[
+                VenueAccountPreflight(
+                    venue="hyperliquid",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_wallet",
+                    available_to_trade=0.0,
+                    free_collateral=0.0,
+                    total_collateral=0.0,
+                ),
+                VenueAccountPreflight(
+                    venue="extended",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_key",
+                    free_collateral=22.0,
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+
+    assert readiness.ready is False
+    assert readiness.blocking_reasons == [
+        "Venue hyperliquid has no usable collateral for the confirmed 11.00 notional preview"
+    ]
+
+
 def test_build_trade_intent_sizes_by_capacity_fraction_and_cap() -> None:
     intent = build_trade_intent(
         OpportunityRecord(
