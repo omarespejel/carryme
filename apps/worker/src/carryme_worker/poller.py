@@ -125,6 +125,20 @@ class ExecutionObservationSummary:
     database_path: str
 
 
+@dataclass
+class ExecutionObservationLoopSummary:
+    """Summary emitted after a supervised execution-observation loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    scanned_executions: int
+    observed_executions: int
+    saved_observations: int
+    saved_alerts: int
+    database_path: str
+
+
 async def poll_watchlist_once(
     settings: WorkerSettings,
     *,
@@ -317,6 +331,104 @@ async def observe_live_executions_once(
         saved_observations += 1
 
     return ExecutionObservationSummary(
+        scanned_executions=scanned_executions,
+        observed_executions=observed_executions,
+        saved_observations=saved_observations,
+        saved_alerts=saved_alerts,
+        database_path=settings.database_path,
+    )
+
+
+async def run_supervised_execution_observation_loop(
+    settings: WorkerSettings,
+    *,
+    execution_store: ExecutionJournalStore | None = None,
+    observation_store: ExecutionObservationStore | None = None,
+    alert_sink: ExecutionAlertSink | None = None,
+    account_service: AccountPreflightService | None = None,
+    order_state_service: ExecutionOrderStateService | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> ExecutionObservationLoopSummary:
+    """Run the execution monitor until stopped by signal or max-iteration limit."""
+
+    journal_store = execution_store or ExecutionJournalStore(settings.database_path)
+    history_store = observation_store or ExecutionObservationStore(settings.database_path)
+    execution_alert_sink = alert_sink or ExecutionAlertStore(settings.database_path)
+    account_probe_service = account_service or AccountPreflightService()
+    state_service = order_state_service or ExecutionOrderStateService(
+        observers=_build_order_state_observers(settings)
+    )
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    supervised_stop_event = stop_event or asyncio.Event()
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    scanned_executions = 0
+    observed_executions = 0
+    saved_observations = 0
+    saved_alerts = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised execution observation cycle %s", attempts)
+        try:
+            summary = await observe_live_executions_once(
+                settings,
+                execution_store=journal_store,
+                observation_store=history_store,
+                alert_sink=execution_alert_sink,
+                account_service=account_probe_service,
+                order_state_service=state_service,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            scanned_executions += summary.scanned_executions
+            observed_executions += summary.observed_executions
+            saved_observations += summary.saved_observations
+            saved_alerts += summary.saved_alerts
+            loop_logger.info(
+                (
+                    "completed supervised execution observation cycle %s with "
+                    "%s observed executions, %s saved observations, and %s saved alerts"
+                ),
+                attempts,
+                summary.observed_executions,
+                summary.saved_observations,
+                summary.saved_alerts,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(settings.execution_observation_interval_seconds)
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.execution_observation_max_backoff_seconds,
+                settings.execution_observation_interval_seconds
+                * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "supervised execution observation cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(backoff_seconds)
+
+    return ExecutionObservationLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
         scanned_executions=scanned_executions,
         observed_executions=observed_executions,
         saved_observations=saved_observations,

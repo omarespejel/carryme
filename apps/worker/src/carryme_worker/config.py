@@ -16,6 +16,8 @@ class WorkerSettings(BaseSettings):
     log_level: LogLevel = "INFO"
     poll_interval_seconds: int = Field(default=30, gt=0)
     max_backoff_seconds: int = Field(default=300, gt=0)
+    execution_observation_interval_seconds: int = Field(default=10, gt=0)
+    execution_observation_max_backoff_seconds: int = Field(default=60, gt=0)
     score_timeout_seconds: float = Field(default=30.0, gt=0)
     min_candidate_entry_edge: float = Field(default=0.0, ge=0)
     min_candidate_capacity_notional: float = Field(default=0.0, ge=0)

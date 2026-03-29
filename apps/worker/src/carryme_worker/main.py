@@ -10,6 +10,7 @@ from carryme_models import AppDescriptor, ServiceHealth
 from carryme_worker.config import WorkerSettings
 from carryme_worker.poller import (
     CandidateRecordSummary,
+    ExecutionObservationLoopSummary,
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
@@ -17,6 +18,7 @@ from carryme_worker.poller import (
     observe_live_executions_once,
     poll_watchlist_once,
     run_polling_loop,
+    run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
 )
 
@@ -83,6 +85,23 @@ def build_execution_observation_payload(
     }
 
 
+def build_execution_observation_loop_payload(
+    summary: ExecutionObservationLoopSummary,
+) -> dict[str, int | str]:
+    """Build a deterministic summary payload for an execution monitor loop."""
+
+    return {
+        "attempts": summary.attempts,
+        "successful_cycles": summary.successful_cycles,
+        "failures": summary.failures,
+        "scanned_executions": summary.scanned_executions,
+        "observed_executions": summary.observed_executions,
+        "saved_observations": summary.saved_observations,
+        "saved_alerts": summary.saved_alerts,
+        "database_path": summary.database_path,
+    }
+
+
 def main() -> None:
     """Run one poll cycle or print worker health."""
 
@@ -95,10 +114,15 @@ def main() -> None:
         help="Observe recent live executions once and persist snapshots",
     )
     mode.add_argument(
+        "--observe-executions-supervise",
+        action="store_true",
+        help="Run the signal-aware supervised execution monitor loop",
+    )
+    parser.add_argument(
         "--iterations",
         type=int,
         default=None,
-        help="Run the worker loop for a fixed number of iterations",
+        help="Run loop modes for a fixed number of iterations",
     )
     mode.add_argument(
         "--supervise",
@@ -109,6 +133,8 @@ def main() -> None:
 
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be at least 1")
+    if args.iterations is not None and (args.once or args.observe_executions_once):
+        parser.error("--iterations is only supported with the looped worker modes")
 
     settings = WorkerSettings()
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
@@ -120,9 +146,27 @@ def main() -> None:
         observation_summary = asyncio.run(observe_live_executions_once(settings))
         print(json.dumps(build_execution_observation_payload(observation_summary), indent=2))
         return
-    if args.iterations is not None:
-        loop_summary = asyncio.run(run_polling_loop(settings, iterations=args.iterations))
-        print(json.dumps(build_loop_payload(loop_summary), indent=2))
+    if args.observe_executions_supervise:
+
+        async def run_execution_supervised() -> ExecutionObservationLoopSummary:
+            stop_event = asyncio.Event()
+            install_signal_handlers(
+                stop_event,
+                signals_to_handle=settings.stop_signals,
+            )
+            return await run_supervised_execution_observation_loop(
+                settings,
+                stop_event=stop_event,
+                max_iterations=args.iterations,
+            )
+
+        supervised_observation_summary = asyncio.run(run_execution_supervised())
+        print(
+            json.dumps(
+                build_execution_observation_loop_payload(supervised_observation_summary),
+                indent=2,
+            )
+        )
         return
     if args.supervise:
 
@@ -132,10 +176,18 @@ def main() -> None:
                 stop_event,
                 signals_to_handle=settings.stop_signals,
             )
-            return await run_supervised_polling_loop(settings, stop_event=stop_event)
+            return await run_supervised_polling_loop(
+                settings,
+                stop_event=stop_event,
+                max_iterations=args.iterations,
+            )
 
         supervised_summary = asyncio.run(run_supervised())
         print(json.dumps(build_loop_payload(supervised_summary), indent=2))
+        return
+    if args.iterations is not None:
+        loop_summary = asyncio.run(run_polling_loop(settings, iterations=args.iterations))
+        print(json.dumps(build_loop_payload(loop_summary), indent=2))
         return
 
     payload = build_health_payload(settings)

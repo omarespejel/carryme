@@ -35,6 +35,7 @@ from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
     build_candidate_payload,
     build_cycle_payload,
+    build_execution_observation_loop_payload,
     build_execution_observation_payload,
     build_health_payload,
     build_loop_payload,
@@ -44,6 +45,7 @@ from carryme_worker.main import (
 )
 from carryme_worker.poller import (
     CandidateRecordSummary,
+    ExecutionObservationLoopSummary,
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
@@ -52,6 +54,7 @@ from carryme_worker.poller import (
     observe_live_executions_once,
     poll_watchlist_once,
     run_polling_loop,
+    run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
     summarize_candidates,
 )
@@ -77,6 +80,8 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.log_level == "INFO"
     assert settings.poll_interval_seconds == 30
     assert settings.max_backoff_seconds == 300
+    assert settings.execution_observation_interval_seconds == 10
+    assert settings.execution_observation_max_backoff_seconds == 60
     assert settings.score_timeout_seconds == 30.0
     assert settings.min_candidate_entry_edge == 0.0
     assert settings.min_candidate_capacity_notional == 0.0
@@ -112,6 +117,17 @@ def test_worker_rejects_non_positive_execution_observation_limit(tmp_path: Path)
         WorkerSettings(
             watchlist_path=str(watchlist),
             execution_observation_limit=0,
+        )
+
+
+def test_worker_rejects_non_positive_execution_observation_interval(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text('{"pairs": []}')
+
+    with pytest.raises(ValidationError, match="execution_observation_interval_seconds"):
+        WorkerSettings(
+            watchlist_path=str(watchlist),
+            execution_observation_interval_seconds=0,
         )
 
 
@@ -207,6 +223,32 @@ def test_worker_execution_observation_payload() -> None:
         "observed_executions": 1,
         "saved_observations": 1,
         "saved_alerts": 0,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_execution_observation_loop_payload() -> None:
+    payload = build_execution_observation_loop_payload(
+        ExecutionObservationLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            scanned_executions=5,
+            observed_executions=4,
+            saved_observations=4,
+            saved_alerts=1,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "scanned_executions": 5,
+        "observed_executions": 4,
+        "saved_observations": 4,
+        "saved_alerts": 1,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -1373,7 +1415,6 @@ def test_observe_live_executions_once_emits_deduped_cleanup_alert(tmp_path: Path
     assert alerts[0].preview_hash == "preview-hash"
     assert alerts[0].pair_status.derived_state == "cleanup_needed"
 
-
 def test_observe_live_executions_once_retries_without_duplicate_alerts_after_atomic_failure(
     tmp_path: Path,
 ) -> None:
@@ -1903,7 +1944,7 @@ def test_worker_main_rejects_mutually_exclusive_modes(
         worker_main()
 
     _, stderr = capsys.readouterr()
-    assert "not allowed with argument" in stderr
+    assert "only supported with the looped worker modes" in stderr
 
 
 def test_worker_main_rejects_observation_mode_with_other_modes(
@@ -1918,7 +1959,239 @@ def test_worker_main_rejects_observation_mode_with_other_modes(
         worker_main()
 
     _, stderr = capsys.readouterr()
-    assert "not allowed with argument" in stderr
+    assert "only supported with the looped worker modes" in stderr
+
+
+def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_observation_interval_seconds=3,
+    )
+
+    class StubExecutionStore:
+        pass
+
+    class StubObservationStore:
+        pass
+
+    class StubAlertSink:
+        pass
+
+    class StableAccountService:
+        pass
+
+    class StableOrderStateService:
+        pass
+
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def fake_observe_live_executions_once(
+        settings_arg: WorkerSettings,
+        *,
+        execution_store: object | None = None,
+        observation_store: object | None = None,
+        alert_sink: object | None = None,
+        account_service: object | None = None,
+        order_state_service: object | None = None,
+        now: datetime | None = None,
+    ) -> ExecutionObservationSummary:
+        assert settings_arg is settings
+        assert execution_store is stub_execution_store
+        assert observation_store is stub_observation_store
+        assert alert_sink is stub_alert_sink
+        assert account_service is stable_account_service
+        assert order_state_service is stable_order_state_service
+        assert now is None
+        calls.append(1)
+        return ExecutionObservationSummary(
+            scanned_executions=2,
+            observed_executions=1,
+            saved_observations=1,
+            saved_alerts=1,
+            database_path=settings.database_path,
+        )
+
+    stub_execution_store = cast(ExecutionJournalStore, StubExecutionStore())
+    stub_observation_store = cast(ExecutionObservationStore, StubObservationStore())
+    stub_alert_sink = cast(ExecutionAlertStore, StubAlertSink())
+    stable_account_service = cast(AccountPreflightService, StableAccountService())
+    stable_order_state_service = cast(ExecutionOrderStateService, StableOrderStateService())
+
+    from unittest.mock import patch
+
+    with patch(
+        "carryme_worker.poller.observe_live_executions_once",
+        side_effect=fake_observe_live_executions_once,
+    ):
+        summary = asyncio.run(
+            run_supervised_execution_observation_loop(
+                settings,
+                execution_store=stub_execution_store,
+                observation_store=stub_observation_store,
+                alert_sink=stub_alert_sink,
+                account_service=stable_account_service,
+                order_state_service=stable_order_state_service,
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.scanned_executions == 4
+    assert summary.observed_executions == 2
+    assert summary.saved_observations == 2
+    assert summary.saved_alerts == 2
+    assert calls == [1, 1]
+    assert sleeps == [3.0]
+
+
+def test_run_supervised_execution_observation_loop_applies_backoff(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_observation_interval_seconds=2,
+        execution_observation_max_backoff_seconds=5,
+    )
+
+    class StableAccountService:
+        pass
+
+    class StableOrderStateService:
+        pass
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    outcomes: list[ExecutionObservationSummary | Exception] = [
+        RuntimeError("temporary monitor failure"),
+        ExecutionObservationSummary(
+            scanned_executions=1,
+            observed_executions=1,
+            saved_observations=1,
+            saved_alerts=0,
+            database_path=settings.database_path,
+        ),
+    ]
+
+    async def fake_observe_live_executions_once(
+        settings_arg: WorkerSettings,
+        *,
+        execution_store: object | None = None,
+        observation_store: object | None = None,
+        alert_sink: object | None = None,
+        account_service: object | None = None,
+        order_state_service: object | None = None,
+        now: datetime | None = None,
+    ) -> ExecutionObservationSummary:
+        assert settings_arg is settings
+        _ = execution_store
+        _ = observation_store
+        _ = alert_sink
+        assert account_service is stable_account_service
+        assert order_state_service is stable_order_state_service
+        assert now is None
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    stable_account_service = cast(AccountPreflightService, StableAccountService())
+    stable_order_state_service = cast(ExecutionOrderStateService, StableOrderStateService())
+
+    from unittest.mock import patch
+
+    with patch(
+        "carryme_worker.poller.observe_live_executions_once",
+        side_effect=fake_observe_live_executions_once,
+    ):
+        summary = asyncio.run(
+            run_supervised_execution_observation_loop(
+                settings,
+                account_service=stable_account_service,
+                order_state_service=stable_order_state_service,
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 1
+    assert summary.failures == 1
+    assert summary.scanned_executions == 1
+    assert summary.observed_executions == 1
+    assert summary.saved_observations == 1
+    assert summary.saved_alerts == 0
+    assert sleeps == [2.0]
+
+
+def test_worker_main_prints_supervised_execution_observation_summary_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    async def fake_execution_supervised(
+        settings: WorkerSettings,
+        *,
+        stop_event: asyncio.Event | None = None,
+        max_iterations: int | None = None,
+    ) -> ExecutionObservationLoopSummary:
+        assert stop_event is not None
+        assert max_iterations == 3
+        return ExecutionObservationLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            scanned_executions=5,
+            observed_executions=4,
+            saved_observations=4,
+            saved_alerts=1,
+            database_path=settings.database_path,
+        )
+
+    monkeypatch.setattr("carryme_worker.main.WorkerSettings", lambda: settings)
+    monkeypatch.setattr("carryme_worker.main.install_signal_handlers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "carryme_worker.main.run_supervised_execution_observation_loop",
+        fake_execution_supervised,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--observe-executions-supervise", "--iterations", "3"],
+    )
+
+    worker_main()
+
+    stdout, _ = capsys.readouterr()
+    assert json.loads(stdout) == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "scanned_executions": 5,
+        "observed_executions": 4,
+        "saved_observations": 4,
+        "saved_alerts": 1,
+        "database_path": settings.database_path,
+    }
 
 
 def test_summarize_candidates_counts_only_threshold_matches() -> None:
