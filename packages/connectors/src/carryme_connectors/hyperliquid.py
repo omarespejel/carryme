@@ -15,8 +15,18 @@ class HyperliquidPublicConnector(BaseHttpConnector):
 
     venue = "hyperliquid"
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        super().__init__(client)
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        max_attempts: int = 3,
+        base_backoff_seconds: float = 0.1,
+    ) -> None:
+        super().__init__(
+            client,
+            max_attempts=max_attempts,
+            base_backoff_seconds=base_backoff_seconds,
+        )
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         payload = await self._request_json("POST", "/info", json_body={"type": "metaAndAssetCtxs"})
@@ -31,7 +41,7 @@ class HyperliquidPublicConnector(BaseHttpConnector):
             funding_rate=parse_float(row.get("funding")),
             open_interest=parse_float(row.get("openInterest")),
             daily_volume=parse_float(row.get("dayNtlVlm")),
-            raw=row,
+            raw=payload,
         )
 
     async def fetch_top_of_book(self, symbol: str) -> TopOfBook:
@@ -42,7 +52,7 @@ class HyperliquidPublicConnector(BaseHttpConnector):
         )
         if not isinstance(payload, dict):
             raise ConnectorError("Hyperliquid l2Book payload must be an object")
-        levels = payload.get("levels", [])
+        levels = payload.get("levels")
         best_bid = _first_book_level(levels, 0)
         best_ask = _first_book_level(levels, 1)
         return TopOfBook(
@@ -61,6 +71,8 @@ def _find_context(universe: Any, contexts: Any, symbol: str) -> dict[str, Any]:
         raise ConnectorError("Hyperliquid universe/context payloads must be lists")
     for index, entry in enumerate(rows):
         if isinstance(entry, dict) and entry.get("name") == symbol:
+            if index >= len(contexts):
+                raise ConnectorError(f"Hyperliquid contexts missing entry for {symbol}")
             row = contexts[index]
             if isinstance(row, dict):
                 return row
@@ -69,12 +81,16 @@ def _find_context(universe: Any, contexts: Any, symbol: str) -> dict[str, Any]:
 
 
 def _first_book_level(levels: Any, side_index: int) -> dict[str, Any] | None:
-    if (
-        isinstance(levels, list)
-        and len(levels) > side_index
-        and isinstance(levels[side_index], list)
-    ):
-        side = levels[side_index]
-        if side and isinstance(side[0], dict):
-            return side[0]
-    return None
+    if not isinstance(levels, list):
+        raise ConnectorError("Hyperliquid orderbook levels must be a list")
+    if len(levels) <= side_index:
+        return None
+    side = levels[side_index]
+    if not isinstance(side, list):
+        raise ConnectorError("Hyperliquid orderbook side levels must be lists")
+    if not side:
+        return None
+    first_level = side[0]
+    if not isinstance(first_level, dict):
+        raise ConnectorError("Hyperliquid orderbook levels must contain objects")
+    return first_level
