@@ -1216,7 +1216,7 @@ def test_extended_account_probe_blocks_malformed_balance_payload(
             }
         )
 
-        assert status.authenticated is True
+        assert status.authenticated is False
         assert status.ready is False
         assert status.blocking_reasons == [
             (

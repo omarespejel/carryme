@@ -205,7 +205,7 @@ class ExtendedAccountProbe:
             return VenueAccountPreflight(
                 venue=self.venue,
                 enabled=enabled,
-                authenticated=True,
+                authenticated=False,
                 ready=False,
                 credential_mode="api_key",
                 blocking_reasons=[f"Extended authenticated read returned malformed payload: {exc}"],
@@ -308,7 +308,7 @@ class ParadexAccountProbe:
             return VenueAccountPreflight(
                 venue=self.venue,
                 enabled=enabled,
-                authenticated=True,
+                authenticated=False,
                 ready=False,
                 credential_mode="bearer_token",
                 blocking_reasons=[f"Paradex authenticated read returned malformed payload: {exc}"],
