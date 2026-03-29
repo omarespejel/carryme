@@ -22,6 +22,7 @@ from carryme_models.preflight import (
     PaperTradeExecutionPreflight,
     VenueExecutionPreflight,
 )
+from carryme_models.preview import PaperTradeOrderPreview, VenueOrderPreview
 
 __all__ = [
     "AppDescriptor",
@@ -40,10 +41,12 @@ __all__ = [
     "OpportunityRecord",
     "PaperTradeEntry",
     "PaperTradeExecutionPreflight",
+    "PaperTradeOrderPreview",
     "ServiceHealth",
     "TopOfBook",
     "TradeLegIntent",
     "TradingFeeProfile",
     "VenueExecutionPreflight",
+    "VenueOrderPreview",
     "WatchlistDocument",
 ]

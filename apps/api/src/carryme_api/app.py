@@ -16,6 +16,7 @@ from carryme_models import (
     OpportunityRecord,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
+    PaperTradeOrderPreview,
     ServiceHealth,
     TradingFeeProfile,
     VenueExecutionPreflight,
@@ -28,6 +29,7 @@ from carryme_runtime import (
     InvalidTradeCandidateError,
     MockExecutionAdapter,
     OpportunityService,
+    OrderPreviewService,
     UpstreamDataError,
     build_live_execution_configs,
     build_paper_trade_execution_preflight,
@@ -204,6 +206,12 @@ def get_mock_execution_adapter() -> MockExecutionAdapter:
     """Return the adapter allowed for mock execution journal submissions."""
 
     return MockExecutionAdapter()
+
+
+def get_order_preview_service() -> OrderPreviewService:
+    """Return the unsigned live order preview service."""
+
+    return OrderPreviewService()
 
 
 def _select_trade_intent_records(
@@ -554,6 +562,32 @@ def create_app() -> FastAPI:
             paper_trade,
             build_live_execution_configs(settings),
         )
+
+    @app.get(
+        "/v1/executions/preview/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeOrderPreview,
+    )
+    async def execution_preview_for_paper_trade(
+        paper_trade_id: int,
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        service: Annotated[OrderPreviewService, Depends(get_order_preview_service)],
+        slippage_tolerance_bps: int = 10,
+    ) -> PaperTradeOrderPreview:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        try:
+            return await service.preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=slippage_tolerance_bps,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post(
         "/v1/executions/mock/from-paper-trade/{paper_trade_id}",
