@@ -193,6 +193,7 @@ def get_execution_journal_store(
     return _execution_journal_store_for_path(settings.database_path)
 
 
+# TODO: wire this provider to the future live execution adapter surface.
 def get_execution_adapter() -> ExecutionAdapter:
     """Return the default explicitly simulated execution adapter."""
 
