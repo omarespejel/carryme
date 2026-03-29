@@ -8,6 +8,74 @@ from carryme_models import OpportunityRecord
 from carryme_runtime import filter_candidate_records
 
 
+def _record_identity_key(record: OpportunityRecord) -> str:
+    """Build a stable identity key for configured pairs."""
+
+    if record.pair.label:
+        return record.pair.label
+    return "|".join(
+        [
+            record.pair.left_venue,
+            record.pair.left_symbol,
+            record.pair.left_fee_profile,
+            record.pair.right_venue,
+            record.pair.right_symbol,
+            record.pair.right_fee_profile,
+        ]
+    )
+
+
+def _display_label(record: OpportunityRecord) -> str:
+    """Render a readable label for configured and unlabeled pairs."""
+
+    if record.pair.label:
+        return record.pair.label
+    return (
+        f"{record.pair.left_venue}:{record.pair.left_symbol}"
+        f" ↔ {record.pair.right_venue}:{record.pair.right_symbol}"
+    )
+
+
+def _stale_sort_value(record: OpportunityRecord) -> float:
+    """Prefer non-stale books when ranking saved opportunities."""
+
+    is_stale = bool(record.opportunity.short_stale_book) or bool(record.opportunity.long_stale_book)
+    return 0.0 if is_stale else 1.0
+
+
+def _min_metric(left: float | None, right: float | None) -> float:
+    """Return the weaker side of a two-venue liquidity metric."""
+
+    values = [value for value in (left, right) if value is not None]
+    if not values:
+        return 0.0
+    return min(values)
+
+
+def _spread_sort_value(record: OpportunityRecord) -> float:
+    """Prefer tighter combined spreads when ranking opportunities."""
+
+    spreads = [
+        spread
+        for spread in (
+            record.opportunity.short_spread_rate,
+            record.opportunity.long_spread_rate,
+        )
+        if spread is not None
+    ]
+    if len(spreads) != 2:
+        return float("-inf")
+    return -sum(spreads)
+
+
+def _break_even_sort_value(record: OpportunityRecord) -> float:
+    """Prefer faster payback when entry edges tie."""
+
+    if record.opportunity.break_even_days_entry is None:
+        return float("-inf")
+    return -record.opportunity.break_even_days_entry
+
+
 def latest_records_by_label(
     records: list[OpportunityRecord],
     *,
@@ -18,11 +86,11 @@ def latest_records_by_label(
     selected: list[OpportunityRecord] = []
     seen_labels: set[str] = set()
     for record in records:
-        label = record.pair.label or record.opportunity.canonical_symbol
-        if label in seen_labels:
+        dedupe_key = _record_identity_key(record)
+        if dedupe_key in seen_labels:
             continue
         selected.append(record)
-        seen_labels.add(label)
+        seen_labels.add(dedupe_key)
         if len(selected) >= limit:
             break
     return selected
@@ -39,12 +107,24 @@ def rank_history_records(
         records,
         key=lambda record: (
             record.opportunity.one_day_net_edge_after_entry,
+            _stale_sort_value(record),
+            record.opportunity.one_day_net_edge_after_round_trip,
+            _min_metric(
+                record.opportunity.short_open_interest,
+                record.opportunity.long_open_interest,
+            ),
+            _min_metric(
+                record.opportunity.short_daily_volume,
+                record.opportunity.long_daily_volume,
+            ),
+            _spread_sort_value(record),
             (
                 record.opportunity.capacity.max_entry_notional
                 if record.opportunity.capacity
                 and record.opportunity.capacity.max_entry_notional is not None
                 else -1.0
             ),
+            _break_even_sort_value(record),
             record.recorded_at.timestamp(),
         ),
         reverse=True,
@@ -58,9 +138,7 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
     latest = latest_records_by_label(records, limit=20)
     ranked = rank_history_records(latest, limit=20)
     total_rows = len(records)
-    tracked_labels = len(
-        {record.pair.label or record.opportunity.canonical_symbol for record in records}
-    )
+    tracked_labels = len({_record_identity_key(record) for record in records})
     best_entry_edge = ranked[0].opportunity.one_day_net_edge_after_entry if ranked else 0.0
 
     rows = "\n".join(_render_row(record) for record in ranked)
@@ -69,7 +147,8 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
 
     subtitle = (
         "Persisted funding opportunities ranked by current one-day net "
-        "entry edge using the latest saved row for each configured label."
+        "entry edge with tie-breakers for stale books, exit economics, "
+        "liquidity, spreads, and recency."
     )
     stats_markup = "\n".join(
         [
@@ -79,115 +158,19 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
         ]
     )
 
-    return f"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>carryme dashboard</title>
-    <style>
-      :root {{
-        color-scheme: light;
-        --bg: #f6f4ed;
-        --panel: #fffdf8;
-        --ink: #1a1f16;
-        --muted: #647066;
-        --accent: #0f766e;
-        --border: #d7d2c5;
-      }}
-      body {{
-        margin: 0;
-        font-family: "Iowan Old Style", "Palatino Linotype", serif;
-        background: radial-gradient(circle at top left, #fff7dd, var(--bg));
-        color: var(--ink);
-      }}
-      main {{
-        max-width: 1120px;
-        margin: 0 auto;
-        padding: 32px 20px 64px;
-      }}
-      h1 {{
-        margin: 0 0 8px;
-        font-size: 2.6rem;
-      }}
-      p {{
-        color: var(--muted);
-        max-width: 760px;
-      }}
-      .stats {{
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-        gap: 12px;
-        margin: 24px 0;
-      }}
-      .card {{
-        background: var(--panel);
-        border: 1px solid var(--border);
-        border-radius: 14px;
-        padding: 16px;
-      }}
-      .label {{
-        font-size: 0.8rem;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        color: var(--muted);
-      }}
-      .value {{
-        font-size: 1.6rem;
-        margin-top: 6px;
-      }}
-      table {{
-        width: 100%;
-        border-collapse: collapse;
-        background: var(--panel);
-        border: 1px solid var(--border);
-        border-radius: 14px;
-        overflow: hidden;
-      }}
-      th, td {{
-        padding: 12px 10px;
-        border-bottom: 1px solid var(--border);
-        text-align: left;
-        vertical-align: top;
-      }}
-      th {{
-        font-size: 0.8rem;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--muted);
-      }}
-      tr:last-child td {{
-        border-bottom: none;
-      }}
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>carryme operator view</h1>
-      <p>{subtitle}</p>
-      <section class="stats">
-        {stats_markup}
-      </section>
-      <table>
-        <thead>
-          <tr>
-            <th>Label</th>
-            <th>Symbol</th>
-            <th>Short</th>
-            <th>Long</th>
-            <th>Entry Edge</th>
-            <th>Round Trip</th>
-            <th>Break-even Days</th>
-            <th>Recorded</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows}
-        </tbody>
-      </table>
-    </main>
-  </body>
-</html>"""
+    return _render_dashboard_document(
+        html_title="carryme dashboard",
+        heading="carryme operator view",
+        subtitle=subtitle,
+        stats_markup=stats_markup,
+        rows=rows,
+        background="radial-gradient(circle at top left, #fff7dd, #f6f4ed)",
+        bg="#f6f4ed",
+        panel="#fffdf8",
+        ink="#1a1f16",
+        muted="#647066",
+        border="#d7d2c5",
+    )
 
 
 def render_candidate_dashboard(
@@ -208,9 +191,7 @@ def render_candidate_dashboard(
     rows = "\n".join(_render_row(record) for record in ranked)
     if not rows:
         rows = (
-            '<tr><td colspan="8">'
-            "No candidate opportunities match the current thresholds."
-            "</td></tr>"
+            '<tr><td colspan="8">No candidate opportunities match the current thresholds.</td></tr>'
         )
 
     subtitle = (
@@ -219,7 +200,7 @@ def render_candidate_dashboard(
     )
     stats_markup = "\n".join(
         [
-            _render_stat_card("Candidates", str(len(ranked))),
+            _render_stat_card("Candidates", str(len(candidates))),
             _render_stat_card(
                 "Min Entry Edge",
                 (
@@ -235,26 +216,56 @@ def render_candidate_dashboard(
         ]
     )
 
+    return _render_dashboard_document(
+        html_title="carryme candidates",
+        heading="carryme candidate view",
+        subtitle=subtitle,
+        stats_markup=stats_markup,
+        rows=rows,
+        background="linear-gradient(135deg, #f7fce6, #eff4ef)",
+        bg="#eff4ef",
+        panel="#fefef9",
+        ink="#0f1720",
+        muted="#5e6e60",
+        border="#c9d6c8",
+    )
+
+
+def _render_dashboard_document(
+    *,
+    html_title: str,
+    heading: str,
+    subtitle: str,
+    stats_markup: str,
+    rows: str,
+    background: str,
+    bg: str,
+    panel: str,
+    ink: str,
+    muted: str,
+    border: str,
+) -> str:
+    """Render a themed HTML dashboard document."""
+
     return f"""<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>carryme candidates</title>
+    <title>{html_title}</title>
     <style>
       :root {{
         color-scheme: light;
-        --bg: #eff4ef;
-        --panel: #fefef9;
-        --ink: #0f1720;
-        --muted: #5e6e60;
-        --accent: #1d6b46;
-        --border: #c9d6c8;
+        --bg: {bg};
+        --panel: {panel};
+        --ink: {ink};
+        --muted: {muted};
+        --border: {border};
       }}
       body {{
         margin: 0;
         font-family: "Iowan Old Style", "Palatino Linotype", serif;
-        background: linear-gradient(135deg, #f7fce6, var(--bg));
+        background: {background};
         color: var(--ink);
       }}
       main {{
@@ -319,7 +330,7 @@ def render_candidate_dashboard(
   </head>
   <body>
     <main>
-      <h1>carryme candidate view</h1>
+      <h1>{heading}</h1>
       <p>{subtitle}</p>
       <section class="stats">
         {stats_markup}
@@ -347,7 +358,7 @@ def render_candidate_dashboard(
 
 
 def _render_row(record: OpportunityRecord) -> str:
-    label = escape(record.pair.label or record.opportunity.canonical_symbol)
+    label = escape(_display_label(record))
     symbol = escape(record.opportunity.canonical_symbol)
     short_venue = escape(record.opportunity.short_venue)
     long_venue = escape(record.opportunity.long_venue)

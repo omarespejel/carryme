@@ -23,8 +23,8 @@ from carryme_runtime.execution_pair_status import build_execution_pair_status
 from carryme_runtime.execution_reconciliation import reconcile_execution
 from carryme_runtime.extended_cleanup_preview import ExtendedCleanupPreviewService
 from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
-from carryme_runtime.intents import build_trade_intent
-from carryme_runtime.opportunities import OpportunityService, fetch_live_snapshot
+from carryme_runtime.intents import InvalidTradeCandidateError, build_trade_intent
+from carryme_runtime.opportunities import OpportunityService, UpstreamDataError, fetch_live_snapshot
 from carryme_runtime.order_preview import OrderPreviewService
 from carryme_runtime.paired_live_execution import (
     PairedLiveExecutionCoordinator,
@@ -34,6 +34,7 @@ from carryme_runtime.paradex_cleanup_preview import ParadexCleanupPreviewService
 from carryme_runtime.paradex_live_execution import ParadexLiveExecutionService
 from carryme_runtime.preflight import (
     LiveExecutionConfigMap,
+    build_live_execution_configs,
     build_paper_trade_execution_preflight,
     build_venue_execution_preflights,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "build_execution_pair_status",
     "ExtendedCleanupPreviewService",
     "ExtendedOrderStateObserver",
+    "ExtendedLiveExecutionService",
     "LiveExecutionConfigMap",
     "MockExecutionAdapter",
     "OrderPreviewService",
@@ -57,16 +59,18 @@ __all__ = [
     "ParadexOrderStateObserver",
     "SingleVenueLiveExecutionService",
     "VenueAccountProbe",
+    "build_live_execution_configs",
+    "build_live_submission_readiness",
     "build_paper_trade_execution_preflight",
     "build_trade_intent",
     "build_venue_execution_preflights",
-    "build_live_submission_readiness",
     "reconcile_execution",
     "require_confirmed_cleanup_preview",
-    "require_confirmed_preview",
     "ConnectorError",
-    "ExtendedLiveExecutionService",
+    "InvalidTradeCandidateError",
     "OpportunityService",
+    "UpstreamDataError",
     "fetch_live_snapshot",
     "filter_candidate_records",
+    "require_confirmed_preview",
 ]
