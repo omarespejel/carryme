@@ -34,12 +34,12 @@ def build_trade_intent(
         raise ValueError("Opportunity capacity is below the configured threshold")
 
     break_even_days_entry = record.opportunity.break_even_days_entry
+    if max_break_even_days_entry is not None and break_even_days_entry is None:
+        raise ValueError("Opportunity missing break-even days entry")
     if (
         max_break_even_days_entry is not None
-        and (
-            break_even_days_entry is None
-            or break_even_days_entry > max_break_even_days_entry
-        )
+        and break_even_days_entry is not None
+        and break_even_days_entry > max_break_even_days_entry
     ):
         raise ValueError("Opportunity break-even days exceed the configured threshold")
 

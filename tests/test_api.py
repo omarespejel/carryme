@@ -1009,6 +1009,56 @@ def test_trade_intents_endpoint_rejects_invalid_max_target_notional(tmp_path: Pa
     assert response.json()["detail"] == "max_target_notional must be greater than zero"
 
 
+def test_trade_intent_endpoint_returns_not_found_when_break_even_days_are_missing(
+    tmp_path: Path,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=None,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get(
+            "/v1/intents/funding-pair",
+            params={"max_break_even_days_entry": 1.0},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No trade intent candidate matched the requested filters"
+
+
 def test_create_paper_trade_from_intent_persists_entry(tmp_path: Path) -> None:
     history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
