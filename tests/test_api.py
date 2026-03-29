@@ -11,6 +11,7 @@ from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
     CleanupPreviewConfirmationEntry,
+    ExecutionAlertEvent,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionLegOrderState,
@@ -35,6 +36,7 @@ from carryme_models import (
 from carryme_storage import (
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
+    ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
@@ -350,6 +352,92 @@ def test_candidate_alerts_endpoint_reads_saved_events(tmp_path: Path) -> None:
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["record"]["pair"]["label"] == "strk_extended_hyperliquid"
+
+
+def test_execution_alerts_endpoint_reads_saved_events(tmp_path: Path) -> None:
+    store = ExecutionAlertStore(tmp_path / "history.sqlite3")
+    store.append(
+        ExecutionAlertEvent(
+            emitted_at=datetime(2026, 3, 29, 12, 5, tzinfo=UTC),
+            alert_type="cleanup_needed",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                derived_state="cleanup_needed",
+                recommended_action="close_open_leg",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=12,
+                    paper_trade_id=7,
+                    preview_hash="preview-hash",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=12,
+                    paper_trade_id=7,
+                    preview_hash="preview-hash",
+                    status="submitted",
+                    recommended_action="verify_fill_status",
+                    matched_all_leg_symbols=False,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            ),
+        )
+    )
+    store.append(
+        ExecutionAlertEvent(
+            emitted_at=datetime(2026, 3, 29, 12, 6, tzinfo=UTC),
+            alert_type="review_required",
+            paper_trade_id=8,
+            preview_hash="other-preview-hash",
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=13,
+                paper_trade_id=8,
+                preview_hash="other-preview-hash",
+                derived_state="review_required",
+                recommended_action="manual_review_required",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=13,
+                    paper_trade_id=8,
+                    preview_hash="other-preview-hash",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=13,
+                    paper_trade_id=8,
+                    preview_hash="other-preview-hash",
+                    status="submitted",
+                    recommended_action="manual_review_required",
+                    matched_all_leg_symbols=False,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            ),
+        )
+    )
+
+    from carryme_api.app import get_execution_alert_store
+
+    app.dependency_overrides[get_execution_alert_store] = lambda: store
+    try:
+        client = TestClient(app)
+        response = client.get("/v1/alerts/executions?paper_trade_id=7")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["alert_type"] == "cleanup_needed"
+    assert payload[0]["paper_trade_id"] == 7
+    assert all(item["paper_trade_id"] == 7 for item in payload)
 
 
 def test_latest_history_endpoint_deduplicates_by_label(tmp_path: Path) -> None:

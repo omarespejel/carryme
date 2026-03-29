@@ -7,7 +7,21 @@ import sqlite3
 from datetime import UTC
 from pathlib import Path
 
-from carryme_models import ExecutionObservationEntry
+from carryme_models import (
+    ExecutionAlertEvent,
+    ExecutionObservationEntry,
+    ExecutionPairStatus,
+)
+
+from carryme_storage.execution_alerts import ExecutionAlertStore
+
+
+def _normalize_observation(entry: ExecutionObservationEntry) -> ExecutionObservationEntry:
+    """Normalize an observation entry before persistence."""
+
+    if entry.observed_at.tzinfo is None or entry.observed_at.utcoffset() is None:
+        raise ValueError("observed_at must be timezone-aware")
+    return entry.model_copy(update={"observed_at": entry.observed_at.astimezone(UTC)})
 
 
 class ExecutionObservationStore:
@@ -57,38 +71,35 @@ class ExecutionObservationStore:
         """Append an observation entry and return it with its assigned id."""
 
         self.initialize()
-        if entry.observed_at.tzinfo is None or entry.observed_at.utcoffset() is None:
-            raise ValueError("observed_at must be timezone-aware")
-        normalized_entry = entry.model_copy(
-            update={"observed_at": entry.observed_at.astimezone(UTC)}
-        )
         with sqlite3.connect(self.database_path) as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO execution_observation_entries (
-                    observed_at,
-                    context,
-                    execution_entry_id,
-                    paper_trade_id,
-                    preview_hash,
-                    entry_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    normalized_entry.observed_at.isoformat(),
-                    normalized_entry.context,
-                    normalized_entry.execution_entry_id,
-                    normalized_entry.paper_trade_id,
-                    normalized_entry.preview_hash,
-                    normalized_entry.model_dump_json(),
-                ),
-            )
-        return ExecutionObservationEntry.model_validate(
-            {
-                **normalized_entry.model_dump(mode="json"),
-                "entry_id": cursor.lastrowid,
-            }
-        )
+            return self._append_on_connection(connection, entry)
+
+    def append_with_alert(
+        self,
+        entry: ExecutionObservationEntry,
+        *,
+        alert_store: ExecutionAlertStore,
+        alert_event: ExecutionAlertEvent | None = None,
+        previous_pair_status: ExecutionPairStatus | None = None,
+    ) -> tuple[ExecutionObservationEntry, bool]:
+        """Append an observation and optional alert atomically within one transaction."""
+
+        self.initialize()
+        alert_store.initialize()
+        if alert_store.database_path != self.database_path:
+            raise ValueError("observation and alert stores must share the same database")
+
+        with sqlite3.connect(self.database_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            alert_saved = False
+            if alert_event is not None:
+                alert_saved = alert_store._append_if_changed_on_connection(
+                    connection,
+                    alert_event,
+                    previous_pair_status=previous_pair_status,
+                )
+            saved_entry = self._append_on_connection(connection, entry)
+        return saved_entry, alert_saved
 
     def latest_for_paper_trade(self, paper_trade_id: int) -> ExecutionObservationEntry | None:
         """Return the newest observation entry for one paper trade."""
@@ -151,3 +162,38 @@ class ExecutionObservationStore:
             )
             for stored_id, entry_json in rows
         ]
+
+    def _append_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        entry: ExecutionObservationEntry,
+    ) -> ExecutionObservationEntry:
+        """Append an observation entry using an existing transaction."""
+
+        normalized_entry = _normalize_observation(entry)
+        cursor = connection.execute(
+            """
+            INSERT INTO execution_observation_entries (
+                observed_at,
+                context,
+                execution_entry_id,
+                paper_trade_id,
+                preview_hash,
+                entry_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_entry.observed_at.isoformat(),
+                normalized_entry.context,
+                normalized_entry.execution_entry_id,
+                normalized_entry.paper_trade_id,
+                normalized_entry.preview_hash,
+                normalized_entry.model_dump_json(),
+            ),
+        )
+        return ExecutionObservationEntry.model_validate(
+            {
+                **normalized_entry.model_dump(mode="json"),
+                "entry_id": cursor.lastrowid,
+            }
+        )

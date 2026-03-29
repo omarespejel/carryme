@@ -78,6 +78,7 @@ def build_execution_observation_payload(
         "scanned_executions": summary.scanned_executions,
         "observed_executions": summary.observed_executions,
         "saved_observations": summary.saved_observations,
+        "saved_alerts": summary.saved_alerts,
         "database_path": summary.database_path,
     }
 

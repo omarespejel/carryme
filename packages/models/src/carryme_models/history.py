@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from carryme_models.execution import ExecutionPairStatus
 from carryme_models.opportunity import FundingArbOpportunity
 
 
@@ -42,3 +43,13 @@ class CandidateAlertEvent(BaseModel):
     min_one_day_net_edge_after_entry: float | None = None
     min_capacity_notional: float | None = None
     record: OpportunityRecord
+
+
+class ExecutionAlertEvent(BaseModel):
+    """An execution-monitor alert emitted when a live pair needs operator attention."""
+
+    emitted_at: datetime
+    alert_type: Literal["cleanup_needed", "review_required"]
+    paper_trade_id: int
+    preview_hash: str | None = None
+    pair_status: ExecutionPairStatus

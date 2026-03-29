@@ -15,6 +15,7 @@ from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
     CleanupPreviewConfirmationEntry,
+    ExecutionAlertEvent,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionObservationEntry,
@@ -75,6 +76,7 @@ from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
+    ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
@@ -199,6 +201,21 @@ def get_candidate_alert_store(
     """Return the shared candidate alert store."""
 
     return _candidate_alert_store_for_path(settings.database_path)
+
+
+@lru_cache
+def _execution_alert_store_for_path(database_path: str) -> ExecutionAlertStore:
+    """Return the shared execution alert store for the configured SQLite path."""
+
+    return ExecutionAlertStore(database_path)
+
+
+def get_execution_alert_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExecutionAlertStore:
+    """Return the shared execution alert store."""
+
+    return _execution_alert_store_for_path(settings.database_path)
 
 
 def get_execution_observation_store(
@@ -984,6 +1001,18 @@ def create_app() -> FastAPI:
         limit = _validated_history_limit("limit", limit)
         try:
             return store.list_recent(limit=limit, label=label)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/alerts/executions", response_model=list[ExecutionAlertEvent])
+    def execution_alerts(
+        store: Annotated[ExecutionAlertStore, Depends(get_execution_alert_store)],
+        limit: int = 50,
+        paper_trade_id: int | None = None,
+    ) -> list[ExecutionAlertEvent]:
+        limit = _validated_history_limit("limit", limit)
+        try:
+            return store.list_recent(limit=limit, paper_trade_id=paper_trade_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
