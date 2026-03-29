@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from decimal import ROUND_FLOOR, Decimal
 from typing import Any, cast
 
@@ -10,8 +11,33 @@ from hyperliquid.exchange import Exchange  # type: ignore[import-untyped]
 from hyperliquid.info import Info  # type: ignore[import-untyped]
 from hyperliquid.utils.constants import MAINNET_API_URL  # type: ignore[import-untyped]
 from hyperliquid.utils.signing import float_to_wire  # type: ignore[import-untyped]
+from hyperliquid.websocket_manager import WebsocketManager  # type: ignore[import-untyped]
 
 HYPERLIQUID_API_BASE_URL = MAINNET_API_URL
+
+
+class ManagedHyperliquidWebsocketManager:
+    """Context-managed Hyperliquid websocket manager wrapper."""
+
+    def __init__(self, *, base_url: str = HYPERLIQUID_API_BASE_URL) -> None:
+        self._manager = WebsocketManager(base_url)
+        self._started = False
+
+    def __enter__(self) -> Any:
+        if not self._started:
+            self._manager.start()
+            self._started = True
+        return self._manager
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._started:
+            return
+        with suppress(Exception):
+            self._manager.stop()
+        self._started = False
 
 
 def build_hyperliquid_wallet(private_key: str) -> Any:
@@ -53,6 +79,19 @@ def build_hyperliquid_info(
     """
 
     return Info(base_url=base_url, skip_ws=True, timeout=timeout)
+
+
+def build_hyperliquid_websocket_manager(
+    *,
+    base_url: str = HYPERLIQUID_API_BASE_URL,
+) -> ManagedHyperliquidWebsocketManager:
+    """Return a managed Hyperliquid websocket wrapper.
+
+    Callers should use this helper as a context manager. Entering the context calls
+    `WebsocketManager.start()`, and leaving it guarantees `WebsocketManager.stop()`.
+    """
+
+    return ManagedHyperliquidWebsocketManager(base_url=base_url)
 
 
 def format_hyperliquid_size(value: Decimal, *, sz_decimals: int) -> tuple[Decimal, str]:

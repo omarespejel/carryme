@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -13,8 +14,14 @@ from carryme_connectors import (
     ParadexJwtTokenProvider,
     ParadexPrivateConnector,
     build_hyperliquid_info,
+    build_hyperliquid_websocket_manager,
 )
-from carryme_models import ExecutionJournalEntry, ExecutionLegOrderState, ExecutionOrderState
+from carryme_models import (
+    ExecutionJournalEntry,
+    ExecutionLegOrderState,
+    ExecutionOrderState,
+    ObservationSource,
+)
 
 
 class ExecutionLegOrderObserver(Protocol):
@@ -220,10 +227,11 @@ class ExtendedOrderStateObserver:
 
 @dataclass(frozen=True)
 class HyperliquidOrderStateObserver:
-    """Observe Hyperliquid order state by oid through the official SDK info client."""
+    """Observe Hyperliquid order state, preferring official websocket updates before REST."""
 
     account_address: str
     vault_address: str | None = None
+    websocket_timeout_seconds: float = 2.0
 
     async def observe(self, leg: dict[str, Any]) -> ExecutionLegOrderState:
         external_reference = _string_value(leg, "external_reference")
@@ -243,37 +251,57 @@ class HyperliquidOrderStateObserver:
                 derived_state="unknown",
                 notes=["Hyperliquid order reference is not a valid integer oid."],
             )
+        observed_address = self.vault_address or self.account_address
+        fallback_notes: list[str] = []
+        if self.websocket_timeout_seconds > 0:
+            try:
+                stream_state = await asyncio.to_thread(
+                    _await_hyperliquid_order_state_from_stream,
+                    observed_address,
+                    oid,
+                    self.websocket_timeout_seconds,
+                )
+            except Exception as exc:
+                stream_state = ExecutionLegOrderState(
+                    venue="hyperliquid",
+                    supported=True,
+                    observation_source="websocket_error",
+                    external_reference=external_reference,
+                    derived_state="unknown",
+                    notes=[f"Hyperliquid websocket observation failed: {exc}"],
+                )
+                fallback_notes.extend(stream_state.notes)
+            if stream_state is not None and stream_state.derived_state != "unknown":
+                return stream_state
+            if stream_state is not None and stream_state.derived_state == "unknown":
+                fallback_notes.extend(
+                    stream_state.notes
+                    or [
+                        (
+                            "Hyperliquid websocket produced an unknown "
+                            "order-state payload; fell back to REST."
+                        )
+                    ]
+                )
+            if not fallback_notes:
+                fallback_notes.append(
+                    "Hyperliquid websocket did not yield a terminal update before timeout; "
+                    "fell back to REST."
+                )
         try:
             payload = await asyncio.to_thread(
                 _fetch_hyperliquid_order_state,
-                self.vault_address or self.account_address,
+                observed_address,
                 oid,
             )
         except Exception as exc:
             raise ConnectorError(f"Hyperliquid order-state observation failed: {exc}") from exc
 
-        order = payload.get("order")
-        order_payload = order if isinstance(order, dict) else {}
-        status = _string_value(payload, "status") or _string_value(order_payload, "status")
-        remaining_size = _string_value(order_payload, "sz")
-        size = _string_value(order_payload, "origSz")
-        avg_fill_price = _string_value(order_payload, "avgPx")
-        return ExecutionLegOrderState(
-            venue="hyperliquid",
-            supported=True,
+        return _build_hyperliquid_order_state(
             external_reference=external_reference,
-            client_id=_string_value(order_payload, "cloid"),
-            derived_state=_classify_hyperliquid_order_state(
-                status=status,
-                remaining_size=remaining_size,
-                size=size,
-                avg_fill_price=avg_fill_price,
-            ),
-            order_status=status,
-            avg_fill_price=avg_fill_price,
-            remaining_size=remaining_size,
-            size=size,
-            raw_response=payload,
+            payload=payload,
+            observation_source="rest_poll",
+            notes=fallback_notes,
         )
 
 
@@ -284,37 +312,12 @@ class ExecutionOrderStateService:
     observers: dict[str, ExecutionLegOrderObserver]
 
     async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
-        legs: list[ExecutionLegOrderState] = []
-        notes: list[str] = []
-        for leg in entry.legs:
-            payload = leg.model_dump(mode="python")
-            observer = self.observers.get(leg.venue)
-            if observer is None:
-                legs.append(
-                    ExecutionLegOrderState(
-                        venue=leg.venue,
-                        supported=False,
-                        external_reference=leg.external_reference,
-                        client_id=_request_client_id(payload),
-                        derived_state="unsupported",
-                        notes=[f"No order-state observer is registered for venue {leg.venue}."],
-                    )
-                )
-                continue
-            try:
-                legs.append(await observer.observe(payload))
-            except (ConnectorError, httpx.HTTPError) as exc:
-                notes.append(f"Order-state observation failed for {leg.venue}: {exc}")
-                legs.append(
-                    ExecutionLegOrderState(
-                        venue=leg.venue,
-                        supported=True,
-                        external_reference=leg.external_reference,
-                        client_id=_request_client_id(payload),
-                        derived_state="unknown",
-                        notes=[f"Order-state observation failed: {exc}"],
-                    )
-                )
+        results = await asyncio.gather(
+            *(self._observe_leg(leg) for leg in entry.legs),
+            return_exceptions=False,
+        )
+        legs = [item[0] for item in results]
+        notes = [note for _, leg_notes in results for note in leg_notes]
         return ExecutionOrderState(
             execution_entry_id=entry.entry_id,
             paper_trade_id=entry.paper_trade_id,
@@ -322,6 +325,40 @@ class ExecutionOrderStateService:
             legs=legs,
             notes=notes,
         )
+
+    async def _observe_leg(
+        self,
+        leg: Any,
+    ) -> tuple[ExecutionLegOrderState, list[str]]:
+        payload = leg.model_dump(mode="python")
+        observer = self.observers.get(leg.venue)
+        if observer is None:
+            return (
+                ExecutionLegOrderState(
+                    venue=leg.venue,
+                    supported=False,
+                    external_reference=leg.external_reference,
+                    client_id=_request_client_id(payload),
+                    derived_state="unsupported",
+                    notes=[f"No order-state observer is registered for venue {leg.venue}."],
+                ),
+                [],
+            )
+        try:
+            return await observer.observe(payload), []
+        except (ConnectorError, httpx.HTTPError) as exc:
+            return (
+                ExecutionLegOrderState(
+                    venue=leg.venue,
+                    supported=True,
+                    external_reference=leg.external_reference,
+                    client_id=_request_client_id(payload),
+                    observation_source="observer_error",
+                    derived_state="unknown",
+                    notes=[f"Order-state observation failed: {exc}"],
+                ),
+                [f"Order-state observation failed for {leg.venue}: {exc}"],
+            )
 
 
 def _classify_paradex_order_state(
@@ -432,6 +469,157 @@ def _coerce_int(value: str) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _await_hyperliquid_order_state_from_stream(
+    account_address: str,
+    oid: int,
+    timeout_seconds: float,
+) -> ExecutionLegOrderState | None:
+    event = threading.Event()
+    result_holder: dict[str, ExecutionLegOrderState | None] = {"state": None}
+    user_fill_notes: list[str] = []
+    lock = threading.Lock()
+    subscriptions: list[tuple[dict[str, str], int]] = []
+
+    def capture(state: ExecutionLegOrderState) -> None:
+        with lock:
+            if result_holder["state"] is None:
+                result_holder["state"] = state
+                event.set()
+
+    def on_order_updates(message: dict[str, Any]) -> None:
+        for item in _unwrap_rows(message.get("data", [])):
+            match = _extract_hyperliquid_order_update(item, oid)
+            if match is not None:
+                capture(match)
+                return
+
+    def on_user_fills(message: dict[str, Any]) -> None:
+        data = message.get("data")
+        if not isinstance(data, dict):
+            return
+        fills = data.get("fills")
+        if not isinstance(fills, list):
+            return
+        is_snapshot = bool(data.get("isSnapshot"))
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            fill_oid = fill.get("oid")
+            if not isinstance(fill_oid, int) or fill_oid != oid:
+                continue
+            note = (
+                "Observed via Hyperliquid websocket userFills"
+                + (" snapshot; " if is_snapshot else "; ")
+                + "fill events may be partial, so REST fallback confirms terminal order state."
+            )
+            with lock:
+                if note not in user_fill_notes:
+                    user_fill_notes.append(note)
+            return
+
+    with build_hyperliquid_websocket_manager() as manager:
+        try:
+            order_subscription: dict[str, str] = {"type": "orderUpdates", "user": account_address}
+            fills_subscription: dict[str, str] = {"type": "userFills", "user": account_address}
+            subscriptions.append(
+                (
+                    order_subscription,
+                    manager.subscribe(order_subscription, on_order_updates),
+                )
+            )
+            subscriptions.append(
+                (
+                    fills_subscription,
+                    manager.subscribe(fills_subscription, on_user_fills),
+                )
+            )
+            if event.wait(timeout_seconds):
+                return result_holder["state"]
+            if user_fill_notes:
+                return ExecutionLegOrderState(
+                    venue="hyperliquid",
+                    supported=True,
+                    observation_source="websocket_user_fills",
+                    external_reference=str(oid),
+                    derived_state="unknown",
+                    notes=user_fill_notes,
+                )
+            return None
+        finally:
+            for subscription, subscription_id in subscriptions:
+                try:
+                    manager.unsubscribe(subscription, subscription_id)
+                except Exception:
+                    continue
+
+
+def _extract_hyperliquid_order_update(
+    payload: dict[str, Any],
+    oid: int,
+) -> ExecutionLegOrderState | None:
+    if _coerce_int(_string_value(payload, "oid") or "") != oid:
+        return None
+    status = _string_value(payload, "status")
+    order = payload.get("order")
+    order_payload = order if isinstance(order, dict) else {}
+    remaining_size = _string_value(order_payload, "sz") or _string_value(payload, "sz")
+    size = _string_value(order_payload, "origSz") or _string_value(payload, "origSz")
+    avg_fill_price = _string_value(order_payload, "avgPx") or _string_value(payload, "avgPx")
+    return ExecutionLegOrderState(
+        venue="hyperliquid",
+        supported=True,
+        observation_source="websocket_order_updates",
+        external_reference=str(oid),
+        client_id=_string_value(order_payload, "cloid") or _string_value(payload, "cloid"),
+        derived_state=_classify_hyperliquid_order_state(
+            status=status,
+            remaining_size=remaining_size,
+            size=size,
+            avg_fill_price=avg_fill_price,
+        ),
+        order_status=status,
+        avg_fill_price=avg_fill_price,
+        remaining_size=remaining_size,
+        size=size,
+        notes=["Observed via Hyperliquid websocket orderUpdates."],
+        raw_response=payload,
+    )
+
+
+def _build_hyperliquid_order_state(
+    *,
+    external_reference: str,
+    payload: dict[str, Any],
+    observation_source: ObservationSource,
+    notes: list[str] | None = None,
+) -> ExecutionLegOrderState:
+    order = payload.get("order")
+    order_payload = order if isinstance(order, dict) else {}
+    status = _string_value(payload, "status") or _string_value(order_payload, "status")
+    remaining_size = _string_value(order_payload, "sz")
+    size = _string_value(order_payload, "origSz")
+    avg_fill_price = _string_value(order_payload, "avgPx")
+    return ExecutionLegOrderState(
+        venue="hyperliquid",
+        supported=True,
+        observation_source=observation_source,
+        external_reference=external_reference,
+        client_id=_string_value(order_payload, "cloid"),
+        derived_state=_classify_hyperliquid_order_state(
+            status=status,
+            remaining_size=remaining_size,
+            size=size,
+            avg_fill_price=avg_fill_price,
+        ),
+        order_status=status,
+        avg_fill_price=avg_fill_price,
+        remaining_size=remaining_size,
+        size=size,
+        raw_response=payload,
+        notes=notes or [],
+    )
 
 
 def _fetch_hyperliquid_order_state(account_address: str, oid: int) -> dict[str, Any]:

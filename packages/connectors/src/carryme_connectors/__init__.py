@@ -16,6 +16,7 @@ from carryme_connectors.hyperliquid_auth import (
     build_hyperliquid_exchange,
     build_hyperliquid_info,
     build_hyperliquid_wallet,
+    build_hyperliquid_websocket_manager,
     format_hyperliquid_price,
     format_hyperliquid_size,
 )
@@ -59,6 +60,7 @@ __all__ = [
     "PublicVenueConnector",
     "build_hyperliquid_exchange",
     "build_hyperliquid_info",
+    "build_hyperliquid_websocket_manager",
     "build_hyperliquid_wallet",
     "format_hyperliquid_price",
     "format_hyperliquid_size",
