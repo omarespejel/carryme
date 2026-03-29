@@ -1400,9 +1400,9 @@ def test_observe_live_executions_once_emits_deduped_cleanup_alert(tmp_path: Path
     notified_events: list[str] = []
 
     class StubAlertNotifier:
-        async def notify(self, event: ExecutionAlertEvent) -> None:
-            alert = cast(ExecutionAlertEvent, event)
-            notified_events.append(alert.alert_type)
+        async def notify(self, event: ExecutionAlertEvent) -> int:
+            notified_events.append(event.alert_type)
+            return 1
 
     for index in range(2):
         summary = asyncio.run(

@@ -46,7 +46,7 @@ from carryme_storage import (
 )
 
 from carryme_worker.config import WorkerSettings
-from carryme_worker.notifications import ExecutionAlertNotifier
+from carryme_worker.notifications import CompositeExecutionAlertNotifier, ExecutionAlertNotifier
 
 logger = logging.getLogger(__name__)
 OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
@@ -328,8 +328,11 @@ async def observe_live_executions_once(
                 history_store.append(observation_entry)
             if alert_event is not None and alert_saved and alert_notifier is not None:
                 try:
-                    await alert_notifier.notify(alert_event)
-                    sent_notifications += 1
+                    sent_notifications += await _notify_execution_alert(
+                        settings,
+                        alert_notifier,
+                        alert_event,
+                    )
                 except Exception:
                     loop_logger.exception(
                         (
@@ -763,6 +766,19 @@ def _build_order_state_observers(
             vault_address=settings.hyperliquid_vault_address,
         )
     return observers
+
+
+async def _notify_execution_alert(
+    settings: WorkerSettings,
+    alert_notifier: ExecutionAlertNotifier,
+    alert_event: ExecutionAlertEvent,
+) -> int:
+    if isinstance(alert_notifier, CompositeExecutionAlertNotifier):
+        return await alert_notifier.notify(alert_event)
+    return await asyncio.wait_for(
+        alert_notifier.notify(alert_event),
+        timeout=settings.execution_alert_webhook_timeout_seconds,
+    )
 
 
 def _list_recent_live_executions(

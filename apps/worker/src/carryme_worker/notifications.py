@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Protocol
@@ -11,11 +12,13 @@ from carryme_models import ExecutionAlertEvent
 
 from carryme_worker.config import WorkerSettings
 
+logger = logging.getLogger(__name__)
+
 
 class ExecutionAlertNotifier(Protocol):
     """Async notifier for execution-monitor attention events."""
 
-    async def notify(self, event: ExecutionAlertEvent) -> None: ...
+    async def notify(self, event: ExecutionAlertEvent) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -24,7 +27,7 @@ class LoggingExecutionAlertNotifier:
 
     logger: logging.Logger
 
-    async def notify(self, event: ExecutionAlertEvent) -> None:
+    async def notify(self, event: ExecutionAlertEvent) -> int:
         self.logger.warning(
             (
                 "execution alert emitted: type=%s paper_trade_id=%s "
@@ -36,6 +39,7 @@ class LoggingExecutionAlertNotifier:
             event.pair_status.recommended_action,
             event.preview_hash,
         )
+        return 1
 
 
 @dataclass(frozen=True)
@@ -45,7 +49,7 @@ class WebhookExecutionAlertNotifier:
     webhook_url: str
     timeout_seconds: float = 10.0
 
-    async def notify(self, event: ExecutionAlertEvent) -> None:
+    async def notify(self, event: ExecutionAlertEvent) -> int:
         payload = {
             "source": "carryme-worker",
             "event_type": "execution_alert",
@@ -54,6 +58,7 @@ class WebhookExecutionAlertNotifier:
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             response = await client.post(self.webhook_url, json=payload)
             response.raise_for_status()
+        return 1
 
 
 @dataclass(frozen=True)
@@ -61,10 +66,29 @@ class CompositeExecutionAlertNotifier:
     """Dispatch one execution alert to multiple downstream notifiers."""
 
     notifiers: tuple[ExecutionAlertNotifier, ...]
+    timeout_seconds: float | None = None
 
-    async def notify(self, event: ExecutionAlertEvent) -> None:
+    async def notify(self, event: ExecutionAlertEvent) -> int:
+        delivered = 0
+        last_error: Exception | None = None
         for notifier in self.notifiers:
-            await notifier.notify(event)
+            try:
+                if self.timeout_seconds is None:
+                    delivered += await notifier.notify(event)
+                else:
+                    delivered += await asyncio.wait_for(
+                        notifier.notify(event),
+                        timeout=self.timeout_seconds,
+                    )
+            except Exception as exc:
+                last_error = exc
+                logger.exception(
+                    "execution notifier %s failed",
+                    notifier.__class__.__name__,
+                )
+        if delivered == 0 and last_error is not None:
+            raise last_error
+        return delivered
 
 
 def build_execution_alert_notifier(
@@ -85,4 +109,7 @@ def build_execution_alert_notifier(
                 timeout_seconds=settings.execution_alert_webhook_timeout_seconds,
             )
         )
-    return CompositeExecutionAlertNotifier(tuple(notifiers))
+    return CompositeExecutionAlertNotifier(
+        tuple(notifiers),
+        timeout_seconds=settings.execution_alert_webhook_timeout_seconds,
+    )
