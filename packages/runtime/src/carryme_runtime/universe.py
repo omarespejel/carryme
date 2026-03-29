@@ -210,7 +210,6 @@ class OpportunityUniverseService:
 
         return FundingUniverseScan(
             venues=normalized_venues,
-            ranking=normalized_ranking,
             fee_profiles=fee_profiles,
             ranking=normalized_ranking,
             target_notional=target_notional,
