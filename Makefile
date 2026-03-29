@@ -1,4 +1,4 @@
-.PHONY: sync lint typecheck test check run-api run-worker
+.PHONY: sync lint format typecheck test check run-api run-worker
 
 sync:
 	uv sync --all-packages --group dev

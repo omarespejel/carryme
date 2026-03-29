@@ -1,10 +1,13 @@
 # carryme
 
-`carryme` is a fee-aware, capacity-aware funding arbitrage control plane.
+`carryme` will be a fee-aware, capacity-aware funding arbitrage control plane.
 
-The initial workspace is intentionally narrow:
-- `apps/api`: FastAPI control-plane skeleton
-- `apps/worker`: async worker skeleton
+> **Status**: this repository currently contains only the workspace skeleton and
+> health endpoints.
+
+The current workspace is intentionally narrow:
+- `apps/api`: FastAPI control-plane skeleton with health endpoints
+- `apps/worker`: worker CLI skeleton that prints a deterministic health payload
 - `packages/models`: shared Pydantic models and settings
 - `packages/connectors`: public REST connectors for market data
 - `packages/normalizers`: venue-specific symbol, funding, and fee normalization

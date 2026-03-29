@@ -1,5 +1,6 @@
 """FastAPI application factory for carryme."""
 
+import os
 from typing import Annotated
 
 import httpx
@@ -11,7 +12,17 @@ from carryme_api.opportunities import ConnectorError, OpportunityService, Upstre
 
 APP_NAME = "carryme-api"
 APP_VERSION = "0.1.0"
-APP_ENVIRONMENT = "development"
+DEFAULT_APP_ENVIRONMENT = "development"
+APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
+
+
+def get_app_environment() -> str:
+    """Return the runtime environment exposed by the API health endpoints."""
+
+    return (
+        os.getenv(APP_ENVIRONMENT_VARIABLE, DEFAULT_APP_ENVIRONMENT).strip()
+        or DEFAULT_APP_ENVIRONMENT
+    )
 
 
 def get_opportunity_service() -> OpportunityService:
@@ -31,7 +42,7 @@ def create_app() -> FastAPI:
             service=AppDescriptor(
                 name=APP_NAME,
                 version=APP_VERSION,
-                environment=APP_ENVIRONMENT,
+                environment=get_app_environment(),
             )
         )
 

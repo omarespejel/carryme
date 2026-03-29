@@ -161,14 +161,12 @@ version = "0.1.0"
 source = { editable = "apps/worker" }
 dependencies = [
     { name = "carryme-models" },
-    { name = "httpx" },
     { name = "pydantic-settings" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "carryme-models", editable = "packages/models" },
-    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "pydantic-settings", specifier = ">=2.11,<3" },
 ]
 
