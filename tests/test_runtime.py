@@ -1417,6 +1417,98 @@ def test_extended_account_probe_treats_missing_balance_rows_as_empty_state(
     asyncio.run(run())
 
 
+def test_extended_account_probe_treats_missing_position_rows_as_empty_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/user/account/info":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "subAccountId": "extended-subaccount",
+                        "status": "OK",
+                        "equity": "0",
+                        "availableForTrade": "0",
+                    }
+                },
+            )
+        if request.url.path == "/api/v1/user/balance":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/api/v1/user/positions":
+            return httpx.Response(404, json={"error": "NOT_FOUND"})
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        probe = ExtendedAccountProbe()
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "api_key": "extended-key",
+                },
+            }
+        )
+        assert status.authenticated is True
+        assert status.ready is True
+        assert status.balance_count == 0
+        assert status.position_count == 0
+
+    asyncio.run(run())
+
+
+def test_extended_account_probe_treats_missing_balance_and_position_rows_as_empty_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/user/account/info":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "subAccountId": "extended-subaccount",
+                        "status": "OK",
+                        "equity": "0",
+                        "availableForTrade": "0",
+                    }
+                },
+            )
+        if request.url.path in {"/api/v1/user/balance", "/api/v1/user/positions"}:
+            return httpx.Response(404, json={"error": "NOT_FOUND"})
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        probe = ExtendedAccountProbe()
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "api_key": "extended-key",
+                },
+            }
+        )
+        assert status.authenticated is True
+        assert status.ready is True
+        assert status.balance_count == 0
+        assert status.position_count == 0
+
+    asyncio.run(run())
+
+
 def test_paradex_account_probe_requires_private_key_or_bearer_override() -> None:
     async def run() -> None:
         probe = ParadexAccountProbe()
