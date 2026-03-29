@@ -26,17 +26,29 @@ async def _run_with_client(
 def test_extended_connector_parses_stats_and_top_of_book() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
-        if request.url.path.endswith("/stats"):
+        if request.url.path == "/api/v1/info/markets":
+            assert request.url.params["market"] == "STRK-USD"
             return httpx.Response(
                 200,
                 json={
                     "status": "OK",
-                    "data": {
-                        "markPrice": "0.03448",
-                        "fundingRate": "0.000013",
-                        "openInterest": "280337.789214",
-                        "dailyVolume": "157165.809800",
-                    },
+                    "data": [
+                        {
+                            "name": "STRK-USD",
+                            "tradingConfig": {
+                                "minOrderSize": "10",
+                                "minOrderSizeChange": "1",
+                                "minPriceChange": "0.00001",
+                                "maxLimitOrderValue": "1250000",
+                            },
+                            "marketStats": {
+                                "markPrice": "0.03448",
+                                "fundingRate": "0.000013",
+                                "openInterest": "280337.789214",
+                                "dailyVolume": "157165.809800",
+                            },
+                        }
+                    ],
                 },
             )
         return httpx.Response(
@@ -63,11 +75,86 @@ def test_extended_connector_parses_stats_and_top_of_book() -> None:
         assert stats.open_interest == pytest.approx(280337.789214)
         assert stats.daily_volume == pytest.approx(157165.8098)
         assert isinstance(stats.raw, dict)
-        assert stats.raw["status"] == "OK"
+        assert stats.raw["tradingConfig"]["minOrderSizeChange"] == "1"
         assert book.best_bid_price == pytest.approx(0.03448)
         assert book.best_bid_size == pytest.approx(117410.0)
         assert book.best_ask_price == pytest.approx(0.03449)
         assert book.best_ask_size == pytest.approx(28990.0)
+
+    asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
+
+
+def test_extended_connector_raises_for_missing_market_stats_in_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": [
+                    {
+                        "name": "STRK-USD",
+                        "tradingConfig": {},
+                    }
+                ],
+            },
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ExtendedPublicConnector(client)
+        with pytest.raises(ConnectorError, match="missing marketStats"):
+            await connector.fetch_market_stats("STRK-USD")
+
+    asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
+
+
+def test_extended_connector_raises_for_unknown_symbol_in_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": [
+                    {
+                        "name": "OTHER-USD",
+                        "marketStats": {},
+                    }
+                ],
+            },
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ExtendedPublicConnector(client)
+        with pytest.raises(ConnectorError, match="Extended market STRK-USD not found"):
+            await connector.fetch_market_stats("STRK-USD")
+
+    asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
+
+
+def test_extended_connector_parses_legacy_dict_payload() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": {
+                    "markPrice": "0.03448",
+                    "fundingRate": "0.000013",
+                    "openInterest": "280337.789214",
+                    "dailyVolume": "157165.809800",
+                },
+            },
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ExtendedPublicConnector(client)
+        stats = await connector.fetch_market_stats("STRK-USD")
+
+        assert stats.mark_price == pytest.approx(0.03448)
+        assert stats.funding_rate == pytest.approx(0.000013)
+        assert stats.open_interest == pytest.approx(280337.789214)
+        assert stats.daily_volume == pytest.approx(157165.8098)
+        assert isinstance(stats.raw, dict)
+        assert "tradingConfig" not in stats.raw
 
     asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
 
@@ -87,6 +174,21 @@ def test_paradex_connector_parses_stats_and_top_of_book() -> None:
                             "funding_rate": "-0.00041270496476",
                             "open_interest": "1351727.4",
                             "volume_24h": "22989.54947000001",
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/v1/markets":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "symbol": "ARB-USD-PERP",
+                            "price_tick_size": "0.0001",
+                            "order_size_increment": "0.1",
+                            "min_notional": "10",
+                            "max_order_size": "12000000",
                         }
                     ]
                 },
@@ -113,7 +215,8 @@ def test_paradex_connector_parses_stats_and_top_of_book() -> None:
         assert stats.open_interest == pytest.approx(1351727.4)
         assert stats.daily_volume == pytest.approx(22989.54947000001)
         assert isinstance(stats.raw, dict)
-        assert len(stats.raw["results"]) == 1
+        assert stats.raw["price_tick_size"] == "0.0001"
+        assert stats.raw["config"]["order_size_increment"] == "0.1"
         assert book.best_bid_price == pytest.approx(0.0913)
         assert book.best_bid_size == pytest.approx(42584.8)
         assert book.best_ask_price == pytest.approx(0.0919)
@@ -272,7 +375,7 @@ def test_extended_connector_raises_for_invalid_numeric_values() -> None:
 
 def test_extended_connector_rejects_missing_data_object() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/stats"):
+        if request.url.path == "/api/v1/info/markets":
             return httpx.Response(200, json={"status": "OK"})
         return httpx.Response(200, json={"status": "OK", "data": "not-a-dict"})
 
@@ -314,7 +417,9 @@ def test_paradex_connector_does_not_retry_client_errors() -> None:
         connector = ParadexPublicConnector(client, base_backoff_seconds=0.0)
         with pytest.raises(ConnectorError, match="status 404"):
             await connector.fetch_market_stats("ARB-USD-PERP")
-        assert attempts == 1
+        # test_paradex_connector_does_not_retry_client_errors still sees 2 initial
+        # requests because fetch_market_stats issues both metadata calls concurrently.
+        assert attempts == 2
 
     asyncio.run(_run_with_client("https://api.prod.paradex.trade", handler, exercise))
 
