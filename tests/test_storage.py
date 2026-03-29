@@ -2231,3 +2231,84 @@ def test_execution_observation_store_rejects_non_positive_limits(
 
     with pytest.raises(ValueError, match="limit must be at least 1"):
         store.list_recent(limit=invalid_limit)
+
+
+def test_execution_journal_store_lists_entries_for_paper_trade(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = PaperTradeEntry(
+        entry_id=7,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0005,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 1, tzinfo=UTC),
+            adapter="extended_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            paper_trade=paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                )
+            ],
+        )
+    )
+    store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 2, tzinfo=UTC),
+            adapter="paradex_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            paper_trade=paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                )
+            ],
+        )
+    )
+
+    results = store.list_for_paper_trade(7, limit=10)
+
+    assert len(results) == 2
+    assert results[0].adapter == "paradex_live"
+    assert results[1].adapter == "extended_live"

@@ -8,6 +8,7 @@ import carryme_models as carryme_models_module
 import pytest
 from carryme_api.app import (
     app,
+    get_execution_accounting_service,
     get_execution_quality_service,
     get_history_store,
     get_opportunity_service,
@@ -19,6 +20,7 @@ from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
     CleanupPreviewConfirmationEntry,
+    ExecutionAccountingSummary,
     ExecutionAlertEvent,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
@@ -40,10 +42,12 @@ from carryme_models import (
     FundingUniverseScan,
     FundingUniverseVenueMarket,
     OpportunityRecord,
+    PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
+    RouteAccountingSummary,
     RouteStabilitySummary,
     TradeLegIntent,
     VenueAccountPreflight,
@@ -603,6 +607,99 @@ def test_route_stability_endpoint_uses_service_dependency() -> None:
     assert payload[0]["stability_weight"] == 0.6
     assert captured["min_sample_size"] == 2
     assert captured["min_presence_ratio"] == 0.5
+
+
+def test_execution_accounting_latest_endpoint_uses_service_dependency() -> None:
+    class StubAccountingService:
+        def latest_for_paper_trade(self, paper_trade_id: int) -> PaperTradeAccountingSummary | None:
+            assert paper_trade_id == 7
+            return PaperTradeAccountingSummary(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                execution_count=2,
+                latest_executed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+                total_filled_notional=21.31,
+                total_estimated_fee_paid=0.004262,
+                entries=[
+                    ExecutionAccountingSummary(
+                        execution_entry_id=12,
+                        paper_trade_id=7,
+                        label="arb_extended_paradex",
+                        canonical_symbol="ARB-USD-PERP",
+                        adapter="paradex_cleanup_live",
+                        mode="live",
+                        status="submitted",
+                        executed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+                        total_leg_count=1,
+                        filled_leg_count=1,
+                        total_filled_notional=21.31,
+                        total_estimated_fee_paid=0.004262,
+                        legs=[],
+                        notes=[],
+                    )
+                ],
+            )
+
+    app.dependency_overrides[get_execution_accounting_service] = (
+        lambda: StubAccountingService()
+    )
+    client = TestClient(app)
+
+    response = client.get("/v1/executions/accounting/latest/from-paper-trade/7")
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == 7
+    assert payload["total_estimated_fee_paid"] == 0.004262
+
+
+def test_execution_accounting_routes_endpoint_uses_service_dependency() -> None:
+    class StubAccountingService:
+        def list_route_summaries(
+            self,
+            *,
+            canonical_symbol: str | None = None,
+            label: str | None = None,
+            limit: int = 50,
+        ) -> list[RouteAccountingSummary]:
+            assert canonical_symbol == "ARB-USD-PERP"
+            assert label is None
+            assert limit == 5
+            return [
+                RouteAccountingSummary(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    short_venue="extended",
+                    long_venue="paradex",
+                    short_fee_profile="default",
+                    long_fee_profile="pro",
+                    execution_count=3,
+                    paper_trade_count=1,
+                    latest_executed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+                    total_filled_notional=42.0,
+                    total_estimated_fee_paid=0.0084,
+                )
+            ]
+
+    app.dependency_overrides[get_execution_accounting_service] = (
+        lambda: StubAccountingService()
+    )
+    client = TestClient(app)
+
+    response = client.get(
+        "/v1/executions/accounting/routes",
+        params=[("canonical_symbol", "ARB-USD-PERP"), ("limit", "5")],
+    )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload[0]["label"] == "arb_extended_paradex"
+    assert payload[0]["total_estimated_fee_paid"] == 0.0084
 
 
 def test_route_stability_service_provider_uses_shared_history_store(tmp_path: Path) -> None:

@@ -34,11 +34,13 @@ from carryme_models import (
     LiveSubmissionReadiness,
     OpportunityRecord,
     PairClosePreviewConfirmationEntry,
+    PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
+    RouteAccountingSummary,
     RouteStabilitySummary,
     ServiceHealth,
     TradingFeeProfile,
@@ -53,6 +55,7 @@ from carryme_runtime import (
     CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
     ConnectorError,
+    ExecutionAccountingService,
     ExecutionAdapter,
     ExecutionOrderStateService,
     ExecutionQualityService,
@@ -443,6 +446,14 @@ def get_execution_adapter() -> ExecutionAdapter:
     """Return the default explicitly simulated execution adapter."""
 
     return MockExecutionAdapter()
+
+
+def get_execution_accounting_service(
+    store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+) -> ExecutionAccountingService:
+    """Return the derived execution accounting service."""
+
+    return ExecutionAccountingService(journal_store=store)
 
 
 def get_paradex_live_execution_service(
@@ -3456,6 +3467,41 @@ def create_app() -> FastAPI:
             short_venue=short_venue,
             long_venue=long_venue,
             min_sample_size=min_sample_size,
+            limit=limit,
+        )
+
+    @app.get(
+        "/v1/executions/accounting/latest/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeAccountingSummary,
+    )
+    async def execution_accounting_for_paper_trade(
+        paper_trade_id: int,
+        service: Annotated[
+            ExecutionAccountingService, Depends(get_execution_accounting_service)
+        ],
+    ) -> PaperTradeAccountingSummary:
+        summary = service.latest_for_paper_trade(paper_trade_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="No execution accounting found")
+        return summary
+
+    @app.get(
+        "/v1/executions/accounting/routes",
+        response_model=list[RouteAccountingSummary],
+    )
+    async def execution_accounting_routes(
+        service: Annotated[
+            ExecutionAccountingService, Depends(get_execution_accounting_service)
+        ],
+        canonical_symbol: str | None = None,
+        label: str | None = None,
+        limit: int = 50,
+    ) -> list[RouteAccountingSummary]:
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return service.list_route_summaries(
+            canonical_symbol=canonical_symbol,
+            label=label,
             limit=limit,
         )
 
