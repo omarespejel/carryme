@@ -396,10 +396,7 @@ def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
 
 def test_execution_quality_service_provider_uses_shared_stores(tmp_path: Path) -> None:
     settings = ApiSettings(database_path=str(tmp_path / "quality.sqlite3"))
-    service = get_execution_quality_service(
-        journal_store=ExecutionJournalStore(settings.database_path),
-        observation_store=ExecutionObservationStore(settings.database_path),
-    )
+    service = get_execution_quality_service(settings)
 
     assert service.journal_store.database_path == Path(settings.database_path)
     assert service.observation_store.database_path == Path(settings.database_path)

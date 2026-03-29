@@ -79,7 +79,6 @@ from carryme_runtime import (
     require_confirmed_cleanup_preview,
     require_confirmed_preview,
 )
-from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_runtime.account_preflight import (
     ExtendedAccountProbe,
     HyperliquidAccountProbe,
@@ -89,6 +88,7 @@ from carryme_runtime.account_preflight import (
     _row_represents_open_position,
 )
 from carryme_runtime.execution_quality import ExecutionQualityService
+from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import ExecutionJournalStore, ExecutionObservationStore
 
 
@@ -227,8 +227,8 @@ def test_opportunity_universe_service_ranks_by_deployable_round_trip_pnl() -> No
 
     async def run() -> None:
         service = OpportunityUniverseService(
-            list_symbols=list_symbols,
-            fetch_snapshot=fetch_snapshot,
+            list_symbols=cast(Any, list_symbols),
+            fetch_snapshot=cast(Any, fetch_snapshot),
         )
         scan = await service.scan(
             venues=["extended", "paradex", "hyperliquid"],
@@ -343,8 +343,8 @@ def test_opportunity_universe_service_filters_thin_markets_for_quality_scan() ->
 
     async def run() -> None:
         service = OpportunityUniverseService(
-            list_symbols=list_symbols,
-            fetch_snapshot=fetch_snapshot,
+            list_symbols=cast(Any, list_symbols),
+            fetch_snapshot=cast(Any, fetch_snapshot),
         )
         scan = await service.scan(
             venues=["extended", "paradex"],
@@ -656,7 +656,17 @@ def test_execution_quality_service_caps_after_latest_per_trade(tmp_path: Path) -
                         ),
                     ),
                 ),
-                legs=[],
+                legs=[
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                    )
+                ],
             )
         )
 
@@ -1054,8 +1064,8 @@ def test_opportunity_universe_service_rejects_invalid_ranking() -> None:
 
     async def run() -> None:
         service = OpportunityUniverseService(
-            list_symbols=list_symbols,
-            fetch_snapshot=fetch_snapshot,
+            list_symbols=cast(Any, list_symbols),
+            fetch_snapshot=cast(Any, fetch_snapshot),
         )
         with pytest.raises(ValueError, match="Unsupported ranking: typo-ranking"):
             await service.scan(
