@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -5,6 +6,8 @@ import pytest
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
+    CleanupPreviewConfirmationEntry,
+    ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionLegResult,
     FundingArbOpportunity,
@@ -19,6 +22,7 @@ from carryme_models import (
 )
 from carryme_storage import (
     CandidateAlertStore,
+    CleanupPreviewConfirmationStore,
     ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
@@ -457,6 +461,21 @@ def test_execution_journal_store_reserves_live_submission_once(tmp_path: Path) -
     )
 
 
+def test_execution_journal_store_allows_same_confirmation_id_for_different_hashes(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_live_submission(
+        confirmation_entry_id=11,
+        preview_hash="preview-hash",
+    )
+    assert store.reserve_live_submission(
+        confirmation_entry_id=11,
+        preview_hash="cleanup-hash",
+    )
+
+
 def test_execution_journal_store_finds_entry_by_confirmation_entry_id(tmp_path: Path) -> None:
     store = ExecutionJournalStore(tmp_path / "history.sqlite3")
     saved = store.append(
@@ -521,6 +540,94 @@ def test_execution_journal_store_finds_entry_by_confirmation_entry_id(tmp_path: 
     assert found.confirmation_entry_id == 11
     assert found.legs[0].request_payload == ["raw", "request"]
     assert found.legs[0].response_payload == ["raw", "response"]
+
+
+def test_execution_journal_store_finds_entry_by_confirmation_and_hash(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    preview_entry = store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="paradex_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=11,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    status="submitted",
+                    simulated=False,
+                )
+            ],
+        )
+    )
+    cleanup_entry = store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+            adapter="extended_cleanup_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="cleanup-hash",
+            confirmation_entry_id=11,
+            paper_trade=preview_entry.paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=1000.0,
+                    status="submitted",
+                    simulated=False,
+                )
+            ],
+        )
+    )
+
+    found = store.find_by_confirmation(
+        confirmation_entry_id=11,
+        preview_hash="cleanup-hash",
+    )
+
+    assert found is not None
+    assert found.entry_id == cleanup_entry.entry_id
+    assert found.preview_hash == "cleanup-hash"
 
 
 def test_execution_journal_store_treats_blank_label_as_unfiltered(tmp_path: Path) -> None:
@@ -639,6 +746,70 @@ def test_execution_journal_store_rejects_whitespace_only_labels(tmp_path: Path) 
         )
 
     assert store.list_recent(limit=10) == []
+
+
+def test_execution_journal_store_normalizes_preview_hashes_on_append(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    saved = store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="extended_cleanup_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash=" cleanup-hash ",
+            confirmation_entry_id=11,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=1000.0,
+                    status="submitted",
+                    simulated=False,
+                )
+            ],
+        )
+    )
+
+    assert saved.preview_hash == "cleanup-hash"
+    found = store.find_by_confirmation(
+        confirmation_entry_id=11,
+        preview_hash="cleanup-hash",
+    )
+    assert found is not None
+    assert found.preview_hash == "cleanup-hash"
 
 
 def test_execution_journal_store_normalizes_executed_at_to_utc(tmp_path: Path) -> None:
@@ -1303,6 +1474,176 @@ def test_preview_confirmation_store_rejects_whitespace_only_hash_lookup(
             paper_trade_id=7,
             preview_hash="  ",
         )
+
+
+def test_cleanup_preview_confirmation_store_finds_latest_by_preview_hash(tmp_path: Path) -> None:
+    store = CleanupPreviewConfirmationStore(tmp_path / "history.sqlite3")
+    store.append(
+        CleanupPreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            preview_hash="cleanup-hash",
+            preview=ExecutionCleanupPreview(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                preview_hash="cleanup-hash",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=500.0,
+                    quantity=5422.0,
+                    quantity_text="5422",
+                    reference_price=0.0921,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0922,
+                    worst_price_text="0.0922",
+                    endpoint_path_hint="/api/v1/user/order",
+                    auth_scheme="api key + Stark signing key",
+                    reduce_only=True,
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+                notes=["first"],
+            ),
+            note="first cleanup confirmation",
+        )
+    )
+    latest = store.append(
+        CleanupPreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            preview_hash=" cleanup-hash ",
+            preview=ExecutionCleanupPreview(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                generated_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+                preview_hash="cleanup-hash",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=500.0,
+                    quantity=5422.0,
+                    quantity_text="5422",
+                    reference_price=0.0921,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0922,
+                    worst_price_text="0.0922",
+                    endpoint_path_hint="/api/v1/user/order",
+                    auth_scheme="api key + Stark signing key",
+                    reduce_only=True,
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+                notes=["latest"],
+            ),
+            note="latest cleanup confirmation",
+        )
+    )
+
+    found = store.find_latest_by_preview_hash(
+        paper_trade_id=7,
+        preview_hash=" cleanup-hash ",
+    )
+
+    assert found is not None
+    assert found.entry_id == latest.entry_id
+    assert found.preview_hash == "cleanup-hash"
+
+
+def test_cleanup_preview_confirmation_store_backfills_legacy_whitespace_hashes(
+    tmp_path: Path,
+) -> None:
+    store = CleanupPreviewConfirmationStore(tmp_path / "history.sqlite3")
+    legacy_entry = CleanupPreviewConfirmationEntry(
+        confirmed_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+        paper_trade_id=7,
+        label=" arb_extended_paradex ",
+        preview_hash=" cleanup-hash ",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            generated_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+            preview_hash=" cleanup-hash ",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=500.0,
+                quantity=5422.0,
+                quantity_text="5422",
+                reference_price=0.0921,
+                reference_price_source="best_ask",
+                worst_acceptable_price=0.0922,
+                worst_price_text="0.0922",
+                endpoint_path_hint="/api/v1/user/order",
+                auth_scheme="api key + Stark signing key",
+                reduce_only=True,
+                payload={"symbol": "ARB-USD", "reduce_only": True},
+                notes=[],
+            ),
+            notes=["latest"],
+        ),
+        note="legacy cleanup confirmation",
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO cleanup_preview_confirmation_entries (
+                confirmed_at,
+                paper_trade_id,
+                label,
+                preview_hash,
+                entry_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                legacy_entry.confirmed_at.isoformat(),
+                legacy_entry.paper_trade_id,
+                legacy_entry.label,
+                legacy_entry.preview_hash,
+                legacy_entry.model_dump_json(),
+            ),
+        )
+        legacy_id = cursor.lastrowid
+
+    found = store.find_latest_by_preview_hash(
+        paper_trade_id=7,
+        preview_hash="cleanup-hash",
+    )
+
+    assert found is not None
+    assert found.entry_id == legacy_id
+    assert found.label == "arb_extended_paradex"
+    assert found.preview_hash == "cleanup-hash"
+    assert found.preview.preview_hash == "cleanup-hash"
+
+    with sqlite3.connect(store.database_path) as connection:
+        stored = connection.execute(
+            """
+            SELECT label, preview_hash, entry_json
+            FROM cleanup_preview_confirmation_entries
+            WHERE id = ?
+            """,
+            (legacy_id,),
+        ).fetchone()
+
+    assert stored is not None
+    stored_label, stored_preview_hash, stored_entry_json = stored
+    assert stored_label == "arb_extended_paradex"
+    assert stored_preview_hash == "cleanup-hash"
+    assert '"label":"arb_extended_paradex"' in stored_entry_json
+    assert '"preview_hash":"cleanup-hash"' in stored_entry_json
 
 
 def test_preview_confirmation_store_normalizes_labels_and_hashes(tmp_path: Path) -> None:

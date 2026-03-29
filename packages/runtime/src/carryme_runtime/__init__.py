@@ -8,6 +8,7 @@ from carryme_runtime.account_preflight import (
     VenueAccountProbe,
 )
 from carryme_runtime.candidates import filter_candidate_records
+from carryme_runtime.cleanup_live_execution import CleanupLiveExecutionRouter
 from carryme_runtime.cleanup_preview import CleanupPreviewRouter
 from carryme_runtime.confirmation import (
     require_confirmed_cleanup_preview,
@@ -43,6 +44,7 @@ from carryme_runtime.readiness import build_live_submission_readiness
 __all__ = [
     "AccountPreflightConfigMap",
     "AccountPreflightService",
+    "CleanupLiveExecutionRouter",
     "CleanupPreviewRouter",
     "ExecutionAdapter",
     "ExecutionOrderStateService",

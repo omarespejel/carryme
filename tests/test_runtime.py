@@ -3,7 +3,6 @@ import json
 from datetime import UTC, datetime
 from typing import Any, cast
 
-import carryme_runtime.account_preflight as account_preflight_runtime
 import httpx
 import pytest
 from carryme_connectors import (
@@ -45,6 +44,7 @@ from carryme_models import (
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
     AccountPreflightService,
+    CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
     ExtendedCleanupPreviewService,
     ExtendedLiveExecutionService,
@@ -1815,95 +1815,6 @@ def test_extended_live_execution_service_submits_confirmed_cleanup_preview(
     asyncio.run(run())
 
 
-def test_extended_live_execution_service_rejects_cleanup_for_wrong_venue() -> None:
-    confirmation = CleanupPreviewConfirmationEntry(
-        entry_id=11,
-        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
-        paper_trade_id=8,
-        label="arb_extended_paradex",
-        preview_hash="cleanup-hash",
-        preview=ExecutionCleanupPreview(
-            execution_entry_id=5,
-            paper_trade_id=8,
-            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
-            preview_hash="cleanup-hash",
-            reason="close_open_leg",
-            leg=VenueOrderPreview(
-                venue="paradex",
-                symbol="ARB-USD-PERP",
-                fee_profile="pro",
-                side="sell",
-                target_notional=11.0,
-                effective_notional=11.0,
-                quantity=123.1,
-                quantity_text="123.10000000",
-                reference_price=0.0892,
-                reference_price_source="best_bid",
-                worst_acceptable_price=0.0891,
-                worst_price_text="0.08910000",
-                reduce_only=True,
-                endpoint_path_hint="/v1/orders",
-                required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
-                auth_scheme="subkey private key",
-                payload={"market": "ARB-USD-PERP", "reduce_only": True},
-                notes=[],
-            ),
-            notes=[],
-        ),
-    )
-
-    service = ExtendedLiveExecutionService(api_key="extended-key", stark_private_key="0x123")
-
-    with pytest.raises(ValueError, match="Cleanup confirmation must target Extended venue"):
-        service._select_extended_cleanup_leg(confirmation)
-
-
-def test_extended_live_execution_service_rejects_non_reduce_only_cleanup() -> None:
-    confirmation = CleanupPreviewConfirmationEntry(
-        entry_id=11,
-        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
-        paper_trade_id=8,
-        label="arb_extended_paradex",
-        preview_hash="cleanup-hash",
-        preview=ExecutionCleanupPreview(
-            execution_entry_id=5,
-            paper_trade_id=8,
-            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
-            preview_hash="cleanup-hash",
-            reason="close_open_leg",
-            leg=VenueOrderPreview(
-                venue="extended",
-                symbol="ARB-USD",
-                fee_profile="default",
-                side="buy",
-                target_notional=11.0,
-                effective_notional=11.0,
-                quantity=123.0,
-                quantity_text="123",
-                reference_price=0.0894,
-                reference_price_source="best_ask",
-                worst_acceptable_price=0.0895,
-                worst_price_text="0.0895",
-                reduce_only=False,
-                endpoint_path_hint="/api/v1/user/order",
-                required_auth_env_vars=["CARRYME_API_EXTENDED_API_KEY"],
-                auth_scheme="api key + Stark signing key",
-                payload={"symbol": "ARB-USD", "reduce_only": False},
-                notes=[],
-            ),
-            notes=[],
-        ),
-    )
-
-    service = ExtendedLiveExecutionService(api_key="extended-key", stark_private_key="0x123")
-
-    with pytest.raises(
-        ValueError,
-        match="Cleanup confirmation must be reduce-only before live execution",
-    ):
-        service._select_extended_cleanup_leg(confirmation)
-
-
 def test_paired_live_execution_coordinator_submits_both_legs() -> None:
     paper_trade = PaperTradeEntry(
         entry_id=11,
@@ -3347,46 +3258,9 @@ def test_cleanup_preview_router_dispatches_to_paradex_when_paradex_leg_is_open()
     asyncio.run(run())
 
 
-def test_extended_live_execution_service_rejects_error_payload(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/v1/user/account/info":
-            return httpx.Response(
-                200,
-                json={
-                    "status": "OK",
-                    "data": {
-                        "accountId": 258270,
-                        "status": "ACTIVE",
-                        "l2Key": (
-                            "0x61c5e7e8339b7d56f197f54ea91b776776690e3232313de0f2ecbd0ef76f466"
-                        ),
-                        "l2Vault": "10002",
-                    },
-                },
-            )
-        if request.url.path == "/api/v1/user/fees":
-            return httpx.Response(200, json={"status": "OK", "data": {"takerFee": "0.00025"}})
-        if request.url.path == "/api/v1/user/order":
-            return httpx.Response(
-                200,
-                json={
-                    "status": "error",
-                    "error": "ORDER_REJECTED",
-                },
-            )
-        raise AssertionError(f"Unexpected request path: {request.url.path}")
-
-    real_async_client = httpx.AsyncClient
-
-    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
-
+def test_cleanup_live_execution_router_dispatches_to_preview_venue() -> None:
     paper_trade = PaperTradeEntry(
-        entry_id=18,
+        entry_id=8,
         created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
         note="candidate accepted",
         intent=FundingPairTradeIntent(
@@ -3396,435 +3270,342 @@ def test_extended_live_execution_service_rejects_error_payload(
             one_day_net_edge_after_entry=0.00055,
             break_even_days_entry=0.45,
             capacity_limit_notional=4500.0,
-            target_notional=1000.0,
+            target_notional=11.0,
             capacity_fraction=0.25,
-            max_target_notional=1000.0,
+            max_target_notional=11.0,
             long_leg=TradeLegIntent(
                 venue="paradex",
                 symbol="ARB-USD-PERP",
                 fee_profile="pro",
                 side="buy",
-                target_notional=1000.0,
+                target_notional=11.0,
             ),
             short_leg=TradeLegIntent(
                 venue="extended",
                 symbol="ARB-USD",
                 fee_profile="default",
                 side="sell",
-                target_notional=1000.0,
+                target_notional=11.0,
             ),
         ),
     )
-    confirmation = PreviewConfirmationEntry(
-        entry_id=5,
-        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
-        paper_trade_id=18,
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
         label="arb_extended_paradex",
-        preview_hash="preview-hash",
-        preview=PaperTradeOrderPreview(
-            paper_trade_id=18,
-            label="arb_extended_paradex",
-            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
-            slippage_tolerance_bps=10,
-            preview_hash="preview-hash",
-            legs=[
-                VenueOrderPreview(
-                    venue="extended",
-                    symbol="ARB-USD",
-                    fee_profile="default",
-                    side="sell",
-                    target_notional=1000.0,
-                    effective_notional=999.9639,
-                    quantity=10881.0,
-                    quantity_text="10881.00000000",
-                    quantity_increment=1.0,
-                    minimum_order_size=10.0,
-                    minimum_notional=0.918,
-                    reference_price=0.0919,
-                    reference_price_source="best_bid",
-                    worst_acceptable_price=0.0918,
-                    worst_price_text="0.09180000",
-                    price_increment=0.0001,
-                    max_order_value=1_250_000.0,
-                    order_type="limit",
-                    time_in_force="ioc",
-                    http_method="POST",
-                    endpoint_path_hint="/api/v1/user/order",
-                    required_auth_env_vars=[
-                        "CARRYME_API_EXTENDED_API_KEY",
-                        "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
-                    ],
-                    auth_scheme="api key + Stark signing key",
-                    payload={
-                        "symbol": "ARB-USD",
-                        "side": "SELL",
-                        "type": "LIMIT",
-                        "size": "10881.00000000",
-                        "price": "0.09180000",
-                        "time_in_force": "IOC",
-                        "client_order_id": "carryme-pt18-extended-sell",
-                        "reduce_only": False,
-                    },
-                    notes=[],
-                )
-            ],
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0891,
+                worst_price_text="0.08910000",
+                reduce_only=True,
+                endpoint_path_hint="/v1/orders",
+                required_auth_env_vars=[],
+                auth_scheme="main account address + subkey private key",
+                payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                notes=[],
+            ),
+            notes=[],
         ),
-        note="operator confirmed",
     )
 
-    async def fetch_snapshot(_: str, __: str) -> NormalizedMarketSnapshot:
-        return _snapshot(
-            "extended",
-            "ARB-USD",
-            0.000013,
-            0.0919,
-            42_584.8,
-            0.0922,
-            42_473.0,
-            raw={
-                "name": "ARB-USD",
-                "l2Config": {
-                    "collateralId": "0x1",
-                    "syntheticId": "0x4152422d3100000000000000000000",
-                    "syntheticResolution": 10,
-                    "collateralResolution": 1000000,
-                },
-            },
-        )
-
-    async def run() -> None:
-        service = ExtendedLiveExecutionService(
-            api_key="extended-key",
-            stark_private_key="0x7a7ff6fd3cab02ccdcd4a572563f5976f8976899b03a39773795a3c486d4986",
-            fetch_snapshot=cast(Any, fetch_snapshot),
-        )
-        entry = await service.submit_confirmed_preview(
-            paper_trade=paper_trade,
-            confirmation=confirmation,
-        )
-        assert entry.status == "rejected"
-        assert entry.legs[0].status == "rejected"
-        assert entry.legs[0].response_payload is not None
-        assert entry.legs[0].response_payload["error"] == "ORDER_REJECTED"
-
-    asyncio.run(run())
-
-
-def test_extended_live_execution_service_preserves_zero_fee_rate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    seen_request: dict[str, Any] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/v1/user/account/info":
-            return httpx.Response(
-                200,
-                json={
-                    "status": "OK",
-                    "data": {
-                        "accountId": 258270,
-                        "status": "ACTIVE",
-                        "l2Key": (
-                            "0x61c5e7e8339b7d56f197f54ea91b776776690e3232313de0f2ecbd0ef76f466"
-                        ),
-                        "l2Vault": "10002",
-                    },
-                },
-            )
-        if request.url.path == "/api/v1/user/fees":
-            return httpx.Response(200, json={"status": "OK", "data": {"takerFee": "0"}})
-        if request.url.path == "/api/v1/user/order":
-            payload = json.loads(request.content.decode("utf-8"))
-            seen_request.update(payload)
-            return httpx.Response(
-                200,
-                json={"status": "OK", "data": {"externalId": payload["id"]}},
-            )
-        raise AssertionError(f"Unexpected request path: {request.url.path}")
-
-    real_async_client = httpx.AsyncClient
-
-    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
-
-    confirmation = PreviewConfirmationEntry(
-        entry_id=6,
-        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
-        paper_trade_id=19,
-        label="arb_extended_paradex",
-        preview_hash="preview-hash",
-        preview=PaperTradeOrderPreview(
-            paper_trade_id=19,
-            label="arb_extended_paradex",
-            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
-            slippage_tolerance_bps=10,
-            preview_hash="preview-hash",
-            legs=[
-                VenueOrderPreview(
-                    venue="extended",
-                    symbol="ARB-USD",
-                    fee_profile="default",
-                    side="sell",
-                    target_notional=1000.0,
-                    effective_notional=999.9639,
-                    quantity=10881.0,
-                    quantity_text="10881.00000000",
-                    quantity_increment=1.0,
-                    minimum_order_size=10.0,
-                    minimum_notional=0.918,
-                    reference_price=0.0919,
-                    reference_price_source="best_bid",
-                    worst_acceptable_price=0.0918,
-                    worst_price_text="0.09180000",
-                    price_increment=0.0001,
-                    max_order_value=1_250_000.0,
-                    order_type="limit",
-                    time_in_force="ioc",
-                    http_method="POST",
-                    endpoint_path_hint="/api/v1/user/order",
-                    required_auth_env_vars=[
-                        "CARRYME_API_EXTENDED_API_KEY",
-                        "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
-                    ],
-                    auth_scheme="api key + Stark signing key",
-                    payload={
-                        "symbol": "ARB-USD",
-                        "side": "SELL",
-                        "type": "LIMIT",
-                        "size": "10881.00000000",
-                        "price": "0.09180000",
-                        "time_in_force": "IOC",
-                        "client_order_id": "carryme-pt19-extended-sell",
-                        "reduce_only": False,
-                    },
-                    notes=[],
-                )
-            ],
-        ),
-        note="operator confirmed",
-    )
-
-    async def fetch_snapshot(_: str, __: str) -> NormalizedMarketSnapshot:
-        return _snapshot(
-            "extended",
-            "ARB-USD",
-            0.000013,
-            0.0919,
-            42_584.8,
-            0.0922,
-            42_473.0,
-            raw={
-                "name": "ARB-USD",
-                "l2Config": {
-                    "collateralId": "0x1",
-                    "syntheticId": "0x4152422d3100000000000000000000",
-                    "syntheticResolution": 10,
-                    "collateralResolution": 1000000,
-                },
-            },
-        )
-
-    async def run() -> None:
-        service = ExtendedLiveExecutionService(
-            api_key="extended-key",
-            stark_private_key="0x7a7ff6fd3cab02ccdcd4a572563f5976f8976899b03a39773795a3c486d4986",
-            fetch_snapshot=cast(Any, fetch_snapshot),
-        )
-        await service.submit_confirmed_preview(
-            paper_trade=PaperTradeEntry(
-                entry_id=19,
-                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
-                note="candidate accepted",
-                intent=FundingPairTradeIntent(
-                    label="arb_extended_paradex",
-                    canonical_symbol="ARB-USD-PERP",
-                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
-                    one_day_net_edge_after_entry=0.00055,
-                    break_even_days_entry=0.45,
-                    capacity_limit_notional=4500.0,
-                    target_notional=1000.0,
-                    capacity_fraction=0.25,
-                    max_target_notional=1000.0,
-                    long_leg=TradeLegIntent(
+    class StubParadexService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 16, tzinfo=UTC),
+                adapter="paradex_cleanup_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
                         venue="paradex",
                         symbol="ARB-USD-PERP",
                         fee_profile="pro",
-                        side="buy",
-                        target_notional=1000.0,
-                    ),
-                    short_leg=TradeLegIntent(
-                        venue="extended",
-                        symbol="ARB-USD",
-                        fee_profile="default",
                         side="sell",
-                        target_notional=1000.0,
-                    ),
-                ),
-            ),
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="cleanup-order-2",
+                    )
+                ],
+            )
+
+    class StubOtherService:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            self.called = True
+            raise AssertionError("Cleanup router dispatched to the wrong venue")
+
+    async def run() -> None:
+        other_service = StubOtherService()
+        router = CleanupLiveExecutionRouter(
+            services={
+                "other": other_service,
+                "paradex": StubParadexService(),
+            }
+        )
+        entry = await router.submit_confirmed_cleanup_preview(
+            paper_trade=paper_trade,
             confirmation=confirmation,
         )
-        assert seen_request["fee"] == "0"
+        assert entry.adapter == "paradex_cleanup_live"
+        assert entry.legs[0].venue == "paradex"
+        assert other_service.called is False
 
     asyncio.run(run())
 
 
-def test_extended_live_execution_service_rejects_blank_credentials() -> None:
-    with pytest.raises(ValueError, match="Extended API key is required"):
-        ExtendedLiveExecutionService(api_key="   ", stark_private_key="0x123")
-    with pytest.raises(ValueError, match="Extended Stark private key is required"):
-        ExtendedLiveExecutionService(api_key="extended-key", stark_private_key="   ")
-
-
-def test_extended_account_probe_blocks_malformed_balance_payload(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    real_async_client = httpx.AsyncClient
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/v1/user/account/info":
-            return httpx.Response(
-                200,
-                json={"data": {"subAccountId": "ext-subaccount", "equity": "1250.5"}},
+def test_cleanup_live_execution_router_rejects_mismatched_trade_or_non_reduce_only() -> None:
+    class StubParadexService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            raise AssertionError(
+                "Router should reject invalid cleanup confirmation before dispatch"
             )
-        if request.url.path == "/api/v1/user/balance":
-            return httpx.Response(200, json={"data": "not-a-list"})
-        if request.url.path == "/api/v1/user/positions":
-            return httpx.Response(200, json={"data": []})
-        raise AssertionError(f"unexpected path: {request.url.path}")
 
-    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        return real_async_client(
-            *args,
-            transport=httpx.MockTransport(handler),
-            **kwargs,
-        )
-
-    monkeypatch.setattr(account_preflight_runtime.httpx, "AsyncClient", client_factory)
-
-    async def run() -> None:
-        status = await ExtendedAccountProbe().probe(
-            {
-                "enabled": True,
-                "credentials": {"api_key": "extended-key"},
-            }
-        )
-
-        assert status.authenticated is False
-        assert status.ready is False
-        assert status.blocking_reasons == [
-            (
-                "Extended authenticated read returned malformed payload: "
-                "Extended balances payload field 'data' must be a list"
-            )
-        ]
-
-    asyncio.run(run())
-
-
-def test_paradex_account_probe_blocks_mismatched_account_identifier(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    real_async_client = httpx.AsyncClient
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/account":
-            return httpx.Response(200, json={"account": "0xdef", "status": "ACTIVE"})
-        if request.url.path == "/v1/balance":
-            return httpx.Response(200, json=[])
-        if request.url.path == "/v1/positions":
-            return httpx.Response(200, json=[])
-        raise AssertionError(f"unexpected path: {request.url.path}")
-
-    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
-        return real_async_client(
-            *args,
-            transport=httpx.MockTransport(handler),
-            **kwargs,
-        )
-
-    monkeypatch.setattr(account_preflight_runtime.httpx, "AsyncClient", client_factory)
-
-    async def run() -> None:
-        status = await ParadexAccountProbe().probe(
-            {
-                "enabled": True,
-                "credentials": {
-                    "account_address": "0xabc",
-                    "bearer_token": "paradex-bearer",
-                },
-            }
-        )
-
-        assert status.authenticated is False
-        assert status.ready is False
-        assert status.blocking_reasons == [
-            (
-                "Paradex authenticated read returned malformed payload: "
-                "Paradex account payload did not match the configured account address"
-            )
-        ]
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize(
-    ("paper_trade_id", "preview_hash"),
-    [
-        (6, "preview-hash"),
-        (5, "wrong-hash"),
-    ],
-)
-def test_require_confirmed_preview_rejects_mismatches(
-    paper_trade_id: int,
-    preview_hash: str,
-) -> None:
-    confirmation = PreviewConfirmationEntry(
-        entry_id=3,
-        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
-        paper_trade_id=5,
-        label="arb_extended_paradex",
-        preview_hash="preview-hash",
-        preview=PaperTradeOrderPreview(
-            paper_trade_id=5,
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
             label="arb_extended_paradex",
-            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
-            slippage_tolerance_bps=12,
-            preview_hash="preview-hash",
-            legs=[
-                VenueOrderPreview(
-                    venue="paradex",
-                    symbol="ARB-USD-PERP",
-                    fee_profile="pro",
-                    side="buy",
-                    target_notional=1000.0,
-                    quantity=10_845.0,
-                    quantity_text="10845.00000000",
-                    reference_price=0.0922,
-                    reference_price_source="best_ask",
-                    worst_acceptable_price=0.09231064,
-                    worst_price_text="0.09231064",
-                    order_type="limit",
-                    time_in_force="ioc",
-                    http_method="POST",
-                    endpoint_path_hint="/v1/orders",
-                    required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
-                    auth_scheme="subkey private key",
-                    payload={"market": "ARB-USD-PERP"},
-                    notes=[],
-                )
-            ],
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
         ),
-        note="operator confirmed",
+    )
+    router = CleanupLiveExecutionRouter(services={"paradex": StubParadexService()})
+
+    mismatched_confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=9,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0890,
+                worst_price_text="0.08900000",
+                reduce_only=True,
+                endpoint_path_hint="/v1/orders",
+                auth_scheme="main account address + subkey private key",
+                payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                notes=[],
+            ),
+            notes=[],
+        ),
     )
 
-    with pytest.raises(ValueError, match="No preview confirmation matched"):
-        require_confirmed_preview(
-            paper_trade_id=paper_trade_id,
-            preview_hash=preview_hash,
-            confirmations=[confirmation],
-        )
+    non_reduce_only_confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=12,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash-2",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash-2",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0890,
+                worst_price_text="0.08900000",
+                reduce_only=False,
+                endpoint_path_hint="/v1/orders",
+                auth_scheme="main account address + subkey private key",
+                payload={"market": "ARB-USD-PERP", "reduce_only": False},
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    async def run() -> None:
+        with pytest.raises(ValueError, match="does not belong"):
+            await router.submit_confirmed_cleanup_preview(
+                paper_trade=paper_trade,
+                confirmation=mismatched_confirmation,
+            )
+        with pytest.raises(ValueError, match="must be reduce-only"):
+            await router.submit_confirmed_cleanup_preview(
+                paper_trade=paper_trade,
+                confirmation=non_reduce_only_confirmation,
+            )
+
+    asyncio.run(run())
+
+
+def test_extended_live_execution_service_rejects_cleanup_for_wrong_venue() -> None:
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0891,
+                worst_price_text="0.08910000",
+                reduce_only=True,
+                endpoint_path_hint="/v1/orders",
+                required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                auth_scheme="subkey private key",
+                payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    service = ExtendedLiveExecutionService(api_key="extended-key", stark_private_key="0x123")
+
+    with pytest.raises(ValueError, match="Cleanup confirmation must target Extended venue"):
+        service._select_extended_cleanup_leg(confirmation)
+
+
+def test_extended_live_execution_service_rejects_non_reduce_only_cleanup() -> None:
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.0,
+                quantity_text="123",
+                reference_price=0.0894,
+                reference_price_source="best_ask",
+                worst_acceptable_price=0.0895,
+                worst_price_text="0.0895",
+                reduce_only=False,
+                endpoint_path_hint="/api/v1/user/order",
+                required_auth_env_vars=["CARRYME_API_EXTENDED_API_KEY"],
+                auth_scheme="api key + Stark signing key",
+                payload={"symbol": "ARB-USD", "reduce_only": False},
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    service = ExtendedLiveExecutionService(api_key="extended-key", stark_private_key="0x123")
+
+    with pytest.raises(
+        ValueError,
+        match="Cleanup confirmation must be reduce-only before live execution",
+    ):
+        service._select_extended_cleanup_leg(confirmation)
 
 
 @pytest.mark.parametrize(

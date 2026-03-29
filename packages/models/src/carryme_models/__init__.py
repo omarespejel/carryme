@@ -13,6 +13,7 @@ from carryme_models.execution import (
     ExecutionPairStatus,
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
+    GuardedPairExecutionResult,
 )
 from carryme_models.health import AppDescriptor, ServiceHealth
 from carryme_models.history import (
@@ -59,6 +60,7 @@ __all__ = [
     "FundingRateNormalization",
     "FundingArbOpportunity",
     "FundingPairTradeIntent",
+    "GuardedPairExecutionResult",
     "LiveSubmissionReadiness",
     "MarketIdentity",
     "MarketStats",

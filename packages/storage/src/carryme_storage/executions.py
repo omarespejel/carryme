@@ -38,6 +38,7 @@ class ExecutionJournalStore:
                         adapter TEXT NOT NULL,
                         status TEXT NOT NULL,
                         paper_trade_id INTEGER,
+                        preview_hash TEXT,
                         confirmation_entry_id INTEGER,
                         label TEXT NOT NULL,
                         entry_json TEXT NOT NULL
@@ -57,6 +58,31 @@ class ExecutionJournalStore:
                         ADD COLUMN confirmation_entry_id INTEGER
                         """
                     )
+                if "preview_hash" not in columns:
+                    connection.execute(
+                        """
+                        ALTER TABLE execution_journal_entries
+                        ADD COLUMN preview_hash TEXT
+                        """
+                    )
+                    legacy_rows = connection.execute(
+                        """
+                        SELECT id, entry_json
+                        FROM execution_journal_entries
+                        WHERE preview_hash IS NULL
+                        """
+                    ).fetchall()
+                    for entry_id, entry_json in legacy_rows:
+                        preview_hash = json.loads(entry_json).get("preview_hash")
+                        if isinstance(preview_hash, str):
+                            connection.execute(
+                                """
+                                UPDATE execution_journal_entries
+                                SET preview_hash = ?
+                                WHERE id = ?
+                                """,
+                                (preview_hash.strip() or None, entry_id),
+                            )
                 connection.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_execution_journal_entries_executed_at
@@ -77,11 +103,62 @@ class ExecutionJournalStore:
                 )
                 connection.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_execution_journal_entries_confirmation_preview
+                    ON execution_journal_entries(confirmation_entry_id, preview_hash)
+                    """
+                )
+                connection.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS live_submission_reservations (
-                        confirmation_entry_id INTEGER PRIMARY KEY,
+                        confirmation_entry_id INTEGER NOT NULL,
                         preview_hash TEXT NOT NULL,
-                        execution_entry_id INTEGER
+                        execution_entry_id INTEGER,
+                        PRIMARY KEY (confirmation_entry_id, preview_hash)
                     )
+                    """
+                )
+                reservation_columns = connection.execute(
+                    "PRAGMA table_info(live_submission_reservations)"
+                ).fetchall()
+                reservation_pk = [
+                    row[1]
+                    for row in sorted(reservation_columns, key=lambda row: row[5])
+                    if row[5] > 0
+                ]
+                if reservation_pk != ["confirmation_entry_id", "preview_hash"]:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS live_submission_reservations_v2 (
+                            confirmation_entry_id INTEGER NOT NULL,
+                            preview_hash TEXT NOT NULL,
+                            execution_entry_id INTEGER,
+                            PRIMARY KEY (confirmation_entry_id, preview_hash)
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO live_submission_reservations_v2 (
+                            confirmation_entry_id,
+                            preview_hash,
+                            execution_entry_id
+                        )
+                        SELECT confirmation_entry_id, preview_hash, execution_entry_id
+                        FROM live_submission_reservations
+                        """
+                    )
+                    connection.execute("DROP TABLE live_submission_reservations")
+                    connection.execute(
+                        """
+                        ALTER TABLE live_submission_reservations_v2
+                        RENAME TO live_submission_reservations
+                        """
+                    )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    idx_live_submission_reservations_confirmation_entry_id
+                    ON live_submission_reservations(confirmation_entry_id)
                     """
                 )
             self._initialized = True
@@ -95,6 +172,9 @@ class ExecutionJournalStore:
         normalized_label = entry.paper_trade.intent.label.strip()
         if not normalized_label:
             raise ValueError("label must be non-empty")
+        normalized_preview_hash = (
+            entry.preview_hash.strip() if isinstance(entry.preview_hash, str) else None
+        ) or None
         normalized_paper_trade = entry.paper_trade.model_copy(
             update={
                 "intent": entry.paper_trade.intent.model_copy(
@@ -105,6 +185,7 @@ class ExecutionJournalStore:
         normalized_entry = entry.model_copy(
             update={
                 "executed_at": entry.executed_at.astimezone(UTC),
+                "preview_hash": normalized_preview_hash,
                 "paper_trade": normalized_paper_trade,
             }
         )
@@ -116,16 +197,18 @@ class ExecutionJournalStore:
                     adapter,
                     status,
                     paper_trade_id,
+                    preview_hash,
                     confirmation_entry_id,
                     label,
                     entry_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized_entry.executed_at.isoformat(),
                     normalized_entry.adapter,
                     normalized_entry.status,
                     normalized_entry.paper_trade_id,
+                    normalized_entry.preview_hash,
                     normalized_entry.confirmation_entry_id,
                     normalized_label,
                     normalized_entry.model_dump_json(),
@@ -164,6 +247,7 @@ class ExecutionJournalStore:
         self,
         *,
         confirmation_entry_id: int,
+        preview_hash: str,
         execution_entry_id: int,
     ) -> None:
         """Attach the persisted execution journal id to an existing reservation."""
@@ -171,6 +255,9 @@ class ExecutionJournalStore:
         self.initialize()
         if confirmation_entry_id < 1:
             raise ValueError("confirmation_entry_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
         if execution_entry_id < 1:
             raise ValueError("execution_entry_id must be positive")
         with sqlite3.connect(self.database_path) as connection:
@@ -178,10 +265,45 @@ class ExecutionJournalStore:
                 """
                 UPDATE live_submission_reservations
                 SET execution_entry_id = ?
-                WHERE confirmation_entry_id = ?
+                WHERE confirmation_entry_id = ? AND preview_hash = ?
                 """,
-                (execution_entry_id, confirmation_entry_id),
+                (execution_entry_id, confirmation_entry_id, normalized_preview_hash),
             )
+
+    def find_by_confirmation(
+        self,
+        *,
+        confirmation_entry_id: int,
+        preview_hash: str,
+    ) -> ExecutionJournalEntry | None:
+        """Return the most recent execution journal entry for one confirmation/hash pair."""
+
+        if confirmation_entry_id < 1:
+            raise ValueError("confirmation_entry_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        self.initialize()
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT id, entry_json
+                FROM execution_journal_entries
+                WHERE confirmation_entry_id = ? AND preview_hash = ?
+                ORDER BY executed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (confirmation_entry_id, normalized_preview_hash),
+            ).fetchone()
+        if row is None:
+            return None
+        stored_id, entry_json = row
+        return ExecutionJournalEntry.model_validate(
+            {
+                **json.loads(entry_json),
+                "entry_id": stored_id,
+            }
+        )
 
     def find_by_confirmation_entry_id(
         self,
