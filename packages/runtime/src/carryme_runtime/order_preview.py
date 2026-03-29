@@ -214,6 +214,12 @@ def _build_leg_preview(
         worst_price_text=worst_price_text,
         client_order_id=client_order_id,
     )
+    notes = list(spec.notes)
+    if constraints.quantity_increment is not None or constraints.price_increment is not None:
+        notes.append(
+            "Preview quantity and limit price were snapped to the venue's public "
+            "order-size and price increments."
+        )
 
     return VenueOrderPreview(
         venue=venue_key,
@@ -237,13 +243,7 @@ def _build_leg_preview(
         required_auth_env_vars=list(spec.required_auth_env_vars),
         auth_scheme=spec.auth_scheme,
         payload=payload,
-        notes=[
-            *spec.notes,
-            (
-                "Preview quantity and limit price were snapped to the venue's public "
-                "order-size and price increments."
-            ),
-        ],
+        notes=notes,
     )
 
 
@@ -295,33 +295,67 @@ def _extract_order_constraints(
     venue: str,
     snapshot: NormalizedMarketSnapshot,
 ) -> OrderConstraints:
-    raw = snapshot.market.raw if isinstance(snapshot.market.raw, dict) else {}
-    mark_price = Decimal(str(snapshot.market.mark_price)) if snapshot.market.mark_price else None
+    raw = _require_mapping(snapshot.market.raw, label=f"{venue} market raw payload")
+    mark_price = _require_mark_price(snapshot.market.mark_price, venue=venue)
     if venue == "paradex":
-        max_order_size = _dict_decimal(raw, "max_order_size")
-        minimum_notional = _dict_decimal(raw, "min_notional")
+        quantity_increment = _require_decimal(
+            raw,
+            "order_size_increment",
+            label="Paradex order constraints",
+        )
+        minimum_notional = _require_decimal(
+            raw,
+            "min_notional",
+            label="Paradex order constraints",
+        )
+        price_increment = _require_decimal(
+            raw,
+            "price_tick_size",
+            label="Paradex order constraints",
+        )
+        max_order_size = _require_decimal(
+            raw,
+            "max_order_size",
+            label="Paradex order constraints",
+        )
         return OrderConstraints(
-            quantity_increment=_dict_decimal(raw, "order_size_increment"),
+            quantity_increment=quantity_increment,
             minimum_order_size=None,
             minimum_notional=minimum_notional,
-            price_increment=_dict_decimal(raw, "price_tick_size"),
-            max_order_value=max_order_size * mark_price
-            if max_order_size is not None and mark_price is not None
-            else None,
+            price_increment=price_increment,
+            max_order_value=max_order_size * mark_price,
         )
     if venue == "extended":
-        trading_config = raw.get("tradingConfig", {})
-        if not isinstance(trading_config, dict):
-            trading_config = {}
-        minimum_order_size = _dict_decimal(trading_config, "minOrderSize")
+        trading_config = _require_mapping(
+            raw.get("tradingConfig"),
+            label="Extended tradingConfig",
+        )
+        minimum_order_size = _require_decimal(
+            trading_config,
+            "minOrderSize",
+            label="Extended order constraints",
+        )
+        quantity_increment = _require_decimal(
+            trading_config,
+            "minOrderSizeChange",
+            label="Extended order constraints",
+        )
+        price_increment = _require_decimal(
+            trading_config,
+            "minPriceChange",
+            label="Extended order constraints",
+        )
+        max_order_value = _require_decimal(
+            trading_config,
+            "maxLimitOrderValue",
+            label="Extended order constraints",
+        )
         return OrderConstraints(
-            quantity_increment=_dict_decimal(trading_config, "minOrderSizeChange"),
+            quantity_increment=quantity_increment,
             minimum_order_size=minimum_order_size,
-            minimum_notional=minimum_order_size * mark_price
-            if minimum_order_size is not None and mark_price is not None
-            else None,
-            price_increment=_dict_decimal(trading_config, "minPriceChange"),
-            max_order_value=_dict_decimal(trading_config, "maxLimitOrderValue"),
+            minimum_notional=minimum_order_size * mark_price,
+            price_increment=price_increment,
+            max_order_value=max_order_value,
         )
     _logger.debug(
         "No order constraint extraction logic for venue %s; raw=%s mark_price=%s",
@@ -337,6 +371,30 @@ def _dict_decimal(raw: dict[str, object], key: str) -> Decimal | None:
     if value is None:
         return None
     return Decimal(str(value))
+
+
+def _require_mapping(value: object, *, label: str) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    raise ValueError(f"{label} must be an object")
+
+
+def _require_mark_price(value: float | None, *, venue: str) -> Decimal:
+    if value is None:
+        raise ValueError(f"Venue {venue} order preview requires a mark price")
+    return Decimal(str(value))
+
+
+def _require_decimal(raw: dict[str, object], key: str, *, label: str) -> Decimal:
+    if key not in raw:
+        raise ValueError(f"{label} missing {key!r}")
+    try:
+        value = _dict_decimal(raw, key)
+    except Exception as exc:
+        raise ValueError(f"{label} field {key!r} must be numeric") from exc
+    if value is None:
+        raise ValueError(f"{label} missing {key!r}")
+    return value
 
 
 def _snap_quantity(value: Decimal, increment: Decimal | None) -> Decimal:

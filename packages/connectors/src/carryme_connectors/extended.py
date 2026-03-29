@@ -41,16 +41,17 @@ class ExtendedPublicConnector(BaseHttpConnector):
         market_stats: dict[str, Any]
         if isinstance(data, list):
             raw = _find_market(data, symbol)
-            market_stats = raw.get("marketStats", {})
-            if not isinstance(market_stats, dict):
+            market_stats_value = raw.get("marketStats")
+            if not isinstance(market_stats_value, dict):
                 raise ConnectorError("Extended market metadata missing marketStats object")
+            market_stats = market_stats_value
         elif isinstance(data, dict):
             raw = data
             market_stats = data
             if "tradingConfig" not in raw:
-                _logger.debug(
+                _logger.warning(
                     "Extended stats payload for %s omitted tradingConfig; "
-                    "preview constraints may be unavailable",
+                    "order_preview may run without snapping or minimum-notional enforcement",
                     symbol,
                 )
         else:
