@@ -14,7 +14,9 @@ def _parse_watchlist_payload(payload: object) -> list[FundingPairSpec]:
     """Parse a raw watchlist payload into validated funding pairs."""
 
     if isinstance(payload, dict):
-        payload = payload.get("pairs", [])
+        if "pairs" not in payload:
+            raise ValueError("Watchlist JSON must be a list or an object with a 'pairs' list")
+        payload = payload["pairs"]
     if not isinstance(payload, list):
         raise ValueError("Watchlist JSON must be a list or an object with a 'pairs' list")
     return [FundingPairSpec.model_validate(item) for item in payload]
@@ -23,7 +25,7 @@ def _parse_watchlist_payload(payload: object) -> list[FundingPairSpec]:
 def load_watchlist(path: str | Path) -> list[FundingPairSpec]:
     """Load a funding-pair watchlist from JSON."""
 
-    payload = json.loads(Path(path).read_text())
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
     return _parse_watchlist_payload(payload)
 
 
@@ -41,13 +43,18 @@ def save_watchlist(path: str | Path, pairs: list[FundingPairSpec]) -> list[Fundi
         prefix=f".{target_path.name}.",
         suffix=".tmp",
         delete=False,
+        encoding="utf-8",
     ) as temporary_file:
         temporary_file.write(f"{payload}\n")
         temporary_file.flush()
         os.fsync(temporary_file.fileno())
         temporary_path = Path(temporary_file.name)
 
-    temporary_path.replace(target_path)
+    try:
+        temporary_path.replace(target_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
     return document.pairs
 
 
