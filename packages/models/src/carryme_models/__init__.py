@@ -10,6 +10,7 @@ from carryme_models.execution import (
     ExecutionLegOrderState,
     ExecutionLegResult,
     ExecutionOrderState,
+    ExecutionPairStatus,
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "ExecutionLegResult",
     "ExecutionLegOrderState",
     "ExecutionOrderState",
+    "ExecutionPairStatus",
     "ExecutionReconciliation",
     "ExecutionVenueReconciliation",
     "FundingPairSpec",

@@ -15,6 +15,7 @@ from carryme_runtime.execution_order_state import (
     ExtendedOrderStateObserver,
     ParadexOrderStateObserver,
 )
+from carryme_runtime.execution_pair_status import build_execution_pair_status
 from carryme_runtime.execution_reconciliation import reconcile_execution
 from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
 from carryme_runtime.intents import build_trade_intent
@@ -37,6 +38,7 @@ __all__ = [
     "AccountPreflightService",
     "ExecutionAdapter",
     "ExecutionOrderStateService",
+    "build_execution_pair_status",
     "ExtendedOrderStateObserver",
     "LiveExecutionConfigMap",
     "MockExecutionAdapter",
