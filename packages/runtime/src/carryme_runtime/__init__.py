@@ -10,6 +10,7 @@ from carryme_runtime.account_preflight import (
 from carryme_runtime.candidates import filter_candidate_records
 from carryme_runtime.confirmation import require_confirmed_preview
 from carryme_runtime.execution import ExecutionAdapter, MockExecutionAdapter
+from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
 from carryme_runtime.intents import build_trade_intent
 from carryme_runtime.opportunities import OpportunityService, fetch_live_snapshot
 from carryme_runtime.order_preview import OrderPreviewService
@@ -36,6 +37,7 @@ __all__ = [
     "build_live_submission_readiness",
     "require_confirmed_preview",
     "ConnectorError",
+    "ExtendedLiveExecutionService",
     "OpportunityService",
     "fetch_live_snapshot",
     "filter_candidate_records",

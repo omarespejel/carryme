@@ -9,6 +9,7 @@ from carryme_connectors import (
     ParadexJwtTokenProvider,
     build_paradex_auth_headers,
     build_paradex_auth_request_path,
+    build_signed_extended_order_payload,
     build_signed_paradex_order_payload,
 )
 from carryme_models import (
@@ -35,6 +36,7 @@ from carryme_models import (
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
     AccountPreflightService,
+    ExtendedLiveExecutionService,
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
@@ -906,6 +908,61 @@ def test_build_signed_paradex_order_payload_adds_signature_fields() -> None:
     assert "flags" not in payload
 
 
+def test_build_signed_extended_order_payload_uses_settlement_schema() -> None:
+    payload = build_signed_extended_order_payload(
+        api_key="extended-key",
+        stark_private_key="0x7a7ff6fd3cab02ccdcd4a572563f5976f8976899b03a39773795a3c486d4986",
+        account_payload={
+            "data": {
+                "l2Key": "0x61c5e7e8339b7d56f197f54ea91b776776690e3232313de0f2ecbd0ef76f466",
+                "l2Vault": "10002",
+            }
+        },
+        market_payload={
+            "data": {
+                "name": "ARB-USD",
+                "l2Config": {
+                    "collateralId": "0x1",
+                    "syntheticId": "0x4152422d3100000000000000000000",
+                    "syntheticResolution": 10,
+                    "collateralResolution": 1000000,
+                },
+            }
+        },
+        order_payload={
+            "symbol": "ARB-USD",
+            "side": "SELL",
+            "type": "LIMIT",
+            "size": "10881.00000000",
+            "price": "0.09180000",
+            "time_in_force": "IOC",
+            "client_order_id": "carryme-pt7-extended-sell",
+            "reduce_only": False,
+            "post_only": False,
+        },
+        taker_fee_rate="0.00025",
+        nonce=1473459052,
+        expire_time=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+    )
+
+    assert payload["id"] == "carryme-pt7-extended-sell"
+    assert payload["market"] == "ARB-USD"
+    assert payload["side"] == "SELL"
+    assert payload["type"] == "LIMIT"
+    assert payload["qty"] == "10881.00000000"
+    assert payload["price"] == "0.09180000"
+    assert payload["fee"] == "0.00025"
+    assert payload["timeInForce"] == "IOC"
+    assert payload["nonce"] == "1473459052"
+    assert payload["settlement"]["starkKey"] == (
+        "0x61c5e7e8339b7d56f197f54ea91b776776690e3232313de0f2ecbd0ef76f466"
+    )
+    assert payload["settlement"]["collateralPosition"] == "10002"
+    assert payload["settlement"]["signature"]["r"].startswith("0x")
+    assert payload["settlement"]["signature"]["s"].startswith("0x")
+    assert payload["debuggingAmounts"]["syntheticAmount"].startswith("-")
+
+
 def test_paradex_live_execution_service_submits_confirmed_preview(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1061,6 +1118,211 @@ def test_paradex_live_execution_service_submits_confirmed_preview(
     asyncio.run(run())
 
 
+def test_extended_live_execution_service_submits_confirmed_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_request: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/user/account/info":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "OK",
+                    "data": {
+                        "accountId": 258270,
+                        "status": "ACTIVE",
+                        "l2Key": (
+                            "0x61c5e7e8339b7d56f197f54ea91b776776690e3232313de0f2ecbd0ef76f466"
+                        ),
+                        "l2Vault": "10002",
+                    },
+                },
+            )
+        if request.url.path == "/api/v1/user/fees":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "OK",
+                    "data": {
+                        "makerFee": "0",
+                        "takerFee": "0.00025",
+                    },
+                },
+            )
+        if request.url.path == "/api/v1/user/order":
+            payload = json.loads(request.content.decode("utf-8"))
+            seen_request.update(payload)
+            assert request.headers["x-api-key"] == "extended-key"
+            assert payload["market"] == "ARB-USD"
+            assert payload["type"] == "LIMIT"
+            assert payload["side"] == "SELL"
+            assert payload["timeInForce"] == "IOC"
+            assert "settlement" in payload
+            return httpx.Response(
+                200,
+                json={
+                    "status": "OK",
+                    "data": {
+                        "id": 321,
+                        "externalId": payload["id"],
+                    },
+                },
+            )
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+    confirmation = PreviewConfirmationEntry(
+        entry_id=4,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=8,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                    effective_notional=999.9639,
+                    quantity=10881.0,
+                    quantity_text="10881.00000000",
+                    quantity_increment=1.0,
+                    minimum_order_size=10.0,
+                    minimum_notional=0.918,
+                    reference_price=0.0919,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0918,
+                    worst_price_text="0.09180000",
+                    price_increment=0.0001,
+                    max_order_value=1_250_000.0,
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[
+                        "CARRYME_API_EXTENDED_API_KEY",
+                        "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
+                    ],
+                    auth_scheme="api key + Stark signing key",
+                    payload={
+                        "symbol": "ARB-USD",
+                        "side": "SELL",
+                        "type": "LIMIT",
+                        "size": "10881.00000000",
+                        "price": "0.09180000",
+                        "time_in_force": "IOC",
+                        "client_order_id": "carryme-pt8-extended-sell",
+                        "reduce_only": False,
+                    },
+                    notes=[],
+                )
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    async def fetch_snapshot(_: str, __: str) -> NormalizedMarketSnapshot:
+        return _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.0919,
+            42_584.8,
+            0.0922,
+            42_473.0,
+            raw={
+                "name": "ARB-USD",
+                "assetName": "ARB",
+                "assetPrecision": 0,
+                "collateralAssetName": "USD",
+                "collateralAssetPrecision": 6,
+                "active": True,
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                },
+                "l2Config": {
+                    "type": "STARKX",
+                    "collateralId": "0x1",
+                    "syntheticId": "0x4152422d3100000000000000000000",
+                    "syntheticResolution": 10,
+                    "collateralResolution": 1000000,
+                },
+            },
+        )
+
+    async def run() -> None:
+        service = ExtendedLiveExecutionService(
+            api_key="extended-key",
+            stark_private_key="0x7a7ff6fd3cab02ccdcd4a572563f5976f8976899b03a39773795a3c486d4986",
+            fetch_snapshot=cast(Any, fetch_snapshot),
+        )
+        entry = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+        )
+        assert entry.mode == "live"
+        assert entry.status == "submitted"
+        assert entry.preview_hash == "preview-hash"
+        assert entry.confirmation_entry_id == 4
+        assert len(entry.legs) == 1
+        assert entry.legs[0].status == "submitted"
+        assert entry.legs[0].simulated is False
+        assert entry.legs[0].external_reference == "carryme-pt8-extended-sell"
+        assert entry.legs[0].request_payload is not None
+        assert entry.legs[0].response_payload is not None
+        assert seen_request["id"] == "carryme-pt8-extended-sell"
+        assert seen_request["fee"] == "0.00025"
+
+    asyncio.run(run())
+
+
 def test_extended_account_probe_treats_missing_balance_rows_as_empty_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1104,6 +1366,58 @@ def test_extended_account_probe_treats_missing_balance_rows_as_empty_state(
         assert status.ready is True
         assert status.balance_count == 0
         assert status.position_count == 0
+
+    asyncio.run(run())
+
+
+def test_extended_account_probe_uses_balance_payload_for_collateral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/user/account/info":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "subAccountId": "extended-subaccount",
+                        "status": "ACTIVE",
+                    }
+                },
+            )
+        if request.url.path == "/api/v1/user/balance":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "equity": "4.989999",
+                        "availableForTrade": "4.989999",
+                    }
+                },
+            )
+        if request.url.path == "/api/v1/user/positions":
+            return httpx.Response(200, json={"data": []})
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        probe = ExtendedAccountProbe()
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "api_key": "extended-key",
+                },
+            }
+        )
+        assert status.authenticated is True
+        assert status.total_collateral == pytest.approx(4.989999)
+        assert status.available_to_trade == pytest.approx(4.989999)
 
     asyncio.run(run())
 

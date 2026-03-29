@@ -163,6 +163,7 @@ class ExtendedAccountProbe:
                 )
 
         account_body = _unwrap_payload(account)
+        balance_body = _unwrap_payload(balances) if isinstance(balances, dict) else {}
         return VenueAccountPreflight(
             venue=self.venue,
             enabled=enabled,
@@ -178,9 +179,18 @@ class ExtendedAccountProbe:
                 "address",
             ),
             account_status=_pick_string(account_body, "status", "accountStatus"),
-            total_collateral=_pick_float(account_body, "equity", "balance", "totalCollateral"),
+            total_collateral=(
+                _pick_float(account_body, "equity", "balance", "totalCollateral")
+                or _pick_float(balance_body, "equity", "balance", "totalCollateral")
+            ),
             available_to_trade=_pick_float(
                 account_body,
+                "availableForTrade",
+                "availableBalance",
+                "available_to_trade",
+            )
+            or _pick_float(
+                balance_body,
                 "availableForTrade",
                 "availableBalance",
                 "available_to_trade",

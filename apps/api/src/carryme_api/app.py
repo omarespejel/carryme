@@ -33,6 +33,7 @@ from carryme_runtime import (
     AccountPreflightService,
     ConnectorError,
     ExecutionAdapter,
+    ExtendedLiveExecutionService,
     LiveExecutionConfigMap,
     MockExecutionAdapter,
     OpportunityService,
@@ -140,6 +141,17 @@ def get_paradex_live_execution_service(
     )
 
 
+def get_extended_live_execution_service(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExtendedLiveExecutionService:
+    """Return the live Extended execution service for manual submissions."""
+
+    return ExtendedLiveExecutionService(
+        api_key=settings.extended_api_key or "",
+        stark_private_key=settings.extended_stark_private_key or "",
+    )
+
+
 @lru_cache
 def get_account_preflight_service() -> AccountPreflightService:
     """Return the authenticated account-state preflight service."""
@@ -218,6 +230,70 @@ async def _build_readiness_for_paper_trade(
         paper_trade,
         _build_account_preflight_configs(settings),
     )
+    confirmations = confirmation_store.list_recent(
+        limit=50,
+        paper_trade_id=paper_trade.entry_id,
+    )
+    return build_live_submission_readiness(
+        paper_trade_id=paper_trade.entry_id or 0,
+        label=paper_trade.intent.label,
+        preview_hash=preview_hash,
+        confirmations=confirmations,
+        execution_preflight=execution_preflight,
+        account_preflight=account_preflight,
+    )
+
+
+async def _build_venue_scoped_readiness_for_paper_trade(
+    *,
+    paper_trade: PaperTradeEntry,
+    preview_hash: str,
+    venue: str,
+    settings: ApiSettings,
+    confirmation_store: PreviewConfirmationStore,
+    account_preflight_service: AccountPreflightService,
+) -> LiveSubmissionReadiness:
+    execution_statuses = {
+        item.venue: item
+        for item in build_venue_execution_preflights(
+            _build_live_execution_configs(settings)
+        )
+    }
+    selected_execution = execution_statuses[venue]
+    execution_blockers: list[str] = []
+    if not selected_execution.enabled:
+        execution_blockers.append(f"Venue {venue} live execution is not enabled")
+    if selected_execution.missing_env_vars:
+        execution_blockers.append(
+            f"Venue {venue} is missing required credentials: "
+            + ", ".join(selected_execution.missing_env_vars)
+        )
+    execution_preflight = PaperTradeExecutionPreflight(
+        paper_trade_id=paper_trade.entry_id or 0,
+        label=paper_trade.intent.label,
+        ready=not execution_blockers,
+        venues=[selected_execution],
+        blocking_reasons=execution_blockers,
+    )
+
+    account_preflight_all = await account_preflight_service.probe_paper_trade(
+        paper_trade,
+        _build_account_preflight_configs(settings),
+    )
+    account_statuses = {item.venue: item for item in account_preflight_all.venues}
+    selected_account = account_statuses[venue]
+    account_blockers: list[str] = []
+    if not selected_account.enabled:
+        account_blockers.append(f"Venue {venue} account preflight is not enabled")
+    account_blockers.extend(selected_account.blocking_reasons)
+    account_preflight = PaperTradeAccountPreflight(
+        paper_trade_id=paper_trade.entry_id or 0,
+        label=paper_trade.intent.label,
+        ready=not account_blockers,
+        venues=[selected_account],
+        blocking_reasons=account_blockers,
+    )
+
     confirmations = confirmation_store.list_recent(
         limit=50,
         paper_trade_id=paper_trade.entry_id,
@@ -728,9 +804,81 @@ def create_app() -> FastAPI:
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
 
-        readiness = await _build_readiness_for_paper_trade(
+        readiness = await _build_venue_scoped_readiness_for_paper_trade(
             paper_trade=paper_trade,
             preview_hash=preview_hash,
+            venue="paradex",
+            settings=settings,
+            confirmation_store=confirmation_store,
+            account_preflight_service=account_preflight_service,
+        )
+        if not readiness.ready:
+            raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
+
+        confirmations = confirmation_store.list_recent(
+            limit=50,
+            paper_trade_id=paper_trade_id,
+        )
+        try:
+            confirmation = next(
+                item
+                for item in confirmations
+                if item.paper_trade_id == paper_trade_id and item.preview_hash == preview_hash
+            )
+        except StopIteration as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No preview confirmation matched the requested paper trade and preview hash"
+                ),
+            ) from exc
+
+        try:
+            journal_entry = await service.submit_confirmed_preview(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        return execution_store.append(journal_entry)
+
+    @app.post(
+        "/v1/executions/live/extended/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionJournalEntry,
+    )
+    async def execute_saved_paper_trade_on_extended(
+        paper_trade_id: int,
+        preview_hash: str,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        account_preflight_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        service: Annotated[
+            ExtendedLiveExecutionService,
+            Depends(get_extended_live_execution_service),
+        ],
+    ) -> ExecutionJournalEntry:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+
+        readiness = await _build_venue_scoped_readiness_for_paper_trade(
+            paper_trade=paper_trade,
+            preview_hash=preview_hash,
+            venue="extended",
             settings=settings,
             confirmation_store=confirmation_store,
             account_preflight_service=account_preflight_service,

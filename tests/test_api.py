@@ -1897,3 +1897,192 @@ def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pat
     assert payload["status"] == "submitted"
     assert payload["preview_hash"] == "preview-hash"
     assert len(execution_store.list_recent(limit=10)) == 1
+
+
+def test_extended_live_execution_endpoint_submits_confirmed_preview(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+    confirmation_store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label="arb_extended_paradex",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        effective_notional=999.96,
+                        quantity=10881.0,
+                        quantity_text="10881.00000000",
+                        quantity_increment=1.0,
+                        minimum_order_size=10.0,
+                        minimum_notional=0.918,
+                        reference_price=0.0919,
+                        reference_price_source="best_bid",
+                        worst_acceptable_price=0.0918,
+                        worst_price_text="0.09180000",
+                        price_increment=0.0001,
+                        max_order_value=1_250_000.0,
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/api/v1/user/order",
+                        required_auth_env_vars=[
+                            "CARRYME_API_EXTENDED_API_KEY",
+                            "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
+                        ],
+                        auth_scheme="api key + Stark signing key",
+                        payload={
+                            "symbol": "ARB-USD",
+                            "side": "SELL",
+                            "type": "LIMIT",
+                            "size": "10881.00000000",
+                            "price": "0.09180000",
+                            "time_in_force": "IOC",
+                            "client_order_id": "carryme-pt8-extended-sell",
+                            "reduce_only": False,
+                        },
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                    )
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubExtendedLiveExecutionService:
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+                adapter="extended_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="carryme-pt8-extended-sell",
+                        request_payload={"market": "ARB-USD"},
+                        response_payload={"id": 321, "externalId": "carryme-pt8-extended-sell"},
+                    )
+                ],
+            )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_api_settings,
+        get_execution_journal_store,
+        get_extended_live_execution_service,
+        get_paper_trade_store,
+        get_preview_confirmation_store,
+    )
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_account_preflight_service] = (
+        lambda: StubAccountPreflightService()
+    )
+    app.dependency_overrides[get_extended_live_execution_service] = (
+        lambda: StubExtendedLiveExecutionService()
+    )
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
+        paradex_live_enabled=False,
+    )
+    client = TestClient(app)
+    response = client.post(
+        f"/v1/executions/live/extended/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "preview-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["adapter"] == "extended_live"
+    assert payload["mode"] == "live"
+    assert payload["status"] == "submitted"
+    assert payload["preview_hash"] == "preview-hash"
+    assert len(execution_store.list_recent(limit=10)) == 1

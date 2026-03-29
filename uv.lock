@@ -79,6 +79,7 @@ source = { editable = "packages/connectors" }
 dependencies = [
     { name = "carryme-models" },
     { name = "ecdsa" },
+    { name = "fast-stark-crypto" },
     { name = "httpx" },
     { name = "pycryptodome" },
     { name = "starknet-crypto-py" },
@@ -88,6 +89,7 @@ dependencies = [
 requires-dist = [
     { name = "carryme-models", editable = "packages/models" },
     { name = "ecdsa", specifier = ">=0.19,<1" },
+    { name = "fast-stark-crypto", specifier = "==0.3.8" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "pycryptodome", specifier = ">=3.23,<4" },
     { name = "starknet-crypto-py", specifier = ">=0.3,<0.4" },
@@ -260,6 +262,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/25/ca/8de7744cb3bc966c85430ca2d0fcaeea872507c6a4cf6e007f7fe269ed9d/ecdsa-0.19.2.tar.gz", hash = "sha256:62635b0ac1ca2e027f82122b5b81cb706edc38cd91c63dda28e4f3455a2bf930", size = 202432, upload-time = "2026-03-26T09:58:17.675Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/51/79/119091c98e2bf49e24ed9f3ae69f816d715d2904aefa6a2baa039a2ba0b0/ecdsa-0.19.2-py2.py3-none-any.whl", hash = "sha256:840f5dc5e375c68f36c1a7a5b9caad28f95daa65185c9253c0c08dd952bb7399", size = 150818, upload-time = "2026-03-26T09:58:15.808Z" },
+]
+
+[[package]]
+name = "fast-stark-crypto"
+version = "0.3.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/30/29/546e58257bf382bde9d6c445225fb4caecbf6f7053e786491a53fd25298c/fast_stark_crypto-0.3.8.tar.gz", hash = "sha256:0149e0389225225ee303721da0c76beea96f03de0ed799f7ab40128061a4d30d", size = 47284, upload-time = "2025-10-04T07:42:41.94Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e3/50/2a1743570bc358ec47b52afa9e88f6f089d6d269590578822adf0139b2e6/fast_stark_crypto-0.3.8-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:6b53d6a83e2f63023341d6f1424728f3a04259a07a249bf8a9c51ddef79078b1", size = 448819, upload-time = "2025-10-04T07:42:24.524Z" },
+    { url = "https://files.pythonhosted.org/packages/45/00/10592ed981733bb4a256adb8f0aead9ca4057e48aba2c94bad01a9a2a7f5/fast_stark_crypto-0.3.8-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:875dfb4c67990ef02eecc4ca06936f876730e66b6b1db00d4d123421670d2328", size = 504646, upload-time = "2025-10-04T07:42:26.329Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/54/ba3f3009eddb473e6af27520e490082d55743deaf5691dfb3376bf0462d9/fast_stark_crypto-0.3.8-cp313-cp313-manylinux_2_24_aarch64.whl", hash = "sha256:f1fed566f8c7e4e3d72fb07d20e382041c5853519eb7a55b15ae66ce09daf7f6", size = 484694, upload-time = "2025-10-04T07:42:27.686Z" },
+    { url = "https://files.pythonhosted.org/packages/99/79/26dbfcc7307838532452401283b1cef9d3f9b688065b22a260f2f6fef63a/fast_stark_crypto-0.3.8-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:f246abd44044859edf66ffcdb6ca8f1224228a1cbeefc36753be7e7b8628cd52", size = 664689, upload-time = "2025-10-04T07:42:29.036Z" },
+    { url = "https://files.pythonhosted.org/packages/4c/80/d02eac650319f4badf05cb019995bd4ba5503751b7a398592c89fdaa24a3/fast_stark_crypto-0.3.8-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:fa3288e7d206d06615c1cb998b366a5c841de6ccbc140cd2a4c90492a2d8a044", size = 658377, upload-time = "2025-10-04T07:42:30.495Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/8c/4f57df5eba6875232e1d230789468554530ff485e45a7a494dd0db20fbf6/fast_stark_crypto-0.3.8-cp313-cp313-win_amd64.whl", hash = "sha256:5050982fb68b72a8eb49f62fb82f03bf6200af7d98af8fd89919294d192e42ac", size = 352499, upload-time = "2025-10-04T07:42:31.823Z" },
 ]
 
 [[package]]

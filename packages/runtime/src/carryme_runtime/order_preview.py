@@ -31,7 +31,7 @@ class VenueOrderSpec(NamedTuple):
 
 _VENUE_ORDER_SPECS: dict[str, VenueOrderSpec] = {
     "extended": VenueOrderSpec(
-        endpoint_path_hint="/api/v1/trade/order",
+        endpoint_path_hint="/api/v1/user/order",
         auth_scheme="api key + Stark signing key",
         required_auth_env_vars=(
             "CARRYME_API_EXTENDED_API_KEY",
@@ -39,10 +39,7 @@ _VENUE_ORDER_SPECS: dict[str, VenueOrderSpec] = {
         ),
         notes=(
             "Preview uses an IOC limit cap from the public best bid/ask.",
-            (
-                "Final live adapter must map these semantic fields to the exact "
-                "Extended signed request schema."
-            ),
+            "Live submit expands this preview into the exact Extended settlement schema.",
         ),
     ),
     "paradex": VenueOrderSpec(
