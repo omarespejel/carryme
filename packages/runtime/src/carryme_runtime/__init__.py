@@ -18,12 +18,14 @@ from carryme_runtime.execution import ExecutionAdapter, MockExecutionAdapter
 from carryme_runtime.execution_order_state import (
     ExecutionOrderStateService,
     ExtendedOrderStateObserver,
+    HyperliquidOrderStateObserver,
     ParadexOrderStateObserver,
 )
 from carryme_runtime.execution_pair_status import build_execution_pair_status
 from carryme_runtime.execution_reconciliation import reconcile_execution
 from carryme_runtime.extended_cleanup_preview import ExtendedCleanupPreviewService
 from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
+from carryme_runtime.hyperliquid_live_execution import HyperliquidLiveExecutionService
 from carryme_runtime.intents import InvalidTradeCandidateError, build_trade_intent
 from carryme_runtime.opportunities import OpportunityService, UpstreamDataError, fetch_live_snapshot
 from carryme_runtime.order_preview import OrderPreviewService
@@ -52,6 +54,8 @@ __all__ = [
     "ExtendedCleanupPreviewService",
     "ExtendedOrderStateObserver",
     "ExtendedLiveExecutionService",
+    "HyperliquidLiveExecutionService",
+    "HyperliquidOrderStateObserver",
     "LiveExecutionConfigMap",
     "MockExecutionAdapter",
     "OrderPreviewService",

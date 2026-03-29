@@ -16,6 +16,8 @@ from carryme_connectors.hyperliquid_auth import (
     build_hyperliquid_exchange,
     build_hyperliquid_info,
     build_hyperliquid_wallet,
+    format_hyperliquid_price,
+    format_hyperliquid_size,
 )
 from carryme_connectors.paradex import ParadexPublicConnector
 from carryme_connectors.paradex_auth import (
@@ -58,6 +60,8 @@ __all__ = [
     "build_hyperliquid_exchange",
     "build_hyperliquid_info",
     "build_hyperliquid_wallet",
+    "format_hyperliquid_price",
+    "format_hyperliquid_size",
     "build_signed_extended_order_payload",
     "build_paradex_auth_headers",
     "build_paradex_auth_request_path",

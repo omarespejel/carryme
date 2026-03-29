@@ -48,6 +48,9 @@ from carryme_runtime import (
     ExtendedLiveExecutionService,
     ExtendedOrderStateObserver,
     InvalidTradeCandidateError,
+    HyperliquidLiveExecutionService,
+    HyperliquidOrderStateObserver,
+    LiveExecutionConfigMap,
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
@@ -310,6 +313,17 @@ def get_extended_live_execution_service(
     )
 
 
+def get_hyperliquid_live_execution_service(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> HyperliquidLiveExecutionService:
+    """Return the live Hyperliquid execution service for manual submissions."""
+
+    return HyperliquidLiveExecutionService(
+        account_address=settings.hyperliquid_account_address or "",
+        api_wallet_private_key=settings.hyperliquid_api_wallet_private_key or "",
+    )
+
+
 def get_cleanup_preview_service(
     settings: Annotated[ApiSettings, Depends(get_api_settings)],
 ) -> CleanupPreviewRouter:
@@ -344,6 +358,10 @@ def get_execution_order_state_service(
             account_address=settings.paradex_account_address,
             private_key=settings.paradex_private_key,
             bearer_token=settings.paradex_bearer_token,
+        )
+    if settings.hyperliquid_account_address and settings.hyperliquid_api_wallet_private_key:
+        observers["hyperliquid"] = HyperliquidOrderStateObserver(
+            account_address=settings.hyperliquid_account_address,
         )
     return ExecutionOrderStateService(observers=observers)
 
@@ -1576,6 +1594,108 @@ def create_app() -> FastAPI:
                 paper_trade=paper_trade,
                 preview_hash=preview_hash,
                 venue="extended",
+                settings=settings,
+                confirmation_store=confirmation_store,
+                account_preflight_service=account_preflight_service,
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not readiness.ready:
+            raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
+
+        if confirmation is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No preview confirmation matched the requested paper trade and preview hash"
+                ),
+            )
+        if confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Preview confirmation entry_id is required before live submission",
+            )
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=confirmation.entry_id,
+                preview_hash=confirmation.preview_hash,
+            )
+            if existing_entry is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=existing_entry.model_dump(mode="json"),
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A live submission is already reserved for this confirmed preview; "
+                    "manual reconciliation is required before retrying"
+                ),
+            )
+
+        try:
+            journal_entry = await service.submit_confirmed_preview(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        saved_entry = execution_store.append(journal_entry)
+        if saved_entry.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        execution_store.mark_live_submission_completed(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+            execution_entry_id=saved_entry.entry_id,
+        )
+        return saved_entry
+
+    @app.post(
+        "/v1/executions/live/hyperliquid/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionJournalEntry,
+    )
+    async def execute_saved_paper_trade_on_hyperliquid(
+        paper_trade_id: int,
+        preview_hash: str,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        account_preflight_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        service: Annotated[
+            HyperliquidLiveExecutionService,
+            Depends(get_hyperliquid_live_execution_service),
+        ],
+    ) -> ExecutionJournalEntry:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+
+        try:
+            readiness, confirmation = await _build_venue_scoped_readiness_for_paper_trade(
+                paper_trade=paper_trade,
+                preview_hash=preview_hash,
+                venue="hyperliquid",
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,

@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Literal, NamedTuple
 
+from carryme_connectors import format_hyperliquid_price, format_hyperliquid_size
 from carryme_models import (
     NormalizedMarketSnapshot,
     PaperTradeEntry,
@@ -58,6 +59,18 @@ _VENUE_ORDER_SPECS: dict[str, VenueOrderSpec] = {
                 "Final live adapter must confirm any instrument-specific lot or "
                 "price increments before submission."
             ),
+        ),
+    ),
+    "hyperliquid": VenueOrderSpec(
+        endpoint_path_hint="/exchange",
+        auth_scheme="account address + API wallet private key",
+        required_auth_env_vars=(
+            "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+            "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+        ),
+        notes=(
+            "Preview uses an IOC limit cap from the public best bid/ask.",
+            "Live submit uses the official Hyperliquid Python SDK exchange client.",
         ),
     ),
 }
@@ -191,6 +204,29 @@ def _build_leg_preview(
         constraints.price_increment,
         side=side,
     )
+
+    if venue_key == "hyperliquid":
+        sz_decimals = _raw_int(raw=snapshot.market.raw, key="szDecimals")
+        if sz_decimals is None:
+            raise ValueError(
+                f"Venue {venue} is missing Hyperliquid szDecimals metadata for {symbol}"
+            )
+        quantity, quantity_text = format_hyperliquid_size(quantity, sz_decimals=sz_decimals)
+        worst_price, worst_price_text = format_hyperliquid_price(
+            worst_price,
+            sz_decimals=sz_decimals,
+        )
+    else:
+        quantity_text = _format_order_value(
+            venue=venue_key,
+            value=quantity,
+            increment=constraints.quantity_increment,
+        )
+        worst_price_text = _format_order_value(
+            venue=venue_key,
+            value=worst_price,
+            increment=constraints.price_increment,
+        )
     effective_notional = quantity * reference
     mark_notional = quantity * mark_price
     limit_order_value = quantity * worst_price
@@ -212,17 +248,6 @@ def _build_leg_preview(
         raise ValueError(
             f"Venue {venue} preview order value for {symbol} exceeded maximum limit order value"
         )
-
-    quantity_text = _format_order_value(
-        venue=venue_key,
-        value=quantity,
-        increment=constraints.quantity_increment,
-    )
-    worst_price_text = _format_order_value(
-        venue=venue_key,
-        value=worst_price,
-        increment=constraints.price_increment,
-    )
     client_order_id = f"carryme-pt{paper_trade_id}-{venue_key}-{side}"
 
     payload = _build_payload(
@@ -274,7 +299,7 @@ def _build_payload(
     quantity_text: str,
     worst_price_text: str,
     client_order_id: str,
-) -> dict[str, str | bool]:
+) -> dict[str, object]:
     side_upper = side.upper()
     if venue == "paradex":
         return {
@@ -296,6 +321,16 @@ def _build_payload(
             "time_in_force": "IOC",
             "client_order_id": client_order_id,
             "reduce_only": False,
+        }
+    if venue == "hyperliquid":
+        return {
+            "coin": symbol,
+            "is_buy": side == "buy",
+            "sz": quantity_text,
+            "limit_px": worst_price_text,
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": False,
+            "client_order_id": client_order_id,
         }
     raise ValueError(f"Unsupported live order preview venue: {venue}")
 
@@ -410,6 +445,16 @@ def _extract_order_constraints(
             price_increment=price_increment,
             max_order_value=max_order_value,
         )
+    if venue == "hyperliquid":
+        sz_decimals = _raw_int(raw, "szDecimals")
+        quantity_increment = None
+        if sz_decimals is not None and sz_decimals >= 0:
+            quantity_increment = Decimal("1").scaleb(-sz_decimals)
+        return OrderConstraints(
+            quantity_increment=quantity_increment,
+            minimum_order_size=quantity_increment,
+            minimum_notional=Decimal("10"),
+        )
     _logger.debug(
         "No order constraint extraction logic for venue %s; raw=%s mark_price=%s",
         venue,
@@ -450,6 +495,15 @@ def _require_decimal(raw: dict[str, object], key: str, *, label: str) -> Decimal
     if value <= 0:
         raise ValueError(f"{label} field {key!r} must be positive")
     return value
+
+
+def _raw_int(raw: dict[str, object], key: str) -> int | None:
+    value = raw.get(key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
 
 
 def _snap_quantity(value: Decimal, increment: Decimal | None) -> Decimal:

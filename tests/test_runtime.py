@@ -49,6 +49,8 @@ from carryme_runtime import (
     CleanupPreviewRouter,
     ExtendedCleanupPreviewService,
     ExtendedLiveExecutionService,
+    HyperliquidLiveExecutionService,
+    HyperliquidOrderStateObserver,
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
@@ -691,6 +693,102 @@ def test_order_preview_service_rejects_preview_below_venue_minimum_notional() ->
                 slippage_tolerance_bps=10,
                 generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
             )
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_builds_hyperliquid_leg() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=6,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_hyperliquid",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=100.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="hyperliquid",
+                symbol="ARB",
+                fee_profile="tier0",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("hyperliquid", "ARB"): _snapshot(
+            "hyperliquid",
+            "ARB",
+            -0.0004,
+            0.0918,
+            500,
+            0.0922,
+            450,
+            raw={
+                "szDecimals": 1,
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        preview = await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+            paper_trade,
+            slippage_tolerance_bps=10,
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+        )
+        legs = {item.venue: item for item in preview.legs}
+        hyperliquid = legs["hyperliquid"]
+
+        assert hyperliquid.reference_price == pytest.approx(0.0922)
+        assert hyperliquid.quantity == pytest.approx(119.3)
+        assert hyperliquid.quantity_text == "119.3"
+        assert hyperliquid.worst_price_text == "0.09229"
+        assert hyperliquid.minimum_notional == pytest.approx(10.0)
+        assert hyperliquid.endpoint_path_hint == "/exchange"
+        assert hyperliquid.auth_scheme == "account address + API wallet private key"
+        assert hyperliquid.payload == {
+            "coin": "ARB",
+            "is_buy": True,
+            "sz": "119.3",
+            "limit_px": "0.09229",
+            "order_type": {"limit": {"tif": "Ioc"}},
+            "reduce_only": False,
+            "client_order_id": "carryme-pt6-hyperliquid-buy",
+        }
 
     asyncio.run(run())
 
@@ -3468,6 +3566,186 @@ def test_paradex_order_state_observer_falls_back_to_history_for_closed_ioc(
         assert state.notes == [
             "Paradex direct order lookup missed the order; fell back to orders-history."
         ]
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_order_state_observer_classifies_filled_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubInfo:
+        def query_order_by_oid(self, address: str, oid: int) -> dict[str, object]:
+            assert address == "0xhyper"
+            assert oid == 777
+            return {
+                "status": "filled",
+                "order": {
+                    "coin": "ARB",
+                    "origSz": "119.3",
+                    "sz": "0",
+                    "avgPx": "0.0923",
+                },
+            }
+
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_info",
+        lambda: StubInfo(),
+    )
+
+    async def run() -> None:
+        observer = HyperliquidOrderStateObserver(account_address="0xhyper")
+        state = await observer.observe(
+            {
+                "venue": "hyperliquid",
+                "external_reference": "777",
+                "request_payload": {},
+            }
+        )
+        assert state.supported is True
+        assert state.derived_state == "filled"
+        assert state.order_status == "filled"
+        assert state.avg_fill_price == "0.0923"
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_live_execution_service_submits_confirmed_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubExchange:
+        def order(
+            self,
+            name: str,
+            is_buy: bool,
+            sz: float,
+            limit_px: float,
+            order_type: dict[str, object],
+            reduce_only: bool = False,
+        ) -> dict[str, object]:
+            assert name == "ARB"
+            assert is_buy is True
+            assert sz == pytest.approx(119.3)
+            assert limit_px == pytest.approx(0.0923)
+            assert order_type == {"limit": {"tif": "Ioc"}}
+            assert reduce_only is False
+            return {
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {
+                                "resting": {
+                                    "oid": 777,
+                                }
+                            }
+                        ]
+                    },
+                },
+            }
+
+    monkeypatch.setattr(
+        "carryme_runtime.hyperliquid_live_execution.build_hyperliquid_exchange",
+        lambda *, private_key, account_address: StubExchange(),
+    )
+
+    paper_trade = PaperTradeEntry(
+        entry_id=7,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_hyperliquid",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=100.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="hyperliquid",
+                symbol="ARB",
+                fee_profile="tier0",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    confirmation = PreviewConfirmationEntry(
+        entry_id=3,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=7,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=7,
+            label="arb_extended_hyperliquid",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                    effective_notional=10.99946,
+                    quantity=119.3,
+                    quantity_text="119.3",
+                    quantity_increment=0.1,
+                    minimum_order_size=0.1,
+                    minimum_notional=10.0,
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0923,
+                    worst_price_text="0.0923",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    endpoint_path_hint="/exchange",
+                    required_auth_env_vars=[
+                        "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+                        "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+                    ],
+                    auth_scheme="account address + API wallet private key",
+                    payload={
+                        "coin": "ARB",
+                        "is_buy": True,
+                        "sz": "119.3",
+                        "limit_px": "0.0923",
+                        "order_type": {"limit": {"tif": "Ioc"}},
+                        "reduce_only": False,
+                        "client_order_id": "carryme-pt7-hyperliquid-buy",
+                    },
+                    notes=[],
+                )
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    async def run() -> None:
+        service = HyperliquidLiveExecutionService(
+            account_address="0xhyper",
+            api_wallet_private_key="0xwallet",
+        )
+        entry = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+        )
+        assert entry.status == "submitted"
+        assert entry.adapter == "hyperliquid_live"
+        assert entry.legs[0].external_reference == "777"
+        assert entry.legs[0].request_payload is not None
+        assert entry.legs[0].request_payload["coin"] == "ARB"
 
     asyncio.run(run())
 
