@@ -253,9 +253,20 @@ def get_extended_live_execution_service(
 ) -> ExtendedLiveExecutionService:
     """Return the live Extended execution service for manual submissions."""
 
+    api_key = settings.extended_api_key
+    stark_private_key = settings.extended_stark_private_key
+    if not api_key or not stark_private_key:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Extended live execution requires "
+                "CARRYME_API_EXTENDED_API_KEY and "
+                "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY"
+            ),
+        )
     return ExtendedLiveExecutionService(
-        api_key=settings.extended_api_key or "",
-        stark_private_key=settings.extended_stark_private_key or "",
+        api_key=api_key,
+        stark_private_key=stark_private_key,
     )
 
 
@@ -339,7 +350,7 @@ async def _build_venue_scoped_readiness_for_paper_trade(
     settings: ApiSettings,
     confirmation_store: PreviewConfirmationStore,
     account_preflight_service: AccountPreflightService,
-) -> LiveSubmissionReadiness:
+) -> tuple[LiveSubmissionReadiness, PreviewConfirmationEntry | None]:
     normalized_preview_hash = preview_hash.strip()
     if not normalized_preview_hash:
         raise ValueError("preview_hash must be non-empty")
@@ -397,13 +408,16 @@ async def _build_venue_scoped_readiness_for_paper_trade(
         paper_trade_id=paper_trade.entry_id or 0,
         preview_hash=normalized_preview_hash,
     )
-    return build_live_submission_readiness(
-        paper_trade_id=paper_trade.entry_id or 0,
-        label=paper_trade.intent.label,
-        preview_hash=normalized_preview_hash,
-        confirmations=[] if confirmation is None else [confirmation],
-        execution_preflight=execution_preflight,
-        account_preflight=account_preflight,
+    return (
+        build_live_submission_readiness(
+            paper_trade_id=paper_trade.entry_id or 0,
+            label=paper_trade.intent.label,
+            preview_hash=normalized_preview_hash,
+            confirmations=[] if confirmation is None else [confirmation],
+            execution_preflight=execution_preflight,
+            account_preflight=account_preflight,
+        ),
+        confirmation,
     )
 
 
@@ -830,6 +844,8 @@ def create_app() -> FastAPI:
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get(
         "/v1/executions/preview/from-paper-trade/{paper_trade_id}",
@@ -975,7 +991,7 @@ def create_app() -> FastAPI:
             )
 
         try:
-            readiness = await _build_venue_scoped_readiness_for_paper_trade(
+            readiness, confirmation = await _build_venue_scoped_readiness_for_paper_trade(
                 paper_trade=paper_trade,
                 preview_hash=preview_hash,
                 venue="paradex",
@@ -983,17 +999,13 @@ def create_app() -> FastAPI:
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not readiness.ready:
             raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
 
-        confirmation = confirmation_store.find_latest_by_preview_hash(
-            paper_trade_id=paper_trade_id,
-            preview_hash=preview_hash,
-        )
         if confirmation is None:
             raise HTTPException(
                 status_code=409,
@@ -1045,7 +1057,7 @@ def create_app() -> FastAPI:
             )
 
         try:
-            readiness = await _build_venue_scoped_readiness_for_paper_trade(
+            readiness, confirmation = await _build_venue_scoped_readiness_for_paper_trade(
                 paper_trade=paper_trade,
                 preview_hash=preview_hash,
                 venue="extended",
@@ -1053,17 +1065,13 @@ def create_app() -> FastAPI:
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not readiness.ready:
             raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
 
-        confirmation = confirmation_store.find_latest_by_preview_hash(
-            paper_trade_id=paper_trade_id,
-            preview_hash=preview_hash,
-        )
         if confirmation is None:
             raise HTTPException(
                 status_code=409,

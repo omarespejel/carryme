@@ -222,8 +222,12 @@ def build_signed_paradex_order_payload(
     market = _require_string(order_payload, "market")
     side = _normalize_order_side(_require_string(order_payload, "side"))
     order_type = _normalize_order_type(_require_string(order_payload, "type"))
-    size = _require_decimal(order_payload, "size")
-    price = _require_decimal(order_payload, "price") if order_type != "MARKET" else Decimal("0")
+    size = _normalize_order_decimal(_require_decimal(order_payload, "size"), key="size")
+    price = (
+        _normalize_order_decimal(_require_decimal(order_payload, "price"), key="price")
+        if order_type != "MARKET"
+        else Decimal("0")
+    )
     instruction = _require_string(order_payload, "instruction")
     client_id = _require_string(order_payload, "client_id")
     reduce_only = bool(order_payload.get("reduce_only"))
@@ -340,6 +344,13 @@ def _to_chain_decimal(value: Decimal) -> int:
 
 def _format_order_decimal(value: Decimal) -> str:
     return format(value, "f")
+
+
+def _normalize_order_decimal(value: Decimal, *, key: str) -> Decimal:
+    normalized = Decimal(_to_chain_decimal(value)).scaleb(-8)
+    if normalized != value:
+        raise ConnectorError(f"Paradex order payload field {key} exceeds 8 decimal places")
+    return normalized
 
 
 @dataclass(frozen=True)
