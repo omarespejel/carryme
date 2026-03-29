@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict, cast
 
@@ -164,10 +164,14 @@ class ExtendedAccountProbe:
         ) as client:
             connector = ExtendedPrivateConnector(client)
             try:
-                account, balances, positions = await asyncio.gather(
-                    connector.fetch_account(),
-                    connector.fetch_balances(),
-                    connector.fetch_positions(),
+                account = await connector.fetch_account()
+                balances = await _fetch_extended_optional_rows(
+                    connector.fetch_balances,
+                    resource_label="balance",
+                )
+                positions = await _fetch_extended_optional_rows(
+                    connector.fetch_positions,
+                    resource_label="positions",
                 )
             except (ConnectorError, httpx.HTTPError) as exc:
                 return VenueAccountPreflight(
@@ -213,7 +217,12 @@ class ExtendedAccountProbe:
                 ),
                 balance_count=_count_rows(balances, context="Extended balances"),
                 position_count=_count_rows(positions, context="Extended positions"),
-                notes=["Extended account preflight completed using authenticated private GETs."],
+                notes=[
+                    (
+                        "Extended account preflight completed using authenticated private GETs. "
+                        "Missing balance or position rows are treated as an empty account state."
+                    )
+                ],
             )
         except (UpstreamDataError, ValidationError) as exc:
             return VenueAccountPreflight(
@@ -374,6 +383,26 @@ class ParadexAccountProbe:
                     "Paradex authenticated read succeeded but returned malformed account data."
                 ],
             )
+
+
+async def _fetch_extended_optional_rows(
+    fetcher: Callable[[], Awaitable[dict[str, Any] | list[Any]]],
+    *,
+    resource_label: str,
+) -> dict[str, Any] | list[Any]:
+    try:
+        return await fetcher()
+    except ConnectorError as exc:
+        cause = exc.__cause__
+        if not (
+            isinstance(cause, httpx.HTTPStatusError)
+            and cause.response.status_code == 404
+        ):
+            raise
+        return {
+            "data": [],
+            "notes": [f"Extended {resource_label} endpoint returned 404; treated as empty"],
+        }
 
 
 def _blocking_reasons(enabled: bool, missing_env_vars: list[str], venue: str) -> list[str]:
