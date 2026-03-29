@@ -100,6 +100,7 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.execution_observation_interval_seconds == 10
     assert settings.execution_observation_max_backoff_seconds == 60
     assert settings.score_timeout_seconds == 30.0
+    assert settings.universe_scan_timeout_seconds == 30.0
     assert settings.min_candidate_entry_edge == 0.0
     assert settings.min_candidate_capacity_notional == 0.0
     assert settings.universe_scan_venues == ("extended", "paradex", "hyperliquid")
@@ -108,6 +109,8 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.universe_scan_min_capacity_notional == 250.0
     assert settings.universe_scan_min_daily_volume == 10_000.0
     assert settings.universe_scan_min_open_interest == 50_000.0
+    assert settings.universe_scan_min_roundtrip_edge == 0.0
+    assert settings.universe_scan_min_execution_quality_score == 0.0
     assert settings.universe_scan_min_execution_samples == 0
     assert settings.universe_scan_limit == 10
     assert settings.stop_signals == ("SIGINT", "SIGTERM")

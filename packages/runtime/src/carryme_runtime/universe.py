@@ -548,6 +548,10 @@ def build_pair_spec_from_universe_opportunity(
     """Convert a universe opportunity into a reusable pair spec."""
 
     scored = opportunity.opportunity
+    if scored.short_venue not in opportunity.venue_markets:
+        raise ValueError(f"Missing venue_markets entry for short_venue: {scored.short_venue}")
+    if scored.long_venue not in opportunity.venue_markets:
+        raise ValueError(f"Missing venue_markets entry for long_venue: {scored.long_venue}")
     short_market = opportunity.venue_markets[scored.short_venue]
     long_market = opportunity.venue_markets[scored.long_venue]
     base_asset = scored.canonical_symbol.split("-", 1)[0].lower()

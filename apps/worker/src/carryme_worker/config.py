@@ -21,6 +21,7 @@ class WorkerSettings(BaseSettings):
     execution_alert_webhook_url: str | None = None
     execution_alert_webhook_timeout_seconds: float = Field(default=10.0, gt=0)
     score_timeout_seconds: float = Field(default=30.0, gt=0)
+    universe_scan_timeout_seconds: float = Field(default=30.0, gt=0)
     min_candidate_entry_edge: float = Field(default=0.0, ge=0)
     min_candidate_capacity_notional: float = Field(default=0.0, ge=0)
     universe_scan_venues: tuple[str, ...] = ("extended", "paradex", "hyperliquid")
@@ -37,7 +38,7 @@ class WorkerSettings(BaseSettings):
     universe_scan_min_capacity_notional: float = Field(default=250.0, ge=0)
     universe_scan_min_daily_volume: float = Field(default=10_000.0, ge=0)
     universe_scan_min_open_interest: float = Field(default=50_000.0, ge=0)
-    universe_scan_min_roundtrip_edge: float = Field(default=0.0)
+    universe_scan_min_roundtrip_edge: float = Field(default=0.0, ge=0)
     universe_scan_min_execution_quality_score: float = Field(default=0.0, ge=0)
     universe_scan_min_execution_samples: int = Field(default=0, ge=0)
     universe_scan_limit: int = Field(default=10, gt=0)
