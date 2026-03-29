@@ -4921,6 +4921,219 @@ def test_paired_live_execution_endpoint_submits_both_legs(tmp_path: Path) -> Non
     assert len(execution_store.list_recent(limit=10)) == 1
 
 
+def test_paired_live_execution_endpoint_defaults_first_venue_to_auto(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+    confirmation_store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label="arb_extended_paradex",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        effective_notional=999.96,
+                        quantity=10881.0,
+                        quantity_text="10881",
+                        quantity_increment=1.0,
+                        minimum_order_size=10.0,
+                        minimum_notional=0.918,
+                        reference_price=0.0919,
+                        reference_price_source="best_bid",
+                        worst_acceptable_price=0.0918,
+                        worst_price_text="0.0918",
+                        price_increment=0.0001,
+                        max_order_value=1_250_000.0,
+                        endpoint_path_hint="/api/v1/user/order",
+                        auth_scheme="api key + Stark signing key",
+                        payload={"symbol": "ARB-USD"},
+                        notes=[],
+                    ),
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        effective_notional=999.99,
+                        quantity=10845.9,
+                        quantity_text="10845.90000000",
+                        quantity_increment=0.1,
+                        minimum_order_size=0.1,
+                        minimum_notional=10.0,
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.0923,
+                        worst_price_text="0.09230000",
+                        price_increment=0.0001,
+                        max_order_value=1_000_000.0,
+                        endpoint_path_hint="/v1/orders",
+                        auth_scheme="main account address + subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    ),
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        free_collateral=25.0,
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                        available_to_trade=25.0,
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubPairedLiveExecutionCoordinator:
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            first_venue: str = "auto",
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            assert first_venue == "auto"
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+                adapter="paired_live:paradex_then_extended",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="paradex-1",
+                    ),
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="extended-1",
+                    ),
+                ],
+            )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_api_settings,
+        get_execution_journal_store,
+        get_paired_live_execution_coordinator,
+        get_paper_trade_store,
+        get_preview_confirmation_store,
+    )
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_account_preflight_service] = (
+        lambda: StubAccountPreflightService()
+    )
+    app.dependency_overrides[get_paired_live_execution_coordinator] = (
+        lambda: StubPairedLiveExecutionCoordinator()
+    )
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="paradex-private",
+    )
+    client = TestClient(app)
+    response = client.post(
+        f"/v1/executions/live/pair/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "preview-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["adapter"] == "paired_live:paradex_then_extended"
+    assert [leg["venue"] for leg in payload["legs"]] == ["paradex", "extended"]
+
+
 def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: Path) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
