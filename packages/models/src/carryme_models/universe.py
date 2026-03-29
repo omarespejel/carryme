@@ -89,6 +89,7 @@ class FundingUniversePortfolioEntry(BaseModel):
     selected_notional: float = Field(ge=0)
     estimated_one_day_pnl_after_entry: float
     estimated_one_day_pnl_after_round_trip: float
+    execution_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
 
 
 class FundingUniversePortfolioPlan(BaseModel):
@@ -100,6 +101,7 @@ class FundingUniversePortfolioPlan(BaseModel):
     unused_notional: float = Field(ge=0)
     estimated_one_day_pnl_after_entry: float
     estimated_one_day_pnl_after_round_trip: float
+    execution_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
     entries: list[FundingUniversePortfolioEntry] = Field(default_factory=list)
 
     @model_validator(mode="after")
