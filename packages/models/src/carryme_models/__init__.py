@@ -1,5 +1,6 @@
 """Shared models for the carryme workspace."""
 
+from carryme_models.confirmation import PreviewConfirmationEntry
 from carryme_models.execution import ExecutionJournalEntry, ExecutionLegResult
 from carryme_models.health import AppDescriptor, ServiceHealth
 from carryme_models.history import (
@@ -42,6 +43,7 @@ __all__ = [
     "PaperTradeEntry",
     "PaperTradeExecutionPreflight",
     "PaperTradeOrderPreview",
+    "PreviewConfirmationEntry",
     "ServiceHealth",
     "TopOfBook",
     "TradeLegIntent",

@@ -17,6 +17,7 @@ from carryme_models import (
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
+    PreviewConfirmationEntry,
     ServiceHealth,
     TradingFeeProfile,
     VenueExecutionPreflight,
@@ -39,6 +40,7 @@ from carryme_storage import (
     ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
+    PreviewConfirmationStore,
     WatchlistStore,
 )
 from fastapi import Body, Depends, FastAPI, HTTPException
@@ -102,6 +104,14 @@ def get_execution_journal_store(
     """Return the shared execution journal store."""
 
     return ExecutionJournalStore(settings.database_path)
+
+
+def get_preview_confirmation_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> PreviewConfirmationStore:
+    """Return the shared preview confirmation store."""
+
+    return PreviewConfirmationStore(settings.database_path)
 
 
 def get_execution_adapter() -> ExecutionAdapter:
@@ -469,6 +479,66 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/executions/preview-confirmations",
+        response_model=list[PreviewConfirmationEntry],
+    )
+    def preview_confirmations(
+        store: Annotated[PreviewConfirmationStore, Depends(get_preview_confirmation_store)],
+        limit: int = 50,
+        label: str | None = None,
+        paper_trade_id: int | None = None,
+    ) -> list[PreviewConfirmationEntry]:
+        return store.list_recent(limit=limit, label=label, paper_trade_id=paper_trade_id)
+
+    @app.post(
+        "/v1/executions/preview-confirmations/from-paper-trade/{paper_trade_id}",
+        response_model=PreviewConfirmationEntry,
+    )
+    async def confirm_paper_trade_preview(
+        paper_trade_id: int,
+        preview_hash: str,
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        service: Annotated[OrderPreviewService, Depends(get_order_preview_service)],
+        slippage_tolerance_bps: int = 10,
+        note: str | None = None,
+    ) -> PreviewConfirmationEntry:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        try:
+            preview = await service.preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=slippage_tolerance_bps,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if preview.preview_hash != preview_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="Preview hash did not match the current unsigned order preview",
+            )
+
+        confirmation = PreviewConfirmationEntry(
+            confirmed_at=datetime.now(UTC),
+            paper_trade_id=paper_trade_id,
+            label=paper_trade.intent.label,
+            preview_hash=preview.preview_hash,
+            preview=preview,
+            note=note,
+        )
+        return confirmation_store.append(confirmation)
 
     @app.post(
         "/v1/executions/mock/from-paper-trade/{paper_trade_id}",
