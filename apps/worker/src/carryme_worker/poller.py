@@ -9,11 +9,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+import httpx
 from carryme_models import FundingArbOpportunity, OpportunityRecord
-from carryme_runtime import OpportunityService
+from carryme_runtime import ConnectorError, OpportunityService
 from carryme_storage import OpportunityHistoryStore, load_watchlist
 
 from carryme_worker.config import WorkerSettings
+
+logger = logging.getLogger(__name__)
 
 
 class PairScorer(Protocol):
@@ -37,6 +40,7 @@ class PollCycleSummary:
 
     watched_pairs: int
     saved_records: int
+    failed_records: int
     database_path: str
 
 
@@ -66,15 +70,30 @@ async def poll_watchlist_once(
     timestamp = now or datetime.now(UTC)
 
     saved_records = 0
+    failed_records = 0
     for pair in pairs:
-        opportunity = await runtime.score_pair(
-            left_venue=pair.left_venue,
-            left_symbol=pair.left_symbol,
-            left_fee_profile=pair.left_fee_profile,
-            right_venue=pair.right_venue,
-            right_symbol=pair.right_symbol,
-            right_fee_profile=pair.right_fee_profile,
-        )
+        try:
+            async with asyncio.timeout(settings.score_timeout_seconds):
+                opportunity = await runtime.score_pair(
+                    left_venue=pair.left_venue,
+                    left_symbol=pair.left_symbol,
+                    left_fee_profile=pair.left_fee_profile,
+                    right_venue=pair.right_venue,
+                    right_symbol=pair.right_symbol,
+                    right_fee_profile=pair.right_fee_profile,
+                )
+        except (ConnectorError, httpx.HTTPError, ValueError, TimeoutError) as exc:
+            logger.warning(
+                "Failed to score pair %s/%s ↔ %s/%s: %s",
+                pair.left_venue,
+                pair.left_symbol,
+                pair.right_venue,
+                pair.right_symbol,
+                exc,
+                exc_info=True,
+            )
+            failed_records += 1
+            continue
         history_store.append(
             OpportunityRecord(
                 recorded_at=timestamp,
@@ -87,6 +106,7 @@ async def poll_watchlist_once(
     return PollCycleSummary(
         watched_pairs=len(pairs),
         saved_records=saved_records,
+        failed_records=failed_records,
         database_path=settings.database_path,
     )
 
@@ -98,20 +118,23 @@ async def run_polling_loop(
     scorer: PairScorer | None = None,
     store: OpportunityHistoryStore | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    logger: logging.Logger | None = None,
+    loop_logger: logging.Logger | None = None,
 ) -> PollLoopSummary:
     """Run the worker for a fixed number of scheduled iterations."""
 
+    if iterations < 1:
+        raise ValueError("iterations must be at least 1")
+
     runtime = scorer or OpportunityService()
     history_store = store or OpportunityHistoryStore(settings.database_path)
-    loop_logger = logger or logging.getLogger("carryme.worker")
+    logger_instance = loop_logger or logging.getLogger("carryme.worker")
 
     successful_cycles = 0
     failures = 0
     saved_records = 0
 
     for attempt in range(1, iterations + 1):
-        loop_logger.info("starting poll cycle %s of %s", attempt, iterations)
+        logger_instance.info("starting poll cycle %s of %s", attempt, iterations)
         try:
             summary = await poll_watchlist_once(
                 settings,
@@ -120,7 +143,7 @@ async def run_polling_loop(
             )
             successful_cycles += 1
             saved_records += summary.saved_records
-            loop_logger.info(
+            logger_instance.info(
                 "completed poll cycle %s of %s with %s saved records",
                 attempt,
                 iterations,
@@ -134,7 +157,7 @@ async def run_polling_loop(
                 settings.max_backoff_seconds,
                 settings.poll_interval_seconds * (2 ** (failures - 1)),
             )
-            loop_logger.exception(
+            logger_instance.exception(
                 "poll cycle %s of %s failed; backing off for %s seconds",
                 attempt,
                 iterations,

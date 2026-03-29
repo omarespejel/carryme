@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import logging
 
 from carryme_models import AppDescriptor, ServiceHealth
@@ -36,6 +37,7 @@ def build_cycle_payload(summary: PollCycleSummary) -> dict[str, int | str]:
     return {
         "watched_pairs": summary.watched_pairs,
         "saved_records": summary.saved_records,
+        "failed_records": summary.failed_records,
         "database_path": summary.database_path,
     }
 
@@ -65,15 +67,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.iterations is not None and args.iterations < 1:
+        parser.error("--iterations must be at least 1")
+
     settings = WorkerSettings()
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
     if args.once:
-        cycle_summary = asyncio.run(poll_watchlist_once(settings))
-        print(build_cycle_payload(cycle_summary))
+        summary = asyncio.run(poll_watchlist_once(settings))
+        print(json.dumps(build_cycle_payload(summary), indent=2))
         return
     if args.iterations is not None:
         loop_summary = asyncio.run(run_polling_loop(settings, iterations=args.iterations))
-        print(build_loop_payload(loop_summary))
+        print(json.dumps(build_loop_payload(loop_summary), indent=2))
         return
 
     payload = build_health_payload(settings)
