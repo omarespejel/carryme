@@ -1,7 +1,7 @@
 """Execution journal models."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +19,7 @@ class ExecutionLegResult(BaseModel):
     status: Literal["accepted", "rejected"]
     simulated: bool = True
     external_reference: str | None = None
+    raw_payload: Any | None = None
 
 
 class ExecutionJournalEntry(BaseModel):
@@ -28,6 +29,7 @@ class ExecutionJournalEntry(BaseModel):
     executed_at: datetime
     adapter: str = Field(min_length=1)
     mode: Literal["mock"]
+    submission_id: str | None = None
     status: Literal["accepted", "rejected"]
     paper_trade_id: int | None = None
     paper_trade: PaperTradeEntry
