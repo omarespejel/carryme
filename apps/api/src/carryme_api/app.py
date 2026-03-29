@@ -51,6 +51,7 @@ from carryme_runtime import (
     HyperliquidLiveExecutionService,
     HyperliquidOrderStateObserver,
     InvalidTradeCandidateError,
+    LiveExecutionConfigMap,
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
