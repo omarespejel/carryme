@@ -223,6 +223,7 @@ class HyperliquidOrderStateObserver:
     """Observe Hyperliquid order state by oid through the official SDK info client."""
 
     account_address: str
+    vault_address: str | None = None
 
     async def observe(self, leg: dict[str, Any]) -> ExecutionLegOrderState:
         external_reference = _string_value(leg, "external_reference")
@@ -245,7 +246,7 @@ class HyperliquidOrderStateObserver:
         try:
             payload = await asyncio.to_thread(
                 _fetch_hyperliquid_order_state,
-                self.account_address,
+                self.vault_address or self.account_address,
                 oid,
             )
         except Exception as exc:

@@ -335,6 +335,7 @@ def get_cleanup_preview_service(
             "extended": ExtendedCleanupPreviewService(api_key=settings.extended_api_key or ""),
             "hyperliquid": HyperliquidCleanupPreviewService(
                 account_address=settings.hyperliquid_account_address or "",
+                vault_address=settings.hyperliquid_vault_address,
             ),
             "paradex": ParadexCleanupPreviewService(
                 account_address=settings.paradex_account_address or "",
@@ -366,6 +367,7 @@ def get_execution_order_state_service(
     if settings.hyperliquid_account_address and settings.hyperliquid_api_wallet_private_key:
         observers["hyperliquid"] = HyperliquidOrderStateObserver(
             account_address=settings.hyperliquid_account_address,
+            vault_address=settings.hyperliquid_vault_address,
         )
     return ExecutionOrderStateService(observers=observers)
 
