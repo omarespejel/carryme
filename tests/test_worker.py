@@ -43,6 +43,7 @@ from carryme_worker.main import (
     build_execution_observation_payload,
     build_health_payload,
     build_loop_payload,
+    build_universe_scan_loop_payload,
     build_universe_scan_payload,
 )
 from carryme_worker.main import (
@@ -54,6 +55,7 @@ from carryme_worker.poller import (
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
+    UniverseScanLoopSummary,
     UniverseScanSummary,
     _build_order_state_observers,
     install_signal_handlers,
@@ -62,6 +64,7 @@ from carryme_worker.poller import (
     run_polling_loop,
     run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
+    run_supervised_universe_scan_loop,
     scan_funding_universe_once,
     summarize_candidates,
 )
@@ -97,6 +100,8 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.log_level == "INFO"
     assert settings.poll_interval_seconds == 30
     assert settings.max_backoff_seconds == 300
+    assert settings.universe_scan_interval_seconds == 60
+    assert settings.universe_scan_max_backoff_seconds == 300
     assert settings.execution_observation_interval_seconds == 10
     assert settings.execution_observation_max_backoff_seconds == 60
     assert settings.score_timeout_seconds == 30.0
@@ -104,13 +109,16 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.min_candidate_entry_edge == 0.0
     assert settings.min_candidate_capacity_notional == 0.0
     assert settings.universe_scan_venues == ("extended", "paradex", "hyperliquid")
-    assert settings.universe_scan_ranking == "execution_adjusted_quality_pnl"
+    assert settings.universe_scan_ranking == "route_adjusted_quality_pnl"
     assert settings.universe_scan_target_notional == 5_000.0
     assert settings.universe_scan_min_capacity_notional == 250.0
     assert settings.universe_scan_min_daily_volume == 10_000.0
     assert settings.universe_scan_min_open_interest == 50_000.0
     assert settings.universe_scan_min_roundtrip_edge == 0.0
     assert settings.universe_scan_min_execution_quality_score == 0.0
+    assert settings.universe_scan_min_route_stability_weight == 0.0
+    assert settings.universe_scan_min_route_presence_ratio == 0.0
+    assert settings.universe_scan_min_route_samples == 0
     assert settings.universe_scan_min_execution_samples == 0
     assert settings.universe_scan_limit == 10
     assert settings.stop_signals == ("SIGINT", "SIGTERM")
@@ -251,6 +259,32 @@ def test_worker_universe_scan_payload() -> None:
         "scanned_opportunities": 10,
         "saved_records": 10,
         "alert_events": 2,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_universe_scan_loop_payload() -> None:
+    payload = build_universe_scan_loop_payload(
+        UniverseScanLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            overlap_count=50,
+            scanned_opportunities=12,
+            saved_records=12,
+            alert_events=4,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "overlap_count": 50,
+        "scanned_opportunities": 12,
+        "saved_records": 12,
+        "alert_events": 4,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -710,6 +744,143 @@ def test_scan_funding_universe_once_saves_ranked_history_and_alerts(tmp_path: Pa
     assert len(history) == 1
     assert history[0].pair.label == "arb_extended_paradex"
     assert len(events) == 1
+
+
+def test_scan_funding_universe_once_passes_route_stability_filters(tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class StubUniverseScanner:
+        async def scan(self, **kwargs: object) -> FundingUniverseScan:
+            captured.update(kwargs)
+            return FundingUniverseScan(
+                venues=["extended", "paradex"],
+                ranking=cast(str, kwargs["ranking"]),
+                target_notional=cast(float, kwargs["target_notional"]),
+                overlap_count=0,
+                overlaps=[],
+                opportunities=[],
+            )
+
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        universe_scan_min_route_stability_weight=0.25,
+        universe_scan_min_route_presence_ratio=0.5,
+        universe_scan_min_route_samples=4,
+    )
+
+    summary = asyncio.run(
+        scan_funding_universe_once(
+            settings,
+            scanner=StubUniverseScanner(),
+            store=OpportunityHistoryStore(settings.database_path),
+        )
+    )
+
+    assert summary.saved_records == 0
+    assert captured["ranking"] == "route_adjusted_quality_pnl"
+    assert captured["min_route_stability_weight"] == 0.25
+    assert captured["min_route_presence_ratio"] == 0.5
+    assert captured["min_route_samples"] == 4
+
+
+def test_run_supervised_universe_scan_loop_honors_max_iterations(tmp_path: Path) -> None:
+    class StubUniverseScanner:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            return FundingUniverseScan(
+                venues=["extended", "paradex"],
+                ranking="route_adjusted_quality_pnl",
+                target_notional=5000.0,
+                overlap_count=1,
+                overlaps=[],
+                opportunities=[
+                    FundingUniverseOpportunity(
+                        opportunity=FundingArbOpportunity(
+                            canonical_symbol="ARB-USD-PERP",
+                            long_venue="paradex",
+                            short_venue="extended",
+                            long_fee_profile="pro",
+                            short_fee_profile="default",
+                            gross_daily_edge=0.004,
+                            entry_cost_rate=0.00045,
+                            round_trip_cost_rate=0.0009,
+                            one_day_net_edge_after_entry=0.00355,
+                            one_day_net_edge_after_round_trip=0.0031,
+                            break_even_days_entry=0.2,
+                            break_even_days_round_trip=0.3,
+                            capacity=CapacityEstimate(
+                                short_bid_notional=1400.0,
+                                long_ask_notional=900.0,
+                                max_entry_notional=900.0,
+                                limiting_venue="paradex",
+                            ),
+                        ),
+                        venue_markets={
+                            "extended": FundingUniverseVenueMarket(
+                                venue="extended",
+                                symbol="ARB-USD",
+                                mark_price=0.091,
+                                daily_funding_rate=0.000312,
+                                open_interest=200_000,
+                                daily_volume=150_000,
+                                bid_notional=1400.0,
+                                ask_notional=1600.0,
+                            ),
+                            "paradex": FundingUniverseVenueMarket(
+                                venue="paradex",
+                                symbol="ARB-USD-PERP",
+                                mark_price=0.0911,
+                                daily_funding_rate=-0.0037,
+                                open_interest=180_000,
+                                daily_volume=140_000,
+                                bid_notional=1200.0,
+                                ask_notional=900.0,
+                            ),
+                        },
+                        target_notional=5000.0,
+                        deployable_notional=900.0,
+                        estimated_one_day_pnl_after_entry=3.195,
+                        estimated_one_day_pnl_after_round_trip=2.79,
+                        quality_score=1.7,
+                    )
+                ],
+            )
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        universe_scan_interval_seconds=1,
+        min_candidate_entry_edge=0.001,
+        min_candidate_capacity_notional=500.0,
+    )
+
+    summary = asyncio.run(
+        run_supervised_universe_scan_loop(
+            settings,
+            scanner=StubUniverseScanner(),
+            store=OpportunityHistoryStore(settings.database_path),
+            sleep=fake_sleep,
+            max_iterations=2,
+        )
+    )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.overlap_count == 2
+    assert summary.scanned_opportunities == 2
+    assert summary.saved_records == 2
+    assert summary.alert_events == 2
+
+
+def test_run_supervised_universe_scan_loop_rejects_non_positive_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+
+    with pytest.raises(ValueError, match="max_iterations must be at least 1"):
+        asyncio.run(run_supervised_universe_scan_loop(settings, max_iterations=0))
 
 
 def test_run_polling_loop_applies_backoff_and_saves_after_retry(tmp_path: Path) -> None:
@@ -2492,6 +2663,63 @@ def test_worker_main_prints_supervised_execution_observation_summary_as_json(
         "saved_observations": 4,
         "saved_alerts": 1,
         "sent_notifications": 1,
+        "database_path": settings.database_path,
+    }
+
+
+def test_worker_main_prints_supervised_universe_scan_summary_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    async def fake_supervised_universe(
+        settings: WorkerSettings,
+        *,
+        stop_event: asyncio.Event | None = None,
+        max_iterations: int | None = None,
+    ) -> UniverseScanLoopSummary:
+        assert stop_event is not None
+        assert max_iterations == 3
+        return UniverseScanLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            overlap_count=9,
+            scanned_opportunities=4,
+            saved_records=4,
+            alert_events=1,
+            database_path=settings.database_path,
+        )
+
+    monkeypatch.setattr("carryme_worker.main.WorkerSettings", lambda: settings)
+    monkeypatch.setattr("carryme_worker.main.install_signal_handlers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "carryme_worker.main.run_supervised_universe_scan_loop",
+        fake_supervised_universe,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--scan-universe-supervise", "--iterations", "3"],
+    )
+
+    worker_main()
+
+    stdout, _ = capsys.readouterr()
+    assert json.loads(stdout) == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "overlap_count": 9,
+        "scanned_opportunities": 4,
+        "saved_records": 4,
+        "alert_events": 1,
         "database_path": settings.database_path,
     }
 
