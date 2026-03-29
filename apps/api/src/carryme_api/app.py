@@ -332,17 +332,22 @@ def create_app() -> FastAPI:
             min_capacity_notional=min_capacity_notional,
             max_break_even_days_entry=max_break_even_days_entry,
         )
-        return [
-            build_trade_intent(
-                record,
-                capacity_fraction=capacity_fraction,
-                max_target_notional=max_target_notional,
-                min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
-                min_capacity_notional=min_capacity_notional,
-                max_break_even_days_entry=max_break_even_days_entry,
-            )
-            for record in selected
-        ]
+        intents: list[FundingPairTradeIntent] = []
+        for record in selected:
+            try:
+                intents.append(
+                    build_trade_intent(
+                        record,
+                        capacity_fraction=capacity_fraction,
+                        max_target_notional=max_target_notional,
+                        min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+                        min_capacity_notional=min_capacity_notional,
+                        max_break_even_days_entry=max_break_even_days_entry,
+                    )
+                )
+            except ValueError:
+                continue
+        return intents
 
     @app.get("/v1/intents/funding-pair", response_model=FundingPairTradeIntent)
     def funding_pair_intent(
