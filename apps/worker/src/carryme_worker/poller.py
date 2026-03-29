@@ -354,6 +354,9 @@ async def run_supervised_execution_observation_loop(
 ) -> ExecutionObservationLoopSummary:
     """Run the execution monitor until stopped by signal or max-iteration limit."""
 
+    if max_iterations is not None and max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
     journal_store = execution_store or ExecutionJournalStore(settings.database_path)
     history_store = observation_store or ExecutionObservationStore(settings.database_path)
     execution_alert_sink = alert_sink or ExecutionAlertStore(settings.database_path)
@@ -405,7 +408,11 @@ async def run_supervised_execution_observation_loop(
                 break
             if supervised_stop_event.is_set():
                 break
-            await sleep(settings.execution_observation_interval_seconds)
+            await _sleep_or_stop(
+                settings.execution_observation_interval_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
         except Exception:
             failures += 1
             consecutive_failures += 1
@@ -422,7 +429,11 @@ async def run_supervised_execution_observation_loop(
                 break
             if supervised_stop_event.is_set():
                 break
-            await sleep(backoff_seconds)
+            await _sleep_or_stop(
+                backoff_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
 
     return ExecutionObservationLoopSummary(
         attempts=attempts,

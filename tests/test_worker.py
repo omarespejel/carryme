@@ -2056,6 +2056,25 @@ def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_pat
     assert sleeps == [3.0]
 
 
+def test_run_supervised_execution_observation_loop_rejects_non_positive_max_iterations(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    with pytest.raises(ValueError, match="max_iterations must be at least 1"):
+        asyncio.run(
+            run_supervised_execution_observation_loop(
+                settings,
+                max_iterations=0,
+            )
+        )
+
+
 def test_run_supervised_execution_observation_loop_applies_backoff(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text('{"pairs": []}')
@@ -2137,6 +2156,93 @@ def test_run_supervised_execution_observation_loop_applies_backoff(tmp_path: Pat
     assert summary.saved_observations == 1
     assert summary.saved_alerts == 0
     assert sleeps == [2.0]
+
+
+def test_run_supervised_execution_observation_loop_clamps_exponential_backoff(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_observation_interval_seconds=2,
+        execution_observation_max_backoff_seconds=5,
+    )
+
+    class StableAccountService:
+        pass
+
+    class StableOrderStateService:
+        pass
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    outcomes: list[ExecutionObservationSummary | Exception] = [
+        RuntimeError("temporary monitor failure #1"),
+        RuntimeError("temporary monitor failure #2"),
+        RuntimeError("temporary monitor failure #3"),
+        ExecutionObservationSummary(
+            scanned_executions=1,
+            observed_executions=1,
+            saved_observations=1,
+            saved_alerts=0,
+            database_path=settings.database_path,
+        ),
+    ]
+
+    async def fake_observe_live_executions_once(
+        settings_arg: WorkerSettings,
+        *,
+        execution_store: object | None = None,
+        observation_store: object | None = None,
+        alert_sink: object | None = None,
+        account_service: object | None = None,
+        order_state_service: object | None = None,
+        now: datetime | None = None,
+    ) -> ExecutionObservationSummary:
+        assert settings_arg is settings
+        _ = execution_store
+        _ = observation_store
+        _ = alert_sink
+        assert account_service is stable_account_service
+        assert order_state_service is stable_order_state_service
+        assert now is None
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    stable_account_service = cast(AccountPreflightService, StableAccountService())
+    stable_order_state_service = cast(ExecutionOrderStateService, StableOrderStateService())
+
+    from unittest.mock import patch
+
+    with patch(
+        "carryme_worker.poller.observe_live_executions_once",
+        side_effect=fake_observe_live_executions_once,
+    ):
+        summary = asyncio.run(
+            run_supervised_execution_observation_loop(
+                settings,
+                account_service=stable_account_service,
+                order_state_service=stable_order_state_service,
+                sleep=fake_sleep,
+                max_iterations=4,
+            )
+        )
+
+    assert summary.attempts == 4
+    assert summary.successful_cycles == 1
+    assert summary.failures == 3
+    assert summary.scanned_executions == 1
+    assert summary.observed_executions == 1
+    assert summary.saved_observations == 1
+    assert summary.saved_alerts == 0
+    assert sleeps == [2.0, 4.0, 5.0]
 
 
 def test_worker_main_prints_supervised_execution_observation_summary_as_json(
