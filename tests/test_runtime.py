@@ -174,7 +174,10 @@ def test_build_live_submission_readiness_requires_confirmation_and_preflights() 
     assert readiness.confirmation_entry_id == 7
     assert readiness.ready is False
     assert "Venue paradex live execution is not enabled" in readiness.blocking_reasons
-    assert "CARRYME_API_PARADEX_BEARER_TOKEN" in str(readiness.blocking_reasons)
+    assert any(
+        "CARRYME_API_PARADEX_BEARER_TOKEN" in reason
+        for reason in readiness.blocking_reasons
+    )
 
 
 def test_build_trade_intent_sizes_by_capacity_fraction_and_cap() -> None:

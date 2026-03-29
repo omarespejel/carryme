@@ -1152,6 +1152,45 @@ def test_preview_confirmation_store_finds_latest_by_trade_and_hash(tmp_path: Pat
             note="operator confirmed other hash",
         )
     )
+    store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 13, tzinfo=UTC),
+            paper_trade_id=8,
+            label="arb_extended_paradex_other",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=8,
+                label="arb_extended_paradex_other",
+                generated_at=datetime(2026, 3, 29, 13, 8, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="sell",
+                        target_notional=500.0,
+                        quantity=5_422.0,
+                        quantity_text="5422.00000000",
+                        reference_price=0.0921,
+                        reference_price_source="best_bid",
+                        worst_acceptable_price=0.09198948,
+                        worst_price_text="0.09198948",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                        auth_scheme="subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="other trade confirmed identical hash",
+        )
+    )
 
     found = store.find_latest_by_preview_hash(
         paper_trade_id=7,
