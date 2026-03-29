@@ -11,6 +11,7 @@ from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
     ExecutionJournalEntry,
+    ExecutionReconciliation,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -44,6 +45,7 @@ from carryme_runtime import (
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
+    reconcile_execution,
 )
 from carryme_storage import (
     CandidateAlertStore,
@@ -603,6 +605,35 @@ def create_app() -> FastAPI:
         label: str | None = None,
     ) -> list[ExecutionJournalEntry]:
         return store.list_recent(limit=limit, label=label)
+
+    @app.get(
+        "/v1/executions/reconciliation/latest/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionReconciliation,
+    )
+    async def reconcile_latest_execution_for_paper_trade(
+        paper_trade_id: int,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+    ) -> ExecutionReconciliation:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        execution = execution_store.latest_for_paper_trade(paper_trade_id)
+        if execution is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No execution journal entry matched paper trade {paper_trade_id}",
+            )
+        account_preflight = await service.probe_paper_trade(
+            paper_trade,
+            _build_account_preflight_configs(settings),
+        )
+        return reconcile_execution(execution, account_preflight)
 
     @app.get("/v1/executions/preflight/venues", response_model=list[VenueExecutionPreflight])
     def execution_preflight_venues(

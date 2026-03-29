@@ -37,3 +37,34 @@ class ExecutionJournalEntry(BaseModel):
     confirmation_entry_id: int | None = None
     paper_trade: PaperTradeEntry
     legs: list[ExecutionLegResult] = Field(min_length=1)
+
+
+class ExecutionVenueReconciliation(BaseModel):
+    """Observed account-state summary for one venue after an execution attempt."""
+
+    venue: str = Field(min_length=1)
+    authenticated: bool
+    ready: bool
+    account_identifier: str | None = None
+    total_collateral: float | None = None
+    available_to_trade: float | None = None
+    free_collateral: float | None = None
+    balance_assets: list[str] = Field(default_factory=list)
+    position_symbols: list[str] = Field(default_factory=list)
+    matched_leg_symbols: list[str] = Field(default_factory=list)
+    unmatched_leg_symbols: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    blocking_reasons: list[str] = Field(default_factory=list)
+
+
+class ExecutionReconciliation(BaseModel):
+    """Combined execution-journal and live account-state reconciliation."""
+
+    execution_entry_id: int | None = None
+    paper_trade_id: int | None = None
+    preview_hash: str | None = None
+    status: Literal["accepted", "rejected", "submitted", "partial"]
+    recommended_action: str = Field(min_length=1)
+    matched_all_leg_symbols: bool
+    venues: list[ExecutionVenueReconciliation] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)

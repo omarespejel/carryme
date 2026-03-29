@@ -5,7 +5,12 @@ from carryme_models.account_preflight import (
     VenueAccountPreflight,
 )
 from carryme_models.confirmation import PreviewConfirmationEntry
-from carryme_models.execution import ExecutionJournalEntry, ExecutionLegResult
+from carryme_models.execution import (
+    ExecutionJournalEntry,
+    ExecutionLegResult,
+    ExecutionReconciliation,
+    ExecutionVenueReconciliation,
+)
 from carryme_models.health import AppDescriptor, ServiceHealth
 from carryme_models.history import (
     CandidateAlertEvent,
@@ -37,6 +42,8 @@ __all__ = [
     "CredentialRequirementStatus",
     "ExecutionJournalEntry",
     "ExecutionLegResult",
+    "ExecutionReconciliation",
+    "ExecutionVenueReconciliation",
     "FundingPairSpec",
     "FundingRateNormalization",
     "FundingArbOpportunity",

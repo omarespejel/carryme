@@ -932,6 +932,133 @@ def test_executions_endpoint_lists_saved_entries(tmp_path: Path) -> None:
     assert payload[0]["paper_trade_id"] == 7
 
 
+def test_execution_reconciliation_endpoint_reports_latest_execution_state(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="partial",
+            paper_trade_id=paper_trade.entry_id,
+            preview_hash="preview-hash",
+            confirmation_entry_id=8,
+            paper_trade=paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                ),
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                    status="rejected",
+                    simulated=False,
+                ),
+            ],
+        )
+    )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_execution_journal_store,
+        get_paper_trade_store,
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id is not None
+            assert configs
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=["ARB-USD"],
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                        balance_assets=["USDC"],
+                        position_symbols=[],
+                    ),
+                ],
+            )
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_account_preflight_service] = (
+        lambda: StubAccountPreflightService()
+    )
+    client = TestClient(app)
+    response = client.get(
+        f"/v1/executions/reconciliation/latest/from-paper-trade/{paper_trade.entry_id}"
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "partial"
+    assert payload["recommended_action"] == "complete_or_unwind_missing_leg"
+    assert payload["matched_all_leg_symbols"] is False
+    by_venue = {item["venue"]: item for item in payload["venues"]}
+    assert by_venue["extended"]["matched_leg_symbols"] == ["ARB-USD"]
+    assert by_venue["paradex"]["unmatched_leg_symbols"] == ["ARB-USD-PERP"]
+
+
 def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None:
     from carryme_api.app import get_api_settings
 

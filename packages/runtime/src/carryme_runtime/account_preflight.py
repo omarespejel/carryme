@@ -197,6 +197,8 @@ class ExtendedAccountProbe:
             ),
             balance_count=_count_rows(balances),
             position_count=_count_rows(positions),
+            balance_assets=_extract_balance_assets(balances),
+            position_symbols=_extract_position_symbols(positions),
             notes=[
                 (
                     "Extended account preflight completed using authenticated private GETs. "
@@ -322,6 +324,8 @@ class ParadexAccountProbe:
             ),
             balance_count=_count_rows(balances),
             position_count=_count_rows(positions),
+            balance_assets=_extract_balance_assets(balances),
+            position_symbols=_extract_position_symbols(positions),
             notes=[
                 (
                     "Paradex account preflight completed using authenticated private GETs "
@@ -378,6 +382,43 @@ def _count_rows(value: dict[str, Any] | list[Any]) -> int:
             if isinstance(nested, list):
                 return len(nested)
     return 0
+
+
+def _unwrap_rows(value: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        for key in ("data", "results", "result", "rows", "positions", "balances"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return [item for item in nested if isinstance(item, dict)]
+    return []
+
+
+def _extract_balance_assets(value: dict[str, Any] | list[Any]) -> list[str]:
+    return _extract_row_strings(value, "asset", "token", "currency", "symbol")
+
+
+def _extract_position_symbols(value: dict[str, Any] | list[Any]) -> list[str]:
+    return _extract_row_strings(value, "symbol", "market", "instrument", "ticker")
+
+
+def _extract_row_strings(value: dict[str, Any] | list[Any], *keys: str) -> list[str]:
+    rows = _unwrap_rows(value)
+    results: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in keys:
+            cell = row.get(key)
+            if not isinstance(cell, str):
+                continue
+            normalized = cell.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            results.append(normalized)
+            break
+    return results
 
 
 def _pick_string(data: dict[str, Any], *keys: str) -> str | None:

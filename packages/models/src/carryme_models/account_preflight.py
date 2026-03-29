@@ -19,6 +19,8 @@ class VenueAccountPreflight(BaseModel):
     free_collateral: float | None = None
     balance_count: int | None = Field(default=None, ge=0)
     position_count: int | None = Field(default=None, ge=0)
+    balance_assets: list[str] = Field(default_factory=list)
+    position_symbols: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
     blocking_reasons: list[str] = Field(default_factory=list)
 
