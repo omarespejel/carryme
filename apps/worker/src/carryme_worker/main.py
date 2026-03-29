@@ -10,9 +10,11 @@ from carryme_models import AppDescriptor, ServiceHealth
 from carryme_worker.config import WorkerSettings
 from carryme_worker.poller import (
     CandidateRecordSummary,
+    ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
     install_signal_handlers,
+    observe_live_executions_once,
     poll_watchlist_once,
     run_polling_loop,
     run_supervised_polling_loop,
@@ -67,12 +69,30 @@ def build_candidate_payload(summary: CandidateRecordSummary) -> dict[str, int]:
     }
 
 
+def build_execution_observation_payload(
+    summary: ExecutionObservationSummary,
+) -> dict[str, int | str]:
+    """Build a deterministic summary payload for execution observation runs."""
+
+    return {
+        "scanned_executions": summary.scanned_executions,
+        "observed_executions": summary.observed_executions,
+        "saved_observations": summary.saved_observations,
+        "database_path": summary.database_path,
+    }
+
+
 def main() -> None:
     """Run one poll cycle or print worker health."""
 
     parser = argparse.ArgumentParser(prog="carryme-worker")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="Poll the configured watchlist once")
+    mode.add_argument(
+        "--observe-executions-once",
+        action="store_true",
+        help="Observe recent live executions once and persist snapshots",
+    )
     mode.add_argument(
         "--iterations",
         type=int,
@@ -94,6 +114,10 @@ def main() -> None:
     if args.once:
         summary = asyncio.run(poll_watchlist_once(settings))
         print(json.dumps(build_cycle_payload(summary), indent=2))
+        return
+    if args.observe_executions_once:
+        observation_summary = asyncio.run(observe_live_executions_once(settings))
+        print(json.dumps(build_execution_observation_payload(observation_summary), indent=2))
         return
     if args.iterations is not None:
         loop_summary = asyncio.run(run_polling_loop(settings, iterations=args.iterations))

@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
@@ -22,6 +22,70 @@ class WorkerSettings(BaseSettings):
     stop_signals: tuple[Literal["SIGINT", "SIGTERM"], ...] = ("SIGINT", "SIGTERM")
     database_path: str = "data/carryme.sqlite3"
     watchlist_path: str = "config/watchlists/default.json"
+    execution_observation_limit: int = 20
+    extended_live_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_EXTENDED_LIVE_ENABLED",
+            "CARRYME_API_EXTENDED_LIVE_ENABLED",
+        ),
+    )
+    extended_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_EXTENDED_API_KEY",
+            "CARRYME_API_EXTENDED_API_KEY",
+        ),
+    )
+    paradex_live_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_PARADEX_LIVE_ENABLED",
+            "CARRYME_API_PARADEX_LIVE_ENABLED",
+        ),
+    )
+    paradex_account_address: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_PARADEX_ACCOUNT_ADDRESS",
+            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+        ),
+    )
+    paradex_private_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_PARADEX_PRIVATE_KEY",
+            "CARRYME_API_PARADEX_PRIVATE_KEY",
+        ),
+    )
+    paradex_bearer_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_PARADEX_BEARER_TOKEN",
+            "CARRYME_API_PARADEX_BEARER_TOKEN",
+        ),
+    )
+    hyperliquid_live_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_HYPERLIQUID_LIVE_ENABLED",
+            "CARRYME_API_HYPERLIQUID_LIVE_ENABLED",
+        ),
+    )
+    hyperliquid_account_address: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_HYPERLIQUID_ACCOUNT_ADDRESS",
+            "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+        ),
+    )
+    hyperliquid_api_wallet_private_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+            "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="CARRYME_WORKER_",
