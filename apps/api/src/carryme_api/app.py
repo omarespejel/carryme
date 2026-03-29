@@ -608,8 +608,13 @@ def create_app() -> FastAPI:
     async def execution_account_preflight_venues(
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+        response: Response,
     ) -> list[VenueAccountPreflight]:
-        return await service.probe_venues(_build_account_preflight_configs(settings))
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return await service.probe_venues(_build_account_preflight_configs(settings))
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get(
         "/v1/executions/preflight/from-paper-trade/{paper_trade_id}",
@@ -640,17 +645,22 @@ def create_app() -> FastAPI:
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
         service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+        response: Response,
     ) -> PaperTradeAccountPreflight:
+        response.headers["Cache-Control"] = "no-store"
         paper_trade = paper_store.get(paper_trade_id)
         if paper_trade is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
-        return await service.probe_paper_trade(
-            paper_trade,
-            _build_account_preflight_configs(settings),
-        )
+        try:
+            return await service.probe_paper_trade(
+                paper_trade,
+                _build_account_preflight_configs(settings),
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get(
         "/v1/executions/readiness/from-paper-trade/{paper_trade_id}",
