@@ -130,13 +130,13 @@ class ExecutionObservationStore:
     def list_recent(
         self,
         *,
-        limit: int = 50,
+        limit: int | None = 50,
         paper_trade_id: int | None = None,
     ) -> list[ExecutionObservationEntry]:
         """Return recent execution observation rows."""
 
         self.initialize()
-        if limit < 1:
+        if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
         query = """
             SELECT id, entry_json
@@ -145,10 +145,13 @@ class ExecutionObservationStore:
         params: tuple[object, ...]
         if paper_trade_id is not None:
             query += " WHERE paper_trade_id = ?"
-            params = (paper_trade_id, limit)
+            params = (paper_trade_id,)
         else:
-            params = (limit,)
-        query += " ORDER BY observed_at DESC, id DESC LIMIT ?"
+            params = ()
+        query += " ORDER BY observed_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (*params, limit)
 
         with sqlite3.connect(self.database_path) as connection:
             rows = connection.execute(query, params).fetchall()

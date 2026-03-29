@@ -1,6 +1,7 @@
 """Funding-universe discovery and ranking models."""
 
 import math
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -28,10 +29,35 @@ class FundingUniverseVenueMarket(BaseModel):
     ask_notional: float | None = Field(default=None, ge=0)
 
 
+class ExecutionQualitySummary(BaseModel):
+    """Smoothed execution-quality summary for one symbol and venue direction."""
+
+    canonical_symbol: str = Field(min_length=1)
+    short_venue: str = Field(min_length=1)
+    long_venue: str = Field(min_length=1)
+    sample_size: int = Field(ge=0)
+    weighted_score: float = Field(ge=0)
+    latest_outcome: Literal[
+        "hedged",
+        "pending",
+        "unfilled",
+        "closed",
+        "cleanup_needed",
+        "review_required",
+    ] | None = None
+    hedged_count: int = Field(default=0, ge=0)
+    closed_count: int = Field(default=0, ge=0)
+    unfilled_count: int = Field(default=0, ge=0)
+    cleanup_needed_count: int = Field(default=0, ge=0)
+    review_required_count: int = Field(default=0, ge=0)
+    pending_count: int = Field(default=0, ge=0)
+
+
 class FundingUniverseOpportunity(BaseModel):
     """A scored funding opportunity enriched with universe-level context."""
 
     opportunity: FundingArbOpportunity
+    policy_tags: list[str] = Field(default_factory=list)
     venue_markets: dict[str, FundingUniverseVenueMarket] = Field(default_factory=dict)
     min_daily_volume: float | None = Field(default=None, ge=0)
     min_open_interest: float | None = Field(default=None, ge=0)
@@ -40,6 +66,9 @@ class FundingUniverseOpportunity(BaseModel):
     estimated_one_day_pnl_after_entry: float | None = None
     estimated_one_day_pnl_after_round_trip: float | None = None
     quality_score: float | None = None
+    execution_quality: ExecutionQualitySummary | None = None
+    execution_adjusted_one_day_pnl_after_round_trip: float | None = None
+    execution_adjusted_quality_score: float | None = None
 
 
 class FundingUniverseScan(BaseModel):

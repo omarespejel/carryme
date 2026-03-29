@@ -8,6 +8,7 @@ import carryme_models as carryme_models_module
 import pytest
 from carryme_api.app import (
     app,
+    get_execution_quality_service,
     get_history_store,
     get_opportunity_service,
     get_opportunity_universe_service,
@@ -287,6 +288,51 @@ def test_funding_universe_endpoint_uses_service_dependency() -> None:
     assert payload["opportunities"][0]["opportunity"]["canonical_symbol"] == "LIT-USD-PERP"
 
 
+def test_funding_universe_endpoint_passes_policy_and_execution_filters() -> None:
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan(self, **kwargs: object) -> FundingUniverseScan:
+            captured.update(kwargs)
+            ranking = kwargs["ranking"]
+            target_notional = kwargs["target_notional"]
+            assert isinstance(ranking, str)
+            assert isinstance(target_notional, float)
+            return FundingUniverseScan(
+                venues=["extended", "paradex"],
+                ranking=ranking,
+                target_notional=target_notional,
+                overlap_count=0,
+                overlaps=[],
+                opportunities=[],
+            )
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("include_symbols", "ARB-USD-PERP"),
+                ("exclude_tags", "meme"),
+                ("exclude_tags", "political"),
+                ("exclude_symbols", "TRUMP-USD-PERP"),
+                ("min_execution_quality_score", "0.7"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["ranking"] == "execution_adjusted_quality_pnl"
+    assert captured["include_symbols"] == ["ARB-USD-PERP"]
+    assert captured["exclude_tags"] == ["meme", "political"]
+    assert captured["exclude_symbols"] == ["TRUMP-USD-PERP"]
+    assert captured["min_execution_quality_score"] == 0.7
+
+
 def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
     class StubUniverseService:
         async def scan(self, **_: object) -> FundingUniverseScan:
@@ -346,6 +392,14 @@ def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
     payload = response.json()
     assert payload["allocated_notional"] == 900.0
     assert payload["entries"][0]["opportunity"]["opportunity"]["canonical_symbol"] == "ARB-USD-PERP"
+
+
+def test_execution_quality_service_provider_uses_shared_stores(tmp_path: Path) -> None:
+    settings = ApiSettings(database_path=str(tmp_path / "quality.sqlite3"))
+    service = get_execution_quality_service(settings)
+
+    assert service.journal_store.database_path == Path(settings.database_path)
+    assert service.observation_store.database_path == Path(settings.database_path)
 
 
 def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:

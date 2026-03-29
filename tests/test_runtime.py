@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import httpx
@@ -20,6 +21,7 @@ from carryme_models import (
     ExecutionJournalEntry,
     ExecutionLegOrderState,
     ExecutionLegResult,
+    ExecutionObservationEntry,
     ExecutionOrderState,
     ExecutionPairClosePreview,
     ExecutionPairStatus,
@@ -85,6 +87,9 @@ from carryme_runtime.account_preflight import (
     _extract_position_symbols,
     _row_represents_open_position,
 )
+from carryme_runtime.execution_quality import ExecutionQualityService
+from carryme_runtime.universe_policy import passes_symbol_policy
+from carryme_storage import ExecutionJournalStore, ExecutionObservationStore
 
 
 def _snapshot(
@@ -222,8 +227,8 @@ def test_opportunity_universe_service_ranks_by_deployable_round_trip_pnl() -> No
 
     async def run() -> None:
         service = OpportunityUniverseService(
-            list_symbols=list_symbols,
-            fetch_snapshot=fetch_snapshot,
+            list_symbols=cast(Any, list_symbols),
+            fetch_snapshot=cast(Any, fetch_snapshot),
         )
         scan = await service.scan(
             venues=["extended", "paradex", "hyperliquid"],
@@ -338,8 +343,8 @@ def test_opportunity_universe_service_filters_thin_markets_for_quality_scan() ->
 
     async def run() -> None:
         service = OpportunityUniverseService(
-            list_symbols=list_symbols,
-            fetch_snapshot=fetch_snapshot,
+            list_symbols=cast(Any, list_symbols),
+            fetch_snapshot=cast(Any, fetch_snapshot),
         )
         scan = await service.scan(
             venues=["extended", "paradex"],
@@ -354,6 +359,719 @@ def test_opportunity_universe_service_filters_thin_markets_for_quality_scan() ->
 
         assert len(scan.opportunities) == 1
         assert scan.opportunities[0].opportunity.canonical_symbol == "LIT-USD-PERP"
+
+    asyncio.run(run())
+
+
+def test_opportunity_universe_service_excludes_policy_tags() -> None:
+    symbol_lists = {
+        "extended": ["TRUMP-USD", "LIT-USD"],
+        "paradex": ["TRUMP-USD-PERP", "LIT-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "TRUMP-USD"): _snapshot(
+            "extended",
+            "TRUMP-USD",
+            0.000013,
+            8.0,
+            300,
+            8.02,
+            200,
+            daily_volume=300_000,
+            open_interest=250_000,
+        ),
+        ("paradex", "TRUMP-USD-PERP"): _snapshot(
+            "paradex",
+            "TRUMP-USD-PERP",
+            -0.0015,
+            8.0,
+            250,
+            8.03,
+            180,
+            daily_volume=220_000,
+            open_interest=190_000,
+        ),
+        ("extended", "LIT-USD"): _snapshot(
+            "extended",
+            "LIT-USD",
+            0.000013,
+            0.83,
+            2_500,
+            0.831,
+            1_500,
+            daily_volume=120_000,
+            open_interest=150_000,
+        ),
+        ("paradex", "LIT-USD-PERP"): _snapshot(
+            "paradex",
+            "LIT-USD-PERP",
+            -0.0006,
+            0.83,
+            3_000,
+            0.831,
+            2_000,
+            daily_volume=110_000,
+            open_interest=140_000,
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            ranking="execution_adjusted_quality_pnl",
+            exclude_tags=["meme", "political"],
+            limit=10,
+        )
+
+        assert len(scan.opportunities) == 1
+        assert scan.opportunities[0].opportunity.canonical_symbol == "LIT-USD-PERP"
+        assert scan.opportunities[0].policy_tags == []
+
+    asyncio.run(run())
+
+
+def test_execution_quality_service_summarizes_latest_outcomes(tmp_path: Path) -> None:
+    journal_store = ExecutionJournalStore(tmp_path / "quality.sqlite3")
+    observation_store = ExecutionObservationStore(tmp_path / "quality.sqlite3")
+
+    def paper_trade(paper_trade_id: int, label: str) -> PaperTradeEntry:
+        return PaperTradeEntry(
+            entry_id=paper_trade_id,
+            created_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label=label,
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 11, 59, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.001,
+                break_even_days_entry=0.2,
+                capacity_limit_notional=500.0,
+                target_notional=11.0,
+                capacity_fraction=0.1,
+                max_target_notional=100.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+
+    journal_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 12, 5, tzinfo=UTC),
+            adapter="paired_live:paradex_then_extended",
+            mode="live",
+            status="submitted",
+            paper_trade_id=1,
+            preview_hash="hash-a",
+            confirmation_entry_id=1,
+            paper_trade=paper_trade(1, "arb_extended_paradex_1"),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                )
+            ],
+        )
+    )
+    journal_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 12, 6, tzinfo=UTC),
+            adapter="paired_live:paradex_then_extended",
+            mode="live",
+            status="submitted",
+            paper_trade_id=2,
+            preview_hash="hash-b",
+            confirmation_entry_id=2,
+            paper_trade=paper_trade(2, "arb_extended_paradex_2"),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                )
+            ],
+        )
+    )
+
+    base_order_state = ExecutionOrderState(
+        execution_entry_id=1,
+        paper_trade_id=1,
+        preview_hash="hash-a",
+        legs=[],
+        notes=[],
+    )
+    base_reconciliation = ExecutionReconciliation(
+        execution_entry_id=1,
+        paper_trade_id=1,
+        preview_hash="hash-a",
+        status="submitted",
+        recommended_action="observe",
+        matched_all_leg_symbols=False,
+        venues=[],
+        notes=[],
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 12, 7, tzinfo=UTC),
+            context="guarded_pair_poll",
+            execution_entry_id=1,
+            paper_trade_id=1,
+            preview_hash="hash-a",
+            order_state=base_order_state,
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=1,
+                paper_trade_id=1,
+                preview_hash="hash-a",
+                derived_state="cleanup_needed",
+                recommended_action="close_open_leg",
+                order_state=base_order_state,
+                reconciliation=base_reconciliation,
+                notes=[],
+            ),
+        )
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 12, 8, tzinfo=UTC),
+            context="guarded_pair_poll",
+            execution_entry_id=2,
+            paper_trade_id=2,
+            preview_hash="hash-b",
+            order_state=ExecutionOrderState(
+                execution_entry_id=2,
+                paper_trade_id=2,
+                preview_hash="hash-b",
+                legs=[],
+                notes=[],
+            ),
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=2,
+                paper_trade_id=2,
+                preview_hash="hash-b",
+                derived_state="hedged",
+                recommended_action="monitor_open_hedge",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=2,
+                    paper_trade_id=2,
+                    preview_hash="hash-b",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=2,
+                    paper_trade_id=2,
+                    preview_hash="hash-b",
+                    status="submitted",
+                    recommended_action="observe",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            ),
+        )
+    )
+
+    summary = ExecutionQualityService(
+        journal_store=journal_store,
+        observation_store=observation_store,
+    ).build_index()[("ARB-USD-PERP", "extended", "paradex")]
+
+    assert summary.sample_size == 2
+    assert summary.latest_outcome == "hedged"
+    assert summary.cleanup_needed_count == 1
+    assert summary.hedged_count == 1
+    assert summary.weighted_score == pytest.approx(0.6)
+
+
+def test_execution_quality_service_caps_after_latest_per_trade(tmp_path: Path) -> None:
+    journal_store = ExecutionJournalStore(tmp_path / "quality-window.sqlite3")
+    observation_store = ExecutionObservationStore(tmp_path / "quality-window.sqlite3")
+
+    def append_trade(paper_trade_id: int) -> None:
+        journal_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 12, paper_trade_id, tzinfo=UTC),
+                adapter="paired_live:auto",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"hash-{paper_trade_id}",
+                confirmation_entry_id=paper_trade_id,
+                paper_trade=PaperTradeEntry(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 3, 29, 11, paper_trade_id, tzinfo=UTC),
+                    intent=FundingPairTradeIntent(
+                        label=f"arb_extended_paradex_{paper_trade_id}",
+                        canonical_symbol="ARB-USD-PERP",
+                        source_recorded_at=datetime(2026, 3, 29, 11, paper_trade_id, tzinfo=UTC),
+                        one_day_net_edge_after_entry=0.001,
+                        break_even_days_entry=0.2,
+                        capacity_limit_notional=500.0,
+                        target_notional=11.0,
+                        capacity_fraction=0.1,
+                        max_target_notional=100.0,
+                        long_leg=TradeLegIntent(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                            fee_profile="pro",
+                            side="buy",
+                            target_notional=11.0,
+                        ),
+                        short_leg=TradeLegIntent(
+                            venue="extended",
+                            symbol="ARB-USD",
+                            fee_profile="default",
+                            side="sell",
+                            target_notional=11.0,
+                        ),
+                    ),
+                ),
+                legs=[
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                    )
+                ],
+            )
+        )
+
+    def append_observation(
+        *,
+        paper_trade_id: int,
+        minute: int,
+        outcome: Literal[
+            "hedged",
+            "pending",
+            "unfilled",
+            "closed",
+            "cleanup_needed",
+            "review_required",
+        ],
+    ) -> None:
+        order_state = ExecutionOrderState(
+            execution_entry_id=paper_trade_id,
+            paper_trade_id=paper_trade_id,
+            preview_hash=f"hash-{paper_trade_id}",
+            legs=[],
+            notes=[],
+        )
+        observation_store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 3, 29, 13, minute, tzinfo=UTC),
+                context="guarded_pair_poll",
+                execution_entry_id=paper_trade_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"hash-{paper_trade_id}",
+                order_state=order_state,
+                pair_status=ExecutionPairStatus(
+                    execution_entry_id=paper_trade_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"hash-{paper_trade_id}",
+                    derived_state=outcome,
+                    recommended_action="observe",
+                    order_state=order_state,
+                    reconciliation=ExecutionReconciliation(
+                        execution_entry_id=paper_trade_id,
+                        paper_trade_id=paper_trade_id,
+                        preview_hash=f"hash-{paper_trade_id}",
+                        status="submitted",
+                        recommended_action="observe",
+                        matched_all_leg_symbols=outcome in {"hedged", "closed"},
+                        venues=[],
+                        notes=[],
+                    ),
+                    notes=[],
+                ),
+            )
+        )
+
+    append_trade(1)
+    append_trade(2)
+    append_trade(3)
+    append_observation(paper_trade_id=1, minute=10, outcome="cleanup_needed")
+    append_observation(paper_trade_id=1, minute=11, outcome="hedged")
+    append_observation(paper_trade_id=2, minute=9, outcome="closed")
+    append_observation(paper_trade_id=3, minute=8, outcome="review_required")
+
+    summary = ExecutionQualityService(
+        journal_store=journal_store,
+        observation_store=observation_store,
+        sample_limit=2,
+    ).build_index()[("ARB-USD-PERP", "extended", "paradex")]
+
+    assert summary.sample_size == 2
+    assert summary.latest_outcome == "hedged"
+    assert summary.hedged_count == 1
+    assert summary.closed_count == 1
+    assert summary.review_required_count == 0
+
+
+def test_opportunity_universe_service_penalizes_bad_execution_history(
+    tmp_path: Path,
+) -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD", "STRK-USD"],
+        "paradex": ["ARB-USD-PERP"],
+        "hyperliquid": ["STRK"],
+    }
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.00030,
+            0.0920,
+            20_000,
+            0.0921,
+            15_000,
+            daily_volume=250_000,
+            open_interest=400_000,
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.00090,
+            0.0919,
+            18_000,
+            0.0921,
+            10_000,
+            daily_volume=210_000,
+            open_interest=350_000,
+        ),
+        ("extended", "STRK-USD"): _snapshot(
+            "extended",
+            "STRK-USD",
+            0.00012,
+            0.0340,
+            120_000,
+            0.0341,
+            110_000,
+            daily_volume=320_000,
+            open_interest=950_000,
+        ),
+        ("hyperliquid", "STRK"): _snapshot(
+            "hyperliquid",
+            "STRK",
+            -0.00012,
+            0.0339,
+            140_000,
+            0.0341,
+            135_000,
+            daily_volume=400_000,
+            open_interest=1_200_000,
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    journal_store = ExecutionJournalStore(tmp_path / "universe-quality.sqlite3")
+    observation_store = ExecutionObservationStore(tmp_path / "universe-quality.sqlite3")
+
+    def append_execution(
+        *,
+        paper_trade_id: int,
+        canonical_symbol: str,
+        short_venue: str,
+        short_symbol: str,
+        short_fee_profile: str,
+        long_venue: str,
+        long_symbol: str,
+        long_fee_profile: str,
+        outcome: Literal[
+            "hedged",
+            "pending",
+            "unfilled",
+            "closed",
+            "cleanup_needed",
+            "review_required",
+        ],
+    ) -> None:
+        journal_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, paper_trade_id, tzinfo=UTC),
+                adapter="paired_live:auto",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"hash-{paper_trade_id}",
+                confirmation_entry_id=paper_trade_id,
+                paper_trade=PaperTradeEntry(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 3, 29, 12, paper_trade_id, tzinfo=UTC),
+                    intent=FundingPairTradeIntent(
+                        label=f"{canonical_symbol.lower()}_{short_venue}_{long_venue}",
+                        canonical_symbol=canonical_symbol,
+                        source_recorded_at=datetime(
+                            2026, 3, 29, 12, paper_trade_id, tzinfo=UTC
+                        ),
+                        one_day_net_edge_after_entry=0.001,
+                        break_even_days_entry=0.2,
+                        capacity_limit_notional=500.0,
+                        target_notional=11.0,
+                        capacity_fraction=0.1,
+                        max_target_notional=100.0,
+                        long_leg=TradeLegIntent(
+                            venue=long_venue,
+                            symbol=long_symbol,
+                            fee_profile=long_fee_profile,
+                            side="buy",
+                            target_notional=11.0,
+                        ),
+                        short_leg=TradeLegIntent(
+                            venue=short_venue,
+                            symbol=short_symbol,
+                            fee_profile=short_fee_profile,
+                            side="sell",
+                            target_notional=11.0,
+                        ),
+                    ),
+                ),
+                legs=[
+                    ExecutionLegResult(
+                        venue=long_venue,
+                        symbol=long_symbol,
+                        fee_profile=long_fee_profile,
+                        side="buy",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                    )
+                ],
+            )
+        )
+        order_state = ExecutionOrderState(
+            execution_entry_id=paper_trade_id,
+            paper_trade_id=paper_trade_id,
+            preview_hash=f"hash-{paper_trade_id}",
+            legs=[],
+            notes=[],
+        )
+        observation_store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 3, 29, 14, paper_trade_id, tzinfo=UTC),
+                context="guarded_pair_poll",
+                execution_entry_id=paper_trade_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"hash-{paper_trade_id}",
+                order_state=order_state,
+                pair_status=ExecutionPairStatus(
+                    execution_entry_id=paper_trade_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"hash-{paper_trade_id}",
+                    derived_state=outcome,
+                    recommended_action="observe",
+                    order_state=order_state,
+                    reconciliation=ExecutionReconciliation(
+                        execution_entry_id=paper_trade_id,
+                        paper_trade_id=paper_trade_id,
+                        preview_hash=f"hash-{paper_trade_id}",
+                        status="submitted",
+                        recommended_action="observe",
+                        matched_all_leg_symbols=outcome in {"hedged", "closed"},
+                        venues=[],
+                        notes=[],
+                    ),
+                    notes=[],
+                ),
+            )
+        )
+
+    append_execution(
+        paper_trade_id=1,
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        short_symbol="ARB-USD",
+        short_fee_profile="default",
+        long_venue="paradex",
+        long_symbol="ARB-USD-PERP",
+        long_fee_profile="pro",
+        outcome="cleanup_needed",
+    )
+    append_execution(
+        paper_trade_id=2,
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        short_symbol="ARB-USD",
+        short_fee_profile="default",
+        long_venue="paradex",
+        long_symbol="ARB-USD-PERP",
+        long_fee_profile="pro",
+        outcome="review_required",
+    )
+    append_execution(
+        paper_trade_id=3,
+        canonical_symbol="STRK-USD-PERP",
+        short_venue="extended",
+        short_symbol="STRK-USD",
+        short_fee_profile="default",
+        long_venue="hyperliquid",
+        long_symbol="STRK",
+        long_fee_profile="tier0",
+        outcome="hedged",
+    )
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+            execution_quality_service=ExecutionQualityService(
+                journal_store=journal_store,
+                observation_store=observation_store,
+            ),
+        )
+        raw_scan = await service.scan(
+            venues=["extended", "paradex", "hyperliquid"],
+            ranking="roundtrip_pnl",
+            target_notional=1_000,
+            limit=10,
+        )
+        execution_scan = await service.scan(
+            venues=["extended", "paradex", "hyperliquid"],
+            ranking="execution_adjusted_quality_pnl",
+            target_notional=1_000,
+            limit=10,
+        )
+
+        assert raw_scan.opportunities[0].opportunity.canonical_symbol == "ARB-USD-PERP"
+        assert execution_scan.opportunities[0].opportunity.canonical_symbol == "STRK-USD-PERP"
+        assert execution_scan.opportunities[0].execution_quality is not None
+        assert execution_scan.opportunities[1].execution_quality is not None
+        assert (
+            execution_scan.opportunities[0].execution_quality.weighted_score
+            > execution_scan.opportunities[1].execution_quality.weighted_score
+        )
+
+    asyncio.run(run())
+
+
+def test_opportunity_universe_service_uses_execution_prior_for_unknown_pairs(
+    tmp_path: Path,
+) -> None:
+    symbol_lists = {
+        "extended": ["STRK-USD"],
+        "hyperliquid": ["STRK"],
+    }
+    snapshots = {
+        ("extended", "STRK-USD"): _snapshot(
+            "extended",
+            "STRK-USD",
+            0.00020,
+            0.0340,
+            120_000,
+            0.0341,
+            110_000,
+            daily_volume=320_000,
+            open_interest=950_000,
+        ),
+        ("hyperliquid", "STRK"): _snapshot(
+            "hyperliquid",
+            "STRK",
+            -0.00040,
+            0.0339,
+            140_000,
+            0.0341,
+            135_000,
+            daily_volume=400_000,
+            open_interest=1_200_000,
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    journal_store = ExecutionJournalStore(tmp_path / "universe-prior.sqlite3")
+    observation_store = ExecutionObservationStore(tmp_path / "universe-prior.sqlite3")
+    quality_service = ExecutionQualityService(
+        journal_store=journal_store,
+        observation_store=observation_store,
+    )
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+            execution_quality_service=quality_service,
+        )
+        scan = await service.scan(
+            venues=["extended", "hyperliquid"],
+            ranking="execution_adjusted_quality_pnl",
+            target_notional=1_000,
+            limit=10,
+        )
+
+        assert len(scan.opportunities) == 1
+        opportunity = scan.opportunities[0]
+        assert opportunity.execution_quality is None
+        assert opportunity.quality_score is not None
+        assert opportunity.estimated_one_day_pnl_after_round_trip is not None
+        assert opportunity.execution_adjusted_quality_score == pytest.approx(
+            opportunity.quality_score * quality_service.prior_score
+        )
+        assert opportunity.execution_adjusted_one_day_pnl_after_round_trip == pytest.approx(
+            opportunity.estimated_one_day_pnl_after_round_trip * quality_service.prior_score
+        )
+
+    asyncio.run(run())
+
+
+def test_opportunity_universe_service_rejects_invalid_ranking() -> None:
+    async def list_symbols(_venue: str) -> list[str]:
+        return ["STRK-USD"]
+
+    async def fetch_snapshot(_venue: str, _symbol: str) -> NormalizedMarketSnapshot:
+        raise AssertionError("fetch_snapshot should not run for invalid rankings")
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=cast(Any, list_symbols),
+            fetch_snapshot=cast(Any, fetch_snapshot),
+        )
+        with pytest.raises(ValueError, match="Unsupported ranking: typo-ranking"):
+            await service.scan(
+                venues=["extended", "hyperliquid"],
+                ranking="typo-ranking",  # type: ignore[arg-type]
+            )
 
     asyncio.run(run())
 
@@ -534,6 +1252,12 @@ def test_build_portfolio_plan_binding_position_cap_skips_duplicates() -> None:
     assert plan.entries[0].selected_notional == 1_000
     assert plan.entries[1].opportunity.opportunity.canonical_symbol == "STRK-USD-PERP"
     assert plan.entries[1].selected_notional == 2_000
+
+
+def test_passes_symbol_policy_accepts_single_string_inputs() -> None:
+    assert passes_symbol_policy("ARB-USD-PERP", include_symbols="ARB-USD-PERP")
+    assert not passes_symbol_policy("ARB-USD-PERP", exclude_symbols="ARB-USD-PERP")
+    assert not passes_symbol_policy("TRUMP-USD-PERP", exclude_tags="political")
 
 
 def test_build_live_submission_readiness_requires_confirmation_and_preflights() -> None:

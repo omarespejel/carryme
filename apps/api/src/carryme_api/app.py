@@ -51,6 +51,7 @@ from carryme_runtime import (
     ConnectorError,
     ExecutionAdapter,
     ExecutionOrderStateService,
+    ExecutionQualityService,
     ExtendedCleanupPreviewService,
     ExtendedLiveExecutionService,
     ExtendedOrderStateObserver,
@@ -206,10 +207,38 @@ def get_opportunity_service() -> OpportunityService:
 
 
 @lru_cache
-def get_opportunity_universe_service() -> OpportunityUniverseService:
+def _execution_quality_service_for_path(database_path: str) -> ExecutionQualityService:
+    """Return the execution-quality summary service."""
+
+    return ExecutionQualityService(
+        journal_store=_execution_journal_store_for_path(database_path),
+        observation_store=_execution_observation_store_for_path(database_path),
+    )
+
+
+def get_execution_quality_service(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExecutionQualityService:
+    """Return the shared execution-quality summary service."""
+
+    return _execution_quality_service_for_path(settings.database_path)
+
+
+@lru_cache
+def _opportunity_universe_service_for_path(database_path: str) -> OpportunityUniverseService:
     """Return the live funding-universe discovery and ranking service."""
 
-    return OpportunityUniverseService()
+    return OpportunityUniverseService(
+        execution_quality_service=_execution_quality_service_for_path(database_path)
+    )
+
+
+def get_opportunity_universe_service(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> OpportunityUniverseService:
+    """Return the shared live funding-universe discovery and ranking service."""
+
+    return _opportunity_universe_service_for_path(settings.database_path)
 
 
 def get_history_store(
@@ -3148,14 +3177,20 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/opportunities/funding-universe", response_model=FundingUniverseScan)
     async def funding_universe(
-        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
-        venues: list[str] | None = None,
-        ranking: str = "quality_adjusted_roundtrip_pnl",
+        service: Annotated[
+            OpportunityUniverseService, Depends(get_opportunity_universe_service)
+        ],
+        venues: Annotated[list[str] | None, Query()] = None,
+        ranking: str = "execution_adjusted_quality_pnl",
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
         min_open_interest: float = 0.0,
         min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.0,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
         limit: int = 20,
     ) -> FundingUniverseScan:
         try:
@@ -3168,11 +3203,15 @@ def create_app() -> FastAPI:
                 min_daily_volume=min_daily_volume,
                 min_open_interest=min_open_interest,
                 min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
                 limit=limit,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get(
@@ -3180,14 +3219,20 @@ def create_app() -> FastAPI:
         response_model=FundingUniversePortfolioPlan,
     )
     async def funding_universe_portfolio(
-        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
-        venues: list[str] | None = None,
-        ranking: str = "quality_adjusted_roundtrip_pnl",
+        service: Annotated[
+            OpportunityUniverseService, Depends(get_opportunity_universe_service)
+        ],
+        venues: Annotated[list[str] | None, Query()] = None,
+        ranking: str = "execution_adjusted_quality_pnl",
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
         min_open_interest: float = 0.0,
         min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.0,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
         max_positions: int = 5,
         min_selected_notional: float = 0.0,
     ) -> FundingUniversePortfolioPlan:
@@ -3201,6 +3246,10 @@ def create_app() -> FastAPI:
                 min_daily_volume=min_daily_volume,
                 min_open_interest=min_open_interest,
                 min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
                 limit=max_positions * 5,
             )
             return build_portfolio_plan(
@@ -3211,7 +3260,7 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
