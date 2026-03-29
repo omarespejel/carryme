@@ -51,6 +51,7 @@ from carryme_storage import (
 )
 from fastapi import Body, Depends, FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 from carryme_api.config import ApiSettings, get_api_settings
 from carryme_api.history_view import (
@@ -66,6 +67,14 @@ APP_VERSION = "0.1.0"
 DEFAULT_APP_ENVIRONMENT = "development"
 APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
 MAX_HISTORY_LIMIT = 1000
+
+
+class ConfirmPreviewRequest(BaseModel):
+    """Operator confirmation payload for one unsigned order preview."""
+
+    preview_hash: str = Field(min_length=1)
+    slippage_tolerance_bps: int = Field(default=10, ge=0)
+    note: str | None = None
 
 
 def get_app_environment() -> str:
@@ -689,15 +698,13 @@ def create_app() -> FastAPI:
     )
     async def confirm_paper_trade_preview(
         paper_trade_id: int,
-        preview_hash: str,
+        request: Annotated[ConfirmPreviewRequest, Body(...)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
         confirmation_store: Annotated[
             PreviewConfirmationStore,
             Depends(get_preview_confirmation_store),
         ],
         service: Annotated[OrderPreviewService, Depends(get_order_preview_service)],
-        slippage_tolerance_bps: int = 10,
-        note: str | None = None,
     ) -> PreviewConfirmationEntry:
         paper_trade = paper_store.get(paper_trade_id)
         if paper_trade is None:
@@ -705,13 +712,13 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
-        normalized_preview_hash = preview_hash.strip()
+        normalized_preview_hash = request.preview_hash.strip()
         if not normalized_preview_hash:
             raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
         try:
             preview = await service.preview_paper_trade(
                 paper_trade,
-                slippage_tolerance_bps=slippage_tolerance_bps,
+                slippage_tolerance_bps=request.slippage_tolerance_bps,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -730,7 +737,7 @@ def create_app() -> FastAPI:
             label=paper_trade.intent.label,
             preview_hash=preview.preview_hash,
             preview=preview,
-            note=note,
+            note=request.note,
         )
         try:
             return confirmation_store.append(confirmation)

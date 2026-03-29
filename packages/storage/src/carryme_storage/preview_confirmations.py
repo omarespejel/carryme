@@ -64,13 +64,17 @@ class PreviewConfirmationStore:
         normalized_preview_hash = entry.preview_hash.strip()
         if not normalized_preview_hash:
             raise ValueError("preview_hash must be non-empty")
+        if entry.preview.paper_trade_id != entry.paper_trade_id:
+            raise ValueError("preview.paper_trade_id must match paper_trade_id")
         normalized_entry = entry.model_copy(
             update={
+                "entry_id": None,
                 "confirmed_at": entry.confirmed_at.astimezone(UTC),
                 "label": normalized_label,
                 "preview_hash": normalized_preview_hash,
                 "preview": entry.preview.model_copy(
                     update={
+                        "paper_trade_id": entry.paper_trade_id,
                         "label": normalized_label,
                         "preview_hash": normalized_preview_hash,
                     }
