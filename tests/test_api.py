@@ -2338,6 +2338,19 @@ def test_account_preflight_venues_endpoint_uses_service_dependency() -> None:
         async def probe_venues(self, configs: dict[str, object]) -> list[VenueAccountPreflight]:
             assert "extended" in configs
             assert "hyperliquid" in configs
+            hyper_cfg = configs["hyperliquid"]
+            if isinstance(hyper_cfg, dict):
+                assert hyper_cfg["enabled"] is True
+                credentials = hyper_cfg["credentials"]
+                assert isinstance(credentials, dict)
+                assert credentials["account_address"] == "0xhyper"
+                assert credentials["api_wallet_private_key"] == "0xwallet"
+            else:
+                assert getattr(hyper_cfg, "enabled", None) is True
+                credentials = getattr(hyper_cfg, "credentials", None)
+                assert isinstance(credentials, dict)
+                assert credentials.get("account_address") == "0xhyper"
+                assert credentials.get("api_wallet_private_key") == "0xwallet"
             return [
                 VenueAccountPreflight(
                     venue="extended",

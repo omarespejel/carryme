@@ -36,7 +36,12 @@ def build_hyperliquid_exchange(
 def build_hyperliquid_info(
     *,
     base_url: str = HYPERLIQUID_API_BASE_URL,
+    timeout: float | None = 15.0,
 ) -> Any:
-    """Return an official Hyperliquid Info client with websocket startup disabled."""
+    """Return an official Hyperliquid Info client with websocket startup disabled.
 
-    return Info(base_url=base_url, skip_ws=True)
+    The default timeout keeps authenticated account probes from hanging indefinitely if the
+    upstream Hyperliquid API becomes unresponsive.
+    """
+
+    return Info(base_url=base_url, skip_ws=True, timeout=timeout)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -892,7 +893,7 @@ def test_hyperliquid_account_probe_reads_sdk_state(
 
     monkeypatch.setattr(
         "carryme_runtime.account_preflight.build_hyperliquid_info",
-        lambda *, base_url: StubInfo(),
+        lambda *, base_url, timeout=15.0: StubInfo(),
     )
 
     async def run() -> None:
@@ -917,6 +918,90 @@ def test_hyperliquid_account_probe_reads_sdk_state(
         assert result.position_symbols == ["ARB", "STRK"]
         assert result.position_count == 2
         assert "Observed 1 currently open Hyperliquid orders." in result.notes
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_account_probe_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def slow_fetch(account_address: str) -> tuple[dict[str, object], list[dict[str, object]]]:
+        assert account_address == "0xhyper"
+        time.sleep(0.05)
+        return {}, []
+
+    monkeypatch.setattr(
+        "carryme_runtime.account_preflight._fetch_hyperliquid_account_state",
+        slow_fetch,
+    )
+    monkeypatch.setattr(
+        "carryme_runtime.account_preflight.HYPERLIQUID_ACCOUNT_READ_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def run() -> None:
+        probe = HyperliquidAccountProbe()
+        result = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xhyper",
+                    "api_wallet_private_key": "0xwallet",
+                },
+            }
+        )
+        assert result.venue == "hyperliquid"
+        assert result.authenticated is False
+        assert result.ready is False
+        assert result.blocking_reasons == ["Hyperliquid account read timed out"]
+        assert any("timeout elapsed" in note for note in result.notes)
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_account_probe_rejects_malformed_sdk_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubInfo:
+        def user_state(self, address: str) -> dict[str, object]:
+            assert address == "0xhyper"
+            return {
+                "marginSummary": {
+                    "accountValue": "not-a-number",
+                },
+                "withdrawable": "8.15",
+                "assetPositions": [],
+            }
+
+        def open_orders(self, address: str) -> list[dict[str, object]]:
+            assert address == "0xhyper"
+            return []
+
+    monkeypatch.setattr(
+        "carryme_runtime.account_preflight.build_hyperliquid_info",
+        lambda *, base_url, timeout=15.0: StubInfo(),
+    )
+
+    async def run() -> None:
+        probe = HyperliquidAccountProbe()
+        result = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xhyper",
+                    "api_wallet_private_key": "0xwallet",
+                },
+            }
+        )
+        assert result.venue == "hyperliquid"
+        assert result.authenticated is False
+        assert result.ready is False
+        assert any(
+            "malformed payload" in reason for reason in result.blocking_reasons
+        )
+        assert any(
+            "malformed account data" in note for note in result.notes
+        )
 
     asyncio.run(run())
 

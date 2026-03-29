@@ -61,6 +61,7 @@ ACCOUNT_CONNECTOR_BASE_URLS: dict[str, str] = {
     "hyperliquid": HYPERLIQUID_API_BASE_URL,
     "paradex": "https://api.prod.paradex.trade",
 }
+HYPERLIQUID_ACCOUNT_READ_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass
@@ -461,9 +462,28 @@ class HyperliquidAccountProbe:
             )
 
         try:
-            state, open_orders = await asyncio.to_thread(
-                _fetch_hyperliquid_account_state,
-                cast(str, account_address),
+            state, open_orders = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _fetch_hyperliquid_account_state,
+                    cast(str, account_address),
+                ),
+                timeout=HYPERLIQUID_ACCOUNT_READ_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=False,
+                ready=False,
+                credential_mode="api_wallet",
+                missing_env_vars=[],
+                blocking_reasons=["Hyperliquid account read timed out"],
+                notes=[
+                    (
+                        "The Hyperliquid SDK request did not complete before the configured "
+                        "timeout elapsed."
+                    )
+                ],
             )
         except Exception as exc:
             return VenueAccountPreflight(
@@ -482,49 +502,62 @@ class HyperliquidAccountProbe:
                 ],
             )
 
-        margin_summary = state.get("marginSummary")
-        if not isinstance(margin_summary, dict):
-            margin_summary = {}
-        positions = state.get("assetPositions")
-        if not isinstance(positions, list):
-            positions = []
-        withdrawable = _pick_float(
-            state,
-            "withdrawable",
-            context="hyperliquid withdrawable balance",
-        )
-        total_collateral = (
-            _pick_float(
+        try:
+            margin_summary = state.get("marginSummary")
+            if not isinstance(margin_summary, dict):
+                margin_summary = {}
+            positions = state.get("assetPositions")
+            if not isinstance(positions, list):
+                positions = []
+            withdrawable = _pick_float(
+                state,
+                "withdrawable",
+                context="hyperliquid withdrawable balance",
+            )
+            margin_collateral = _pick_float(
                 margin_summary,
                 "accountValue",
                 "totalRawUsd",
                 context="hyperliquid account collateral",
             )
-            or withdrawable
-        )
-        return VenueAccountPreflight(
-            venue=self.venue,
-            enabled=enabled,
-            authenticated=True,
-            ready=True,
-            credential_mode="api_wallet",
-            account_identifier=account_address,
-            total_collateral=total_collateral,
-            available_to_trade=withdrawable,
-            free_collateral=withdrawable,
-            balance_count=1 if total_collateral is not None else 0,
-            position_count=len([item for item in positions if isinstance(item, dict)]),
-            balance_assets=["USDC"] if total_collateral is not None else [],
-            position_symbols=_extract_hyperliquid_position_symbols(positions),
-            notes=[
-                (
-                    "Hyperliquid account preflight completed using the official SDK "
-                    "Info.user_state/open_orders flow. Account reads are address-based; the "
-                    "API wallet private key remains required for live submission."
-                ),
-                f"Observed {len(open_orders)} currently open Hyperliquid orders.",
-            ],
-        )
+            total_collateral = (
+                margin_collateral if margin_collateral is not None else withdrawable
+            )
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=True,
+                ready=True,
+                credential_mode="api_wallet",
+                account_identifier=account_address,
+                total_collateral=total_collateral,
+                available_to_trade=withdrawable,
+                free_collateral=withdrawable,
+                balance_count=1 if total_collateral is not None else 0,
+                position_count=len([item for item in positions if isinstance(item, dict)]),
+                balance_assets=["USDC"] if total_collateral is not None else [],
+                position_symbols=_extract_hyperliquid_position_symbols(positions),
+                notes=[
+                    (
+                        "Hyperliquid account preflight completed using the official SDK "
+                        "Info.user_state/open_orders flow. Account reads are address-based; the "
+                        "API wallet private key remains required for live submission."
+                    ),
+                    f"Observed {len(open_orders)} currently open Hyperliquid orders.",
+                ],
+            )
+        except (UpstreamDataError, ValidationError) as exc:
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=False,
+                ready=False,
+                credential_mode="api_wallet",
+                blocking_reasons=[f"Hyperliquid account read returned malformed payload: {exc}"],
+                notes=[
+                    "Hyperliquid authenticated read succeeded but returned malformed account data."
+                ],
+            )
 
 
 async def _fetch_extended_optional_rows(
