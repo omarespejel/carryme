@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -12,6 +14,8 @@ from carryme_runtime import ConnectorError, OpportunityService
 from carryme_storage import OpportunityHistoryStore, load_watchlist
 
 from carryme_worker.config import WorkerSettings
+
+logger = logging.getLogger(__name__)
 
 
 class PairScorer(Protocol):
@@ -57,15 +61,25 @@ async def poll_watchlist_once(
     failed_records = 0
     for pair in pairs:
         try:
-            opportunity = await runtime.score_pair(
-                left_venue=pair.left_venue,
-                left_symbol=pair.left_symbol,
-                left_fee_profile=pair.left_fee_profile,
-                right_venue=pair.right_venue,
-                right_symbol=pair.right_symbol,
-                right_fee_profile=pair.right_fee_profile,
+            async with asyncio.timeout(settings.score_timeout_seconds):
+                opportunity = await runtime.score_pair(
+                    left_venue=pair.left_venue,
+                    left_symbol=pair.left_symbol,
+                    left_fee_profile=pair.left_fee_profile,
+                    right_venue=pair.right_venue,
+                    right_symbol=pair.right_symbol,
+                    right_fee_profile=pair.right_fee_profile,
+                )
+        except (ConnectorError, httpx.HTTPError, ValueError, TimeoutError) as exc:
+            logger.warning(
+                "Failed to score pair %s/%s ↔ %s/%s: %s",
+                pair.left_venue,
+                pair.left_symbol,
+                pair.right_venue,
+                pair.right_symbol,
+                exc,
+                exc_info=True,
             )
-        except (ConnectorError, httpx.HTTPError, ValueError):
             failed_records += 1
             continue
         history_store.append(

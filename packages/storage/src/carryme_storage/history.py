@@ -9,6 +9,24 @@ from pathlib import Path
 from carryme_models import OpportunityRecord
 
 
+def _normalize_label(label: str | None) -> str | None:
+    """Normalize optional labels consistently for write and read paths."""
+
+    if label is None:
+        return None
+    normalized = label.strip()
+    return normalized or None
+
+
+def _normalize_pair_payload(pair_payload: dict[str, object]) -> dict[str, object]:
+    """Normalize persisted pair payloads before model validation."""
+
+    normalized = dict(pair_payload)
+    raw_label = normalized.get("label")
+    normalized["label"] = _normalize_label(raw_label if isinstance(raw_label, str) else None)
+    return normalized
+
+
 class OpportunityHistoryStore:
     """Persist and query scored opportunity history."""
 
@@ -49,6 +67,9 @@ class OpportunityHistoryStore:
         """Append a scored opportunity to history."""
 
         self.initialize()
+        normalized_label = _normalize_label(record.pair.label)
+        pair_payload = record.pair.model_dump()
+        pair_payload["label"] = normalized_label
         with sqlite3.connect(self.database_path) as connection:
             connection.execute(
                 """
@@ -62,9 +83,9 @@ class OpportunityHistoryStore:
                 """,
                 (
                     record.recorded_at.isoformat(),
-                    record.pair.label,
+                    normalized_label,
                     record.opportunity.canonical_symbol,
-                    record.pair.model_dump_json(),
+                    json.dumps(pair_payload),
                     record.opportunity.model_dump_json(),
                 ),
             )
@@ -75,7 +96,7 @@ class OpportunityHistoryStore:
         if limit < 1:
             raise ValueError("limit must be at least 1")
         self.initialize()
-        normalized_label = label.strip() if label is not None else None
+        normalized_label = _normalize_label(label)
         query = """
             SELECT recorded_at, pair_json, opportunity_json
             FROM opportunity_history
@@ -86,7 +107,7 @@ class OpportunityHistoryStore:
             params = (normalized_label, limit)
         else:
             params = (limit,)
-        query += " ORDER BY recorded_at DESC LIMIT ?"
+        query += " ORDER BY recorded_at DESC, id DESC LIMIT ?"
 
         with sqlite3.connect(self.database_path) as connection:
             rows = connection.execute(query, params).fetchall()
@@ -95,7 +116,7 @@ class OpportunityHistoryStore:
             OpportunityRecord.model_validate(
                 {
                     "recorded_at": recorded_at,
-                    "pair": json.loads(pair_json),
+                    "pair": _normalize_pair_payload(json.loads(pair_json)),
                     "opportunity": json.loads(opportunity_json),
                 }
             )

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 
 from carryme_models import AppDescriptor, ServiceHealth
 
@@ -45,7 +46,7 @@ def main() -> None:
     settings = WorkerSettings()
     if args.once:
         summary = asyncio.run(poll_watchlist_once(settings))
-        print(build_cycle_payload(summary))
+        print(json.dumps(build_cycle_payload(summary), indent=2))
         return
 
     payload = build_health_payload(settings)

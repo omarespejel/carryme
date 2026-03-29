@@ -1,4 +1,6 @@
 import asyncio
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -15,7 +17,7 @@ from carryme_models import (
     OpportunityRecord,
     TopOfBook,
 )
-from carryme_normalizers import normalize_market_snapshot
+from carryme_normalizers import NormalizationError, normalize_market_snapshot
 from carryme_runtime import (
     ConnectorError,
     OpportunityService,
@@ -51,6 +53,23 @@ def _snapshot(
         ),
     )
     return normalize_market_snapshot(venue, market)
+
+
+@contextmanager
+def _dependency_override(
+    dependency: Callable[..., object],
+    provider: Callable[..., object],
+) -> Iterator[None]:
+    sentinel = object()
+    previous = app.dependency_overrides.get(dependency, sentinel)
+    app.dependency_overrides[dependency] = provider
+    try:
+        yield
+    finally:
+        if previous is sentinel:
+            app.dependency_overrides.pop(dependency, None)
+        else:
+            app.dependency_overrides[dependency] = cast(Callable[..., object], previous)
 
 
 def test_health_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -143,12 +162,9 @@ def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:
         )
     )
 
-    app.dependency_overrides[get_history_store] = lambda: store
     client = TestClient(app)
-
-    response = client.get("/v1/history/funding-pairs")
-
-    app.dependency_overrides.clear()
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs")
 
     assert response.status_code == 200
     payload = response.json()
@@ -159,15 +175,23 @@ def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:
 def test_history_endpoint_rejects_non_positive_limit(tmp_path: Path) -> None:
     store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
 
-    app.dependency_overrides[get_history_store] = lambda: store
     client = TestClient(app)
-
-    response = client.get("/v1/history/funding-pairs", params={"limit": 0})
-
-    app.dependency_overrides.clear()
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs", params={"limit": 0})
 
     assert response.status_code == 400
     assert response.json()["detail"] == "limit must be at least 1"
+
+
+def test_history_endpoint_rejects_excessive_limit(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs", params={"limit": 1001})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at most 1000"
 
 
 def test_history_endpoint_treats_blank_label_as_unfiltered(tmp_path: Path) -> None:
@@ -201,12 +225,9 @@ def test_history_endpoint_treats_blank_label_as_unfiltered(tmp_path: Path) -> No
         )
     )
 
-    app.dependency_overrides[get_history_store] = lambda: store
     client = TestClient(app)
-
-    response = client.get("/v1/history/funding-pairs", params={"label": "   "})
-
-    app.dependency_overrides.clear()
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs", params={"label": "   "})
 
     assert response.status_code == 200
     assert len(response.json()) == 1
@@ -236,26 +257,24 @@ def test_funding_pair_endpoint_uses_service_dependency() -> None:
                 ),
             )
 
-    app.dependency_overrides[get_opportunity_service] = lambda: StubOpportunityService()
     client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-pair",
-        params={
-            "left_venue": "extended",
-            "left_symbol": "STRK-USD",
-            "left_fee_profile": "default",
-            "right_venue": "hyperliquid",
-            "right_symbol": "STRK",
-            "right_fee_profile": "tier0",
-        },
-    )
-
-    app.dependency_overrides.clear()
+    with _dependency_override(get_opportunity_service, lambda: StubOpportunityService()):
+        response = client.get(
+            "/v1/opportunities/funding-pair",
+            params={
+                "left_venue": "extended",
+                "left_symbol": "STRK-USD",
+                "left_fee_profile": "default",
+                "right_venue": "hyperliquid",
+                "right_symbol": "STRK",
+                "right_fee_profile": "tier0",
+            },
+        )
 
     assert response.status_code == 200
     assert response.json()["canonical_symbol"] == "STRK-USD-PERP"
     assert response.json()["capacity"]["limiting_venue"] == "hyperliquid"
+    assert response.headers["Cache-Control"] == "no-store"
 
 
 def test_funding_pair_endpoint_maps_value_errors_to_bad_request() -> None:
@@ -263,22 +282,19 @@ def test_funding_pair_endpoint_maps_value_errors_to_bad_request() -> None:
         async def score_pair(self, **_: str) -> FundingArbOpportunity:
             raise ValueError("Unsupported venue: nope")
 
-    app.dependency_overrides[get_opportunity_service] = lambda: FailingOpportunityService()
     client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-pair",
-        params={
-            "left_venue": "nope",
-            "left_symbol": "STRK-USD",
-            "left_fee_profile": "default",
-            "right_venue": "hyperliquid",
-            "right_symbol": "STRK",
-            "right_fee_profile": "tier0",
-        },
-    )
-
-    app.dependency_overrides.clear()
+    with _dependency_override(get_opportunity_service, lambda: FailingOpportunityService()):
+        response = client.get(
+            "/v1/opportunities/funding-pair",
+            params={
+                "left_venue": "nope",
+                "left_symbol": "STRK-USD",
+                "left_fee_profile": "default",
+                "right_venue": "hyperliquid",
+                "right_symbol": "STRK",
+                "right_fee_profile": "tier0",
+            },
+        )
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Unsupported venue: nope"
@@ -289,22 +305,19 @@ def test_funding_pair_endpoint_maps_connector_errors_to_bad_gateway() -> None:
         async def score_pair(self, **_: str) -> FundingArbOpportunity:
             raise ConnectorError("upstream venue timeout")
 
-    app.dependency_overrides[get_opportunity_service] = lambda: FailingOpportunityService()
     client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-pair",
-        params={
-            "left_venue": "extended",
-            "left_symbol": "STRK-USD",
-            "left_fee_profile": "default",
-            "right_venue": "hyperliquid",
-            "right_symbol": "STRK",
-            "right_fee_profile": "tier0",
-        },
-    )
-
-    app.dependency_overrides.clear()
+    with _dependency_override(get_opportunity_service, lambda: FailingOpportunityService()):
+        response = client.get(
+            "/v1/opportunities/funding-pair",
+            params={
+                "left_venue": "extended",
+                "left_symbol": "STRK-USD",
+                "left_fee_profile": "default",
+                "right_venue": "hyperliquid",
+                "right_symbol": "STRK",
+                "right_fee_profile": "tier0",
+            },
+        )
 
     assert response.status_code == 502
     assert response.json()["detail"] == "upstream venue timeout"
@@ -315,22 +328,19 @@ def test_funding_pair_endpoint_maps_upstream_data_errors_to_bad_gateway() -> Non
         async def score_pair(self, **_: str) -> FundingArbOpportunity:
             raise UpstreamDataError("malformed upstream payload")
 
-    app.dependency_overrides[get_opportunity_service] = lambda: FailingOpportunityService()
     client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-pair",
-        params={
-            "left_venue": "extended",
-            "left_symbol": "STRK-USD",
-            "left_fee_profile": "default",
-            "right_venue": "hyperliquid",
-            "right_symbol": "STRK",
-            "right_fee_profile": "tier0",
-        },
-    )
-
-    app.dependency_overrides.clear()
+    with _dependency_override(get_opportunity_service, lambda: FailingOpportunityService()):
+        response = client.get(
+            "/v1/opportunities/funding-pair",
+            params={
+                "left_venue": "extended",
+                "left_symbol": "STRK-USD",
+                "left_fee_profile": "default",
+                "right_venue": "hyperliquid",
+                "right_symbol": "STRK",
+                "right_fee_profile": "tier0",
+            },
+        )
 
     assert response.status_code == 502
     assert response.json()["detail"] == "malformed upstream payload"
@@ -341,22 +351,19 @@ def test_funding_pair_endpoint_maps_httpx_errors_to_bad_gateway() -> None:
         async def score_pair(self, **_: str) -> FundingArbOpportunity:
             raise httpx.ConnectError("connection refused")
 
-    app.dependency_overrides[get_opportunity_service] = lambda: FailingOpportunityService()
     client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-pair",
-        params={
-            "left_venue": "extended",
-            "left_symbol": "STRK-USD",
-            "left_fee_profile": "default",
-            "right_venue": "hyperliquid",
-            "right_symbol": "STRK",
-            "right_fee_profile": "tier0",
-        },
-    )
-
-    app.dependency_overrides.clear()
+    with _dependency_override(get_opportunity_service, lambda: FailingOpportunityService()):
+        response = client.get(
+            "/v1/opportunities/funding-pair",
+            params={
+                "left_venue": "extended",
+                "left_symbol": "STRK-USD",
+                "left_fee_profile": "default",
+                "right_venue": "hyperliquid",
+                "right_symbol": "STRK",
+                "right_fee_profile": "tier0",
+            },
+        )
 
     assert response.status_code == 502
     assert "connection refused" in response.json()["detail"]
@@ -504,6 +511,44 @@ def test_fetch_live_snapshot_rejects_upstream_symbol_mismatch(
     )
 
     with pytest.raises(UpstreamDataError, match="symbol mismatch"):
+        asyncio.run(fetch_live_snapshot("extended", "STRK-USD"))
+
+
+def test_fetch_live_snapshot_wraps_normalization_errors_as_upstream_data_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeConnector:
+        async def fetch_market_stats(self, _symbol: str) -> MarketStats:
+            return MarketStats(
+                venue="extended",
+                symbol="STRK-USD",
+                mark_price=0.03455,
+                funding_rate=0.0002,
+                open_interest=1_000_000,
+                daily_volume=500_000,
+            )
+
+        async def fetch_top_of_book(self, _symbol: str) -> TopOfBook:
+            return TopOfBook(
+                best_bid_price=0.0345,
+                best_bid_size=100_000,
+                best_ask_price=0.0346,
+                best_ask_size=80_000,
+            )
+
+    def _raise_normalization_error(_venue: str, _market: MarketStats) -> NormalizedMarketSnapshot:
+        raise NormalizationError("bad payload from upstream")
+
+    monkeypatch.setattr(
+        "carryme_runtime.opportunities._build_connector",
+        lambda _venue, _client: FakeConnector(),
+    )
+    monkeypatch.setattr(
+        "carryme_runtime.opportunities.normalize_market_snapshot",
+        _raise_normalization_error,
+    )
+
+    with pytest.raises(UpstreamDataError, match="could not be normalized"):
         asyncio.run(fetch_live_snapshot("extended", "STRK-USD"))
 
 

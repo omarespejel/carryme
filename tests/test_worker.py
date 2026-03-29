@@ -8,13 +8,15 @@ from carryme_models import CapacityEstimate, FundingArbOpportunity
 from carryme_storage import OpportunityHistoryStore
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import build_cycle_payload, build_health_payload
-from carryme_worker.poller import poll_watchlist_once
+from carryme_worker.poller import PollCycleSummary, poll_watchlist_once
+from pydantic import ValidationError
 
 
 def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CARRYME_WORKER_ENVIRONMENT", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_LOG_LEVEL", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_POLL_INTERVAL_SECONDS", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_SCORE_TIMEOUT_SECONDS", raising=False)
 
 
 def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -24,8 +26,17 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.environment == "development"
     assert settings.log_level == "INFO"
     assert settings.poll_interval_seconds == 30
+    assert settings.score_timeout_seconds == 30.0
     assert settings.database_path == "data/carryme.sqlite3"
-    assert settings.watchlist_path == "config/watchlists/default.json"
+    assert Path(settings.watchlist_path).is_file()
+    assert settings.watchlist_path.endswith("config/watchlists/default.json")
+
+
+def test_worker_rejects_missing_watchlist_path(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.json"
+
+    with pytest.raises(ValidationError, match="watchlist_path"):
+        WorkerSettings(watchlist_path=str(missing))
 
 
 def test_worker_health_payload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -44,16 +55,12 @@ def test_worker_health_payload(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_worker_cycle_payload() -> None:
     payload = build_cycle_payload(
-        type(
-            "Summary",
-            (),
-            {
-                "watched_pairs": 2,
-                "saved_records": 2,
-                "failed_records": 0,
-                "database_path": "tmp/history.sqlite3",
-            },
-        )()
+        PollCycleSummary(
+            watched_pairs=2,
+            saved_records=2,
+            failed_records=0,
+            database_path="tmp/history.sqlite3",
+        )
     )
 
     assert payload == {
@@ -131,7 +138,9 @@ def test_poll_watchlist_once_saves_history(tmp_path: Path) -> None:
     assert history[0].pair.label == "strk_extended_hyperliquid"
 
 
-def test_poll_watchlist_once_continues_after_pair_failures(tmp_path: Path) -> None:
+def test_poll_watchlist_once_continues_after_pair_failures(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(
         """
@@ -191,14 +200,15 @@ def test_poll_watchlist_once_continues_after_pair_failures(tmp_path: Path) -> No
     )
     store = OpportunityHistoryStore(settings.database_path)
 
-    summary = asyncio.run(
-        poll_watchlist_once(
-            settings,
-            scorer=StubScorer(),
-            store=store,
-            now=datetime(2026, 3, 29, tzinfo=UTC),
+    with caplog.at_level("WARNING"):
+        summary = asyncio.run(
+            poll_watchlist_once(
+                settings,
+                scorer=StubScorer(),
+                store=store,
+                now=datetime(2026, 3, 29, tzinfo=UTC),
+            )
         )
-    )
 
     history = store.list_recent()
 
@@ -207,9 +217,12 @@ def test_poll_watchlist_once_continues_after_pair_failures(tmp_path: Path) -> No
     assert summary.failed_records == 1
     assert len(history) == 1
     assert history[0].pair.label == "good_pair"
+    assert "Failed to score pair extended/STRK-USD" in caplog.text
 
 
-def test_poll_watchlist_once_continues_after_transport_errors(tmp_path: Path) -> None:
+def test_poll_watchlist_once_continues_after_transport_errors(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(
         """
@@ -273,14 +286,15 @@ def test_poll_watchlist_once_continues_after_transport_errors(tmp_path: Path) ->
     )
     store = OpportunityHistoryStore(settings.database_path)
 
-    summary = asyncio.run(
-        poll_watchlist_once(
-            settings,
-            scorer=StubScorer(),
-            store=store,
-            now=datetime(2026, 3, 29, tzinfo=UTC),
+    with caplog.at_level("WARNING"):
+        summary = asyncio.run(
+            poll_watchlist_once(
+                settings,
+                scorer=StubScorer(),
+                store=store,
+                now=datetime(2026, 3, 29, tzinfo=UTC),
+            )
         )
-    )
 
     history = store.list_recent()
 
@@ -289,3 +303,54 @@ def test_poll_watchlist_once_continues_after_transport_errors(tmp_path: Path) ->
     assert summary.failed_records == 1
     assert len(history) == 1
     assert history[0].pair.label == "good_pair"
+    assert "connection refused" in caplog.text
+
+
+def test_poll_watchlist_once_times_out_slow_pairs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        """
+        {
+          "pairs": [
+            {
+              "label": "slow_pair",
+              "left_venue": "extended",
+              "left_symbol": "STRK-USD",
+              "left_fee_profile": "default",
+              "right_venue": "hyperliquid",
+              "right_symbol": "STRK",
+              "right_fee_profile": "tier0"
+            }
+          ]
+        }
+        """
+    )
+
+    class SlowScorer:
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            await asyncio.sleep(0.05)
+            raise AssertionError("timeout should have fired first")
+
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        score_timeout_seconds=0.001,
+    )
+    store = OpportunityHistoryStore(settings.database_path)
+
+    with caplog.at_level("WARNING"):
+        summary = asyncio.run(
+            poll_watchlist_once(
+                settings,
+                scorer=SlowScorer(),
+                store=store,
+                now=datetime(2026, 3, 29, tzinfo=UTC),
+            )
+        )
+
+    assert summary.watched_pairs == 1
+    assert summary.saved_records == 0
+    assert summary.failed_records == 1
+    assert "Failed to score pair extended/STRK-USD" in caplog.text

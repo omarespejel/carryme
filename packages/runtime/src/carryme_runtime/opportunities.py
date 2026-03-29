@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -29,10 +30,13 @@ class SnapshotFetcher(Protocol):
     async def __call__(self, venue: str, symbol: str) -> NormalizedMarketSnapshot: ...
 
 
-CONNECTOR_BASE_URLS: dict[str, str] = {
-    "extended": "https://api.starknet.extended.exchange",
-    "hyperliquid": "https://api.hyperliquid.xyz",
-    "paradex": "https://api.prod.paradex.trade",
+ConnectorFactory = Callable[[httpx.AsyncClient], PublicVenueConnector]
+
+
+VENUE_REGISTRY: dict[str, tuple[str, ConnectorFactory]] = {
+    "extended": ("https://api.starknet.extended.exchange", ExtendedPublicConnector),
+    "hyperliquid": ("https://api.hyperliquid.xyz", HyperliquidPublicConnector),
+    "paradex": ("https://api.prod.paradex.trade", ParadexPublicConnector),
 }
 
 
@@ -44,11 +48,14 @@ async def fetch_live_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapsh
     """Fetch a live market snapshot and normalize it into canonical form."""
 
     key = venue.strip().lower()
-    base_url = CONNECTOR_BASE_URLS.get(key)
-    if base_url is None:
+    venue_config = VENUE_REGISTRY.get(key)
+    if venue_config is None:
         raise ValueError(f"Unsupported venue: {venue}")
+    base_url, _connector_class = venue_config
     expected_identity = normalize_symbol(key, symbol)
 
+    # Connector-level HTTP helpers already apply bounded retry/backoff for
+    # transient 429/5xx/transport failures. Avoid duplicating that policy here.
     async with httpx.AsyncClient(base_url=base_url, timeout=15.0) as client:
         connector = _build_connector(key, client)
         stats, book = await asyncio.gather(
@@ -107,13 +114,11 @@ class OpportunityService:
 
 
 def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnector:
-    if venue == "extended":
-        return ExtendedPublicConnector(client)
-    if venue == "hyperliquid":
-        return HyperliquidPublicConnector(client)
-    if venue == "paradex":
-        return ParadexPublicConnector(client)
-    raise ValueError(f"Unsupported venue: {venue}")
+    venue_config = VENUE_REGISTRY.get(venue)
+    if venue_config is None:
+        raise ValueError(f"Unsupported venue: {venue}")
+    _base_url, connector_class = venue_config
+    return connector_class(client)
 
 
 __all__ = ["OpportunityService", "UpstreamDataError", "fetch_live_snapshot"]
