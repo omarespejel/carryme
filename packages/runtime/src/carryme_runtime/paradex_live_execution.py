@@ -239,7 +239,6 @@ class ParadexLiveExecutionService:
 
         observer = self._build_order_state_observer()
         attempt_history: list[dict[str, Any]] = []
-        last_entry: ExecutionJournalEntry | None = None
 
         for attempt_index in range(1, self.adaptive_retry_attempts + 1):
             attempt_leg = await self._build_attempt_leg(
@@ -254,7 +253,6 @@ class ParadexLiveExecutionService:
                 leg=attempt_leg,
                 executed_at=executed_at,
             )
-            last_entry = entry
             current_leg = entry.legs[0]
             observed_state = None
             if current_leg.status == "submitted":
@@ -269,7 +267,7 @@ class ParadexLiveExecutionService:
                     observed_state=observed_state,
                 )
             )
-            _attach_attempt_history(
+            entry = _entry_with_attempt_history(
                 entry=entry,
                 attempt_history=attempt_history,
                 observed_state=observed_state,
@@ -283,9 +281,7 @@ class ParadexLiveExecutionService:
                     continue
                 return entry
             return entry
-
-        assert last_entry is not None
-        return last_entry
+        raise AssertionError("adaptive retry loop exited unexpectedly")
 
     async def _build_attempt_leg(
         self,
@@ -471,15 +467,16 @@ def _build_attempt_history_entry(
     }
 
 
-def _attach_attempt_history(
+def _entry_with_attempt_history(
     *,
     entry: ExecutionJournalEntry,
     attempt_history: list[dict[str, Any]],
     observed_state: ExecutionLegOrderState | None,
-) -> None:
+) -> ExecutionJournalEntry:
     leg = entry.legs[0]
     response_payload = dict(leg.response_payload) if isinstance(leg.response_payload, dict) else {}
     response_payload["attempt_history"] = attempt_history
     if observed_state is not None:
         response_payload["observed_order_state"] = observed_state.model_dump(mode="json")
-    leg.response_payload = response_payload
+    updated_leg = leg.model_copy(update={"response_payload": response_payload})
+    return entry.model_copy(update={"legs": [updated_leg, *entry.legs[1:]]})
