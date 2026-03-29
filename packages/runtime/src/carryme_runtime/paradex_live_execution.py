@@ -26,6 +26,7 @@ from carryme_models import (
     PreviewConfirmationEntry,
     VenueOrderPreview,
 )
+
 from carryme_runtime.execution_order_state import ParadexOrderStateObserver
 from carryme_runtime.opportunities import SnapshotFetcher, fetch_live_snapshot
 from carryme_runtime.order_preview import _format_order_value, _snap_price
