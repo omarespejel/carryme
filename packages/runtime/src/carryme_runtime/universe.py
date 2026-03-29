@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import math
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol
@@ -68,7 +69,7 @@ DEFAULT_SNAPSHOT_CONCURRENCY_BY_VENUE: dict[str, int] = {
     "hyperliquid": 8,
     "paradex": 3,
 }
-RETRYABLE_SNAPSHOT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+RETRYABLE_SNAPSHOT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 UNIVERSE_RANKINGS: tuple[UniverseRanking, ...] = (
     "roundtrip_edge",
     "entry_edge",
@@ -255,9 +256,8 @@ class OpportunityUniverseService:
             except httpx.HTTPError as exc:
                 if attempt >= attempts or not _is_retryable_snapshot_error(exc):
                     raise
-                await asyncio.sleep(
-                    self.snapshot_retry_backoff_seconds * (2 ** (attempt - 1))
-                )
+                base_delay = self.snapshot_retry_backoff_seconds * (2 ** (attempt - 1))
+                await asyncio.sleep(base_delay * random.uniform(0.75, 1.25))
         raise RuntimeError("unreachable snapshot retry loop")
 
 
