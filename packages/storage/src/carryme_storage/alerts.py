@@ -5,8 +5,41 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from threading import Lock
+from typing import cast
 
 from carryme_models import CandidateAlertEvent
+
+
+def _normalize_label(label: str | None) -> str | None:
+    """Normalize optional labels consistently for write and read paths."""
+
+    if label is None:
+        return None
+    normalized = label.strip()
+    return normalized or None
+
+
+def _normalize_event_payload(event: CandidateAlertEvent) -> dict[str, object]:
+    """Normalize persisted event payloads before storage."""
+
+    payload = event.model_dump(mode="json")
+    record = dict(payload["record"])
+    pair = dict(record["pair"])
+    pair["label"] = _normalize_label(pair.get("label"))
+    record["pair"] = pair
+    payload["record"] = record
+    return payload
+
+
+def _alert_identity_key(event: CandidateAlertEvent) -> str:
+    """Build a deterministic dedupe key for candidate alerts."""
+
+    return json.dumps(
+        _normalize_event_payload(event),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class CandidateAlertStore:
@@ -14,60 +47,101 @@ class CandidateAlertStore:
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
+        self._initialized = False
+        self._initialize_lock = Lock()
 
     def initialize(self) -> None:
-        """Create the alert table if it does not exist."""
+        """Create the alert table if it does not exist and migrate older schemas."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS candidate_alert_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    emitted_at TEXT NOT NULL,
-                    label TEXT,
-                    canonical_symbol TEXT NOT NULL,
-                    alert_type TEXT NOT NULL,
-                    event_json TEXT NOT NULL
+        if self._initialized:
+            return
+
+        with self._initialize_lock:
+            if self._initialized:
+                return
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(self.database_path) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS candidate_alert_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        emitted_at TEXT NOT NULL,
+                        label TEXT,
+                        canonical_symbol TEXT NOT NULL,
+                        alert_type TEXT NOT NULL,
+                        alert_key TEXT,
+                        event_json TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_candidate_alert_events_emitted_at
-                ON candidate_alert_events(emitted_at DESC)
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_candidate_alert_events_label
-                ON candidate_alert_events(label)
-                """
-            )
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(candidate_alert_events)"
+                    ).fetchall()
+                }
+                if "alert_key" not in columns:
+                    connection.execute(
+                        "ALTER TABLE candidate_alert_events ADD COLUMN alert_key TEXT"
+                    )
+                connection.execute(
+                    """
+                    UPDATE candidate_alert_events
+                    SET alert_key = printf('legacy:%s', id)
+                    WHERE alert_key IS NULL
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_candidate_alert_events_emitted_at
+                    ON candidate_alert_events(emitted_at DESC)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_candidate_alert_events_label
+                    ON candidate_alert_events(label)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_alert_events_alert_key
+                    ON candidate_alert_events(alert_key)
+                    """
+                )
+            self._initialized = True
 
-    def append(self, event: CandidateAlertEvent) -> None:
-        """Append a candidate alert event."""
+    def append(self, event: CandidateAlertEvent) -> bool:
+        """Append a candidate alert event when it has not been persisted already."""
 
         self.initialize()
+        normalized_payload = _normalize_event_payload(event)
+        record_payload = cast(dict[str, object], normalized_payload["record"])
+        pair_payload = cast(dict[str, object], record_payload["pair"])
+        normalized_label = cast(str | None, pair_payload["label"])
+        alert_key = _alert_identity_key(event)
         with sqlite3.connect(self.database_path) as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
-                INSERT INTO candidate_alert_events (
+                INSERT OR IGNORE INTO candidate_alert_events (
                     emitted_at,
                     label,
                     canonical_symbol,
                     alert_type,
+                    alert_key,
                     event_json
-                ) VALUES (?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.emitted_at.isoformat(),
-                    event.record.pair.label,
+                    normalized_label,
                     event.record.opportunity.canonical_symbol,
                     event.alert_type,
-                    event.model_dump_json(),
+                    alert_key,
+                    json.dumps(normalized_payload, sort_keys=True),
                 ),
             )
+        return cursor.rowcount > 0
 
     def list_recent(
         self,
@@ -77,23 +151,25 @@ class CandidateAlertStore:
     ) -> list[CandidateAlertEvent]:
         """Return recent candidate alert events."""
 
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         self.initialize()
+        normalized_label = _normalize_label(label)
         query = """
             SELECT event_json
             FROM candidate_alert_events
         """
         params: tuple[object, ...]
-        if label:
+        if normalized_label:
             query += " WHERE label = ?"
-            params = (label, limit)
+            params = (normalized_label, limit)
         else:
             params = (limit,)
-        query += " ORDER BY emitted_at DESC LIMIT ?"
+        query += " ORDER BY emitted_at DESC, id DESC LIMIT ?"
 
         with sqlite3.connect(self.database_path) as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [
-            CandidateAlertEvent.model_validate(json.loads(event_json))
-            for (event_json,) in rows
+            CandidateAlertEvent.model_validate(json.loads(event_json)) for (event_json,) in rows
         ]

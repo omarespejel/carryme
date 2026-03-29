@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import logging
 
 from carryme_models import AppDescriptor, ServiceHealth
@@ -39,6 +40,7 @@ def build_cycle_payload(summary: PollCycleSummary) -> dict[str, int | str]:
     return {
         "watched_pairs": summary.watched_pairs,
         "saved_records": summary.saved_records,
+        "failed_records": summary.failed_records,
         "database_path": summary.database_path,
     }
 
@@ -69,31 +71,36 @@ def main() -> None:
     """Run one poll cycle or print worker health."""
 
     parser = argparse.ArgumentParser(prog="carryme-worker")
-    parser.add_argument("--once", action="store_true", help="Poll the configured watchlist once")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="Poll the configured watchlist once")
+    mode.add_argument(
         "--iterations",
         type=int,
         default=None,
         help="Run the worker loop for a fixed number of iterations",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--supervise",
         action="store_true",
         help="Run the signal-aware supervised worker loop",
     )
     args = parser.parse_args()
 
+    if args.iterations is not None and args.iterations < 1:
+        parser.error("--iterations must be at least 1")
+
     settings = WorkerSettings()
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
     if args.once:
-        cycle_summary = asyncio.run(poll_watchlist_once(settings))
-        print(build_cycle_payload(cycle_summary))
+        summary = asyncio.run(poll_watchlist_once(settings))
+        print(json.dumps(build_cycle_payload(summary), indent=2))
         return
     if args.iterations is not None:
         loop_summary = asyncio.run(run_polling_loop(settings, iterations=args.iterations))
-        print(build_loop_payload(loop_summary))
+        print(json.dumps(build_loop_payload(loop_summary), indent=2))
         return
     if args.supervise:
+
         async def run_supervised() -> PollLoopSummary:
             stop_event = asyncio.Event()
             install_signal_handlers(
@@ -103,7 +110,7 @@ def main() -> None:
             return await run_supervised_polling_loop(settings, stop_event=stop_event)
 
         supervised_summary = asyncio.run(run_supervised())
-        print(build_loop_payload(supervised_summary))
+        print(json.dumps(build_loop_payload(supervised_summary), indent=2))
         return
 
     payload = build_health_payload(settings)
