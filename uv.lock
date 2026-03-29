@@ -203,6 +203,7 @@ dependencies = [
     { name = "carryme-models" },
     { name = "carryme-runtime" },
     { name = "carryme-storage" },
+    { name = "httpx" },
     { name = "pydantic-settings" },
 ]
 
@@ -211,6 +212,7 @@ requires-dist = [
     { name = "carryme-models", editable = "packages/models" },
     { name = "carryme-runtime", editable = "packages/runtime" },
     { name = "carryme-storage", editable = "packages/storage" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "pydantic-settings", specifier = ">=2.11,<3" },
 ]
 
