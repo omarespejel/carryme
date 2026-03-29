@@ -359,6 +359,7 @@ def test_paper_trade_store_appends_and_lists_recent(tmp_path: Path) -> None:
     assert results[0].intent.label == "arb_extended_paradex"
     assert results[0].note == "operator accepted candidate"
     assert store.get(saved.entry_id) is not None
+    assert store.get(999999) is None
 
 
 def test_execution_journal_store_appends_and_lists_recent(tmp_path: Path) -> None:
@@ -431,6 +432,132 @@ def test_execution_journal_store_appends_and_lists_recent(tmp_path: Path) -> Non
     assert results[0].entry_id == saved.entry_id
     assert results[0].paper_trade_id == 7
     assert results[0].legs[0].external_reference == "mock:7:buy"
+
+
+def test_execution_journal_store_normalizes_executed_at_to_utc(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    saved = store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(
+                2026,
+                3,
+                29,
+                16,
+                5,
+                tzinfo=timezone(timedelta(hours=3)),
+            ),
+            adapter="mock",
+            mode="mock",
+            submission_id="submission-1",
+            status="accepted",
+            paper_trade_id=7,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    status="accepted",
+                    simulated=True,
+                    external_reference="mock:7:buy",
+                )
+            ],
+        )
+    )
+
+    assert saved.executed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)
+
+
+def test_execution_journal_store_orders_ties_deterministically(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    for paper_trade_id in [1, 2]:
+        store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                adapter="mock",
+                mode="mock",
+                submission_id=f"submission-{paper_trade_id}",
+                status="accepted",
+                paper_trade_id=paper_trade_id,
+                paper_trade=PaperTradeEntry(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                    note=f"operator accepted candidate {paper_trade_id}",
+                    intent=FundingPairTradeIntent(
+                        label=f"arb_extended_paradex_{paper_trade_id}",
+                        canonical_symbol="ARB-USD-PERP",
+                        source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                        one_day_net_edge_after_entry=0.00055,
+                        break_even_days_entry=0.45,
+                        capacity_limit_notional=4500.0,
+                        target_notional=1000.0,
+                        capacity_fraction=0.25,
+                        max_target_notional=1000.0,
+                        long_leg=TradeLegIntent(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                            fee_profile="pro",
+                            side="buy",
+                            target_notional=1000.0,
+                        ),
+                        short_leg=TradeLegIntent(
+                            venue="extended",
+                            symbol="ARB-USD",
+                            fee_profile="default",
+                            side="sell",
+                            target_notional=1000.0,
+                        ),
+                    ),
+                ),
+                legs=[
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        status="accepted",
+                        simulated=True,
+                        external_reference=f"mock:{paper_trade_id}:buy",
+                    )
+                ],
+            )
+        )
+
+    results = store.list_recent(limit=2)
+
+    assert [entry.paper_trade_id for entry in results] == [2, 1]
 
 
 def test_paper_trade_store_normalizes_created_at_to_utc(tmp_path: Path) -> None:

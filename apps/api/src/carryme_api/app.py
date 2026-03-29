@@ -504,8 +504,7 @@ def create_app() -> FastAPI:
         limit: int = 50,
         label: str | None = None,
     ) -> list[ExecutionJournalEntry]:
-        if limit < 1:
-            raise HTTPException(status_code=400, detail="limit must be at least 1")
+        limit = _validated_history_limit("limit", limit)
         try:
             return store.list_recent(limit=limit, label=label)
         except ValueError as exc:

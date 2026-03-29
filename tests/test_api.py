@@ -1462,6 +1462,23 @@ def test_mock_execution_endpoint_submits_saved_paper_trade(tmp_path: Path) -> No
     assert len(execution_store.list_recent(limit=10)) == 1
 
 
+def test_mock_execution_endpoint_returns_404_for_missing_paper_trade(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
+        get_execution_journal_store, lambda: execution_store
+    ):
+        response = client.post("/v1/executions/mock/from-paper-trade/999999")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Paper trade 999999 was not found"
+    assert execution_store.list_recent(limit=10) == []
+
+
 def test_executions_endpoint_lists_saved_entries(tmp_path: Path) -> None:
     execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
     execution_store.append(
@@ -1545,6 +1562,17 @@ def test_executions_endpoint_rejects_invalid_limit(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "limit must be at least 1"
+
+
+def test_executions_endpoint_rejects_limit_above_history_cap(tmp_path: Path) -> None:
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_execution_journal_store, lambda: execution_store):
+        response = client.get("/v1/executions", params={"limit": 1001})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at most 1000"
 
 
 def test_funding_pair_endpoint_uses_service_dependency() -> None:
