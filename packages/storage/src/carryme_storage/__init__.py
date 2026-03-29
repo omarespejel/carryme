@@ -6,6 +6,7 @@ from carryme_storage.execution_alerts import ExecutionAlertStore
 from carryme_storage.execution_observations import ExecutionObservationStore
 from carryme_storage.executions import ExecutionJournalStore
 from carryme_storage.history import OpportunityHistoryStore
+from carryme_storage.pair_close_preview_confirmations import PairClosePreviewConfirmationStore
 from carryme_storage.paper_trades import PaperTradeStore
 from carryme_storage.preview_confirmations import PreviewConfirmationStore
 from carryme_storage.watchlist import WatchlistStore, load_watchlist, save_watchlist
@@ -17,6 +18,7 @@ __all__ = [
     "ExecutionJournalStore",
     "ExecutionObservationStore",
     "OpportunityHistoryStore",
+    "PairClosePreviewConfirmationStore",
     "PaperTradeStore",
     "PreviewConfirmationStore",
     "WatchlistStore",

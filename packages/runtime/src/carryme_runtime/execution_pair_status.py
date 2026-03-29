@@ -31,6 +31,7 @@ def build_execution_pair_status(
     position_presence = _position_presence_by_leg(entry, reconciliation)
     order_states = {item.venue: item.derived_state for item in order_state.legs}
 
+    is_multi_leg_entry = len(entry.legs) >= 2
     any_position = any(position_presence.values())
     all_positions = bool(position_presence) and all(position_presence.values())
     any_open = any(state == "open" for state in order_states.values())
@@ -57,7 +58,7 @@ def build_execution_pair_status(
         derived_state = "pending"
         recommended_action = "wait_for_fill_or_timeout"
         notes.append("At least one venue still reports the order as open.")
-    elif all_positions:
+    elif is_multi_leg_entry and all_positions:
         derived_state = "hedged"
         recommended_action = "monitor_open_hedge"
         notes.append("Both legs are currently reflected in live position state.")

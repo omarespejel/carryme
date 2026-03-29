@@ -59,3 +59,17 @@ class ExecutionCleanupPreview(BaseModel):
     reason: str = Field(min_length=1)
     leg: VenueOrderPreview
     notes: list[str] = Field(default_factory=list)
+
+
+class ExecutionPairClosePreview(BaseModel):
+    """A multi-leg reduce-only close preview derived from a live hedged pair."""
+
+    execution_entry_id: int | None = None
+    paper_trade_id: int | None = None
+    label: str = Field(min_length=1)
+    generated_at: datetime
+    slippage_tolerance_bps: int = Field(ge=0)
+    preview_hash: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    legs: list[VenueOrderPreview] = Field(min_length=2)
+    notes: list[str] = Field(default_factory=list)

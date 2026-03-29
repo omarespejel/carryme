@@ -4,7 +4,11 @@ from carryme_models.account_preflight import (
     PaperTradeAccountPreflight,
     VenueAccountPreflight,
 )
-from carryme_models.confirmation import CleanupPreviewConfirmationEntry, PreviewConfirmationEntry
+from carryme_models.confirmation import (
+    CleanupPreviewConfirmationEntry,
+    PairClosePreviewConfirmationEntry,
+    PreviewConfirmationEntry,
+)
 from carryme_models.execution import (
     ExecutionJournalEntry,
     ExecutionLegOrderState,
@@ -41,6 +45,7 @@ from carryme_models.preflight import (
 )
 from carryme_models.preview import (
     ExecutionCleanupPreview,
+    ExecutionPairClosePreview,
     PaperTradeOrderPreview,
     VenueOrderPreview,
 )
@@ -53,6 +58,7 @@ __all__ = [
     "ExecutionAlertEvent",
     "CleanupPreviewConfirmationEntry",
     "CredentialRequirementStatus",
+    "ExecutionPairClosePreview",
     "ExecutionJournalEntry",
     "ExecutionLegResult",
     "ExecutionLegOrderState",
@@ -76,6 +82,7 @@ __all__ = [
     "PaperTradeEntry",
     "PaperTradeExecutionPreflight",
     "ExecutionCleanupPreview",
+    "PairClosePreviewConfirmationEntry",
     "PaperTradeOrderPreview",
     "PreviewConfirmationEntry",
     "ServiceHealth",

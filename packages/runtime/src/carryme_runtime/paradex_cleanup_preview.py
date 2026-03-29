@@ -147,7 +147,7 @@ class ParadexCleanupPreviewService:
         slippage_tolerance_bps: int,
     ) -> VenueOrderPreview:
         symbol = target_leg.symbol
-        side: Literal["buy", "sell"] = "sell" if target_leg.side == "buy" else "buy"
+        side = _determine_cleanup_side(position=position, fallback_side=target_leg.side)
         reference_price_source: Literal["best_bid", "best_ask"] = (
             "best_ask" if side == "buy" else "best_bid"
         )
@@ -230,6 +230,28 @@ class ParadexCleanupPreviewService:
                 "Reduce-only close preview does not enforce standard minimum-notional checks.",
             ],
         )
+
+
+def _determine_cleanup_side(
+    *,
+    position: dict[str, Any],
+    fallback_side: Literal["buy", "sell"],
+) -> Literal["buy", "sell"]:
+    signed_size = _required_decimal(position, "size", "position_size", "qty", "quantity")
+    if signed_size > 0:
+        return "sell"
+    if signed_size < 0:
+        return "buy"
+
+    side_value = _string_value(position, "side")
+    if side_value is not None:
+        normalized_side = side_value.upper()
+        if normalized_side in {"BUY", "LONG"}:
+            return "sell"
+        if normalized_side in {"SELL", "SHORT"}:
+            return "buy"
+
+    return "sell" if fallback_side == "buy" else "buy"
 
 
 def _select_open_paradex_leg(
