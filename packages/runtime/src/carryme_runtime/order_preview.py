@@ -206,7 +206,11 @@ def _build_leg_preview(
     )
 
     if venue_key == "hyperliquid":
-        sz_decimals = _raw_int(raw=snapshot.market.raw, key="szDecimals")
+        hyperliquid_raw = _require_mapping(
+            snapshot.market.raw,
+            label=f"{venue} market raw payload",
+        )
+        sz_decimals = _raw_int(raw=hyperliquid_raw, key="szDecimals")
         if sz_decimals is None:
             raise ValueError(
                 f"Venue {venue} is missing Hyperliquid szDecimals metadata for {symbol}"
@@ -447,12 +451,12 @@ def _extract_order_constraints(
         )
     if venue == "hyperliquid":
         sz_decimals = _raw_int(raw, "szDecimals")
-        quantity_increment = None
+        hyperliquid_quantity_increment: Decimal | None = None
         if sz_decimals is not None and sz_decimals >= 0:
-            quantity_increment = Decimal("1").scaleb(-sz_decimals)
+            hyperliquid_quantity_increment = Decimal("1").scaleb(-sz_decimals)
         return OrderConstraints(
-            quantity_increment=quantity_increment,
-            minimum_order_size=quantity_increment,
+            quantity_increment=hyperliquid_quantity_increment,
+            minimum_order_size=hyperliquid_quantity_increment,
             minimum_notional=Decimal("10"),
         )
     _logger.debug(
