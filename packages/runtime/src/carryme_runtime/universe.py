@@ -6,6 +6,7 @@ import asyncio
 import itertools
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal, Protocol
 
 import httpx
@@ -18,6 +19,7 @@ from carryme_connectors import (
 from carryme_models import (
     ExecutionQualitySummary,
     FundingArbOpportunity,
+    FundingPairSpec,
     FundingUniverseOpportunity,
     FundingUniverseOverlap,
     FundingUniversePortfolioEntry,
@@ -25,6 +27,7 @@ from carryme_models import (
     FundingUniverseScan,
     FundingUniverseVenueMarket,
     NormalizedMarketSnapshot,
+    OpportunityRecord,
 )
 from carryme_normalizers import get_fee_profile, normalize_symbol
 from carryme_scoring import score_funding_pair

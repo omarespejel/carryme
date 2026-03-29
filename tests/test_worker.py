@@ -678,8 +678,9 @@ def test_scan_funding_universe_once_saves_ranked_history_and_alerts(tmp_path: Pa
     events: list[CandidateAlertEvent] = []
 
     class StubCandidateAlertSink:
-        def append(self, event: CandidateAlertEvent) -> None:
+        def append(self, event: CandidateAlertEvent) -> bool:
             events.append(event)
+            return True
 
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
