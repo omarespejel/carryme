@@ -43,7 +43,7 @@ class VenueSpec(TypedDict):
     notes: list[str]
 
 
-_VENUE_SPECS: dict[str, VenueSpec] = {
+LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
     "extended": {
         "enabled_setting": "extended_live_enabled",
         "credential_settings": {
@@ -122,7 +122,7 @@ def build_live_execution_configs(settings: object) -> LiveExecutionConfigMap:
     """Build live execution config directly from the shared venue specification."""
 
     configs: LiveExecutionConfigMap = {}
-    for venue, spec in _VENUE_SPECS.items():
+    for venue, spec in LIVE_EXECUTION_VENUE_SPECS.items():
         configs[venue] = {
             "enabled": bool(getattr(settings, spec["enabled_setting"])),
             "credentials": {
@@ -139,7 +139,7 @@ def build_venue_execution_preflights(
     """Build live-readiness status for all supported venues."""
 
     statuses: list[VenueExecutionPreflight] = []
-    for venue, spec in _VENUE_SPECS.items():
+    for venue, spec in LIVE_EXECUTION_VENUE_SPECS.items():
         config = configs.get(venue, {"enabled": False, "credentials": {}})
         credentials = config["credentials"]
         requirements = [

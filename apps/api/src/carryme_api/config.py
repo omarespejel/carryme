@@ -4,6 +4,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
+from carryme_runtime.preflight import LIVE_EXECUTION_VENUE_SPECS
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -45,24 +46,14 @@ class ApiSettings(BaseSettings):
     def warn_on_enabled_live_execution_without_credentials(self) -> "ApiSettings":
         """Warn operators when live execution flags are enabled without credentials."""
 
-        live_requirements = {
-            "extended_live_enabled": (
-                "extended_api_key",
-                "extended_stark_private_key",
-            ),
-            "paradex_live_enabled": ("paradex_private_key",),
-            "hyperliquid_live_enabled": (
-                "hyperliquid_account_address",
-                "hyperliquid_api_wallet_private_key",
-            ),
-        }
-        for flag_name, credential_names in live_requirements.items():
+        for spec in LIVE_EXECUTION_VENUE_SPECS.values():
+            flag_name = spec["enabled_setting"]
             if not getattr(self, flag_name):
                 continue
             missing = [
-                credential_name
-                for credential_name in credential_names
-                if not getattr(self, credential_name)
+                attribute_name
+                for attribute_name in spec["credential_settings"].values()
+                if not getattr(self, attribute_name)
             ]
             if missing:
                 logger.warning(
