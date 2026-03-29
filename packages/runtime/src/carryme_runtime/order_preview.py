@@ -280,7 +280,6 @@ def _build_payload(
             "price": worst_price_text,
             "instruction": "IOC",
             "client_id": client_order_id,
-            "reduce_only": False,
         }
     if venue == "extended":
         return {

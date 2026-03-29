@@ -9,11 +9,15 @@ from carryme_connectors.paradex_auth import (
     PARADEX_API_BASE_URL,
     PARADEX_AUTH_PATH,
     PARADEX_AUTH_TOKEN_LIFETIME_SECONDS,
+    PARADEX_DEFAULT_RECV_WINDOW_MS,
+    PARADEX_ORDER_PATH,
     PARADEX_SYSTEM_CONFIG_PATH,
     ParadexJwtTokenProvider,
     ParadexSystemConfig,
     build_paradex_auth_headers,
     build_paradex_auth_request_path,
+    build_paradex_order_signature,
+    build_signed_paradex_order_payload,
 )
 from carryme_connectors.paradex_private import ParadexPrivateConnector
 
@@ -25,6 +29,8 @@ __all__ = [
     "PARADEX_API_BASE_URL",
     "PARADEX_AUTH_PATH",
     "PARADEX_AUTH_TOKEN_LIFETIME_SECONDS",
+    "PARADEX_DEFAULT_RECV_WINDOW_MS",
+    "PARADEX_ORDER_PATH",
     "PARADEX_SYSTEM_CONFIG_PATH",
     "ParadexPublicConnector",
     "ParadexJwtTokenProvider",
@@ -33,4 +39,6 @@ __all__ = [
     "PublicVenueConnector",
     "build_paradex_auth_headers",
     "build_paradex_auth_request_path",
+    "build_paradex_order_signature",
+    "build_signed_paradex_order_payload",
 ]

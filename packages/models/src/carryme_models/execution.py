@@ -16,9 +16,12 @@ class ExecutionLegResult(BaseModel):
     fee_profile: str = Field(min_length=1)
     side: Literal["buy", "sell"]
     target_notional: float = Field(gt=0)
-    status: Literal["accepted", "rejected"]
+    status: Literal["accepted", "rejected", "submitted"]
     simulated: bool = True
     external_reference: str | None = None
+    request_payload: Any | None = None
+    response_payload: Any | None = None
+    signature_timestamp_ms: int | None = None
     raw_payload: Any | None = None
 
 
@@ -28,9 +31,11 @@ class ExecutionJournalEntry(BaseModel):
     entry_id: int | None = None
     executed_at: datetime
     adapter: str = Field(min_length=1)
-    mode: Literal["mock"]
+    mode: Literal["mock", "live"]
     submission_id: str | None = None
-    status: Literal["accepted", "rejected"]
+    status: Literal["accepted", "rejected", "submitted"]
     paper_trade_id: int | None = None
+    preview_hash: str | None = None
+    confirmation_entry_id: int | None = None
     paper_trade: PaperTradeEntry
     legs: list[ExecutionLegResult] = Field(min_length=1)
