@@ -9,6 +9,7 @@ from carryme_storage.history import OpportunityHistoryStore
 from carryme_storage.pair_close_preview_confirmations import PairClosePreviewConfirmationStore
 from carryme_storage.paper_trades import PaperTradeStore
 from carryme_storage.preview_confirmations import PreviewConfirmationStore
+from carryme_storage.route_approvals import RouteApprovalStore
 from carryme_storage.watchlist import WatchlistStore, load_watchlist, save_watchlist
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "PairClosePreviewConfirmationStore",
     "PaperTradeStore",
     "PreviewConfirmationStore",
+    "RouteApprovalStore",
     "WatchlistStore",
     "load_watchlist",
     "save_watchlist",

@@ -24,6 +24,7 @@ from carryme_models import (
     PaperTradeEntry,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
+    RouteApprovalEntry,
     TradeLegIntent,
     VenueOrderPreview,
 )
@@ -36,6 +37,7 @@ from carryme_storage import (
     OpportunityHistoryStore,
     PaperTradeStore,
     PreviewConfirmationStore,
+    RouteApprovalStore,
     WatchlistStore,
     load_watchlist,
     save_watchlist,
@@ -2312,3 +2314,43 @@ def test_execution_journal_store_lists_entries_for_paper_trade(tmp_path: Path) -
     assert len(results) == 2
     assert results[0].adapter == "paradex_live"
     assert results[1].adapter == "extended_live"
+
+
+def test_route_approval_store_upserts_and_reads_route(tmp_path: Path) -> None:
+    store = RouteApprovalStore(tmp_path / "history.sqlite3")
+    original = RouteApprovalEntry(
+        updated_at=datetime(2026, 3, 29, 14, 0, tzinfo=UTC),
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=25.0,
+        note="initial canary",
+    )
+    updated = original.model_copy(
+        update={
+            "updated_at": datetime(2026, 3, 29, 14, 5, tzinfo=UTC),
+            "max_live_notional": 40.0,
+        }
+    )
+
+    store.upsert(original)
+    store.upsert(updated)
+
+    loaded = store.get_route(
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+    )
+    results = store.list_recent(limit=10, approved=True)
+
+    assert loaded is not None
+    assert loaded.max_live_notional == 40.0
+    assert len(results) == 1
+    assert results[0].label == "arb_extended_paradex"

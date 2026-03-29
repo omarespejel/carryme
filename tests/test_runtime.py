@@ -49,6 +49,7 @@ from carryme_models import (
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
     RouteAccountingSummary,
+    RouteApprovalEntry,
     RouteStabilitySummary,
     TopOfBook,
     TradeLegIntent,
@@ -77,6 +78,7 @@ from carryme_runtime import (
     ParadexCleanupPreviewService,
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
+    RouteApprovalService,
     RouteStabilityService,
     VenueAccountProbe,
     build_execution_pair_status,
@@ -103,6 +105,7 @@ from carryme_storage import (
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
+    RouteApprovalStore,
 )
 from pydantic import ValidationError
 
@@ -10699,7 +10702,6 @@ def test_execution_accounting_service_summarizes_filled_attempt_history(tmp_path
         summary.total_estimated_fee_paid
     )
 
-
 def test_extended_live_execution_service_rejects_cleanup_for_wrong_venue() -> None:
     confirmation = CleanupPreviewConfirmationEntry(
         entry_id=11,
@@ -10843,3 +10845,95 @@ def test_require_confirmed_cleanup_preview_rejects_mismatches(
             preview_hash=preview_hash,
             confirmations=[confirmation],
         )
+
+
+def test_route_approval_service_filters_canaries_and_enforces_live_cap(
+    tmp_path: Path,
+) -> None:
+    store = RouteApprovalStore(tmp_path / "history.sqlite3")
+    service = RouteApprovalService(store=store)
+    service.upsert(
+        label="arb_extended_paradex",
+        payload=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 14, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=12.0,
+            note="canary only",
+        ),
+    )
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.0015,
+                entry_cost_rate=0.0004,
+                round_trip_cost_rate=0.0008,
+                one_day_net_edge_after_entry=0.0011,
+                one_day_net_edge_after_round_trip=0.0007,
+                break_even_days_entry=0.4,
+                break_even_days_round_trip=0.8,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1500.0,
+                    long_ask_notional=1400.0,
+                    max_entry_notional=1400.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=300.0,
+            estimated_one_day_pnl_after_round_trip=0.21,
+        ),
+        suggested_canary_notional=25.0,
+    )
+    filtered = service.filter_approved_canary_candidates([candidate])
+    permitted_intent = FundingPairTradeIntent(
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        source_recorded_at=datetime(2026, 3, 29, 14, 0, tzinfo=UTC),
+        one_day_net_edge_after_entry=0.0011,
+        break_even_days_entry=0.4,
+        capacity_limit_notional=1400.0,
+        target_notional=11.0,
+        capacity_fraction=0.25,
+        max_target_notional=11.0,
+        long_leg=TradeLegIntent(
+            venue="paradex",
+            symbol="ARB-USD-PERP",
+            fee_profile="pro_fastfills",
+            side="buy",
+            target_notional=11.0,
+        ),
+        short_leg=TradeLegIntent(
+            venue="extended",
+            symbol="ARB-USD",
+            fee_profile="default",
+            side="sell",
+            target_notional=11.0,
+        ),
+    )
+    blocked_intent = permitted_intent.model_copy(update={"target_notional": 15.0})
+
+    assert len(filtered) == 1
+    assert filtered[0].suggested_canary_notional == 12.0
+    assert service.require_live_approval(permitted_intent).max_live_notional == 12.0
+    with pytest.raises(ValueError, match="approved cap"):
+        service.require_live_approval(blocked_intent)

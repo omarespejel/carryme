@@ -10,6 +10,7 @@ from carryme_models.accounting import (
     PaperTradeAccountingSummary,
     RouteAccountingSummary,
 )
+from carryme_models.approval import RouteApprovalEntry, RouteApprovalUpsert
 from carryme_models.confirmation import (
     CleanupPreviewConfirmationEntry,
     PairClosePreviewConfirmationEntry,
@@ -76,6 +77,8 @@ __all__ = [
     "ExecutionAlertEvent",
     "CleanupPreviewConfirmationEntry",
     "CredentialRequirementStatus",
+    "RouteApprovalEntry",
+    "RouteApprovalUpsert",
     "ExecutionAccountingSummary",
     "ExecutionPairClosePreview",
     "ExecutionJournalEntry",

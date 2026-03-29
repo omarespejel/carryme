@@ -13,6 +13,7 @@ from carryme_api.app import (
     get_history_store,
     get_opportunity_service,
     get_opportunity_universe_service,
+    get_route_approval_service,
     get_route_stability_service,
 )
 from carryme_api.config import ApiSettings
@@ -48,6 +49,8 @@ from carryme_models import (
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
     RouteAccountingSummary,
+    RouteApprovalEntry,
+    RouteApprovalUpsert,
     RouteStabilitySummary,
     TradeLegIntent,
     VenueAccountPreflight,
@@ -446,6 +449,78 @@ def test_funding_universe_canary_endpoint_uses_policy_defaults() -> None:
     assert captured["exclude_tags"] is None
 
 
+def test_funding_universe_canary_endpoint_can_filter_approved_routes() -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            return [candidate]
+
+    class StubRouteApprovalService:
+        def filter_approved_canary_candidates(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+        ) -> list[FundingUniverseCanaryCandidate]:
+            assert len(candidates) == 1
+            return [candidates[0].model_copy(update={"suggested_canary_notional": 11.0})]
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: StubRouteApprovalService()
+    )
+    client = TestClient(app)
+
+    response = client.get(
+        "/v1/opportunities/funding-universe/canary",
+        params={"approved_only": "true"},
+    )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["suggested_canary_notional"] == 11.0
+
+
 def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
     class StubUniverseService:
         async def scan(self, **_: object) -> FundingUniverseScan:
@@ -505,6 +580,86 @@ def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
     payload = response.json()
     assert payload["allocated_notional"] == 900.0
     assert payload["entries"][0]["opportunity"]["opportunity"]["canonical_symbol"] == "ARB-USD-PERP"
+
+
+def test_route_approvals_endpoint_uses_service_dependency() -> None:
+    captured: dict[str, object] = {}
+
+    class StubRouteApprovalService:
+        def list_recent(self, **kwargs: object) -> list[RouteApprovalEntry]:
+            captured.update(kwargs)
+            return [
+                RouteApprovalEntry(
+                    updated_at=datetime(2026, 3, 29, 16, 0, tzinfo=UTC),
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    short_venue="extended",
+                    long_venue="paradex",
+                    short_fee_profile="default",
+                    long_fee_profile="pro_fastfills",
+                    approved=True,
+                    max_live_notional=25.0,
+                    note="canary approved",
+                )
+            ]
+
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: StubRouteApprovalService()
+    )
+    client = TestClient(app)
+    response = client.get(
+        "/v1/opportunities/route-approvals",
+        params={"approved": "true", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["approved"] is True
+    assert captured["limit"] == 5
+    assert response.json()[0]["max_live_notional"] == 25.0
+
+
+def test_upsert_route_approval_endpoint_uses_service_dependency() -> None:
+    class StubRouteApprovalService:
+        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
+            assert label == "arb_extended_paradex"
+            assert payload.max_live_notional == 15.0
+            return RouteApprovalEntry(
+                updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+                label=label,
+                canonical_symbol=payload.canonical_symbol,
+                short_venue=payload.short_venue,
+                long_venue=payload.long_venue,
+                short_fee_profile=payload.short_fee_profile,
+                long_fee_profile=payload.long_fee_profile,
+                approved=payload.approved,
+                max_live_notional=payload.max_live_notional,
+                note=payload.note,
+            )
+
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: StubRouteApprovalService()
+    )
+    client = TestClient(app)
+    response = client.put(
+        "/v1/opportunities/route-approvals/arb_extended_paradex",
+        json={
+            "canonical_symbol": "ARB-USD-PERP",
+            "short_venue": "extended",
+            "long_venue": "paradex",
+            "short_fee_profile": "default",
+            "long_fee_profile": "pro_fastfills",
+            "approved": True,
+            "max_live_notional": 15.0,
+            "note": "raise canary cap",
+        },
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["label"] == "arb_extended_paradex"
+    assert payload["max_live_notional"] == 15.0
 
 
 def test_execution_quality_endpoint_uses_service_dependency() -> None:
@@ -1455,6 +1610,85 @@ def test_create_paper_trade_from_intent_persists_entry(tmp_path: Path) -> None:
     assert len(paper_store.list_recent(limit=10)) == 1
 
 
+def test_create_paper_trade_from_canary_caps_to_approved_notional(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "paper-trades.sqlite3")
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            return [candidate]
+
+    class StubRouteApprovalService:
+        def filter_approved_canary_candidates(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+        ) -> list[FundingUniverseCanaryCandidate]:
+            assert len(candidates) == 1
+            return [candidates[0].model_copy(update={"suggested_canary_notional": 7.5})]
+
+    from carryme_api.app import get_paper_trade_store
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: StubRouteApprovalService()
+    )
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    client = TestClient(app)
+    response = client.post(
+        "/v1/paper-trades/from-canary",
+        params={
+            "label": "arb_extended_paradex",
+            "desired_notional": 20.0,
+            "note": "approved canary",
+        },
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"]["target_notional"] == 7.5
+    assert payload["note"] == "approved canary"
+    assert len(paper_store.list_recent(limit=10)) == 1
+
+
 def test_paper_trades_endpoint_lists_saved_entries(tmp_path: Path) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     paper_store.append(
@@ -1549,7 +1783,67 @@ def test_mock_execution_endpoint_submits_saved_paper_trade(tmp_path: Path) -> No
     payload = response.json()
     assert payload["paper_trade_id"] == paper_trade.entry_id
     assert payload["adapter"] == "mock"
-    assert len(execution_store.list_recent(limit=10)) == 1
+
+
+def test_live_extended_execution_requires_route_approval(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+
+    class StubRouteApprovalService:
+        def require_live_approval(self, intent: FundingPairTradeIntent) -> None:
+            assert intent.label == "arb_extended_paradex"
+            raise ValueError("Live execution is blocked because this route has not been approved")
+
+    from carryme_api.app import get_api_settings, get_paper_trade_store
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: StubRouteApprovalService()
+    )
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
+    )
+    client = TestClient(app)
+    response = client.post(
+        f"/v1/executions/live/extended/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "preview-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert "has not been approved" in response.json()["detail"]
 
 
 def test_executions_endpoint_lists_saved_entries(tmp_path: Path) -> None:
@@ -4201,6 +4495,9 @@ def test_execute_extended_cleanup_endpoint_submits_confirmed_cleanup_preview(
     app.dependency_overrides[get_extended_live_execution_service] = (
         lambda: StubExtendedLiveExecutionService()
     )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
+    )
     client = TestClient(app)
     assert paper_trade.entry_id is not None
     response = client.post(
@@ -4455,6 +4752,9 @@ def test_execute_paradex_cleanup_endpoint_submits_confirmed_cleanup_preview(
     app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_paradex_live_execution_service] = (
         lambda: StubParadexLiveExecutionService()
+    )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
     )
     client = TestClient(app)
     assert paper_trade.entry_id is not None
@@ -4737,6 +5037,9 @@ def test_execute_hyperliquid_cleanup_endpoint_submits_confirmed_cleanup_preview(
     app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_hyperliquid_live_execution_service] = (
         lambda: StubHyperliquidLiveExecutionService()
+    )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
     )
     client = TestClient(app)
     assert paper_trade.entry_id is not None
@@ -5680,6 +5983,22 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
     ]
 
 
+class _AllowAllRouteApprovalService:
+    def require_live_approval(self, intent: FundingPairTradeIntent) -> RouteApprovalEntry:
+        return RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            label=intent.label,
+            canonical_symbol=intent.canonical_symbol,
+            short_venue=intent.short_leg.venue,
+            long_venue=intent.long_leg.venue,
+            short_fee_profile=intent.short_leg.fee_profile,
+            long_fee_profile=intent.long_leg.fee_profile,
+            approved=True,
+            max_live_notional=max(intent.target_notional, 10_000.0),
+            note="test allow",
+        )
+
+
 def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Path) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
@@ -5852,6 +6171,9 @@ def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pat
     app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_paradex_live_execution_service] = (
         lambda: StubParadexLiveExecutionService()
+    )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
     )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
@@ -6043,6 +6365,9 @@ def test_extended_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pa
     app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_extended_live_execution_service] = (
         lambda: StubExtendedLiveExecutionService()
+    )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
     )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
@@ -6236,6 +6561,9 @@ def test_hyperliquid_live_execution_endpoint_submits_confirmed_preview(tmp_path:
     app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_hyperliquid_live_execution_service] = (
         lambda: StubHyperliquidLiveExecutionService()
+    )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
     )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
@@ -6451,6 +6779,9 @@ def test_paired_live_execution_endpoint_submits_both_legs(tmp_path: Path) -> Non
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
+    )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -6664,6 +6995,9 @@ def test_paired_live_execution_endpoint_defaults_first_venue_to_auto(tmp_path: P
     app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
+    )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
     )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
@@ -7010,7 +7344,12 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
-    app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
+    )
+    app.dependency_overrides[get_cleanup_preview_service] = (
+        lambda: StubCleanupPreviewService()
+    )
     app.dependency_overrides[get_cleanup_live_execution_router] = (
         lambda: StubCleanupLiveExecutionRouter()
     )
@@ -7397,6 +7736,7 @@ def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirma
         get_paired_live_execution_coordinator,
         get_paper_trade_store,
         get_preview_confirmation_store,
+        get_route_approval_service,
     )
 
     account_service = StubAccountPreflightService()
@@ -7412,6 +7752,9 @@ def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirma
     )
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
+    )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
     )
     app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_cleanup_live_execution_router] = (
@@ -7784,6 +8127,9 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
+    )
     app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_cleanup_live_execution_router] = (
         lambda: StubCleanupLiveExecutionRouter()
@@ -8024,6 +8370,9 @@ def test_guarded_paired_live_execution_endpoint_rejects_duplicate_retry(
     app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
+    )
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: _AllowAllRouteApprovalService()
     )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,

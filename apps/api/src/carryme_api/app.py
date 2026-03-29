@@ -41,6 +41,8 @@ from carryme_models import (
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
     RouteAccountingSummary,
+    RouteApprovalEntry,
+    RouteApprovalUpsert,
     RouteStabilitySummary,
     ServiceHealth,
     TradingFeeProfile,
@@ -76,12 +78,15 @@ from carryme_runtime import (
     ParadexCleanupPreviewService,
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
+    RouteApprovalService,
     RouteStabilityService,
     UpstreamDataError,
     build_account_preflight_configs,
     build_execution_pair_status,
     build_live_execution_configs,
     build_live_submission_readiness,
+    build_opportunity_record_from_universe_opportunity,
+    build_pair_spec_from_universe_opportunity,
     build_paper_trade_execution_preflight,
     build_portfolio_plan,
     build_trade_intent,
@@ -100,6 +105,7 @@ from carryme_storage import (
     PairClosePreviewConfirmationStore,
     PaperTradeStore,
     PreviewConfirmationStore,
+    RouteApprovalStore,
     WatchlistStore,
 )
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
@@ -225,6 +231,17 @@ def _build_fee_profile_overrides(
         if (profile := configured_profiles.get(venue))
     }
     return overrides or None
+
+
+def _require_live_route_approval(
+    *,
+    paper_trade: PaperTradeEntry,
+    approval_service: RouteApprovalService,
+) -> RouteApprovalEntry:
+    try:
+        return approval_service.require_live_approval(paper_trade.intent)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def get_opportunity_service() -> OpportunityService:
@@ -454,6 +471,22 @@ def get_execution_accounting_service(
     """Return the derived execution accounting service."""
 
     return ExecutionAccountingService(journal_store=store)
+
+
+def get_route_approval_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> RouteApprovalStore:
+    """Return the shared route approval store."""
+
+    return RouteApprovalStore(settings.database_path)
+
+
+def get_route_approval_service(
+    store: Annotated[RouteApprovalStore, Depends(get_route_approval_store)],
+) -> RouteApprovalService:
+    """Return the route approval service."""
+
+    return RouteApprovalService(store=store)
 
 
 def get_paradex_live_execution_service(
@@ -1328,6 +1361,34 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/v1/opportunities/route-approvals", response_model=list[RouteApprovalEntry])
+    def route_approvals(
+        service: Annotated[RouteApprovalService, Depends(get_route_approval_service)],
+        limit: int = 50,
+        label: str | None = None,
+        canonical_symbol: str | None = None,
+        approved: bool | None = None,
+    ) -> list[RouteApprovalEntry]:
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return service.list_recent(
+            limit=limit,
+            label=label,
+            canonical_symbol=canonical_symbol,
+            approved=approved,
+        )
+
+    @app.put(
+        "/v1/opportunities/route-approvals/{label}",
+        response_model=RouteApprovalEntry,
+    )
+    def upsert_route_approval(
+        label: str,
+        service: Annotated[RouteApprovalService, Depends(get_route_approval_service)],
+        payload: Annotated[RouteApprovalUpsert, Body()],
+    ) -> RouteApprovalEntry:
+        return service.upsert(label=label, payload=payload)
+
     @app.post("/v1/paper-trades/from-intent", response_model=PaperTradeEntry)
     def create_paper_trade_from_intent(
         history_store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
@@ -1360,6 +1421,102 @@ def create_app() -> FastAPI:
         entry = PaperTradeEntry(
             created_at=datetime.now(UTC),
             intent=intents[0],
+            note=note,
+        )
+        return paper_store.append(entry)
+
+    @app.post("/v1/paper-trades/from-canary", response_model=PaperTradeEntry)
+    async def create_paper_trade_from_canary(
+        universe_service: Annotated[
+            OpportunityUniverseService, Depends(get_opportunity_universe_service)
+        ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        venues: Annotated[list[str] | None, Query()] = None,
+        label: str | None = None,
+        desired_notional: float | None = None,
+        note: str | None = None,
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = "pro_fastfills",
+        hyperliquid_fee_profile: str | None = None,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.35,
+        min_route_presence_ratio: float = 0.35,
+        min_route_samples: int = 2,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+        limit: int = 10,
+    ) -> PaperTradeEntry:
+        selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+        candidates = await universe_service.scan_canary_candidates(
+            venues=selected_venues,
+            fee_profile_overrides=_build_fee_profile_overrides(
+                extended_fee_profile=extended_fee_profile,
+                paradex_fee_profile=paradex_fee_profile,
+                hyperliquid_fee_profile=hyperliquid_fee_profile,
+            ),
+            target_notional=target_notional,
+            canary_max_notional=canary_max_notional,
+            min_capacity_notional=min_capacity_notional,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+            min_execution_quality_score=min_execution_quality_score,
+            min_execution_samples=min_execution_samples,
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+            include_symbols=include_symbols,
+            exclude_symbols=exclude_symbols,
+            exclude_tags=exclude_tags,
+            limit=limit,
+        )
+        approved_candidates = approval_service.filter_approved_canary_candidates(candidates)
+        if label is not None:
+            approved_candidates = [
+                item
+                for item in approved_candidates
+                if build_pair_spec_from_universe_opportunity(item.opportunity).label == label
+            ]
+        if not approved_candidates:
+            raise HTTPException(
+                status_code=404,
+                detail="No approved canary candidate matched the requested filters",
+            )
+        selected = approved_candidates[0]
+        capped_notional = selected.suggested_canary_notional
+        if desired_notional is not None:
+            capped_notional = min(capped_notional, desired_notional)
+        if capped_notional <= 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Approved route does not allow a positive live notional",
+            )
+        record = build_opportunity_record_from_universe_opportunity(
+            recorded_at=datetime.now(UTC),
+            opportunity=selected.opportunity,
+        )
+        intent = build_trade_intent(
+            record,
+            capacity_fraction=1.0,
+            max_target_notional=capped_notional,
+            min_one_day_net_edge_after_entry=0.0,
+            min_capacity_notional=0.0,
+        )
+        entry = PaperTradeEntry(
+            created_at=datetime.now(UTC),
+            intent=intent,
             note=note,
         )
         return paper_store.append(entry)
@@ -1924,6 +2081,10 @@ def create_app() -> FastAPI:
         preview_hash: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         confirmation_store: Annotated[
             PreviewConfirmationStore,
             Depends(get_preview_confirmation_store),
@@ -1944,6 +2105,10 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
 
         try:
             readiness, confirmation = await _build_venue_scoped_readiness_for_paper_trade(
@@ -2026,6 +2191,10 @@ def create_app() -> FastAPI:
         preview_hash: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         confirmation_store: Annotated[
             PreviewConfirmationStore,
             Depends(get_preview_confirmation_store),
@@ -2046,6 +2215,10 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
 
         try:
             readiness, confirmation = await _build_venue_scoped_readiness_for_paper_trade(
@@ -2128,6 +2301,10 @@ def create_app() -> FastAPI:
         preview_hash: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         confirmation_store: Annotated[
             PreviewConfirmationStore,
             Depends(get_preview_confirmation_store),
@@ -2148,6 +2325,10 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
 
         try:
             readiness, confirmation = await _build_venue_scoped_readiness_for_paper_trade(
@@ -2536,6 +2717,10 @@ def create_app() -> FastAPI:
         preview_hash: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         confirmation_store: Annotated[
             PreviewConfirmationStore,
             Depends(get_preview_confirmation_store),
@@ -2557,6 +2742,10 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
 
         try:
             readiness = await _build_readiness_for_paper_trade(
@@ -2641,6 +2830,10 @@ def create_app() -> FastAPI:
         preview_hash: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         confirmation_store: Annotated[
             PreviewConfirmationStore,
             Depends(get_preview_confirmation_store),
@@ -2693,6 +2886,10 @@ def create_app() -> FastAPI:
         normalized_preview_hash = preview_hash.strip()
         if not normalized_preview_hash:
             raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
 
         try:
             readiness = await _build_readiness_for_paper_trade(
@@ -3321,6 +3518,10 @@ def create_app() -> FastAPI:
         service: Annotated[
             OpportunityUniverseService, Depends(get_opportunity_universe_service)
         ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         venues: Annotated[list[str] | None, Query()] = None,
         extended_fee_profile: str | None = None,
         paradex_fee_profile: str | None = "pro_fastfills",
@@ -3339,11 +3540,12 @@ def create_app() -> FastAPI:
         include_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_tags: Annotated[list[str] | None, Query()] = None,
+        approved_only: bool = False,
         limit: int = 10,
     ) -> list[FundingUniverseCanaryCandidate]:
         try:
             selected_venues = venues or ["extended", "paradex", "hyperliquid"]
-            return await service.scan_canary_candidates(
+            candidates = await service.scan_canary_candidates(
                 venues=selected_venues,
                 fee_profile_overrides=_build_fee_profile_overrides(
                     extended_fee_profile=extended_fee_profile,
@@ -3366,6 +3568,9 @@ def create_app() -> FastAPI:
                 exclude_tags=exclude_tags,
                 limit=limit,
             )
+            if approved_only:
+                return approval_service.filter_approved_canary_candidates(candidates)[:limit]
+            return candidates
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
