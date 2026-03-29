@@ -44,6 +44,7 @@ from carryme_models import (
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
     AccountPreflightService,
+    CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
     ExtendedCleanupPreviewService,
     ExtendedLiveExecutionService,
@@ -2966,5 +2967,115 @@ def test_cleanup_preview_router_dispatches_to_paradex_when_paradex_leg_is_open()
         preview = await router.preview_from_execution(entry=entry, pair_status=pair_status)
         assert preview.leg.venue == "paradex"
         assert preview.leg.side == "sell"
+
+    asyncio.run(run())
+
+
+def test_cleanup_live_execution_router_dispatches_to_preview_venue() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0891,
+                worst_price_text="0.08910000",
+                reduce_only=True,
+                endpoint_path_hint="/v1/orders",
+                required_auth_env_vars=[],
+                auth_scheme="main account address + subkey private key",
+                payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    class StubParadexService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 16, tzinfo=UTC),
+                adapter="paradex_cleanup_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="sell",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="cleanup-order-2",
+                    )
+                ],
+            )
+
+    async def run() -> None:
+        router = CleanupLiveExecutionRouter(services={"paradex": StubParadexService()})
+        entry = await router.submit_confirmed_cleanup_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+        )
+        assert entry.adapter == "paradex_cleanup_live"
+        assert entry.legs[0].venue == "paradex"
 
     asyncio.run(run())

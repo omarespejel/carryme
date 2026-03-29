@@ -108,3 +108,13 @@ class ExecutionPairStatus(BaseModel):
     order_state: ExecutionOrderState
     reconciliation: ExecutionReconciliation
     notes: list[str] = Field(default_factory=list)
+
+
+class GuardedPairExecutionResult(BaseModel):
+    """Result of a guarded pair attempt with optional automatic cleanup."""
+
+    paper_trade_id: int
+    preview_hash: str = Field(min_length=1)
+    primary_execution: ExecutionJournalEntry
+    cleanup_execution: ExecutionJournalEntry | None = None
+    pair_status: ExecutionPairStatus

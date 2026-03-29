@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Annotated
@@ -19,6 +20,7 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    GuardedPairExecutionResult,
     LiveSubmissionReadiness,
     OpportunityRecord,
     PaperTradeAccountPreflight,
@@ -36,6 +38,7 @@ from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
     AccountPreflightConfigMap,
     AccountPreflightService,
+    CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
     ConnectorError,
     ExecutionAdapter,
@@ -228,6 +231,26 @@ def get_paired_live_execution_coordinator(
     """Return the paired manual live execution coordinator."""
 
     return PairedLiveExecutionCoordinator(
+        services={
+            "extended": extended_service,
+            "paradex": paradex_service,
+        }
+    )
+
+
+def get_cleanup_live_execution_router(
+    extended_service: Annotated[
+        ExtendedLiveExecutionService,
+        Depends(get_extended_live_execution_service),
+    ],
+    paradex_service: Annotated[
+        ParadexLiveExecutionService,
+        Depends(get_paradex_live_execution_service),
+    ],
+) -> CleanupLiveExecutionRouter:
+    """Return the cleanup live execution router for supported venues."""
+
+    return CleanupLiveExecutionRouter(
         services={
             "extended": extended_service,
             "paradex": paradex_service,
@@ -482,6 +505,44 @@ async def _ensure_cleanup_live_ready(
                 blocking_reasons=account_blockers,
             ).model_dump(mode="json"),
         )
+
+
+async def _observe_pair_status_for_execution(
+    *,
+    paper_trade: PaperTradeEntry,
+    execution: ExecutionJournalEntry,
+    settings: ApiSettings,
+    account_service: AccountPreflightService,
+    order_state_service: ExecutionOrderStateService,
+    poll_attempts: int = 5,
+    poll_interval_seconds: float = 2.0,
+) -> ExecutionPairStatus:
+    if poll_attempts <= 0:
+        raise ValueError("poll_attempts must be positive")
+    if poll_interval_seconds < 0:
+        raise ValueError("poll_interval_seconds must be non-negative")
+
+    last_status: ExecutionPairStatus | None = None
+    for attempt in range(poll_attempts):
+        if attempt > 0 and poll_interval_seconds > 0:
+            await asyncio.sleep(poll_interval_seconds)
+        account_preflight = await account_service.probe_paper_trade(
+            paper_trade,
+            _build_account_preflight_configs(settings),
+        )
+        reconciliation = reconcile_execution(execution, account_preflight)
+        order_state = await order_state_service.observe_execution(execution)
+        last_status = build_execution_pair_status(execution, order_state, reconciliation)
+        if last_status.derived_state in {
+            "hedged",
+            "unfilled",
+            "cleanup_needed",
+            "review_required",
+        }:
+            return last_status
+
+    assert last_status is not None  # poll_attempts is validated positive
+    return last_status
 
 
 def _select_trade_intent_records(
@@ -1504,6 +1565,161 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         return execution_store.append(journal_entry)
+
+    @app.post(
+        "/v1/executions/live/pair/guarded/from-paper-trade/{paper_trade_id}",
+        response_model=GuardedPairExecutionResult,
+    )
+    async def execute_saved_paper_trade_as_guarded_pair(
+        paper_trade_id: int,
+        preview_hash: str,
+        first_venue: str,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        cleanup_confirmation_store: Annotated[
+            CleanupPreviewConfirmationStore,
+            Depends(get_cleanup_preview_confirmation_store),
+        ],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        account_preflight_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        order_state_service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+        cleanup_preview_service: Annotated[
+            CleanupPreviewRouter,
+            Depends(get_cleanup_preview_service),
+        ],
+        cleanup_live_router: Annotated[
+            CleanupLiveExecutionRouter,
+            Depends(get_cleanup_live_execution_router),
+        ],
+        service: Annotated[
+            PairedLiveExecutionCoordinator,
+            Depends(get_paired_live_execution_coordinator),
+        ],
+        poll_attempts: int = 5,
+        poll_interval_seconds: float = 2.0,
+        auto_cleanup: bool = True,
+    ) -> GuardedPairExecutionResult:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+
+        readiness = await _build_readiness_for_paper_trade(
+            paper_trade=paper_trade,
+            preview_hash=preview_hash,
+            settings=settings,
+            confirmation_store=confirmation_store,
+            account_preflight_service=account_preflight_service,
+        )
+        if not readiness.ready:
+            raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
+
+        confirmations = confirmation_store.list_recent(
+            limit=50,
+            paper_trade_id=paper_trade_id,
+        )
+        try:
+            confirmation = next(
+                item
+                for item in confirmations
+                if item.paper_trade_id == paper_trade_id and item.preview_hash == preview_hash
+            )
+        except StopIteration as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No preview confirmation matched the requested paper trade and preview hash"
+                ),
+            ) from exc
+
+        try:
+            primary_execution = await service.submit_confirmed_preview(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+                first_venue=first_venue,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        primary_execution = execution_store.append(primary_execution)
+        try:
+            pair_status = await _observe_pair_status_for_execution(
+                paper_trade=paper_trade,
+                execution=primary_execution,
+                settings=settings,
+                account_service=account_preflight_service,
+                order_state_service=order_state_service,
+                poll_attempts=poll_attempts,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        cleanup_execution: ExecutionJournalEntry | None = None
+        if auto_cleanup and pair_status.recommended_action == "close_open_leg":
+            try:
+                cleanup_preview = await cleanup_preview_service.preview_from_execution(
+                    entry=primary_execution,
+                    pair_status=pair_status,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+            await _ensure_cleanup_live_ready(
+                venue=cleanup_preview.leg.venue,
+                settings=settings,
+                account_service=account_preflight_service,
+            )
+
+            cleanup_confirmation = cleanup_confirmation_store.append(
+                CleanupPreviewConfirmationEntry(
+                    confirmed_at=datetime.now(UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=paper_trade.intent.label,
+                    preview_hash=cleanup_preview.preview_hash,
+                    preview=cleanup_preview,
+                    note="guarded pair auto-cleanup",
+                )
+            )
+            try:
+                cleanup_execution = await cleanup_live_router.submit_confirmed_cleanup_preview(
+                    paper_trade=paper_trade,
+                    confirmation=cleanup_confirmation,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (ConnectorError, httpx.HTTPError) as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            cleanup_execution = execution_store.append(cleanup_execution)
+            pair_status = await _observe_pair_status_for_execution(
+                paper_trade=paper_trade,
+                execution=primary_execution,
+                settings=settings,
+                account_service=account_preflight_service,
+                order_state_service=order_state_service,
+                poll_attempts=poll_attempts,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+
+        return GuardedPairExecutionResult(
+            paper_trade_id=paper_trade_id,
+            preview_hash=preview_hash,
+            primary_execution=primary_execution,
+            cleanup_execution=cleanup_execution,
+            pair_status=pair_status,
+        )
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(
