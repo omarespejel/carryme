@@ -4561,6 +4561,13 @@ def test_guarded_paired_live_execution_endpoint_rejects_duplicate_retry(
     assert first.status_code == 200
     assert second.status_code == 409
     assert second.json()["detail"]["adapter"] == "paired_live:extended_then_paradex"
+    saved_executions = [
+        entry
+        for entry in execution_store.list_recent(limit=10)
+        if entry.paper_trade_id == paper_trade.entry_id
+    ]
+    assert len(saved_executions) == 1
+    assert cleanup_confirmation_store.list_recent(limit=10) == []
 
 
 def test_observe_pair_status_retries_after_probe_timeout(

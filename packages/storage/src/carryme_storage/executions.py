@@ -172,6 +172,9 @@ class ExecutionJournalStore:
         normalized_label = entry.paper_trade.intent.label.strip()
         if not normalized_label:
             raise ValueError("label must be non-empty")
+        normalized_preview_hash = (
+            entry.preview_hash.strip() if isinstance(entry.preview_hash, str) else None
+        ) or None
         normalized_paper_trade = entry.paper_trade.model_copy(
             update={
                 "intent": entry.paper_trade.intent.model_copy(
@@ -182,6 +185,7 @@ class ExecutionJournalStore:
         normalized_entry = entry.model_copy(
             update={
                 "executed_at": entry.executed_at.astimezone(UTC),
+                "preview_hash": normalized_preview_hash,
                 "paper_trade": normalized_paper_trade,
             }
         )

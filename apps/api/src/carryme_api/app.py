@@ -75,7 +75,7 @@ from carryme_storage import (
     PreviewConfirmationStore,
     WatchlistStore,
 )
-from fastapi import Body, Depends, FastAPI, HTTPException, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -2009,10 +2009,15 @@ def create_app() -> FastAPI:
             PairedLiveExecutionCoordinator,
             Depends(get_paired_live_execution_coordinator),
         ],
-        poll_attempts: int = 5,
-        poll_interval_seconds: float = 2.0,
+        poll_attempts: int = Query(default=5, ge=1, le=10),
+        poll_interval_seconds: float = Query(default=2.0, ge=0.0, le=10.0),
         auto_cleanup: bool = True,
     ) -> GuardedPairExecutionResult:
+        if not math.isfinite(poll_interval_seconds):
+            raise HTTPException(
+                status_code=400,
+                detail="poll_interval_seconds must be finite",
+            )
         paper_trade = paper_store.get(paper_trade_id)
         if paper_trade is None:
             raise HTTPException(
