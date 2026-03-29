@@ -203,12 +203,19 @@ def get_candidate_alert_store(
     return _candidate_alert_store_for_path(settings.database_path)
 
 
+@lru_cache
+def _execution_alert_store_for_path(database_path: str) -> ExecutionAlertStore:
+    """Return the shared execution alert store for the configured SQLite path."""
+
+    return ExecutionAlertStore(database_path)
+
+
 def get_execution_alert_store(
     settings: Annotated[ApiSettings, Depends(get_api_settings)],
 ) -> ExecutionAlertStore:
     """Return the shared execution alert store."""
 
-    return ExecutionAlertStore(settings.database_path)
+    return _execution_alert_store_for_path(settings.database_path)
 
 
 def get_execution_observation_store(

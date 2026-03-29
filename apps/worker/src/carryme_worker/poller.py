@@ -260,6 +260,7 @@ async def observe_live_executions_once(
             previous_pair_status = (
                 previous_observation.pair_status if previous_observation is not None else None
             )
+            alert_event: ExecutionAlertEvent | None = None
             if _should_emit_execution_alert(
                 pair_status,
                 previous_pair_status=previous_pair_status,
@@ -268,29 +269,42 @@ async def observe_live_executions_once(
                     Literal["cleanup_needed", "review_required"],
                     pair_status.derived_state,
                 )
-                saved_alerts += int(
-                    execution_alert_sink.append_if_changed(
-                        ExecutionAlertEvent(
-                            emitted_at=timestamp,
-                            alert_type=alert_type,
-                            paper_trade_id=paper_trade_id,
-                            preview_hash=execution.preview_hash,
-                            pair_status=pair_status,
-                        ),
-                        previous_pair_status=previous_pair_status,
-                    )
-                )
-            history_store.append(
-                ExecutionObservationEntry(
-                    observed_at=timestamp,
-                    context="worker_execution_monitor",
-                    execution_entry_id=execution.entry_id,
+                alert_event = ExecutionAlertEvent(
+                    emitted_at=timestamp,
+                    alert_type=alert_type,
                     paper_trade_id=paper_trade_id,
                     preview_hash=execution.preview_hash,
-                    order_state=order_state,
                     pair_status=pair_status,
-                ),
+                )
+            observation_entry = ExecutionObservationEntry(
+                observed_at=timestamp,
+                context="worker_execution_monitor",
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=execution.preview_hash,
+                order_state=order_state,
+                pair_status=pair_status,
             )
+            if isinstance(history_store, ExecutionObservationStore) and isinstance(
+                execution_alert_sink,
+                ExecutionAlertStore,
+            ):
+                _, alert_saved = history_store.append_with_alert(
+                    observation_entry,
+                    alert_store=execution_alert_sink,
+                    alert_event=alert_event,
+                    previous_pair_status=previous_pair_status,
+                )
+                saved_alerts += int(alert_saved)
+            else:
+                if alert_event is not None:
+                    saved_alerts += int(
+                        execution_alert_sink.append_if_changed(
+                            alert_event,
+                            previous_pair_status=previous_pair_status,
+                        )
+                    )
+                history_store.append(observation_entry)
         except Exception:
             logger.warning(
                 "Failed to observe execution entry_id=%s paper_trade_id=%s",

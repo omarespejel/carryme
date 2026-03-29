@@ -431,6 +431,89 @@ def test_execution_alert_store_ignores_retried_older_alert(tmp_path: Path) -> No
     assert store.append(older) is False
 
 
+def test_execution_alert_store_normalizes_offset_aware_emitted_at(tmp_path: Path) -> None:
+    store = ExecutionAlertStore(tmp_path / "history.sqlite3")
+    utc_event = ExecutionAlertEvent(
+        emitted_at=datetime(2026, 3, 29, 12, 5, tzinfo=UTC),
+        alert_type="cleanup_needed",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        pair_status=ExecutionPairStatus(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            derived_state="cleanup_needed",
+            recommended_action="close_open_leg",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                legs=[],
+                notes=[],
+            ),
+            reconciliation=ExecutionReconciliation(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                status="submitted",
+                recommended_action="verify_fill_status",
+                matched_all_leg_symbols=False,
+                venues=[],
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+    offset_event = utc_event.model_copy(
+        update={"emitted_at": datetime(2026, 3, 29, 15, 5, tzinfo=timezone(timedelta(hours=3)))}
+    )
+
+    assert store.append(utc_event) is True
+    assert store.append(offset_event) is False
+    latest = store.latest_for_paper_trade(7)
+
+    assert latest is not None
+    assert latest.emitted_at == datetime(2026, 3, 29, 12, 5, tzinfo=UTC)
+
+
+def test_execution_alert_store_rejects_naive_emitted_at(tmp_path: Path) -> None:
+    store = ExecutionAlertStore(tmp_path / "history.sqlite3")
+    event = ExecutionAlertEvent(
+        emitted_at=datetime(2026, 3, 29, 12, 5),
+        alert_type="cleanup_needed",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        pair_status=ExecutionPairStatus(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            derived_state="cleanup_needed",
+            recommended_action="close_open_leg",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                legs=[],
+                notes=[],
+            ),
+            reconciliation=ExecutionReconciliation(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                status="submitted",
+                recommended_action="verify_fill_status",
+                matched_all_leg_symbols=False,
+                venues=[],
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="emitted_at must be timezone-aware"):
+        store.append(event)
+
+
 def test_paper_trade_store_appends_and_lists_recent(tmp_path: Path) -> None:
     store = PaperTradeStore(tmp_path / "history.sqlite3")
     entry = PaperTradeEntry(

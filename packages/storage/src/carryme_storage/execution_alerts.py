@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import cast
@@ -13,18 +14,34 @@ from carryme_models import ExecutionAlertEvent, ExecutionPairStatus
 ALERTING_EXECUTION_STATES = {"cleanup_needed", "review_required"}
 
 
+def _normalize_emitted_at(emitted_at: datetime) -> datetime:
+    """Normalize alert timestamps to timezone-aware UTC values."""
+
+    if emitted_at.tzinfo is None or emitted_at.utcoffset() is None:
+        raise ValueError("emitted_at must be timezone-aware")
+    return emitted_at.astimezone(UTC)
+
+
+def _normalize_event(event: ExecutionAlertEvent) -> ExecutionAlertEvent:
+    """Normalize an execution alert event before persistence."""
+
+    return event.model_copy(update={"emitted_at": _normalize_emitted_at(event.emitted_at)})
+
+
 def _normalize_event_payload(event: ExecutionAlertEvent) -> dict[str, object]:
     """Normalize an execution alert payload before persistence."""
 
-    return cast(dict[str, object], json.loads(event.model_dump_json()))
+    normalized_event = _normalize_event(event)
+    return cast(dict[str, object], json.loads(normalized_event.model_dump_json()))
 
 
 def _alert_identity_key(event: ExecutionAlertEvent) -> str:
     """Build a deterministic insert key for one alert emission attempt."""
 
+    normalized_emitted_at = _normalize_emitted_at(event.emitted_at)
     return json.dumps(
         {
-            "emitted_at": event.emitted_at.isoformat(),
+            "emitted_at": normalized_emitted_at.isoformat(),
             "paper_trade_id": event.paper_trade_id,
             "preview_hash": event.preview_hash,
             "alert_type": event.alert_type,
@@ -123,42 +140,58 @@ class ExecutionAlertStore:
         """Append one execution alert event when it represents a new alert transition."""
 
         self.initialize()
-        alert_key = _alert_identity_key(event)
-        normalized_payload = _normalize_event_payload(event)
         with sqlite3.connect(self.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            latest = self._latest_for_paper_trade(connection, event.paper_trade_id)
-            if latest is not None and latest.alert_type == event.alert_type:
-                same_preview = latest.preview_hash == event.preview_hash
-                continued_same_state = (
-                    previous_pair_status is not None
-                    and previous_pair_status.derived_state in ALERTING_EXECUTION_STATES
-                    and previous_pair_status.derived_state == event.alert_type
-                    and previous_pair_status.preview_hash == event.preview_hash
-                )
-                exact_retry = same_preview and latest.emitted_at == event.emitted_at
-                if continued_same_state or exact_retry:
-                    return False
-            cursor = connection.execute(
-                """
-                INSERT OR IGNORE INTO execution_alert_events (
-                    emitted_at,
-                    paper_trade_id,
-                    preview_hash,
-                    alert_type,
-                    alert_key,
-                    event_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.emitted_at.isoformat(),
-                    event.paper_trade_id,
-                    event.preview_hash,
-                    event.alert_type,
-                    alert_key,
-                    json.dumps(normalized_payload, sort_keys=True),
-                ),
+            return self._append_if_changed_on_connection(
+                connection,
+                event,
+                previous_pair_status=previous_pair_status,
             )
+
+    def _append_if_changed_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        event: ExecutionAlertEvent,
+        *,
+        previous_pair_status: ExecutionPairStatus | None = None,
+    ) -> bool:
+        """Append one execution alert event using an existing transaction."""
+
+        normalized_event = _normalize_event(event)
+        alert_key = _alert_identity_key(normalized_event)
+        normalized_payload = _normalize_event_payload(normalized_event)
+        latest = self._latest_for_paper_trade(connection, normalized_event.paper_trade_id)
+        if latest is not None and latest.alert_type == normalized_event.alert_type:
+            same_preview = latest.preview_hash == normalized_event.preview_hash
+            continued_same_state = (
+                previous_pair_status is not None
+                and previous_pair_status.derived_state in ALERTING_EXECUTION_STATES
+                and previous_pair_status.derived_state == normalized_event.alert_type
+                and previous_pair_status.preview_hash == normalized_event.preview_hash
+            )
+            exact_retry = same_preview and latest.emitted_at == normalized_event.emitted_at
+            if continued_same_state or exact_retry:
+                return False
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO execution_alert_events (
+                emitted_at,
+                paper_trade_id,
+                preview_hash,
+                alert_type,
+                alert_key,
+                event_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_event.emitted_at.isoformat(),
+                normalized_event.paper_trade_id,
+                normalized_event.preview_hash,
+                normalized_event.alert_type,
+                alert_key,
+                json.dumps(normalized_payload, sort_keys=True),
+            ),
+        )
         return cursor.rowcount > 0
 
     def latest_for_paper_trade(self, paper_trade_id: int) -> ExecutionAlertEvent | None:
@@ -193,7 +226,7 @@ class ExecutionAlertStore:
             params = (paper_trade_id, limit)
         else:
             params = (limit,)
-        query += " ORDER BY emitted_at DESC, rowid DESC LIMIT ?"
+        query += " ORDER BY emitted_at DESC, id DESC LIMIT ?"
 
         with sqlite3.connect(self.database_path) as connection:
             rows = connection.execute(query, params).fetchall()

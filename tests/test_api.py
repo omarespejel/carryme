@@ -426,9 +426,11 @@ def test_execution_alerts_endpoint_reads_saved_events(tmp_path: Path) -> None:
     from carryme_api.app import get_execution_alert_store
 
     app.dependency_overrides[get_execution_alert_store] = lambda: store
-    client = TestClient(app)
-    response = client.get("/v1/alerts/executions?paper_trade_id=7")
-    app.dependency_overrides.clear()
+    try:
+        client = TestClient(app)
+        response = client.get("/v1/alerts/executions?paper_trade_id=7")
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     payload = response.json()
