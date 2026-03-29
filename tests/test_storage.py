@@ -7,6 +7,7 @@ from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
     CleanupPreviewConfirmationEntry,
+    ExecutionAlertEvent,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionLegOrderState,
@@ -29,6 +30,7 @@ from carryme_models import (
 from carryme_storage import (
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
+    ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
@@ -332,6 +334,101 @@ def test_candidate_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:
     assert len(results) == 1
     assert results[0].record.pair.label == "arb_extended_paradex"
     assert results[0].record.opportunity.canonical_symbol == "ARB-USD-PERP"
+
+
+def test_execution_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:
+    store = ExecutionAlertStore(tmp_path / "history.sqlite3")
+    event = ExecutionAlertEvent(
+        emitted_at=datetime(2026, 3, 29, 12, 5, tzinfo=UTC),
+        alert_type="cleanup_needed",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        pair_status=ExecutionPairStatus(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            derived_state="cleanup_needed",
+            recommended_action="close_open_leg",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                legs=[],
+                notes=[],
+            ),
+            reconciliation=ExecutionReconciliation(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                status="submitted",
+                recommended_action="verify_fill_status",
+                matched_all_leg_symbols=False,
+                venues=[],
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    first_insert = store.append(event)
+    second_insert = store.append(event)
+    results = store.list_recent(limit=10)
+
+    assert first_insert is True
+    assert second_insert is False
+    assert len(results) == 1
+    assert results[0].alert_type == "cleanup_needed"
+    assert results[0].paper_trade_id == 7
+    assert store.latest_for_paper_trade(7) is not None
+
+
+def test_execution_alert_store_ignores_retried_older_alert(tmp_path: Path) -> None:
+    store = ExecutionAlertStore(tmp_path / "history.sqlite3")
+    older = ExecutionAlertEvent(
+        emitted_at=datetime(2026, 3, 29, 12, 5, tzinfo=UTC),
+        alert_type="cleanup_needed",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        pair_status=ExecutionPairStatus(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            derived_state="cleanup_needed",
+            recommended_action="close_open_leg",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                legs=[],
+                notes=[],
+            ),
+            reconciliation=ExecutionReconciliation(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                status="submitted",
+                recommended_action="verify_fill_status",
+                matched_all_leg_symbols=False,
+                venues=[],
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+    newer = older.model_copy(
+        update={
+            "emitted_at": datetime(2026, 3, 29, 12, 6, tzinfo=UTC),
+            "pair_status": older.pair_status.model_copy(
+                update={
+                    "execution_entry_id": 13,
+                }
+            ),
+        }
+    )
+
+    assert store.append(older) is True
+    assert store.append(newer) is True
+    assert store.append(older) is False
 
 
 def test_paper_trade_store_appends_and_lists_recent(tmp_path: Path) -> None:

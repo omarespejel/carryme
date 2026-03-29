@@ -9,13 +9,15 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 import httpx
 from carryme_models import (
     CandidateAlertEvent,
+    ExecutionAlertEvent,
     ExecutionJournalEntry,
     ExecutionObservationEntry,
+    ExecutionPairStatus,
     FundingArbOpportunity,
     OpportunityRecord,
 )
@@ -36,6 +38,7 @@ from carryme_runtime import (
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
     CandidateAlertStore,
+    ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
@@ -67,6 +70,17 @@ class CandidateAlertSink(Protocol):
     """Append-only sink for emitted candidate alert events."""
 
     def append(self, event: CandidateAlertEvent) -> bool: ...
+
+
+class ExecutionAlertSink(Protocol):
+    """Append-only sink for emitted execution alert events."""
+
+    def append_if_changed(
+        self,
+        event: ExecutionAlertEvent,
+        *,
+        previous_pair_status: ExecutionPairStatus | None = None,
+    ) -> bool: ...
 
 
 @dataclass
@@ -107,6 +121,7 @@ class ExecutionObservationSummary:
     scanned_executions: int
     observed_executions: int
     saved_observations: int
+    saved_alerts: int
     database_path: str
 
 
@@ -195,6 +210,7 @@ async def observe_live_executions_once(
     *,
     execution_store: ExecutionJournalStore | None = None,
     observation_store: ExecutionObservationStore | None = None,
+    alert_sink: ExecutionAlertSink | None = None,
     account_service: AccountPreflightService | None = None,
     order_state_service: ExecutionOrderStateService | None = None,
     now: datetime | None = None,
@@ -203,6 +219,7 @@ async def observe_live_executions_once(
 
     journal_store = execution_store or ExecutionJournalStore(settings.database_path)
     history_store = observation_store or ExecutionObservationStore(settings.database_path)
+    execution_alert_sink = alert_sink or ExecutionAlertStore(settings.database_path)
     account_probe_service = account_service or AccountPreflightService()
     state_service = order_state_service or ExecutionOrderStateService(
         observers=_build_order_state_observers(settings)
@@ -216,10 +233,14 @@ async def observe_live_executions_once(
     scanned_executions = 0
     observed_executions = 0
     saved_observations = 0
+    saved_alerts = 0
     for execution in recent_live_executions:
         scanned_executions += 1
 
         try:
+            paper_trade_id = execution.paper_trade_id
+            assert paper_trade_id is not None
+            previous_observation = history_store.latest_for_paper_trade(paper_trade_id)
             account_preflight = await asyncio.wait_for(
                 account_probe_service.probe_paper_trade(
                     execution.paper_trade,
@@ -236,12 +257,35 @@ async def observe_live_executions_once(
                 order_state,
                 reconcile_execution(execution, account_preflight),
             )
+            previous_pair_status = (
+                previous_observation.pair_status if previous_observation is not None else None
+            )
+            if _should_emit_execution_alert(
+                pair_status,
+                previous_pair_status=previous_pair_status,
+            ):
+                alert_type = cast(
+                    Literal["cleanup_needed", "review_required"],
+                    pair_status.derived_state,
+                )
+                saved_alerts += int(
+                    execution_alert_sink.append_if_changed(
+                        ExecutionAlertEvent(
+                            emitted_at=timestamp,
+                            alert_type=alert_type,
+                            paper_trade_id=paper_trade_id,
+                            preview_hash=execution.preview_hash,
+                            pair_status=pair_status,
+                        ),
+                        previous_pair_status=previous_pair_status,
+                    )
+                )
             history_store.append(
                 ExecutionObservationEntry(
                     observed_at=timestamp,
                     context="worker_execution_monitor",
                     execution_entry_id=execution.entry_id,
-                    paper_trade_id=execution.paper_trade_id,
+                    paper_trade_id=paper_trade_id,
                     preview_hash=execution.preview_hash,
                     order_state=order_state,
                     pair_status=pair_status,
@@ -262,6 +306,7 @@ async def observe_live_executions_once(
         scanned_executions=scanned_executions,
         observed_executions=observed_executions,
         saved_observations=saved_observations,
+        saved_alerts=saved_alerts,
         database_path=settings.database_path,
     )
 
@@ -580,6 +625,22 @@ def _list_recent_live_executions(
             break
 
     return selected
+
+
+def _should_emit_execution_alert(
+    pair_status: ExecutionPairStatus,
+    *,
+    previous_pair_status: ExecutionPairStatus | None,
+) -> bool:
+    derived_state = pair_status.derived_state
+    if derived_state not in {"cleanup_needed", "review_required"}:
+        return False
+    if previous_pair_status is None:
+        return True
+    return (
+        previous_pair_status.derived_state != derived_state
+        or previous_pair_status.preview_hash != pair_status.preview_hash
+    )
 
 
 def install_signal_handlers(

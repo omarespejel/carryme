@@ -20,6 +20,7 @@ from carryme_models.execution import (
 from carryme_models.health import AppDescriptor, ServiceHealth
 from carryme_models.history import (
     CandidateAlertEvent,
+    ExecutionAlertEvent,
     FundingPairSpec,
     OpportunityRecord,
     WatchlistDocument,
@@ -49,6 +50,7 @@ __all__ = [
     "AppDescriptor",
     "CapacityEstimate",
     "CandidateAlertEvent",
+    "ExecutionAlertEvent",
     "CleanupPreviewConfirmationEntry",
     "CredentialRequirementStatus",
     "ExecutionJournalEntry",
