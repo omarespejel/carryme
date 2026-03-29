@@ -1793,6 +1793,23 @@ def test_create_paper_trade_from_canary_caps_to_approved_notional(tmp_path: Path
             assert len(candidates) == 1
             return [candidates[0].model_copy(update={"suggested_canary_notional": 7.5})]
 
+        def get_for_candidate(
+            self,
+            _candidate: FundingUniverseCanaryCandidate,
+        ) -> RouteApprovalEntry:
+            return RouteApprovalEntry(
+                updated_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                short_venue="extended",
+                long_venue="paradex",
+                short_fee_profile="default",
+                long_fee_profile="pro_fastfills",
+                approved=True,
+                max_live_notional=7.5,
+                note="approved canary",
+            )
+
     from carryme_api.app import get_paper_trade_store
 
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()

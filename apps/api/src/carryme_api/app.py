@@ -14,6 +14,7 @@ import httpx
 from carryme_models import (
     SUPPORTED_UNIVERSE_VENUES,
     AppDescriptor,
+    CanaryLifecycleResult,
     CandidateAlertEvent,
     CleanupPreviewConfirmationEntry,
     ExecutionAlertEvent,
@@ -1182,6 +1183,621 @@ def _build_trade_intent_candidates(
         if len(intents) == limit:
             break
     return intents
+
+
+async def _select_approved_canary_candidate(
+    *,
+    universe_service: OpportunityUniverseService,
+    approval_service: RouteApprovalService,
+    venues: list[str] | None,
+    label: str | None,
+    extended_fee_profile: str | None,
+    paradex_fee_profile: str | None,
+    hyperliquid_fee_profile: str | None,
+    target_notional: float,
+    canary_max_notional: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+    include_symbols: list[str] | None,
+    exclude_symbols: list[str] | None,
+    exclude_tags: list[str] | None,
+    limit: int,
+) -> tuple[FundingUniverseCanaryCandidate, RouteApprovalEntry]:
+    selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
+    _validate_route_stability_filters(
+        min_route_stability_weight=min_route_stability_weight,
+        min_route_presence_ratio=min_route_presence_ratio,
+        min_route_samples=min_route_samples,
+    )
+    candidates = await universe_service.scan_canary_candidates(
+        venues=selected_venues,
+        fee_profile_overrides=_build_fee_profile_overrides(
+            extended_fee_profile=extended_fee_profile,
+            paradex_fee_profile=paradex_fee_profile,
+            hyperliquid_fee_profile=hyperliquid_fee_profile,
+        ),
+        target_notional=target_notional,
+        canary_max_notional=canary_max_notional,
+        min_capacity_notional=min_capacity_notional,
+        min_daily_volume=min_daily_volume,
+        min_open_interest=min_open_interest,
+        min_roundtrip_edge=min_roundtrip_edge,
+        min_execution_quality_score=min_execution_quality_score,
+        min_execution_samples=min_execution_samples,
+        min_route_stability_weight=min_route_stability_weight,
+        min_route_presence_ratio=min_route_presence_ratio,
+        min_route_samples=min_route_samples,
+        include_symbols=include_symbols,
+        exclude_symbols=exclude_symbols,
+        exclude_tags=exclude_tags,
+        limit=limit,
+    )
+    approved_candidates = approval_service.filter_approved_canary_candidates(candidates)
+    if label is not None:
+        approved_candidates = [
+            item
+            for item in approved_candidates
+            if build_pair_spec_from_universe_opportunity(item.opportunity).label == label
+        ]
+    if not approved_candidates:
+        raise HTTPException(
+            status_code=404,
+            detail="No approved canary candidate matched the requested filters",
+        )
+    selected = approved_candidates[0]
+    approval = approval_service.get_for_candidate(selected)
+    if approval is None or not approval.approved:
+        raise HTTPException(
+            status_code=409,
+            detail="Selected canary route is no longer approved for live execution",
+        )
+    return selected, approval
+
+
+def _append_paper_trade_from_canary_candidate(
+    *,
+    candidate: FundingUniverseCanaryCandidate,
+    paper_store: PaperTradeStore,
+    desired_notional: float | None,
+    note: str | None,
+) -> PaperTradeEntry:
+    capped_notional = candidate.suggested_canary_notional
+    if desired_notional is not None:
+        capped_notional = min(capped_notional, desired_notional)
+    if capped_notional <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved route does not allow a positive live notional",
+        )
+    record = build_opportunity_record_from_universe_opportunity(
+        recorded_at=datetime.now(UTC),
+        opportunity=candidate.opportunity,
+    )
+    intent = build_trade_intent(
+        record,
+        capacity_fraction=1.0,
+        max_target_notional=capped_notional,
+        min_one_day_net_edge_after_entry=0.0,
+        min_capacity_notional=0.0,
+    )
+    entry = PaperTradeEntry(
+        created_at=datetime.now(UTC),
+        intent=intent,
+        note=note,
+    )
+    return paper_store.append(entry)
+
+
+async def _capture_authenticated_balance_snapshots_for_paper_trade(
+    *,
+    paper_trade: PaperTradeEntry,
+    stage: str,
+    note: str | None,
+    settings: ApiSettings,
+    account_service: AccountPreflightService,
+    balance_service: BalanceAccountingService,
+) -> list[VenueBalanceSnapshot]:
+    preflight = await account_service.probe_paper_trade(
+        paper_trade,
+        _build_account_preflight_configs(settings),
+    )
+    unauthenticated = [item.venue for item in preflight.venues if not item.authenticated]
+    if unauthenticated:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Balance snapshot capture requires authenticated venue reads for: "
+                + ", ".join(sorted(unauthenticated))
+            ),
+        )
+    return balance_service.capture_paper_trade(
+        paper_trade=paper_trade,
+        preflight=preflight,
+        stage=stage,
+        note=note,
+    )
+
+
+async def _append_preview_confirmation_for_paper_trade(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation_store: PreviewConfirmationStore,
+    service: OrderPreviewService,
+    slippage_tolerance_bps: int,
+    note: str | None,
+) -> PreviewConfirmationEntry:
+    try:
+        preview = await service.preview_paper_trade(
+            paper_trade,
+            slippage_tolerance_bps=slippage_tolerance_bps,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ConnectorError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return confirmation_store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime.now(UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label=paper_trade.intent.label,
+            preview_hash=preview.preview_hash,
+            preview=preview,
+            note=note,
+        )
+    )
+
+
+def _append_pair_close_confirmation_for_preview(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation_store: PairClosePreviewConfirmationStore,
+    preview: ExecutionPairClosePreview,
+    note: str | None,
+) -> PairClosePreviewConfirmationEntry:
+    return confirmation_store.append(
+        PairClosePreviewConfirmationEntry(
+            confirmed_at=datetime.now(UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label=paper_trade.intent.label,
+            preview_hash=preview.preview_hash,
+            preview=preview,
+            note=note,
+        )
+    )
+
+
+async def _execute_guarded_pair_from_confirmation(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: PreviewConfirmationEntry,
+    settings: ApiSettings,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    cleanup_confirmation_store: CleanupPreviewConfirmationStore,
+    account_preflight_service: AccountPreflightService,
+    order_state_service: ExecutionOrderStateService,
+    cleanup_preview_service: CleanupPreviewRouter,
+    cleanup_live_router: CleanupLiveExecutionRouter,
+    service: PairedLiveExecutionCoordinator,
+    first_venue: str,
+    poll_attempts: int,
+    poll_interval_seconds: float,
+    auto_cleanup: bool,
+) -> GuardedPairExecutionResult:
+    paper_trade_id = paper_trade.entry_id or 0
+    if confirmation.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Preview confirmation entry_id is required before live submission",
+        )
+    if not execution_store.reserve_live_submission(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+    ):
+        existing_entry = execution_store.find_by_confirmation(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        )
+        if existing_entry is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=existing_entry.model_dump(mode="json"),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A live submission is already reserved for this confirmed preview; "
+                "manual reconciliation is required before retrying"
+            ),
+        )
+    try:
+        primary_execution = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            first_venue=first_venue,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ConnectorError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    primary_execution = execution_store.append(primary_execution)
+    if primary_execution.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Execution journal append did not return an id",
+        )
+    execution_store.mark_live_submission_completed(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+        execution_entry_id=primary_execution.entry_id,
+    )
+    try:
+        pair_status = await _observe_pair_status_for_execution(
+            paper_trade=paper_trade,
+            execution=primary_execution,
+            settings=settings,
+            account_service=account_preflight_service,
+            order_state_service=order_state_service,
+            observation_store=observation_store,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    cleanup_execution: ExecutionJournalEntry | None = None
+    if auto_cleanup and pair_status.recommended_action == "close_open_leg":
+        try:
+            cleanup_preview = await cleanup_preview_service.preview_from_execution(
+                entry=primary_execution,
+                pair_status=pair_status,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        try:
+            await _ensure_cleanup_live_ready(
+                venue=cleanup_preview.leg.venue,
+                settings=settings,
+                account_service=account_preflight_service,
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        cleanup_confirmation = cleanup_confirmation_store.find_latest_by_preview_hash(
+            paper_trade_id=paper_trade_id,
+            preview_hash=cleanup_preview.preview_hash,
+        )
+        if cleanup_confirmation is None:
+            cleanup_confirmation = cleanup_confirmation_store.append(
+                CleanupPreviewConfirmationEntry(
+                    confirmed_at=datetime.now(UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=paper_trade.intent.label,
+                    preview_hash=cleanup_preview.preview_hash,
+                    preview=cleanup_preview,
+                    note="guarded pair auto-cleanup",
+                )
+            )
+        if cleanup_confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Cleanup preview confirmation entry_id is required before live submission",
+            )
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=cleanup_confirmation.entry_id,
+            preview_hash=cleanup_confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=cleanup_confirmation.entry_id,
+                preview_hash=cleanup_confirmation.preview_hash,
+            )
+            if existing_entry is not None:
+                return GuardedPairExecutionResult(
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=confirmation.preview_hash,
+                    primary_execution=primary_execution,
+                    cleanup_execution=existing_entry,
+                    pair_status=pair_status.model_copy(
+                        update={
+                            "notes": [
+                                *pair_status.notes,
+                                "Existing cleanup execution reused for this confirmation",
+                            ]
+                        }
+                    ),
+                )
+            return GuardedPairExecutionResult(
+                paper_trade_id=paper_trade_id,
+                preview_hash=confirmation.preview_hash,
+                primary_execution=primary_execution,
+                cleanup_execution=None,
+                pair_status=pair_status.model_copy(
+                    update={
+                        "notes": [
+                            *pair_status.notes,
+                            (
+                                "Cleanup live submission was already reserved; "
+                                "manual reconciliation is required before retrying"
+                            ),
+                        ]
+                    }
+                ),
+            )
+        try:
+            cleanup_execution = await cleanup_live_router.submit_confirmed_cleanup_preview(
+                paper_trade=paper_trade,
+                confirmation=cleanup_confirmation,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        cleanup_execution = execution_store.append(cleanup_execution)
+        if cleanup_execution.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        execution_store.mark_live_submission_completed(
+            confirmation_entry_id=cleanup_confirmation.entry_id,
+            preview_hash=cleanup_confirmation.preview_hash,
+            execution_entry_id=cleanup_execution.entry_id,
+        )
+        try:
+            pair_status = await _observe_pair_status_for_execution(
+                paper_trade=paper_trade,
+                execution=cleanup_execution,
+                settings=settings,
+                account_service=account_preflight_service,
+                order_state_service=order_state_service,
+                observation_store=observation_store,
+                poll_attempts=poll_attempts,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return GuardedPairExecutionResult(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+        primary_execution=primary_execution,
+        cleanup_execution=cleanup_execution,
+        pair_status=pair_status,
+    )
+
+
+async def _execute_guarded_pair_close_from_confirmation(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: PairClosePreviewConfirmationEntry,
+    settings: ApiSettings,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    cleanup_confirmation_store: CleanupPreviewConfirmationStore,
+    account_preflight_service: AccountPreflightService,
+    order_state_service: ExecutionOrderStateService,
+    cleanup_preview_service: CleanupPreviewRouter,
+    cleanup_live_router: CleanupLiveExecutionRouter,
+    service: PairCloseLiveExecutionCoordinator,
+    first_venue: str,
+    poll_attempts: int,
+    poll_interval_seconds: float,
+    auto_cleanup: bool,
+) -> GuardedPairExecutionResult:
+    paper_trade_id = paper_trade.entry_id or 0
+    if confirmation.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Pair-close confirmation entry_id is required before live submission",
+        )
+    for venue in {leg.venue for leg in confirmation.preview.legs}:
+        try:
+            await _ensure_cleanup_live_ready(
+                venue=venue,
+                settings=settings,
+                account_service=account_preflight_service,
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not execution_store.reserve_live_submission(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+    ):
+        existing_entry = execution_store.find_by_confirmation(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        )
+        if existing_entry is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=existing_entry.model_dump(mode="json"),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A live submission is already reserved for this confirmed preview; "
+                "manual reconciliation is required before retrying"
+            ),
+        )
+    try:
+        primary_execution = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            first_venue=first_venue,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    primary_execution = execution_store.append(primary_execution)
+    if primary_execution.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Execution journal append did not return an id",
+        )
+    execution_store.mark_live_submission_completed(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+        execution_entry_id=primary_execution.entry_id,
+    )
+    try:
+        pair_status = await _observe_pair_status_for_execution(
+            paper_trade=paper_trade,
+            execution=primary_execution,
+            settings=settings,
+            account_service=account_preflight_service,
+            order_state_service=order_state_service,
+            observation_store=observation_store,
+            observation_context="guarded_pair_close_poll",
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    cleanup_execution: ExecutionJournalEntry | None = None
+    if auto_cleanup and pair_status.recommended_action == "close_open_leg":
+        try:
+            cleanup_preview = await cleanup_preview_service.preview_from_execution(
+                entry=primary_execution,
+                pair_status=pair_status,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        try:
+            await _ensure_cleanup_live_ready(
+                venue=cleanup_preview.leg.venue,
+                settings=settings,
+                account_service=account_preflight_service,
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        cleanup_confirmation = cleanup_confirmation_store.find_latest_by_preview_hash(
+            paper_trade_id=paper_trade_id,
+            preview_hash=cleanup_preview.preview_hash,
+        )
+        if cleanup_confirmation is None:
+            cleanup_confirmation = cleanup_confirmation_store.append(
+                CleanupPreviewConfirmationEntry(
+                    confirmed_at=datetime.now(UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=paper_trade.intent.label,
+                    preview_hash=cleanup_preview.preview_hash,
+                    preview=cleanup_preview,
+                    note="guarded pair close auto-cleanup",
+                )
+            )
+        if cleanup_confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Cleanup preview confirmation entry_id is required before live submission",
+            )
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=cleanup_confirmation.entry_id,
+            preview_hash=cleanup_confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=cleanup_confirmation.entry_id,
+                preview_hash=cleanup_confirmation.preview_hash,
+            )
+            if existing_entry is not None:
+                return GuardedPairExecutionResult(
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=confirmation.preview_hash,
+                    primary_execution=primary_execution,
+                    cleanup_execution=existing_entry,
+                    pair_status=pair_status.model_copy(
+                        update={
+                            "notes": [
+                                *pair_status.notes,
+                                "Existing cleanup execution reused for this confirmation",
+                            ]
+                        }
+                    ),
+                )
+            return GuardedPairExecutionResult(
+                paper_trade_id=paper_trade_id,
+                preview_hash=confirmation.preview_hash,
+                primary_execution=primary_execution,
+                cleanup_execution=None,
+                pair_status=pair_status.model_copy(
+                    update={
+                        "notes": [
+                            *pair_status.notes,
+                            (
+                                "Cleanup live submission was already reserved; "
+                                "manual reconciliation is required before retrying"
+                            ),
+                        ]
+                    }
+                ),
+            )
+        try:
+            cleanup_execution = await cleanup_live_router.submit_confirmed_cleanup_preview(
+                paper_trade=paper_trade,
+                confirmation=cleanup_confirmation,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        cleanup_execution = execution_store.append(cleanup_execution)
+        if cleanup_execution.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        execution_store.mark_live_submission_completed(
+            confirmation_entry_id=cleanup_confirmation.entry_id,
+            preview_hash=cleanup_confirmation.preview_hash,
+            execution_entry_id=cleanup_execution.entry_id,
+        )
+        try:
+            pair_status = await _observe_pair_status_for_execution(
+                paper_trade=paper_trade,
+                execution=cleanup_execution,
+                settings=settings,
+                account_service=account_preflight_service,
+                order_state_service=order_state_service,
+                observation_store=observation_store,
+                observation_context="guarded_pair_close_cleanup_poll",
+                poll_attempts=poll_attempts,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return GuardedPairExecutionResult(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+        primary_execution=primary_execution,
+        cleanup_execution=cleanup_execution,
+        pair_status=pair_status,
+    )
 
 
 def create_app() -> FastAPI:
@@ -3681,6 +4297,263 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post(
+        "/v1/executions/live/canary-cycle",
+        response_model=CanaryLifecycleResult,
+    )
+    async def execute_guarded_canary_cycle(
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        universe_service: Annotated[
+            OpportunityUniverseService, Depends(get_opportunity_universe_service)
+        ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        pair_close_confirmation_store: Annotated[
+            PairClosePreviewConfirmationStore,
+            Depends(get_pair_close_preview_confirmation_store),
+        ],
+        cleanup_confirmation_store: Annotated[
+            CleanupPreviewConfirmationStore,
+            Depends(get_cleanup_preview_confirmation_store),
+        ],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        observation_store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
+        account_preflight_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        balance_service: Annotated[
+            BalanceAccountingService,
+            Depends(get_balance_accounting_service),
+        ],
+        order_preview_service: Annotated[
+            OrderPreviewService,
+            Depends(get_order_preview_service),
+        ],
+        order_state_service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+        cleanup_preview_service: Annotated[
+            CleanupPreviewRouter,
+            Depends(get_cleanup_preview_service),
+        ],
+        pair_close_preview_service: Annotated[
+            PairClosePreviewService,
+            Depends(get_pair_close_preview_service),
+        ],
+        cleanup_live_router: Annotated[
+            CleanupLiveExecutionRouter,
+            Depends(get_cleanup_live_execution_router),
+        ],
+        paired_service: Annotated[
+            PairedLiveExecutionCoordinator,
+            Depends(get_paired_live_execution_coordinator),
+        ],
+        pair_close_live_service: Annotated[
+            PairCloseLiveExecutionCoordinator,
+            Depends(get_pair_close_live_execution_coordinator),
+        ],
+        venues: Annotated[list[str] | None, Query()] = None,
+        label: str | None = None,
+        desired_notional: float | None = None,
+        note: str | None = None,
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = "pro_fastfills",
+        hyperliquid_fee_profile: str | None = None,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.35,
+        min_route_presence_ratio: float = 0.35,
+        min_route_samples: int = 2,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+        limit: int = 10,
+        slippage_tolerance_bps: int = 20,
+        open_first_venue: str = "auto",
+        close_first_venue: str = "auto",
+        poll_attempts: int = 5,
+        poll_interval_seconds: float = 2.0,
+        auto_cleanup: bool = True,
+        close_position: bool = True,
+    ) -> CanaryLifecycleResult:
+        selected, approval = await _select_approved_canary_candidate(
+            universe_service=universe_service,
+            approval_service=approval_service,
+            venues=venues,
+            label=label,
+            extended_fee_profile=extended_fee_profile,
+            paradex_fee_profile=paradex_fee_profile,
+            hyperliquid_fee_profile=hyperliquid_fee_profile,
+            target_notional=target_notional,
+            canary_max_notional=canary_max_notional,
+            min_capacity_notional=min_capacity_notional,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+            min_execution_quality_score=min_execution_quality_score,
+            min_execution_samples=min_execution_samples,
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+            include_symbols=include_symbols,
+            exclude_symbols=exclude_symbols,
+            exclude_tags=exclude_tags,
+            limit=limit,
+        )
+        paper_trade = _append_paper_trade_from_canary_candidate(
+            candidate=selected,
+            paper_store=paper_store,
+            desired_notional=desired_notional,
+            note=note or "guarded canary lifecycle",
+        )
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
+
+        pre_open_snapshots = await _capture_authenticated_balance_snapshots_for_paper_trade(
+            paper_trade=paper_trade,
+            stage="pre_open",
+            note="guarded canary lifecycle pre-open",
+            settings=settings,
+            account_service=account_preflight_service,
+            balance_service=balance_service,
+        )
+        open_confirmation = await _append_preview_confirmation_for_paper_trade(
+            paper_trade=paper_trade,
+            confirmation_store=confirmation_store,
+            service=order_preview_service,
+            slippage_tolerance_bps=slippage_tolerance_bps,
+            note="guarded canary lifecycle auto-confirm open preview",
+        )
+        readiness = await _build_readiness_for_paper_trade(
+            paper_trade=paper_trade,
+            preview_hash=open_confirmation.preview_hash,
+            settings=settings,
+            confirmation_store=confirmation_store,
+            account_preflight_service=account_preflight_service,
+        )
+        if not readiness.ready:
+            raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
+        open_execution = await _execute_guarded_pair_from_confirmation(
+            paper_trade=paper_trade,
+            confirmation=open_confirmation,
+            settings=settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            account_preflight_service=account_preflight_service,
+            order_state_service=order_state_service,
+            cleanup_preview_service=cleanup_preview_service,
+            cleanup_live_router=cleanup_live_router,
+            service=paired_service,
+            first_venue=open_first_venue,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            auto_cleanup=auto_cleanup,
+        )
+        post_open_snapshots = await _capture_authenticated_balance_snapshots_for_paper_trade(
+            paper_trade=paper_trade,
+            stage="post_open",
+            note="guarded canary lifecycle post-open",
+            settings=settings,
+            account_service=account_preflight_service,
+            balance_service=balance_service,
+        )
+
+        close_confirmation: PairClosePreviewConfirmationEntry | None = None
+        close_execution: GuardedPairExecutionResult | None = None
+        post_close_snapshots: list[VenueBalanceSnapshot] = []
+        notes: list[str] = []
+        final_pair_status = open_execution.pair_status
+
+        if close_position and open_execution.pair_status.derived_state == "hedged":
+            _paper_trade, _execution, _pair_status, pair_close_preview = (
+                await _build_pair_close_context_for_paper_trade(
+                    paper_trade_id=paper_trade.entry_id or 0,
+                    settings=settings,
+                    paper_store=paper_store,
+                    execution_store=execution_store,
+                    account_service=account_preflight_service,
+                    order_state_service=order_state_service,
+                    pair_close_service=pair_close_preview_service,
+                )
+            )
+            close_confirmation = _append_pair_close_confirmation_for_preview(
+                paper_trade=paper_trade,
+                confirmation_store=pair_close_confirmation_store,
+                preview=pair_close_preview,
+                note="guarded canary lifecycle auto-confirm close preview",
+            )
+            close_execution = await _execute_guarded_pair_close_from_confirmation(
+                paper_trade=paper_trade,
+                confirmation=close_confirmation,
+                settings=settings,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                cleanup_confirmation_store=cleanup_confirmation_store,
+                account_preflight_service=account_preflight_service,
+                order_state_service=order_state_service,
+                cleanup_preview_service=cleanup_preview_service,
+                cleanup_live_router=cleanup_live_router,
+                service=pair_close_live_service,
+                first_venue=close_first_venue,
+                poll_attempts=poll_attempts,
+                poll_interval_seconds=poll_interval_seconds,
+                auto_cleanup=auto_cleanup,
+            )
+            post_close_snapshots = (
+                await _capture_authenticated_balance_snapshots_for_paper_trade(
+                    paper_trade=paper_trade,
+                    stage="post_close",
+                    note="guarded canary lifecycle post-close",
+                    settings=settings,
+                    account_service=account_preflight_service,
+                    balance_service=balance_service,
+                )
+            )
+            final_pair_status = close_execution.pair_status
+        elif close_position:
+            notes.append(
+                "Close step was skipped because the open step did not end in a hedged state."
+            )
+        else:
+            notes.append("Close step was disabled for this canary cycle.")
+
+        return CanaryLifecycleResult(
+            candidate=selected,
+            approval=approval,
+            paper_trade=paper_trade,
+            open_confirmation=open_confirmation,
+            open_execution=open_execution,
+            close_confirmation=close_confirmation,
+            close_execution=close_execution,
+            pre_open_snapshots=pre_open_snapshots,
+            post_open_snapshots=post_open_snapshots,
+            post_close_snapshots=post_close_snapshots,
+            balance_delta=balance_service.summarize_paper_trade(paper_trade.entry_id or 0),
+            final_pair_status=final_pair_status,
+            notes=notes,
+        )
 
     @app.get(
         "/v1/opportunities/funding-universe/portfolio",
