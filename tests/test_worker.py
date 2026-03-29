@@ -3,7 +3,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -19,24 +19,30 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    FundingUniverseCanaryCandidate,
     FundingUniverseOpportunity,
     FundingUniverseScan,
     FundingUniverseVenueMarket,
     OpportunityRecord,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
+    RouteApprovalEntry,
     TradeLegIntent,
     VenueAccountPreflight,
 )
 from carryme_runtime import AccountPreflightService, ExecutionOrderStateService
 from carryme_storage import (
+    ApprovedCanaryStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
+    RouteApprovalStore,
 )
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
+    build_approved_canary_scan_loop_payload,
+    build_approved_canary_scan_payload,
     build_candidate_payload,
     build_cycle_payload,
     build_execution_observation_loop_payload,
@@ -50,6 +56,8 @@ from carryme_worker.main import (
     main as worker_main,
 )
 from carryme_worker.poller import (
+    ApprovedCanaryScanLoopSummary,
+    ApprovedCanaryScanSummary,
     CandidateRecordSummary,
     ExecutionObservationLoopSummary,
     ExecutionObservationSummary,
@@ -62,9 +70,11 @@ from carryme_worker.poller import (
     observe_live_executions_once,
     poll_watchlist_once,
     run_polling_loop,
+    run_supervised_approved_canary_scan_loop,
     run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
     run_supervised_universe_scan_loop,
+    scan_approved_canary_once,
     scan_funding_universe_once,
     summarize_candidates,
 )
@@ -296,6 +306,48 @@ def test_worker_universe_scan_loop_payload() -> None:
         "scanned_opportunities": 12,
         "saved_records": 12,
         "alert_events": 4,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_approved_canary_scan_payload() -> None:
+    payload = build_approved_canary_scan_payload(
+        ApprovedCanaryScanSummary(
+            scanned_candidates=4,
+            approved_candidates=2,
+            saved_snapshots=2,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "scanned_candidates": 4,
+        "approved_candidates": 2,
+        "saved_snapshots": 2,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_approved_canary_scan_loop_payload() -> None:
+    payload = build_approved_canary_scan_loop_payload(
+        ApprovedCanaryScanLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            scanned_candidates=9,
+            approved_candidates=4,
+            saved_snapshots=4,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "scanned_candidates": 9,
+        "approved_candidates": 4,
+        "saved_snapshots": 4,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -828,6 +880,149 @@ def test_scan_funding_universe_once_passes_fee_profile_overrides(tmp_path: Path)
         "extended": "default",
         "paradex": "retail",
     }
+
+
+def test_scan_approved_canary_once_saves_operator_approved_snapshots(tmp_path: Path) -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    class StubUniverseScanner:
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            return [candidate]
+
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, StubUniverseScanner()),
+            store=snapshot_store,
+            now=datetime(2026, 3, 29, 20, 5, tzinfo=UTC),
+        )
+    )
+
+    snapshots = snapshot_store.list_recent(limit=10)
+
+    assert summary.scanned_candidates == 1
+    assert summary.approved_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].label == "arb_extended_paradex"
+    assert snapshots[0].candidate.suggested_canary_notional == 11.0
+    assert snapshots[0].approval.max_live_notional == 11.0
+
+
+def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        approved_canary_scan_interval_seconds=3,
+    )
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def fake_scan_approved_canary_once(
+        settings_arg: WorkerSettings,
+        *,
+        scanner: object | None = None,
+        approval_service: object | None = None,
+        store: object | None = None,
+        now: datetime | None = None,
+    ) -> ApprovedCanaryScanSummary:
+        assert settings_arg is settings
+        _ = scanner
+        _ = approval_service
+        _ = store
+        assert now is None
+        calls.append(1)
+        return ApprovedCanaryScanSummary(
+            scanned_candidates=2,
+            approved_candidates=1,
+            saved_snapshots=1,
+            database_path=settings.database_path,
+        )
+
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    from unittest.mock import patch
+
+    with patch(
+        "carryme_worker.poller.scan_approved_canary_once",
+        side_effect=fake_scan_approved_canary_once,
+    ):
+        summary = asyncio.run(
+            run_supervised_approved_canary_scan_loop(
+                settings,
+                store=ApprovedCanaryStore(settings.database_path),
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.scanned_candidates == 4
+    assert summary.approved_candidates == 2
+    assert summary.saved_snapshots == 2
+    assert calls == [1, 1]
+    assert sleeps == [3.0]
 
 
 def test_run_supervised_universe_scan_loop_honors_max_iterations(tmp_path: Path) -> None:

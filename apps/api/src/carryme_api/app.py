@@ -14,6 +14,7 @@ import httpx
 from carryme_models import (
     SUPPORTED_UNIVERSE_VENUES,
     AppDescriptor,
+    ApprovedCanarySnapshot,
     CanaryLifecycleResult,
     CandidateAlertEvent,
     CleanupPreviewConfirmationEntry,
@@ -100,6 +101,7 @@ from carryme_runtime import (
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
+    ApprovedCanaryStore,
     BalanceSnapshotStore,
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
@@ -306,6 +308,14 @@ def _route_stability_service_for_path(database_path: str) -> RouteStabilityServi
     """Return the shared route-stability service for the configured SQLite path."""
 
     return RouteStabilityService(history_store=_history_store_for_path(database_path))
+
+
+def get_approved_canary_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ApprovedCanaryStore:
+    """Return the shared approved-canary snapshot store."""
+
+    return ApprovedCanaryStore(settings.database_path)
 
 
 def get_route_stability_service(
@@ -2013,6 +2023,32 @@ def create_app() -> FastAPI:
             canonical_symbol=canonical_symbol,
             approved=approved,
         )
+
+    @app.get(
+        "/v1/opportunities/funding-universe/canary/snapshots",
+        response_model=list[ApprovedCanarySnapshot],
+    )
+    def approved_canary_snapshots(
+        store: Annotated[ApprovedCanaryStore, Depends(get_approved_canary_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[ApprovedCanarySnapshot]:
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return store.list_recent(limit=limit, label=label)
+
+    @app.get(
+        "/v1/opportunities/funding-universe/canary/latest-approved",
+        response_model=ApprovedCanarySnapshot,
+    )
+    def latest_approved_canary_snapshot(
+        store: Annotated[ApprovedCanaryStore, Depends(get_approved_canary_store)],
+        label: str | None = None,
+    ) -> ApprovedCanarySnapshot:
+        snapshot = store.latest(label=label)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="No approved canary snapshot found")
+        return snapshot
 
     @app.put(
         "/v1/opportunities/route-approvals/{label}",

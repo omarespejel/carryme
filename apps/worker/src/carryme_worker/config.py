@@ -20,6 +20,8 @@ class WorkerSettings(BaseSettings):
     max_backoff_seconds: int = Field(default=300, gt=0)
     universe_scan_interval_seconds: int = Field(default=60, gt=0)
     universe_scan_max_backoff_seconds: int = Field(default=300, gt=0)
+    approved_canary_scan_interval_seconds: int = Field(default=30, gt=0)
+    approved_canary_scan_max_backoff_seconds: int = Field(default=300, gt=0)
     execution_observation_interval_seconds: int = Field(default=10, gt=0)
     execution_observation_max_backoff_seconds: int = Field(default=60, gt=0)
     execution_alert_webhook_url: str | None = None
@@ -58,6 +60,25 @@ class WorkerSettings(BaseSettings):
     universe_scan_include_symbols: tuple[str, ...] = ()
     universe_scan_exclude_symbols: tuple[str, ...] = ()
     universe_scan_exclude_tags: tuple[str, ...] = ()
+    approved_canary_scan_venues: tuple[str, ...] = ("extended", "paradex", "hyperliquid")
+    approved_canary_scan_extended_fee_profile: str | None = None
+    approved_canary_scan_paradex_fee_profile: str | None = "pro_fastfills"
+    approved_canary_scan_hyperliquid_fee_profile: str | None = None
+    approved_canary_scan_target_notional: float = 5_000.0
+    approved_canary_scan_max_notional: float = 25.0
+    approved_canary_scan_min_capacity_notional: float = 25.0
+    approved_canary_scan_min_daily_volume: float = 0.0
+    approved_canary_scan_min_open_interest: float = 0.0
+    approved_canary_scan_min_roundtrip_edge: float = 0.0
+    approved_canary_scan_min_execution_quality_score: float = 0.5
+    approved_canary_scan_min_execution_samples: int = 0
+    approved_canary_scan_min_route_stability_weight: float = 0.35
+    approved_canary_scan_min_route_presence_ratio: float = 0.35
+    approved_canary_scan_min_route_samples: int = 2
+    approved_canary_scan_limit: int = 5
+    approved_canary_scan_include_symbols: tuple[str, ...] = ()
+    approved_canary_scan_exclude_symbols: tuple[str, ...] = ()
+    approved_canary_scan_exclude_tags: tuple[str, ...] = ("meme", "political")
     stop_signals: tuple[Literal["SIGINT", "SIGTERM"], ...] = ("SIGINT", "SIGTERM")
     database_path: str = "data/carryme.sqlite3"
     watchlist_path: str = "config/watchlists/default.json"

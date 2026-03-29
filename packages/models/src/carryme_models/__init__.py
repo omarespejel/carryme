@@ -11,6 +11,7 @@ from carryme_models.accounting import (
     RouteAccountingSummary,
 )
 from carryme_models.approval import RouteApprovalEntry, RouteApprovalUpsert
+from carryme_models.approved_canary import ApprovedCanarySnapshot
 from carryme_models.balance_accounting import (
     PaperTradeBalanceDelta,
     VenueBalanceDelta,
@@ -78,6 +79,7 @@ from carryme_models.universe import (
 
 __all__ = [
     "AppDescriptor",
+    "ApprovedCanarySnapshot",
     "CapacityEstimate",
     "CandidateAlertEvent",
     "CanaryLifecycleResult",

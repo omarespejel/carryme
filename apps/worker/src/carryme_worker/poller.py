@@ -13,6 +13,7 @@ from typing import Literal, Protocol, cast
 
 import httpx
 from carryme_models import (
+    ApprovedCanarySnapshot,
     CandidateAlertEvent,
     ExecutionAlertEvent,
     ExecutionJournalEntry,
@@ -33,20 +34,24 @@ from carryme_runtime import (
     OpportunityService,
     OpportunityUniverseService,
     ParadexOrderStateObserver,
+    RouteApprovalService,
     RouteStabilityService,
     build_account_preflight_configs,
     build_execution_pair_status,
     build_opportunity_record_from_universe_opportunity,
+    build_pair_spec_from_universe_opportunity,
     filter_candidate_records,
     reconcile_execution,
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
+    ApprovedCanaryStore,
     CandidateAlertStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
+    RouteApprovalStore,
     load_watchlist,
 )
 
@@ -161,6 +166,30 @@ class UniverseScanLoopSummary:
     scanned_opportunities: int
     saved_records: int
     alert_events: int
+    database_path: str
+
+
+@dataclass
+class ApprovedCanaryScanSummary:
+    """Summary emitted after one approved-canary scan."""
+
+    scanned_candidates: int
+    approved_candidates: int
+    saved_snapshots: int
+    database_path: str
+    snapshots: list[ApprovedCanarySnapshot] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class ApprovedCanaryScanLoopSummary:
+    """Summary emitted after a supervised approved-canary scan loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    scanned_candidates: int
+    approved_candidates: int
+    saved_snapshots: int
     database_path: str
 
 
@@ -342,6 +371,101 @@ async def scan_funding_universe_once(
     )
 
 
+def _build_universe_fee_profile_overrides(
+    settings: WorkerSettings,
+) -> dict[str, str] | None:
+    overrides = {
+        venue: profile
+        for venue in settings.universe_scan_venues
+        if (profile := getattr(settings, f"universe_scan_{venue}_fee_profile", None))
+    }
+    return overrides or None
+
+
+def _build_approved_canary_fee_profile_overrides(
+    settings: WorkerSettings,
+) -> dict[str, str] | None:
+    overrides = {
+        venue: profile
+        for venue, profile in {
+            "extended": settings.approved_canary_scan_extended_fee_profile,
+            "paradex": settings.approved_canary_scan_paradex_fee_profile,
+            "hyperliquid": settings.approved_canary_scan_hyperliquid_fee_profile,
+        }.items()
+        if profile
+    }
+    return overrides or None
+
+
+async def scan_approved_canary_once(
+    settings: WorkerSettings,
+    *,
+    scanner: OpportunityUniverseService | None = None,
+    approval_service: RouteApprovalService | None = None,
+    store: ApprovedCanaryStore | None = None,
+    now: datetime | None = None,
+) -> ApprovedCanaryScanSummary:
+    """Scan the live universe for canaries that are currently operator-approved."""
+
+    timestamp = now or datetime.now(UTC)
+    snapshot_store = store or ApprovedCanaryStore(settings.database_path)
+    route_approval_service = approval_service or RouteApprovalService(
+        store=RouteApprovalStore(settings.database_path)
+    )
+    runtime = scanner or OpportunityUniverseService(
+        execution_quality_service=ExecutionQualityService(
+            journal_store=ExecutionJournalStore(settings.database_path),
+            observation_store=ExecutionObservationStore(settings.database_path),
+        ),
+        route_stability_service=RouteStabilityService(
+            history_store=OpportunityHistoryStore(settings.database_path)
+        ),
+    )
+
+    candidates = await runtime.scan_canary_candidates(
+        venues=list(settings.approved_canary_scan_venues),
+        fee_profile_overrides=_build_approved_canary_fee_profile_overrides(settings),
+        target_notional=settings.approved_canary_scan_target_notional,
+        canary_max_notional=settings.approved_canary_scan_max_notional,
+        min_capacity_notional=settings.approved_canary_scan_min_capacity_notional,
+        min_daily_volume=settings.approved_canary_scan_min_daily_volume,
+        min_open_interest=settings.approved_canary_scan_min_open_interest,
+        min_roundtrip_edge=settings.approved_canary_scan_min_roundtrip_edge,
+        min_execution_quality_score=settings.approved_canary_scan_min_execution_quality_score,
+        min_execution_samples=settings.approved_canary_scan_min_execution_samples,
+        min_route_stability_weight=settings.approved_canary_scan_min_route_stability_weight,
+        min_route_presence_ratio=settings.approved_canary_scan_min_route_presence_ratio,
+        min_route_samples=settings.approved_canary_scan_min_route_samples,
+        include_symbols=list(settings.approved_canary_scan_include_symbols) or None,
+        exclude_symbols=list(settings.approved_canary_scan_exclude_symbols) or None,
+        exclude_tags=list(settings.approved_canary_scan_exclude_tags) or None,
+        limit=settings.approved_canary_scan_limit,
+    )
+    approved_candidates = route_approval_service.filter_approved_canary_candidates(candidates)
+    snapshots: list[ApprovedCanarySnapshot] = []
+    for candidate in approved_candidates:
+        approval = route_approval_service.get_for_candidate(candidate)
+        if approval is None or not approval.approved:
+            continue
+        label = build_pair_spec_from_universe_opportunity(candidate.opportunity).label
+        snapshots.append(
+            snapshot_store.append(
+                ApprovedCanarySnapshot(
+                    captured_at=timestamp,
+                    label=label or approval.label,
+                    candidate=candidate,
+                    approval=approval,
+                )
+            )
+        )
+
+    return ApprovedCanaryScanSummary(
+        scanned_candidates=len(candidates),
+        approved_candidates=len(approved_candidates),
+        saved_snapshots=len(snapshots),
+        database_path=settings.database_path,
+        snapshots=snapshots,
+    )
 async def run_supervised_universe_scan_loop(
     settings: WorkerSettings,
     *,
@@ -442,15 +566,99 @@ async def run_supervised_universe_scan_loop(
     )
 
 
-def _build_universe_fee_profile_overrides(
+async def run_supervised_approved_canary_scan_loop(
     settings: WorkerSettings,
-) -> dict[str, str] | None:
-    overrides = {
-        venue: profile
-        for venue in settings.universe_scan_venues
-        if (profile := getattr(settings, f"universe_scan_{venue}_fee_profile", None))
-    }
-    return overrides or None
+    *,
+    scanner: OpportunityUniverseService | None = None,
+    approval_service: RouteApprovalService | None = None,
+    store: ApprovedCanaryStore | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> ApprovedCanaryScanLoopSummary:
+    """Run supervised approved-canary scans until stopped or capped."""
+
+    if max_iterations is not None and max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
+    snapshot_store = store or ApprovedCanaryStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    supervised_stop_event = stop_event or asyncio.Event()
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    scanned_candidates = 0
+    approved_candidates = 0
+    saved_snapshots = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised approved canary scan cycle %s", attempts)
+        try:
+            summary = await scan_approved_canary_once(
+                settings,
+                scanner=scanner,
+                approval_service=approval_service,
+                store=snapshot_store,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            scanned_candidates += summary.scanned_candidates
+            approved_candidates += summary.approved_candidates
+            saved_snapshots += summary.saved_snapshots
+            loop_logger.info(
+                (
+                    "completed supervised approved canary scan cycle %s with %s candidates, "
+                    "%s approved candidates, and %s saved snapshots"
+                ),
+                attempts,
+                summary.scanned_candidates,
+                summary.approved_candidates,
+                summary.saved_snapshots,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                settings.approved_canary_scan_interval_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.approved_canary_scan_max_backoff_seconds,
+                settings.approved_canary_scan_interval_seconds * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "supervised approved canary scan cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                backoff_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+
+    return ApprovedCanaryScanLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        scanned_candidates=scanned_candidates,
+        approved_candidates=approved_candidates,
+        saved_snapshots=saved_snapshots,
+        database_path=settings.database_path,
+    )
 
 
 def summarize_candidates(

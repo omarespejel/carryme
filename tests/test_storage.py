@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from carryme_models import (
+    ApprovedCanarySnapshot,
     CandidateAlertEvent,
     CapacityEstimate,
     CleanupPreviewConfirmationEntry,
@@ -20,6 +21,9 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    FundingUniverseCanaryCandidate,
+    FundingUniverseOpportunity,
+    FundingUniverseVenueMarket,
     OpportunityRecord,
     PaperTradeEntry,
     PaperTradeOrderPreview,
@@ -30,6 +34,7 @@ from carryme_models import (
     VenueOrderPreview,
 )
 from carryme_storage import (
+    ApprovedCanaryStore,
     BalanceSnapshotStore,
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
@@ -2356,6 +2361,74 @@ def test_route_approval_store_upserts_and_reads_route(tmp_path: Path) -> None:
     assert loaded.max_live_notional == 40.0
     assert len(results) == 1
     assert results[0].label == "arb_extended_paradex"
+
+
+def test_approved_canary_store_appends_and_lists_recent(tmp_path: Path) -> None:
+    store = ApprovedCanaryStore(tmp_path / "history.sqlite3")
+    snapshot = ApprovedCanarySnapshot(
+        captured_at=datetime(2026, 3, 29, 14, 10, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 14, 9, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+
+    store.append(snapshot)
+    results = store.list_recent(limit=10)
+    latest = store.latest(label="arb_extended_paradex")
+
+    assert len(results) == 1
+    assert results[0].snapshot_id is not None
+    assert results[0].label == "arb_extended_paradex"
+    assert results[0].candidate.suggested_canary_notional == 11.0
+    assert latest is not None
+    assert latest.snapshot_id == results[0].snapshot_id
 
 
 def test_balance_snapshot_store_appends_and_filters(tmp_path: Path) -> None:
