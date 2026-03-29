@@ -75,7 +75,10 @@ def _find_context(universe: Any, contexts: Any, symbol: str) -> dict[str, Any]:
                 raise ConnectorError(f"Hyperliquid contexts missing entry for {symbol}")
             row = contexts[index]
             if isinstance(row, dict):
-                return row
+                merged = dict(row)
+                if "szDecimals" in entry:
+                    merged["szDecimals"] = entry["szDecimals"]
+                return merged
             break
     raise ConnectorError(f"Hyperliquid market {symbol} not found")
 

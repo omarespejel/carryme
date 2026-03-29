@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -11,6 +12,7 @@ from carryme_connectors import (
     ExtendedPrivateConnector,
     ParadexJwtTokenProvider,
     ParadexPrivateConnector,
+    build_hyperliquid_info,
 )
 from carryme_models import ExecutionJournalEntry, ExecutionLegOrderState, ExecutionOrderState
 
@@ -217,6 +219,64 @@ class ExtendedOrderStateObserver:
 
 
 @dataclass(frozen=True)
+class HyperliquidOrderStateObserver:
+    """Observe Hyperliquid order state by oid through the official SDK info client."""
+
+    account_address: str
+
+    async def observe(self, leg: dict[str, Any]) -> ExecutionLegOrderState:
+        external_reference = _string_value(leg, "external_reference")
+        if external_reference is None:
+            return ExecutionLegOrderState(
+                venue="hyperliquid",
+                supported=True,
+                derived_state="unknown",
+                notes=["Execution leg is missing a Hyperliquid order reference."],
+            )
+        oid = _coerce_int(external_reference)
+        if oid is None:
+            return ExecutionLegOrderState(
+                venue="hyperliquid",
+                supported=True,
+                external_reference=external_reference,
+                derived_state="unknown",
+                notes=["Hyperliquid order reference is not a valid integer oid."],
+            )
+        try:
+            payload = await asyncio.to_thread(
+                _fetch_hyperliquid_order_state,
+                self.account_address,
+                oid,
+            )
+        except Exception as exc:
+            raise ConnectorError(f"Hyperliquid order-state observation failed: {exc}") from exc
+
+        order = payload.get("order")
+        order_payload = order if isinstance(order, dict) else {}
+        status = _string_value(payload, "status") or _string_value(order_payload, "status")
+        remaining_size = _string_value(order_payload, "sz")
+        size = _string_value(order_payload, "origSz")
+        avg_fill_price = _string_value(order_payload, "avgPx")
+        return ExecutionLegOrderState(
+            venue="hyperliquid",
+            supported=True,
+            external_reference=external_reference,
+            client_id=_string_value(order_payload, "cloid"),
+            derived_state=_classify_hyperliquid_order_state(
+                status=status,
+                remaining_size=remaining_size,
+                size=size,
+                avg_fill_price=avg_fill_price,
+            ),
+            order_status=status,
+            avg_fill_price=avg_fill_price,
+            remaining_size=remaining_size,
+            size=size,
+            raw_response=payload,
+        )
+
+
+@dataclass(frozen=True)
 class ExecutionOrderStateService:
     """Observe venue order-state for the latest journaled execution legs."""
 
@@ -282,6 +342,36 @@ def _classify_paradex_order_state(
     return "unknown"
 
 
+def _classify_hyperliquid_order_state(
+    *,
+    status: str | None,
+    remaining_size: str | None,
+    size: str | None,
+    avg_fill_price: str | None,
+) -> DerivedOrderState:
+    normalized = (status or "").lower()
+    if normalized in {"open", "triggered", "activated"}:
+        if (
+            remaining_size is not None
+            and size is not None
+            and remaining_size != size
+            and remaining_size != "0"
+        ):
+            return "partial_fill"
+        return "open"
+    if normalized == "filled":
+        return "filled"
+    if (
+        normalized.endswith("canceled")
+        or normalized.endswith("cancelled")
+        or normalized.endswith("rejected")
+    ):
+        if avg_fill_price and remaining_size not in {None, size}:
+            return "partial_fill"
+        return "unfilled"
+    return "unknown"
+
+
 def _request_client_id(payload: dict[str, Any]) -> str | None:
     request_payload = payload.get("request_payload")
     if not isinstance(request_payload, dict):
@@ -334,3 +424,18 @@ def _string_value(payload: dict[str, Any], key: str) -> str | None:
     if isinstance(value, int):
         return str(value)
     return None
+
+
+def _coerce_int(value: str) -> int | None:
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _fetch_hyperliquid_order_state(account_address: str, oid: int) -> dict[str, Any]:
+    info = build_hyperliquid_info()
+    payload = info.query_order_by_oid(account_address, oid)
+    if not isinstance(payload, dict):
+        raise ConnectorError("Hyperliquid order status payload must be an object")
+    return payload
