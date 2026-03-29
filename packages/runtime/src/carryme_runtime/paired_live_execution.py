@@ -39,7 +39,7 @@ class PairedLiveExecutionCoordinator:
         *,
         paper_trade: PaperTradeEntry,
         confirmation: PreviewConfirmationEntry,
-        first_venue: str,
+        first_venue: str = "auto",
         executed_at: datetime | None = None,
     ) -> ExecutionJournalEntry:
         if paper_trade.entry_id is None:
@@ -47,10 +47,13 @@ class PairedLiveExecutionCoordinator:
         if confirmation.entry_id is None:
             raise ValueError("Preview confirmation entry_id is required before live execution")
 
-        normalized_first = first_venue.strip().lower()
         preview_venues = [leg.venue.strip().lower() for leg in confirmation.preview.legs]
         if not all(preview_venues):
             raise ValueError("Paired execution requires non-empty preview leg venues")
+        normalized_first = self._resolve_first_venue(
+            requested_first_venue=first_venue,
+            preview_venues=preview_venues,
+        )
         if normalized_first not in preview_venues:
             raise ValueError(
                 f"Requested first venue {first_venue!r} is not present in the confirmed preview"
@@ -148,3 +151,25 @@ class PairedLiveExecutionCoordinator:
                     )
                 ],
             )
+
+    @staticmethod
+    def _resolve_first_venue(
+        *,
+        requested_first_venue: str,
+        preview_venues: list[str],
+    ) -> str:
+        normalized = requested_first_venue.strip().lower()
+        if normalized and normalized != "auto":
+            return normalized
+
+        venue_priority = {
+            # Prefer the venue with the weaker observed fill behavior first so the paired
+            # coordinator avoids opening the easier hedge leg before the harder leg is live.
+            "paradex": 0,
+            "extended": 1,
+            "hyperliquid": 2,
+        }
+        return min(
+            preview_venues,
+            key=lambda venue: (venue_priority.get(venue, 100), preview_venues.index(venue)),
+        )

@@ -2174,7 +2174,6 @@ def create_app() -> FastAPI:
     async def execute_saved_paper_trade_as_pair(
         paper_trade_id: int,
         preview_hash: str,
-        first_venue: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
         confirmation_store: Annotated[
@@ -2190,6 +2189,7 @@ def create_app() -> FastAPI:
             PairedLiveExecutionCoordinator,
             Depends(get_paired_live_execution_coordinator),
         ],
+        first_venue: str = "auto",
     ) -> ExecutionJournalEntry:
         paper_trade = paper_store.get(paper_trade_id)
         if paper_trade is None:
@@ -2279,7 +2279,6 @@ def create_app() -> FastAPI:
     async def execute_saved_paper_trade_as_guarded_pair(
         paper_trade_id: int,
         preview_hash: str,
-        first_venue: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
         confirmation_store: Annotated[
@@ -2315,6 +2314,7 @@ def create_app() -> FastAPI:
             PairedLiveExecutionCoordinator,
             Depends(get_paired_live_execution_coordinator),
         ],
+        first_venue: str = "auto",
         poll_attempts: int = Query(default=5, ge=1, le=10),
         poll_interval_seconds: float = Query(default=2.0, ge=0.0, le=10.0),
         auto_cleanup: bool = True,
