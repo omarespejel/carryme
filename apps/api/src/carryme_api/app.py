@@ -14,17 +14,21 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairTradeIntent,
     OpportunityRecord,
+    PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
     ServiceHealth,
     TradingFeeProfile,
+    VenueAccountPreflight,
     VenueExecutionPreflight,
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
+    AccountPreflightConfigMap,
+    AccountPreflightService,
     ConnectorError,
     ExecutionAdapter,
     InvalidTradeCandidateError,
@@ -234,10 +238,36 @@ def get_mock_execution_adapter() -> MockExecutionAdapter:
     return MockExecutionAdapter()
 
 
+def get_account_preflight_service() -> AccountPreflightService:
+    """Return the authenticated account-state preflight service."""
+
+    return AccountPreflightService()
+
+
 def get_order_preview_service() -> OrderPreviewService:
     """Return the unsigned live order preview service."""
 
     return OrderPreviewService()
+
+
+def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightConfigMap:
+    """Build the authenticated-read account probe config map from API settings."""
+
+    return {
+        "extended": {
+            "enabled": settings.extended_live_enabled,
+            "credentials": {
+                "api_key": settings.extended_api_key,
+            },
+        },
+        "paradex": {
+            "enabled": settings.paradex_live_enabled,
+            "credentials": {
+                "account_address": settings.paradex_account_address,
+                "bearer_token": settings.paradex_bearer_token,
+            },
+        },
+    }
 
 
 def _select_trade_intent_records(
@@ -570,6 +600,21 @@ def create_app() -> FastAPI:
         return build_venue_execution_preflights(build_live_execution_configs(settings))
 
     @app.get(
+        "/v1/executions/account-preflight/venues",
+        response_model=list[VenueAccountPreflight],
+    )
+    async def execution_account_preflight_venues(
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+        response: Response,
+    ) -> list[VenueAccountPreflight]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return await service.probe_venues(_build_account_preflight_configs(settings))
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
         "/v1/executions/preflight/from-paper-trade/{paper_trade_id}",
         response_model=PaperTradeExecutionPreflight,
     )
@@ -588,6 +633,32 @@ def create_app() -> FastAPI:
             paper_trade,
             build_live_execution_configs(settings),
         )
+
+    @app.get(
+        "/v1/executions/account-preflight/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeAccountPreflight,
+    )
+    async def execution_account_preflight_for_paper_trade(
+        paper_trade_id: int,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+        response: Response,
+    ) -> PaperTradeAccountPreflight:
+        response.headers["Cache-Control"] = "no-store"
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        try:
+            return await service.probe_paper_trade(
+                paper_trade,
+                _build_account_preflight_configs(settings),
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get(
         "/v1/executions/preview/from-paper-trade/{paper_trade_id}",

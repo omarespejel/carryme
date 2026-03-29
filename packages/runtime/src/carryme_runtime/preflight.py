@@ -74,20 +74,27 @@ LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
     "paradex": {
         "enabled_setting": "paradex_live_enabled",
         "credential_settings": {
+            "account_address": "paradex_account_address",
             "private_key": "paradex_private_key",
         },
         "requirements": [
             RequirementSpec(
+                "account_address",
+                "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                "Paradex main account address paired with the trading subkey.",
+                False,
+            ),
+            RequirementSpec(
                 "private_key",
                 "CARRYME_API_PARADEX_PRIVATE_KEY",
-                "Paradex trading private key used to derive authenticated API access.",
+                "Paradex trading subkey private key used to derive authenticated API access.",
                 True,
             ),
         ],
         "notes": [
             (
-                "Paradex live trading requires the account private key used for "
-                "authenticated API access."
+                "Paradex live trading requires the main account address and the "
+                "trading subkey private key used for authenticated API access."
             ),
         ],
     },

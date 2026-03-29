@@ -21,7 +21,9 @@ class ApiSettings(BaseSettings):
     extended_api_key: str | None = None
     extended_stark_private_key: str | None = None
     paradex_live_enabled: bool = False
+    paradex_account_address: str | None = None
     paradex_private_key: str | None = None
+    paradex_bearer_token: str | None = None
     hyperliquid_live_enabled: bool = False
     hyperliquid_account_address: str | None = None
     hyperliquid_api_wallet_private_key: str | None = None

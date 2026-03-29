@@ -30,11 +30,13 @@ from carryme_models import (
     MarketStats,
     NormalizedMarketSnapshot,
     OpportunityRecord,
+    PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
     TopOfBook,
     TradeLegIntent,
+    VenueAccountPreflight,
     VenueOrderPreview,
 )
 from carryme_normalizers import NormalizationError, normalize_market_snapshot
@@ -1639,16 +1641,17 @@ def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None
     client = TestClient(app)
     with _dependency_override(
         get_api_settings,
-        lambda: ApiSettings(
-            extended_live_enabled=True,
-            extended_api_key=None,
-            extended_stark_private_key=None,
-            paradex_live_enabled=True,
-            paradex_private_key="paradex-secret",
-            hyperliquid_live_enabled=False,
-            hyperliquid_account_address=None,
-            hyperliquid_api_wallet_private_key=None,
-        ),
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key=None,
+                extended_stark_private_key=None,
+                paradex_live_enabled=True,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-secret",
+                hyperliquid_live_enabled=False,
+                hyperliquid_account_address=None,
+                hyperliquid_api_wallet_private_key=None,
+            ),
     ):
         response = client.get("/v1/executions/preflight/venues")
 
@@ -1744,6 +1747,301 @@ def test_live_execution_preflight_returns_404_for_missing_paper_trade(
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Paper trade 999999 was not found"
+
+
+def test_account_preflight_venues_endpoint_uses_service_dependency() -> None:
+    class StubAccountPreflightService:
+        async def probe_venues(self, configs: dict[str, object]) -> list[VenueAccountPreflight]:
+            assert configs == {
+                "extended": {
+                    "enabled": True,
+                    "credentials": {"api_key": "extended-key"},
+                },
+                "paradex": {
+                    "enabled": True,
+                    "credentials": {
+                        "account_address": "0xabc",
+                        "bearer_token": None,
+                    },
+                },
+            }
+            return [
+                VenueAccountPreflight(
+                    venue="extended",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_key",
+                    account_identifier="ext-subaccount",
+                    available_to_trade=1250.0,
+                    balance_count=2,
+                    position_count=1,
+                ),
+                VenueAccountPreflight(
+                    venue="paradex",
+                    enabled=True,
+                    authenticated=False,
+                    ready=False,
+                    credential_mode="bearer_token",
+                    missing_env_vars=["CARRYME_API_PARADEX_BEARER_TOKEN"],
+                    blocking_reasons=[
+                        (
+                            "Venue paradex is missing required account credentials: "
+                            "CARRYME_API_PARADEX_BEARER_TOKEN"
+                        )
+                    ],
+                ),
+            ]
+
+    from carryme_api.app import get_account_preflight_service
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_account_preflight_service, lambda: StubAccountPreflightService()),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=True,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-secret",
+                paradex_bearer_token=None,
+            ),
+        ),
+    ):
+        response = client.get("/v1/executions/account-preflight/venues")
+
+    assert response.status_code == 200
+    payload = {item["venue"]: item for item in response.json()}
+    assert payload["extended"]["authenticated"] is True
+    assert payload["paradex"]["authenticated"] is False
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_account_preflight_for_saved_paper_trade_uses_service_dependency(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id is not None
+            assert configs == {
+                "extended": {
+                    "enabled": True,
+                    "credentials": {"api_key": "extended-key"},
+                },
+                "paradex": {
+                    "enabled": True,
+                    "credentials": {
+                        "account_address": "0xabc",
+                        "bearer_token": None,
+                    },
+                },
+            }
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id,
+                label=paper_trade.intent.label,
+                ready=False,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=False,
+                        ready=False,
+                        credential_mode="bearer_token",
+                        missing_env_vars=["CARRYME_API_PARADEX_BEARER_TOKEN"],
+                        blocking_reasons=[
+                            (
+                                "Venue paradex is missing required account credentials: "
+                                "CARRYME_API_PARADEX_BEARER_TOKEN"
+                            )
+                        ],
+                    ),
+                ],
+                blocking_reasons=[
+                    (
+                        "Venue paradex is missing required account credentials: "
+                        "CARRYME_API_PARADEX_BEARER_TOKEN"
+                    )
+                ],
+            )
+
+    from carryme_api.app import get_account_preflight_service
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(get_account_preflight_service, lambda: StubAccountPreflightService()),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=True,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-secret",
+                paradex_bearer_token=None,
+            ),
+        ),
+    ):
+        response = client.get(
+            f"/v1/executions/account-preflight/from-paper-trade/{paper_trade.entry_id}"
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["ready"] is False
+    assert {item["venue"] for item in payload["venues"]} == {"extended", "paradex"}
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_account_preflight_venues_endpoint_maps_upstream_errors_to_bad_gateway() -> None:
+    class FailingAccountPreflightService:
+        async def probe_venues(self, configs: dict[str, object]) -> list[VenueAccountPreflight]:
+            assert "extended" in configs
+            raise UpstreamDataError("malformed account payload")
+
+    from carryme_api.app import get_account_preflight_service
+
+    client = TestClient(app)
+    with (
+        _dependency_override(
+            get_account_preflight_service,
+            lambda: FailingAccountPreflightService(),
+        ),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                paradex_live_enabled=False,
+            ),
+        ),
+    ):
+        response = client.get("/v1/executions/account-preflight/venues")
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "malformed account payload"
+
+
+def test_account_preflight_for_saved_paper_trade_maps_upstream_errors_to_bad_gateway(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    class FailingAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id is not None
+            assert "paradex" in configs
+            raise UpstreamDataError("malformed account payload")
+
+    from carryme_api.app import get_account_preflight_service
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(
+            get_account_preflight_service,
+            lambda: FailingAccountPreflightService(),
+        ),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                paradex_live_enabled=True,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-secret",
+                paradex_bearer_token=None,
+            ),
+        ),
+    ):
+        response = client.get(
+            f"/v1/executions/account-preflight/from-paper-trade/{paper_trade.entry_id}"
+        )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "malformed account payload"
 
 
 def test_order_preview_endpoint_returns_saved_paper_trade_preview(tmp_path: Path) -> None:
