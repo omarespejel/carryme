@@ -1197,7 +1197,7 @@ def test_trade_intents_endpoint_skips_invalid_zero_capacity_records(tmp_path: Pa
     with _dependency_override(get_history_store, lambda: store):
         response = client.get(
             "/v1/intents/funding-pairs",
-            params={"limit": 10, "min_capacity_notional": 0.0},
+            params={"limit": 1, "min_capacity_notional": 0.0},
         )
 
     assert response.status_code == 200
