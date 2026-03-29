@@ -8,7 +8,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -223,14 +223,21 @@ def build_signed_paradex_order_payload(
     side = _normalize_order_side(_require_string(order_payload, "side"))
     order_type = _normalize_order_type(_require_string(order_payload, "type"))
     size = _normalize_order_decimal(_require_decimal(order_payload, "size"), key="size")
+    if size <= 0:
+        raise ConnectorError("Paradex order payload field size must be greater than zero")
     price = (
         _normalize_order_decimal(_require_decimal(order_payload, "price"), key="price")
         if order_type != "MARKET"
         else Decimal("0")
     )
+    if order_type != "MARKET" and price <= 0:
+        raise ConnectorError("Paradex order payload field price must be greater than zero")
     instruction = _require_string(order_payload, "instruction")
     client_id = _require_string(order_payload, "client_id")
-    reduce_only = bool(order_payload.get("reduce_only"))
+    reduce_only_value = order_payload.get("reduce_only", False)
+    if not isinstance(reduce_only_value, bool):
+        raise ConnectorError("Paradex order payload field reduce_only must be a boolean")
+    reduce_only = reduce_only_value
     signature_timestamp = (
         int(time.time() * 1000) if signature_timestamp_ms is None else signature_timestamp_ms
     )
@@ -321,7 +328,13 @@ def _require_decimal(payload: Mapping[str, Any], key: str) -> Decimal:
     value = payload.get(key)
     if value is None:
         raise ConnectorError(f"Paradex order payload missing required decimal field: {key}")
-    return Decimal(str(value))
+    try:
+        parsed = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ConnectorError(f"Paradex order payload field {key} must be a decimal") from exc
+    if not parsed.is_finite():
+        raise ConnectorError(f"Paradex order payload field {key} must be finite")
+    return parsed
 
 
 def _normalize_order_side(value: str) -> str:

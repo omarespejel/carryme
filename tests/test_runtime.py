@@ -64,7 +64,7 @@ def _snapshot(
     ask_price: float,
     ask_size: float,
     *,
-    raw: dict[str, object] | None = None,
+    raw: dict[str, object] | list[object] | None = None,
 ) -> NormalizedMarketSnapshot:
     return normalize_market_snapshot(
         venue,
@@ -81,7 +81,7 @@ def _snapshot(
                 best_ask_price=ask_price,
                 best_ask_size=ask_size,
             ),
-            raw=raw or {},
+            raw={} if raw is None else raw,
         ),
     )
 
@@ -768,7 +768,10 @@ def test_order_preview_service_builds_per_venue_templates() -> None:
         assert paradex.quantity == pytest.approx(10845.9)
         assert paradex.effective_notional == pytest.approx(999.99198)
         assert paradex.quantity_increment == pytest.approx(0.1)
+        assert paradex.minimum_order_size is None
+        assert paradex.minimum_notional == pytest.approx(10.0)
         assert paradex.price_increment == pytest.approx(0.0001)
+        assert paradex.max_order_value == pytest.approx(1_104_000.0)
         assert paradex.time_in_force == "ioc"
         assert paradex.http_method == "POST"
         assert paradex.endpoint_path_hint == "/v1/orders"
@@ -783,7 +786,10 @@ def test_order_preview_service_builds_per_venue_templates() -> None:
         assert extended.quantity == pytest.approx(10881.0)
         assert extended.effective_notional == pytest.approx(999.9639)
         assert extended.quantity_increment == pytest.approx(1.0)
+        assert extended.minimum_order_size == pytest.approx(10.0)
+        assert extended.minimum_notional == pytest.approx(0.92)
         assert extended.price_increment == pytest.approx(0.0001)
+        assert extended.max_order_value == pytest.approx(1_250_000.0)
         assert extended.time_in_force == "ioc"
         assert extended.http_method == "POST"
         assert extended.payload["symbol"] == "ARB-USD"
@@ -806,22 +812,22 @@ def test_order_preview_service_rejects_preview_below_venue_minimum_notional() ->
             one_day_net_edge_after_entry=0.0008,
             break_even_days_entry=0.5,
             capacity_limit_notional=4500.0,
-            target_notional=5.0,
+            target_notional=10.001,
             capacity_fraction=0.25,
-            max_target_notional=5.0,
+            max_target_notional=10.001,
             long_leg=TradeLegIntent(
                 venue="paradex",
                 symbol="ARB-USD-PERP",
                 fee_profile="pro",
                 side="buy",
-                target_notional=5.0,
+                target_notional=10.001,
             ),
             short_leg=TradeLegIntent(
                 venue="extended",
                 symbol="ARB-USD",
                 fee_profile="default",
                 side="sell",
-                target_notional=5.0,
+                target_notional=10.001,
             ),
         ),
     )
@@ -865,7 +871,512 @@ def test_order_preview_service_rejects_preview_below_venue_minimum_notional() ->
         return snapshots[(venue, symbol)]
 
     async def run() -> None:
-        with pytest.raises(ValueError, match="minimum notional"):
+        with pytest.raises(
+            ValueError,
+            match=r"Venue paradex preview notional for ARB-USD-PERP fell below minimum notional",
+        ):
+            await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=10,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            )
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_allows_extended_leg_at_exact_minimum_order_size() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=14,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="extended_exact_min_size",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=0.919,
+            capacity_fraction=0.25,
+            max_target_notional=0.919,
+            long_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=0.919,
+            ),
+            short_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        preview = await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+            paper_trade,
+            slippage_tolerance_bps=10,
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+        )
+
+        extended = next(leg for leg in preview.legs if leg.venue == "extended")
+        assert extended.side == "sell"
+        assert extended.quantity == pytest.approx(10.0)
+        assert extended.minimum_order_size == pytest.approx(10.0)
+        assert extended.minimum_notional == pytest.approx(0.92)
+        assert extended.effective_notional == pytest.approx(0.919)
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_allows_paradex_leg_at_exact_maximum_order_size() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=15,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="paradex_exact_max_size",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=10.142,
+            capacity_fraction=0.25,
+            max_target_notional=10.142,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=10.142,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "110",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        preview = await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+            paper_trade,
+            slippage_tolerance_bps=10,
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+        )
+
+        paradex = next(leg for leg in preview.legs if leg.venue == "paradex")
+        assert paradex.side == "buy"
+        assert paradex.quantity == pytest.approx(110.0)
+        assert paradex.max_order_value == pytest.approx(10.12)
+        assert paradex.effective_notional == pytest.approx(10.142)
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_rejects_missing_known_venue_constraints() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=10,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="bad_extended_constraints",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={"tradingConfig": {"minOrderSize": "10"}},
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        with pytest.raises(ValueError, match="Extended order constraints missing"):
+            await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=10,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            )
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_rejects_malformed_paradex_constraints() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=11,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="bad_paradex_constraints",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "oops",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        with pytest.raises(
+            ValueError,
+            match="Paradex order constraints field 'order_size_increment'",
+        ):
+            await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=10,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            )
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_rejects_extended_leg_below_minimum_order_size() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=12,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="tiny_extended_leg",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=0.5,
+            capacity_fraction=0.25,
+            max_target_notional=0.5,
+            long_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=0.5,
+            ),
+            short_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        with pytest.raises(
+            ValueError,
+            match=r"Venue extended preview quantity for ARB-USD fell below minimum order size",
+        ):
+            await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=10,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            )
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_rejects_order_value_above_venue_cap() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=13,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="oversized_extended_leg",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=2_000_000.0,
+            target_notional=1_300_000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1_300_000.0,
+            long_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=1_300_000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"Venue extended preview order value for ARB-USD "
+                r"exceeded maximum limit order value"
+            ),
+        ):
             await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
                 paper_trade,
                 slippage_tolerance_bps=10,
@@ -1474,6 +1985,70 @@ def test_build_signed_paradex_order_payload_rejects_over_precision() -> None:
                 "price": "0.0923",
                 "instruction": "IOC",
                 "client_id": "carryme-pt5-paradex-buy",
+            },
+        )
+
+
+def test_build_signed_paradex_order_payload_rejects_malformed_size() -> None:
+    with pytest.raises(
+        ConnectorError,
+        match="Paradex order payload field size must be a decimal",
+    ):
+        build_signed_paradex_order_payload(
+            account_address="0x123",
+            private_key="0x456",
+            starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+            order_payload={
+                "market": "ARB-USD-PERP",
+                "side": "BUY",
+                "type": "LIMIT",
+                "size": "not-a-number",
+                "price": "0.0923",
+                "instruction": "IOC",
+                "client_id": "carryme-pt5-paradex-buy",
+            },
+        )
+
+
+def test_build_signed_paradex_order_payload_rejects_non_positive_price() -> None:
+    with pytest.raises(
+        ConnectorError,
+        match="Paradex order payload field price must be greater than zero",
+    ):
+        build_signed_paradex_order_payload(
+            account_address="0x123",
+            private_key="0x456",
+            starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+            order_payload={
+                "market": "ARB-USD-PERP",
+                "side": "BUY",
+                "type": "LIMIT",
+                "size": "1.0",
+                "price": "0",
+                "instruction": "IOC",
+                "client_id": "carryme-pt5-paradex-buy",
+            },
+        )
+
+
+def test_build_signed_paradex_order_payload_rejects_non_boolean_reduce_only() -> None:
+    with pytest.raises(
+        ConnectorError,
+        match="Paradex order payload field reduce_only must be a boolean",
+    ):
+        build_signed_paradex_order_payload(
+            account_address="0x123",
+            private_key="0x456",
+            starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+            order_payload={
+                "market": "ARB-USD-PERP",
+                "side": "BUY",
+                "type": "LIMIT",
+                "size": "1.0",
+                "price": "0.0923",
+                "instruction": "IOC",
+                "client_id": "carryme-pt5-paradex-buy",
+                "reduce_only": "false",
             },
         )
 

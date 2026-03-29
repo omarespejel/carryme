@@ -317,6 +317,9 @@ async def _build_readiness_for_paper_trade(
     confirmation_store: PreviewConfirmationStore,
     account_preflight_service: AccountPreflightService,
 ) -> LiveSubmissionReadiness:
+    normalized_preview_hash = preview_hash.strip()
+    if not normalized_preview_hash:
+        raise ValueError("preview_hash must be non-empty")
     execution_preflight = build_paper_trade_execution_preflight(
         paper_trade,
         build_live_execution_configs(settings),
@@ -325,9 +328,6 @@ async def _build_readiness_for_paper_trade(
         paper_trade,
         _build_account_preflight_configs(settings),
     )
-    normalized_preview_hash = preview_hash.strip()
-    if not normalized_preview_hash:
-        raise ValueError("preview_hash must be non-empty")
     confirmation = confirmation_store.find_latest_by_preview_hash(
         paper_trade_id=paper_trade.entry_id or 0,
         preview_hash=normalized_preview_hash,
@@ -1013,6 +1013,28 @@ def create_app() -> FastAPI:
                     "No preview confirmation matched the requested paper trade and preview hash"
                 ),
             )
+        if confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Preview confirmation entry_id is required before live submission",
+            )
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            if existing_entry is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=existing_entry.model_dump(mode="json"),
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A live submission is already reserved for this confirmed preview; "
+                    "manual reconciliation is required before retrying"
+                ),
+            )
 
         try:
             journal_entry = await service.submit_confirmed_preview(
@@ -1024,7 +1046,17 @@ def create_app() -> FastAPI:
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-        return execution_store.append(journal_entry)
+        saved_entry = execution_store.append(journal_entry)
+        if saved_entry.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        execution_store.mark_live_submission_completed(
+            confirmation_entry_id=confirmation.entry_id,
+            execution_entry_id=saved_entry.entry_id,
+        )
+        return saved_entry
 
     @app.post(
         "/v1/executions/live/extended/from-paper-trade/{paper_trade_id}",
@@ -1079,6 +1111,28 @@ def create_app() -> FastAPI:
                     "No preview confirmation matched the requested paper trade and preview hash"
                 ),
             )
+        if confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Preview confirmation entry_id is required before live submission",
+            )
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            if existing_entry is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=existing_entry.model_dump(mode="json"),
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A live submission is already reserved for this confirmed preview; "
+                    "manual reconciliation is required before retrying"
+                ),
+            )
 
         try:
             journal_entry = await service.submit_confirmed_preview(
@@ -1090,7 +1144,17 @@ def create_app() -> FastAPI:
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-        return execution_store.append(journal_entry)
+        saved_entry = execution_store.append(journal_entry)
+        if saved_entry.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        execution_store.mark_live_submission_completed(
+            confirmation_entry_id=confirmation.entry_id,
+            execution_entry_id=saved_entry.entry_id,
+        )
+        return saved_entry
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(

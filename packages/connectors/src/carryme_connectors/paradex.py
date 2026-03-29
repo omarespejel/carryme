@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -29,16 +30,17 @@ class ParadexPublicConnector(BaseHttpConnector):
         )
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
-        summary_payload = await self._request_json(
-            "GET",
-            "/v1/markets/summary",
-            params={"market": symbol},
+        summary_payload, market_payload = await asyncio.gather(
+            self._request_json(
+                "GET",
+                "/v1/markets/summary",
+                params={"market": symbol},
+            ),
+            self._request_json("GET", "/v1/markets", params={"market": symbol}),
         )
         if not isinstance(summary_payload, dict):
             raise ConnectorError("Paradex market summary payload must be an object")
         summary_row = _find_market(summary_payload.get("results", []), symbol)
-
-        market_payload = await self._request_json("GET", "/v1/markets", params={"market": symbol})
         if not isinstance(market_payload, dict):
             raise ConnectorError("Paradex market config payload must be an object")
         market_row = _find_market(market_payload.get("results", []), symbol)
@@ -67,7 +69,7 @@ class ParadexPublicConnector(BaseHttpConnector):
 
 def _find_market(rows: Any, symbol: str) -> dict[str, Any]:
     if not isinstance(rows, list):
-        raise ConnectorError("Paradex market summary results must be a list")
+        raise ConnectorError("Paradex market results must be a list")
     for row in rows:
         if isinstance(row, dict) and row.get("symbol") == symbol:
             return row

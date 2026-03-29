@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -20,6 +21,8 @@ from carryme_models import (
     PreviewConfirmationEntry,
     VenueOrderPreview,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 class ParadexLiveTokenProvider(Protocol):
@@ -170,6 +173,7 @@ def _response_payload(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
     except ValueError:
+        _logger.warning("Paradex response was not JSON: status=%s", response.status_code)
         return {
             "status_code": response.status_code,
             "text": response.text,
@@ -179,6 +183,11 @@ def _response_payload(response: httpx.Response) -> dict[str, Any]:
             "status_code": response.status_code,
             **payload,
         }
+    _logger.warning(
+        "Paradex response JSON was not an object: status=%s type=%s",
+        response.status_code,
+        type(payload).__name__,
+    )
     return {
         "status_code": response.status_code,
         "payload": payload,
