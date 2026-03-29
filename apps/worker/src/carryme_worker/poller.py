@@ -7,14 +7,14 @@ import logging
 import signal
 import sqlite3
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 
 import httpx
-from carryme_models import FundingArbOpportunity, OpportunityRecord
-from carryme_runtime import ConnectorError, OpportunityService
-from carryme_storage import OpportunityHistoryStore, load_watchlist
+from carryme_models import CandidateAlertEvent, FundingArbOpportunity, OpportunityRecord
+from carryme_runtime import ConnectorError, OpportunityService, filter_candidate_records
+from carryme_storage import CandidateAlertStore, OpportunityHistoryStore, load_watchlist
 
 from carryme_worker.config import WorkerSettings
 
@@ -36,6 +36,12 @@ class PairScorer(Protocol):
     ) -> FundingArbOpportunity: ...
 
 
+class CandidateAlertSink(Protocol):
+    """Append-only sink for emitted candidate alert events."""
+
+    def append(self, event: CandidateAlertEvent) -> bool: ...
+
+
 @dataclass
 class PollCycleSummary:
     """Summary emitted after a watchlist poll cycle."""
@@ -44,6 +50,7 @@ class PollCycleSummary:
     saved_records: int
     failed_records: int
     database_path: str
+    records: list[OpportunityRecord] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -55,6 +62,7 @@ class PollLoopSummary:
     failures: int
     saved_records: int
     database_path: str
+    alert_events: int = 0
 
 
 @dataclass
@@ -81,6 +89,7 @@ async def poll_watchlist_once(
 
     saved_records = 0
     failed_records = 0
+    records: list[OpportunityRecord] = []
     for pair in pairs:
         try:
             async with asyncio.timeout(settings.score_timeout_seconds):
@@ -92,13 +101,12 @@ async def poll_watchlist_once(
                     right_symbol=pair.right_symbol,
                     right_fee_profile=pair.right_fee_profile,
                 )
-            history_store.append(
-                OpportunityRecord(
-                    recorded_at=timestamp,
-                    pair=pair,
-                    opportunity=opportunity,
-                )
+            record = OpportunityRecord(
+                recorded_at=timestamp,
+                pair=pair,
+                opportunity=opportunity,
             )
+            history_store.append(record)
         except (ConnectorError, httpx.HTTPError, ValueError, TimeoutError, sqlite3.Error) as exc:
             logger.warning(
                 "Failed to score or persist pair %s/%s ↔ %s/%s: %s",
@@ -111,6 +119,7 @@ async def poll_watchlist_once(
             )
             failed_records += 1
             continue
+        records.append(record)
         saved_records += 1
 
     return PollCycleSummary(
@@ -118,6 +127,7 @@ async def poll_watchlist_once(
         saved_records=saved_records,
         failed_records=failed_records,
         database_path=settings.database_path,
+        records=records,
     )
 
 
@@ -129,23 +139,43 @@ def summarize_candidates(
 ) -> CandidateRecordSummary:
     """Count candidate records that satisfy the worker thresholds."""
 
-    candidate_records = 0
-    for record in records:
-        if record.opportunity.one_day_net_edge_after_entry < min_one_day_net_edge_after_entry:
-            continue
-        capacity = (
-            record.opportunity.capacity.max_entry_notional
-            if record.opportunity.capacity is not None
-            else None
+    candidate_records = len(
+        filter_candidate_records(
+            records,
+            min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+            min_capacity_notional=min_capacity_notional,
         )
-        if capacity is None or capacity < min_capacity_notional:
-            continue
-        candidate_records += 1
+    )
 
     return CandidateRecordSummary(
         total_records=len(records),
         candidate_records=candidate_records,
     )
+
+
+def emit_candidate_alerts(
+    records: list[OpportunityRecord],
+    *,
+    sink: CandidateAlertSink,
+    emitted_at: datetime,
+    min_one_day_net_edge_after_entry: float,
+    min_capacity_notional: float,
+) -> int:
+    """Emit one append-only candidate event per selected record."""
+
+    inserted = 0
+    for record in records:
+        inserted += int(
+            sink.append(
+                CandidateAlertEvent(
+                    emitted_at=emitted_at,
+                    min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+                    min_capacity_notional=min_capacity_notional,
+                    record=record,
+                )
+            )
+        )
+    return inserted
 
 
 async def run_polling_loop(
@@ -155,7 +185,7 @@ async def run_polling_loop(
     scorer: PairScorer | None = None,
     store: OpportunityHistoryStore | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    loop_logger: logging.Logger | None = None,
+    logger: logging.Logger | None = None,
 ) -> PollLoopSummary:
     """Run the worker for a fixed number of scheduled iterations."""
 
@@ -164,7 +194,7 @@ async def run_polling_loop(
 
     runtime = scorer or OpportunityService()
     history_store = store or OpportunityHistoryStore(settings.database_path)
-    logger_instance = loop_logger or logging.getLogger("carryme.worker")
+    loop_logger = logger or logging.getLogger("carryme.worker")
 
     successful_cycles = 0
     failures = 0
@@ -172,7 +202,7 @@ async def run_polling_loop(
     saved_records = 0
 
     for attempt in range(1, iterations + 1):
-        logger_instance.info("starting poll cycle %s of %s", attempt, iterations)
+        loop_logger.info("starting poll cycle %s of %s", attempt, iterations)
         try:
             summary = await poll_watchlist_once(
                 settings,
@@ -182,7 +212,7 @@ async def run_polling_loop(
             successful_cycles += 1
             consecutive_failures = 0
             saved_records += summary.saved_records
-            logger_instance.info(
+            loop_logger.info(
                 "completed poll cycle %s of %s with %s saved records",
                 attempt,
                 iterations,
@@ -197,7 +227,7 @@ async def run_polling_loop(
                 settings.max_backoff_seconds,
                 settings.poll_interval_seconds * (2 ** (consecutive_failures - 1)),
             )
-            logger_instance.exception(
+            loop_logger.exception(
                 "poll cycle %s of %s failed; backing off for %s seconds",
                 attempt,
                 iterations,
@@ -215,11 +245,44 @@ async def run_polling_loop(
     )
 
 
+async def _sleep_or_stop(
+    seconds: float,
+    *,
+    sleep: Callable[[float], Awaitable[None]],
+    stop_event: asyncio.Event | None,
+) -> None:
+    """Sleep until the next cycle unless a stop signal arrives first."""
+
+    if stop_event is None:
+        await sleep(seconds)
+        return
+    if stop_event.is_set():
+        return
+
+    async def _await_sleep() -> None:
+        await sleep(seconds)
+
+    async def _await_stop() -> None:
+        await stop_event.wait()
+
+    sleep_task: asyncio.Task[None] = asyncio.create_task(_await_sleep())
+    stop_task: asyncio.Task[None] = asyncio.create_task(_await_stop())
+    done, pending = await asyncio.wait(
+        {sleep_task, stop_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    await asyncio.gather(*done, return_exceptions=True)
+
+
 async def run_supervised_polling_loop(
     settings: WorkerSettings,
     *,
     scorer: PairScorer | None = None,
     store: OpportunityHistoryStore | None = None,
+    alert_sink: CandidateAlertSink | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     logger: logging.Logger | None = None,
     stop_event: asyncio.Event | None = None,
@@ -232,6 +295,7 @@ async def run_supervised_polling_loop(
 
     runtime = scorer or OpportunityService()
     history_store = store or OpportunityHistoryStore(settings.database_path)
+    candidate_alert_sink = alert_sink or CandidateAlertStore(settings.database_path)
     loop_logger = logger or logging.getLogger("carryme.worker")
     supervised_stop_event = stop_event or asyncio.Event()
     attempts = 0
@@ -239,6 +303,7 @@ async def run_supervised_polling_loop(
     failures = 0
     consecutive_failures = 0
     saved_records = 0
+    alert_events = 0
 
     while not supervised_stop_event.is_set():
         attempts += 1
@@ -252,32 +317,54 @@ async def run_supervised_polling_loop(
             successful_cycles += 1
             consecutive_failures = 0
             saved_records += summary.saved_records
-            candidate_records = 0
-            if summary.saved_records > 0:
-                try:
-                    recent_records = history_store.list_recent(limit=summary.saved_records)
-                    candidate_summary = summarize_candidates(
-                        recent_records,
-                        min_one_day_net_edge_after_entry=settings.min_candidate_entry_edge,
-                        min_capacity_notional=settings.min_candidate_capacity_notional,
-                    )
-                    candidate_records = candidate_summary.candidate_records
-                except Exception:
-                    loop_logger.exception(
-                        "failed to summarize candidate records for supervised poll cycle %s",
-                        attempts,
-                    )
+
+            candidate_summary = CandidateRecordSummary(
+                total_records=0,
+                candidate_records=0,
+            )
+            inserted_alerts = 0
+            if summary.records:
+                candidate_records = filter_candidate_records(
+                    summary.records,
+                    min_one_day_net_edge_after_entry=settings.min_candidate_entry_edge,
+                    min_capacity_notional=settings.min_candidate_capacity_notional,
+                )
+                candidate_summary = CandidateRecordSummary(
+                    total_records=len(summary.records),
+                    candidate_records=len(candidate_records),
+                )
+                if candidate_records:
+                    try:
+                        inserted_alerts = emit_candidate_alerts(
+                            candidate_records,
+                            sink=candidate_alert_sink,
+                            emitted_at=summary.records[0].recorded_at,
+                            min_one_day_net_edge_after_entry=settings.min_candidate_entry_edge,
+                            min_capacity_notional=settings.min_candidate_capacity_notional,
+                        )
+                    except Exception:
+                        loop_logger.exception(
+                            "failed to persist candidate alerts for supervised poll cycle %s",
+                            attempts,
+                        )
+            alert_events += inserted_alerts
             loop_logger.info(
-                "completed supervised poll cycle %s with %s saved records and %s candidates",
+                (
+                    "completed supervised poll cycle %s with %s saved records, "
+                    "%s candidates, and %s alerts"
+                ),
                 attempts,
                 summary.saved_records,
-                candidate_records,
+                candidate_summary.candidate_records,
+                inserted_alerts,
             )
             if max_iterations is not None and attempts >= max_iterations:
                 break
-            if supervised_stop_event.is_set():
-                break
-            await sleep(settings.poll_interval_seconds)
+            await _sleep_or_stop(
+                settings.poll_interval_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
         except Exception:
             failures += 1
             consecutive_failures += 1
@@ -292,9 +379,11 @@ async def run_supervised_polling_loop(
             )
             if max_iterations is not None and attempts >= max_iterations:
                 break
-            if supervised_stop_event.is_set():
-                break
-            await sleep(backoff_seconds)
+            await _sleep_or_stop(
+                backoff_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
 
     return PollLoopSummary(
         attempts=attempts,
@@ -302,6 +391,7 @@ async def run_supervised_polling_loop(
         failures=failures,
         saved_records=saved_records,
         database_path=settings.database_path,
+        alert_events=alert_events,
     )
 
 

@@ -7,8 +7,15 @@ from typing import cast
 
 import httpx
 import pytest
-from carryme_api.app import app, get_history_store, get_opportunity_service
+from carryme_api.app import (
+    app,
+    get_candidate_alert_store,
+    get_history_store,
+    get_opportunity_service,
+    get_watchlist_store,
+)
 from carryme_models import (
+    CandidateAlertEvent,
     CapacityEstimate,
     FundingArbOpportunity,
     FundingPairSpec,
@@ -25,7 +32,7 @@ from carryme_runtime import (
     fetch_live_snapshot,
 )
 from carryme_runtime.opportunities import SnapshotFetcher
-from carryme_storage import OpportunityHistoryStore
+from carryme_storage import CandidateAlertStore, OpportunityHistoryStore, WatchlistStore
 from fastapi.testclient import TestClient
 
 
@@ -170,6 +177,143 @@ def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["pair"]["label"] == "strk_extended_hyperliquid"
+
+
+def test_watchlist_endpoint_reads_saved_pairs(tmp_path: Path) -> None:
+    store = WatchlistStore(tmp_path / "watchlist.json")
+    store.replace(
+        [
+            FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            )
+        ]
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_watchlist_store, lambda: store):
+        response = client.get("/v1/watchlist")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "pairs": [
+            {
+                "label": "strk_extended_hyperliquid",
+                "left_venue": "extended",
+                "left_symbol": "STRK-USD",
+                "left_fee_profile": "default",
+                "right_venue": "hyperliquid",
+                "right_symbol": "STRK",
+                "right_fee_profile": "tier0",
+            }
+        ]
+    }
+
+
+def test_watchlist_endpoint_returns_empty_when_file_is_missing(tmp_path: Path) -> None:
+    store = WatchlistStore(tmp_path / "missing-watchlist.json")
+
+    client = TestClient(app)
+    with _dependency_override(get_watchlist_store, lambda: store):
+        response = client.get("/v1/watchlist")
+
+    assert response.status_code == 200
+    assert response.json() == {"pairs": []}
+
+
+def test_watchlist_endpoint_replaces_pairs(tmp_path: Path) -> None:
+    store = WatchlistStore(tmp_path / "watchlist.json")
+
+    client = TestClient(app)
+    with _dependency_override(get_watchlist_store, lambda: store):
+        response = client.put(
+            "/v1/watchlist",
+            json={
+                "pairs": [
+                    {
+                        "label": "arb_extended_paradex",
+                        "left_venue": "extended",
+                        "left_symbol": "ARB-USD",
+                        "left_fee_profile": "default",
+                        "right_venue": "paradex",
+                        "right_symbol": "ARB-USD-PERP",
+                        "right_fee_profile": "pro",
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    assert store.load()[0].label == "arb_extended_paradex"
+
+
+def test_candidate_alerts_endpoint_reads_saved_events(tmp_path: Path) -> None:
+    store = CandidateAlertStore(tmp_path / "history.sqlite3")
+    inserted = store.append(
+        CandidateAlertEvent(
+            emitted_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+            min_one_day_net_edge_after_entry=0.0,
+            min_capacity_notional=2500.0,
+            record=OpportunityRecord(
+                recorded_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+                pair=FundingPairSpec(
+                    label="strk_extended_hyperliquid",
+                    left_venue="extended",
+                    left_symbol="STRK-USD",
+                    left_fee_profile="default",
+                    right_venue="hyperliquid",
+                    right_symbol="STRK",
+                    right_fee_profile="tier0",
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="STRK-USD-PERP",
+                    long_venue="hyperliquid",
+                    short_venue="extended",
+                    long_fee_profile="tier0",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.0005,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=0.0002,
+                    one_day_net_edge_after_round_trip=-0.0001,
+                    break_even_days_entry=0.6,
+                    break_even_days_round_trip=1.2,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=4000.0,
+                        long_ask_notional=3000.0,
+                        max_entry_notional=3000.0,
+                        limiting_venue="hyperliquid",
+                    ),
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_candidate_alert_store, lambda: store):
+        response = client.get("/v1/alerts/candidates")
+
+    assert inserted is True
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["record"]["pair"]["label"] == "strk_extended_hyperliquid"
+
+
+def test_candidate_alerts_endpoint_rejects_non_positive_limit(tmp_path: Path) -> None:
+    store = CandidateAlertStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_candidate_alert_store, lambda: store):
+        response = client.get("/v1/alerts/candidates", params={"limit": 0})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at least 1"
 
 
 def test_history_endpoint_rejects_non_positive_limit(tmp_path: Path) -> None:

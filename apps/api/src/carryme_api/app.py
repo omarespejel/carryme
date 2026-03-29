@@ -8,15 +8,17 @@ from typing import Annotated
 import httpx
 from carryme_models import (
     AppDescriptor,
+    CandidateAlertEvent,
     FundingArbOpportunity,
     OpportunityRecord,
     ServiceHealth,
     TradingFeeProfile,
+    WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
 from carryme_runtime import ConnectorError, OpportunityService, UpstreamDataError
-from carryme_storage import OpportunityHistoryStore
-from fastapi import Depends, FastAPI, HTTPException, Response
+from carryme_storage import CandidateAlertStore, OpportunityHistoryStore, WatchlistStore
+from fastapi import Body, Depends, FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
 
 from carryme_api.config import ApiSettings, get_api_settings
@@ -51,6 +53,20 @@ def _history_store_for_path(database_path: str) -> OpportunityHistoryStore:
     return OpportunityHistoryStore(database_path)
 
 
+@lru_cache
+def _candidate_alert_store_for_path(database_path: str) -> CandidateAlertStore:
+    """Return a shared candidate alert store for the configured SQLite path."""
+
+    return CandidateAlertStore(database_path)
+
+
+@lru_cache
+def _watchlist_store_for_path(watchlist_path: str) -> WatchlistStore:
+    """Return a shared watchlist store for the configured watchlist path."""
+
+    return WatchlistStore(watchlist_path)
+
+
 def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
@@ -63,6 +79,22 @@ def get_history_store(
     """Return the shared opportunity history store."""
 
     return _history_store_for_path(settings.database_path)
+
+
+def get_candidate_alert_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> CandidateAlertStore:
+    """Return the shared candidate alert store."""
+
+    return _candidate_alert_store_for_path(settings.database_path)
+
+
+def get_watchlist_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> WatchlistStore:
+    """Return the shared watchlist store."""
+
+    return _watchlist_store_for_path(settings.watchlist_path)
 
 
 def _validated_history_limit(name: str, value: int) -> int:
@@ -113,6 +145,23 @@ def create_app() -> FastAPI:
             return list_fee_profiles(venue)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/watchlist", response_model=WatchlistDocument)
+    def watchlist(
+        store: Annotated[WatchlistStore, Depends(get_watchlist_store)],
+    ) -> WatchlistDocument:
+        try:
+            pairs = store.load()
+        except FileNotFoundError:
+            pairs = []
+        return WatchlistDocument(pairs=pairs)
+
+    @app.put("/v1/watchlist", response_model=WatchlistDocument)
+    def replace_watchlist(
+        document: Annotated[WatchlistDocument, Body(...)],
+        store: Annotated[WatchlistStore, Depends(get_watchlist_store)],
+    ) -> WatchlistDocument:
+        return WatchlistDocument(pairs=store.replace(document.pairs))
 
     @app.get("/v1/history/funding-pairs", response_model=list[OpportunityRecord])
     def history(
@@ -178,6 +227,18 @@ def create_app() -> FastAPI:
             min_capacity_notional=min_capacity_notional,
         )
         return rank_history_records(candidates, limit=limit)
+
+    @app.get("/v1/alerts/candidates", response_model=list[CandidateAlertEvent])
+    def candidate_alerts(
+        store: Annotated[CandidateAlertStore, Depends(get_candidate_alert_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[CandidateAlertEvent]:
+        limit = _validated_history_limit("limit", limit)
+        try:
+            return store.list_recent(limit=limit, label=label)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(

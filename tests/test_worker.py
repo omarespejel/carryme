@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 from carryme_models import (
+    CandidateAlertEvent,
     CapacityEstimate,
     FundingArbOpportunity,
     FundingPairSpec,
@@ -129,6 +130,7 @@ def test_worker_loop_payload() -> None:
         "successful_cycles": 2,
         "failures": 1,
         "saved_records": 2,
+        "alert_events": 0,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -866,6 +868,7 @@ def test_run_supervised_polling_loop_honors_max_iterations(tmp_path: Path) -> No
     assert summary.successful_cycles == 2
     assert summary.failures == 0
     assert summary.saved_records == 2
+    assert summary.alert_events == 2
     assert sleeps == [2.0]
 
 
@@ -922,6 +925,159 @@ def test_run_supervised_polling_loop_skips_candidate_lookup_when_cycle_saves_not
     assert summary.successful_cycles == 1
     assert summary.failures == 0
     assert summary.saved_records == 0
+    assert summary.alert_events == 0
+
+
+def test_run_supervised_polling_loop_emits_candidate_alert_events(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        """
+        {
+          "pairs": [
+            {
+              "label": "strk_extended_hyperliquid",
+              "left_venue": "extended",
+              "left_symbol": "STRK-USD",
+              "left_fee_profile": "default",
+              "right_venue": "hyperliquid",
+              "right_symbol": "STRK",
+              "right_fee_profile": "tier0"
+            }
+          ]
+        }
+        """
+    )
+
+    class StableScorer:
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            return FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            )
+
+    emitted: list[CandidateAlertEvent] = []
+
+    class StubAlertSink:
+        def append(self, event: CandidateAlertEvent) -> bool:
+            emitted.append(event)
+            return True
+
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        min_candidate_entry_edge=0.0,
+        min_candidate_capacity_notional=2500.0,
+    )
+
+    summary = asyncio.run(
+        run_supervised_polling_loop(
+            settings,
+            scorer=StableScorer(),
+            store=OpportunityHistoryStore(settings.database_path),
+            alert_sink=StubAlertSink(),
+            max_iterations=1,
+        )
+    )
+
+    assert summary.attempts == 1
+    assert summary.successful_cycles == 1
+    assert summary.failures == 0
+    assert summary.saved_records == 1
+    assert summary.alert_events == 1
+    assert len(emitted) == 1
+    assert emitted[0].record.pair.label == "strk_extended_hyperliquid"
+
+
+def test_run_supervised_polling_loop_tolerates_alert_sink_failures(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        """
+        {
+          "pairs": [
+            {
+              "label": "strk_extended_hyperliquid",
+              "left_venue": "extended",
+              "left_symbol": "STRK-USD",
+              "left_fee_profile": "default",
+              "right_venue": "hyperliquid",
+              "right_symbol": "STRK",
+              "right_fee_profile": "tier0"
+            }
+          ]
+        }
+        """
+    )
+
+    class StableScorer:
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            return FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            )
+
+    class FailingAlertSink:
+        def append(self, event: CandidateAlertEvent) -> bool:
+            raise RuntimeError("alert sink unavailable")
+
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        min_candidate_entry_edge=0.0,
+        min_candidate_capacity_notional=2500.0,
+    )
+
+    with caplog.at_level("ERROR"):
+        summary = asyncio.run(
+            run_supervised_polling_loop(
+                settings,
+                scorer=StableScorer(),
+                store=OpportunityHistoryStore(settings.database_path),
+                alert_sink=FailingAlertSink(),
+                max_iterations=1,
+            )
+        )
+
+    assert summary.attempts == 1
+    assert summary.successful_cycles == 1
+    assert summary.failures == 0
+    assert summary.saved_records == 1
+    assert summary.alert_events == 0
+    assert "failed to persist candidate alerts" in caplog.text
 
 
 def test_run_supervised_polling_loop_resets_backoff_after_success(tmp_path: Path) -> None:
@@ -1058,6 +1214,7 @@ def test_worker_main_prints_supervised_summary_as_json(
             failures=1,
             saved_records=1,
             database_path=settings.database_path,
+            alert_events=0,
         )
 
     monkeypatch.setattr("carryme_worker.main.WorkerSettings", lambda: settings)
@@ -1073,5 +1230,6 @@ def test_worker_main_prints_supervised_summary_as_json(
         "successful_cycles": 1,
         "failures": 1,
         "saved_records": 1,
+        "alert_events": 0,
         "database_path": settings.database_path,
     }
