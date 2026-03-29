@@ -54,6 +54,8 @@ class ExecutionJournalStore:
         if entry.executed_at.tzinfo is None or entry.executed_at.utcoffset() is None:
             raise ValueError("executed_at must be timezone-aware")
         normalized_label = entry.paper_trade.intent.label.strip()
+        if not normalized_label:
+            raise ValueError("label must be non-empty")
         normalized_paper_trade = entry.paper_trade.model_copy(
             update={
                 "intent": entry.paper_trade.intent.model_copy(
