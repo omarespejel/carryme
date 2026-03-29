@@ -1,5 +1,6 @@
 """Shared models for the carryme workspace."""
 
+from carryme_models.execution import ExecutionJournalEntry, ExecutionLegResult
 from carryme_models.health import AppDescriptor, ServiceHealth
 from carryme_models.history import (
     CandidateAlertEvent,
@@ -21,6 +22,8 @@ __all__ = [
     "AppDescriptor",
     "CapacityEstimate",
     "CandidateAlertEvent",
+    "ExecutionJournalEntry",
+    "ExecutionLegResult",
     "FundingPairSpec",
     "FundingRateNormalization",
     "FundingArbOpportunity",

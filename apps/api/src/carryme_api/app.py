@@ -10,6 +10,7 @@ import httpx
 from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
+    ExecutionJournalEntry,
     FundingArbOpportunity,
     FundingPairTradeIntent,
     OpportunityRecord,
@@ -21,13 +22,16 @@ from carryme_models import (
 from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
     ConnectorError,
+    ExecutionAdapter,
     InvalidTradeCandidateError,
+    MockExecutionAdapter,
     OpportunityService,
     UpstreamDataError,
     build_trade_intent,
 )
 from carryme_storage import (
     CandidateAlertStore,
+    ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     WatchlistStore,
@@ -86,6 +90,13 @@ def _paper_trade_store_for_path(database_path: str) -> PaperTradeStore:
     """Return a shared paper trade journal wrapper for the configured SQLite path."""
 
     return PaperTradeStore(database_path)
+
+
+@lru_cache
+def _execution_journal_store_for_path(database_path: str) -> ExecutionJournalStore:
+    """Return a shared execution journal store for the configured SQLite path."""
+
+    return ExecutionJournalStore(database_path)
 
 
 def get_opportunity_service() -> OpportunityService:
@@ -167,6 +178,27 @@ def _validated_fraction(name: str, value: float) -> float:
     if value <= 0 or value > 1:
         raise HTTPException(status_code=400, detail=f"{name} must be within (0, 1]")
     return value
+
+
+def get_execution_journal_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExecutionJournalStore:
+    """Return the shared execution journal store."""
+
+    return _execution_journal_store_for_path(settings.database_path)
+
+
+# TODO: wire this provider to the future live execution adapter surface.
+def get_execution_adapter() -> ExecutionAdapter:
+    """Return the default explicitly simulated execution adapter."""
+
+    return MockExecutionAdapter()
+
+
+def get_mock_execution_adapter() -> MockExecutionAdapter:
+    """Return the adapter allowed for mock execution journal submissions."""
+
+    return MockExecutionAdapter()
 
 
 def _select_trade_intent_records(
@@ -478,8 +510,38 @@ def create_app() -> FastAPI:
             intent=intents[0],
             note=note,
         )
-        paper_store.append(entry)
-        return entry
+        return paper_store.append(entry)
+
+    @app.get("/v1/executions", response_model=list[ExecutionJournalEntry])
+    def executions(
+        store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[ExecutionJournalEntry]:
+        limit = _validated_history_limit("limit", limit)
+        try:
+            return store.list_recent(limit=limit, label=label)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post(
+        "/v1/executions/mock/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionJournalEntry,
+    )
+    def execute_saved_paper_trade(
+        paper_trade_id: int,
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        adapter: Annotated[MockExecutionAdapter, Depends(get_mock_execution_adapter)],
+    ) -> ExecutionJournalEntry:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        journal_entry = adapter.submit(paper_trade)
+        return execution_store.append(journal_entry)
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(

@@ -10,6 +10,8 @@ import pytest
 from carryme_api.app import (
     app,
     get_candidate_alert_store,
+    get_execution_adapter,
+    get_execution_journal_store,
     get_history_store,
     get_opportunity_service,
     get_paper_trade_store,
@@ -18,6 +20,8 @@ from carryme_api.app import (
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
+    ExecutionJournalEntry,
+    ExecutionLegResult,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -38,6 +42,7 @@ from carryme_runtime import (
 from carryme_runtime.opportunities import SnapshotFetcher
 from carryme_storage import (
     CandidateAlertStore,
+    ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     WatchlistStore,
@@ -1406,6 +1411,222 @@ def test_paper_trades_endpoint_rejects_invalid_limit(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "limit must be at least 1"
+
+
+def test_mock_execution_endpoint_submits_saved_paper_trade(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
+        get_execution_journal_store, lambda: execution_store
+    ):
+        response = client.post(
+            f"/v1/executions/mock/from-paper-trade/{paper_trade.entry_id}"
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["adapter"] == "mock"
+    assert len(execution_store.list_recent(limit=10)) == 1
+
+
+def test_mock_execution_endpoint_returns_404_for_missing_paper_trade(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
+        get_execution_journal_store, lambda: execution_store
+    ):
+        response = client.post("/v1/executions/mock/from-paper-trade/999999")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Paper trade 999999 was not found"
+    assert execution_store.list_recent(limit=10) == []
+
+
+def test_mock_execution_endpoint_ignores_generic_execution_adapter_override(
+    tmp_path: Path,
+) -> None:
+    class FailingAdapter:
+        def submit(self, *_: object, **__: object) -> ExecutionJournalEntry:
+            raise AssertionError("generic execution adapter should not be used")
+
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
+        get_execution_journal_store, lambda: execution_store
+    ), _dependency_override(get_execution_adapter, lambda: FailingAdapter()):
+        response = client.post(
+            f"/v1/executions/mock/from-paper-trade/{paper_trade.entry_id}"
+        )
+
+    assert response.status_code == 200
+    assert execution_store.list_recent(limit=10)[0].paper_trade_id == paper_trade.entry_id
+
+
+def test_executions_endpoint_lists_saved_entries(tmp_path: Path) -> None:
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="mock",
+            mode="mock",
+            status="accepted",
+            paper_trade_id=7,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    status="accepted",
+                    simulated=True,
+                    external_reference="mock:7:buy",
+                ),
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                    status="accepted",
+                    simulated=True,
+                    external_reference="mock:7:sell",
+                ),
+            ],
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_execution_journal_store, lambda: execution_store):
+        response = client.get("/v1/executions")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["paper_trade_id"] == 7
+
+
+def test_executions_endpoint_rejects_invalid_limit(tmp_path: Path) -> None:
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_execution_journal_store, lambda: execution_store):
+        response = client.get("/v1/executions", params={"limit": 0})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at least 1"
+
+
+def test_executions_endpoint_rejects_limit_above_history_cap(tmp_path: Path) -> None:
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_execution_journal_store, lambda: execution_store):
+        response = client.get("/v1/executions", params={"limit": 1001})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at most 1000"
 
 
 def test_funding_pair_endpoint_uses_service_dependency() -> None:
