@@ -7,6 +7,36 @@ from html import escape
 from carryme_models import OpportunityRecord
 
 
+def filter_candidate_records(
+    records: list[OpportunityRecord],
+    *,
+    min_one_day_net_edge_after_entry: float | None = None,
+    min_capacity_notional: float | None = None,
+) -> list[OpportunityRecord]:
+    """Keep only records that satisfy the requested candidate thresholds."""
+
+    selected: list[OpportunityRecord] = []
+    for record in records:
+        if (
+            min_one_day_net_edge_after_entry is not None
+            and record.opportunity.one_day_net_edge_after_entry < min_one_day_net_edge_after_entry
+        ):
+            continue
+
+        capacity = (
+            record.opportunity.capacity.max_entry_notional
+            if record.opportunity.capacity is not None
+            else None
+        )
+        if min_capacity_notional is not None and (
+            capacity is None or capacity < min_capacity_notional
+        ):
+            continue
+
+        selected.append(record)
+    return selected
+
+
 def _record_identity_key(record: OpportunityRecord) -> str:
     """Build a stable identity key for configured pairs."""
 
@@ -157,26 +187,114 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
         ]
     )
 
+    return _render_dashboard_document(
+        html_title="carryme dashboard",
+        heading="carryme operator view",
+        subtitle=subtitle,
+        stats_markup=stats_markup,
+        rows=rows,
+        background="radial-gradient(circle at top left, #fff7dd, #f6f4ed)",
+        bg="#f6f4ed",
+        panel="#fffdf8",
+        ink="#1a1f16",
+        muted="#647066",
+        border="#d7d2c5",
+    )
+
+
+def render_candidate_dashboard(
+    records: list[OpportunityRecord],
+    *,
+    min_one_day_net_edge_after_entry: float | None,
+    min_capacity_notional: float | None,
+) -> str:
+    """Render a filtered dashboard focused on candidate opportunities."""
+
+    latest = latest_records_by_label(records, limit=200)
+    candidates = filter_candidate_records(
+        latest,
+        min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+        min_capacity_notional=min_capacity_notional,
+    )
+    ranked = rank_history_records(candidates, limit=20)
+    rows = "\n".join(_render_row(record) for record in ranked)
+    if not rows:
+        rows = (
+            '<tr><td colspan="8">No candidate opportunities match the current thresholds.</td></tr>'
+        )
+
+    subtitle = (
+        "Filtered candidates from the latest saved row per label using explicit "
+        "minimum one-day entry edge and capacity thresholds."
+    )
+    stats_markup = "\n".join(
+        [
+            _render_stat_card("Candidates", str(len(candidates))),
+            _render_stat_card(
+                "Min Entry Edge",
+                (
+                    "-"
+                    if min_one_day_net_edge_after_entry is None
+                    else f"{min_one_day_net_edge_after_entry:.6f}"
+                ),
+            ),
+            _render_stat_card(
+                "Min Capacity",
+                "-" if min_capacity_notional is None else f"{min_capacity_notional:.2f}",
+            ),
+        ]
+    )
+
+    return _render_dashboard_document(
+        html_title="carryme candidates",
+        heading="carryme candidate view",
+        subtitle=subtitle,
+        stats_markup=stats_markup,
+        rows=rows,
+        background="linear-gradient(135deg, #f7fce6, #eff4ef)",
+        bg="#eff4ef",
+        panel="#fefef9",
+        ink="#0f1720",
+        muted="#5e6e60",
+        border="#c9d6c8",
+    )
+
+
+def _render_dashboard_document(
+    *,
+    html_title: str,
+    heading: str,
+    subtitle: str,
+    stats_markup: str,
+    rows: str,
+    background: str,
+    bg: str,
+    panel: str,
+    ink: str,
+    muted: str,
+    border: str,
+) -> str:
+    """Render a themed HTML dashboard document."""
+
     return f"""<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>carryme dashboard</title>
+    <title>{html_title}</title>
     <style>
       :root {{
         color-scheme: light;
-        --bg: #f6f4ed;
-        --panel: #fffdf8;
-        --ink: #1a1f16;
-        --muted: #647066;
-        --accent: #0f766e;
-        --border: #d7d2c5;
+        --bg: {bg};
+        --panel: {panel};
+        --ink: {ink};
+        --muted: {muted};
+        --border: {border};
       }}
       body {{
         margin: 0;
         font-family: "Iowan Old Style", "Palatino Linotype", serif;
-        background: radial-gradient(circle at top left, #fff7dd, var(--bg));
+        background: {background};
         color: var(--ink);
       }}
       main {{
@@ -241,7 +359,7 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
   </head>
   <body>
     <main>
-      <h1>carryme operator view</h1>
+      <h1>{heading}</h1>
       <p>{subtitle}</p>
       <section class="stats">
         {stats_markup}

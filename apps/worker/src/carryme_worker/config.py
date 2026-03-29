@@ -17,6 +17,9 @@ class WorkerSettings(BaseSettings):
     poll_interval_seconds: int = Field(default=30, gt=0)
     max_backoff_seconds: int = Field(default=300, gt=0)
     score_timeout_seconds: float = Field(default=30.0, gt=0)
+    min_candidate_entry_edge: float = Field(default=0.0, ge=0)
+    min_candidate_capacity_notional: float = Field(default=0.0, ge=0)
+    stop_signals: tuple[Literal["SIGINT", "SIGTERM"], ...] = ("SIGINT", "SIGTERM")
     database_path: str = "data/carryme.sqlite3"
     watchlist_path: str = "config/watchlists/default.json"
 
