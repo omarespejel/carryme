@@ -7,7 +7,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Literal, NamedTuple
 
 from carryme_models import (
@@ -61,6 +61,17 @@ _VENUE_ORDER_SPECS: dict[str, VenueOrderSpec] = {
         ),
     ),
 }
+
+
+@dataclass(frozen=True)
+class OrderConstraints:
+    """Venue-specific constraints used to make previews executable."""
+
+    quantity_increment: Decimal | None = None
+    minimum_order_size: Decimal | None = None
+    minimum_notional: Decimal | None = None
+    price_increment: Decimal | None = None
+    max_order_value: Decimal | None = None
 
 
 @dataclass
@@ -162,8 +173,31 @@ def _build_leg_preview(
         )
 
     reference = Decimal(str(reference_price))
-    quantity = Decimal(str(target_notional)) / reference
-    worst_price = reference * multiplier
+    constraints = _extract_order_constraints(venue_key, snapshot)
+    raw_quantity = Decimal(str(target_notional)) / reference
+    quantity = _snap_quantity(raw_quantity, constraints.quantity_increment)
+    if quantity <= 0:
+        raise ValueError(f"Venue {venue} snapped quantity to zero for {symbol}")
+    if constraints.minimum_order_size is not None and quantity < constraints.minimum_order_size:
+        raise ValueError(
+            f"Venue {venue} preview quantity for {symbol} fell below minimum order size"
+        )
+
+    raw_worst_price = reference * multiplier
+    worst_price = _snap_price(
+        raw_worst_price,
+        constraints.price_increment,
+        side=side,
+    )
+    effective_notional = quantity * reference
+    limit_order_value = quantity * worst_price
+    if (
+        constraints.minimum_notional is not None
+        and effective_notional < constraints.minimum_notional
+    ):
+        raise ValueError(f"Venue {venue} preview notional for {symbol} fell below minimum notional")
+    if constraints.max_order_value is not None and limit_order_value > constraints.max_order_value:
+        raise ValueError(f"Venue {venue} preview notional for {symbol} exceeded max order value")
 
     quantity_text = _format_decimal(quantity)
     worst_price_text = _format_decimal(worst_price)
@@ -184,17 +218,29 @@ def _build_leg_preview(
         fee_profile=fee_profile,
         side=side,
         target_notional=target_notional,
+        effective_notional=float(effective_notional),
         quantity=float(quantity),
         quantity_text=quantity_text,
+        quantity_increment=_to_float(constraints.quantity_increment),
+        minimum_order_size=_to_float(constraints.minimum_order_size),
+        minimum_notional=_to_float(constraints.minimum_notional),
         reference_price=float(reference),
         reference_price_source=reference_price_source,
         worst_acceptable_price=float(worst_price),
         worst_price_text=worst_price_text,
+        price_increment=_to_float(constraints.price_increment),
+        max_order_value=_to_float(constraints.max_order_value),
         endpoint_path_hint=spec.endpoint_path_hint,
         required_auth_env_vars=list(spec.required_auth_env_vars),
         auth_scheme=spec.auth_scheme,
         payload=payload,
-        notes=list(spec.notes),
+        notes=[
+            *spec.notes,
+            (
+                "Preview quantity and limit price were snapped to the venue's public "
+                "order-size and price increments."
+            ),
+        ],
     )
 
 
@@ -240,6 +286,78 @@ def _format_decimal(value: Decimal, places: int = 8) -> str:
 
 def _bps_decimal(value: int) -> Decimal:
     return Decimal(value) / Decimal(10_000)
+
+
+def _extract_order_constraints(
+    venue: str,
+    snapshot: NormalizedMarketSnapshot,
+) -> OrderConstraints:
+    raw = snapshot.market.raw
+    mark_price = Decimal(str(snapshot.market.mark_price)) if snapshot.market.mark_price else None
+    if venue == "paradex":
+        max_order_size = _raw_decimal(raw, "max_order_size")
+        return OrderConstraints(
+            quantity_increment=_raw_decimal(raw, "order_size_increment"),
+            minimum_order_size=_raw_decimal(raw, "order_size_increment"),
+            minimum_notional=_raw_decimal(raw, "min_notional"),
+            price_increment=_raw_decimal(raw, "price_tick_size"),
+            max_order_value=max_order_size * mark_price
+            if max_order_size is not None and mark_price is not None
+            else None,
+        )
+    if venue == "extended":
+        trading_config = raw.get("tradingConfig", {})
+        if not isinstance(trading_config, dict):
+            trading_config = {}
+        minimum_order_size = _dict_decimal(trading_config, "minOrderSize")
+        return OrderConstraints(
+            quantity_increment=_dict_decimal(trading_config, "minOrderSizeChange"),
+            minimum_order_size=minimum_order_size,
+            minimum_notional=minimum_order_size * mark_price
+            if minimum_order_size is not None and mark_price is not None
+            else None,
+            price_increment=_dict_decimal(trading_config, "minPriceChange"),
+            max_order_value=_dict_decimal(trading_config, "maxLimitOrderValue"),
+        )
+    return OrderConstraints()
+
+
+def _raw_decimal(raw: dict[str, object], key: str) -> Decimal | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    return Decimal(str(value))
+
+
+def _dict_decimal(raw: dict[str, object], key: str) -> Decimal | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    return Decimal(str(value))
+
+
+def _snap_quantity(value: Decimal, increment: Decimal | None) -> Decimal:
+    if increment is None or increment <= 0:
+        return value
+    units = (value / increment).to_integral_value(rounding=ROUND_FLOOR)
+    return units * increment
+
+
+def _snap_price(
+    value: Decimal,
+    increment: Decimal | None,
+    *,
+    side: Literal["buy", "sell"],
+) -> Decimal:
+    if increment is None or increment <= 0:
+        return value
+    rounding = ROUND_CEILING if side == "buy" else ROUND_FLOOR
+    units = (value / increment).to_integral_value(rounding=rounding)
+    return units * increment
+
+
+def _to_float(value: Decimal | None) -> float | None:
+    return float(value) if value is not None else None
 
 
 def _preview_hash(

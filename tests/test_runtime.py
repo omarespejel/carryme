@@ -55,6 +55,8 @@ def _snapshot(
     bid_size: float,
     ask_price: float,
     ask_size: float,
+    *,
+    raw: dict[str, object] | None = None,
 ) -> NormalizedMarketSnapshot:
     return normalize_market_snapshot(
         venue,
@@ -71,6 +73,7 @@ def _snapshot(
                 best_ask_price=ask_price,
                 best_ask_size=ask_size,
             ),
+            raw=raw or {},
         ),
     )
 
@@ -497,10 +500,36 @@ def test_order_preview_service_builds_per_venue_templates() -> None:
 
     snapshots = {
         ("extended", "ARB-USD"): _snapshot(
-            "extended", "ARB-USD", 0.0002, 0.0919, 30_000, 0.0921, 25_000
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
         ),
         ("paradex", "ARB-USD-PERP"): _snapshot(
-            "paradex", "ARB-USD-PERP", -0.0004, 0.0918, 20_000, 0.0922, 18_000
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
         ),
     }
 
@@ -527,22 +556,113 @@ def test_order_preview_service_builds_per_venue_templates() -> None:
 
         assert paradex.side == "buy"
         assert paradex.reference_price == pytest.approx(0.0922)
-        assert paradex.worst_acceptable_price == pytest.approx(0.0922922)
-        assert paradex.quantity == pytest.approx(1000.0 / 0.0922)
+        assert paradex.worst_acceptable_price == pytest.approx(0.0923)
+        assert paradex.quantity == pytest.approx(10845.9)
+        assert paradex.effective_notional == pytest.approx(999.99198)
+        assert paradex.quantity_increment == pytest.approx(0.1)
+        assert paradex.price_increment == pytest.approx(0.0001)
         assert paradex.time_in_force == "ioc"
         assert paradex.http_method == "POST"
         assert paradex.endpoint_path_hint == "/v1/orders"
         assert paradex.payload["market"] == "ARB-USD-PERP"
         assert paradex.payload["side"] == "BUY"
+        assert paradex.payload["size"] == "10845.90000000"
+        assert paradex.payload["price"] == "0.09230000"
 
         assert extended.side == "sell"
         assert extended.reference_price == pytest.approx(0.0919)
-        assert extended.worst_acceptable_price == pytest.approx(0.0918081)
-        assert extended.quantity == pytest.approx(1000.0 / 0.0919)
+        assert extended.worst_acceptable_price == pytest.approx(0.0918)
+        assert extended.quantity == pytest.approx(10881.0)
+        assert extended.effective_notional == pytest.approx(999.9639)
+        assert extended.quantity_increment == pytest.approx(1.0)
+        assert extended.price_increment == pytest.approx(0.0001)
         assert extended.time_in_force == "ioc"
         assert extended.http_method == "POST"
         assert extended.payload["symbol"] == "ARB-USD"
         assert extended.payload["side"] == "SELL"
+        assert extended.payload["size"] == "10881.00000000"
+        assert extended.payload["price"] == "0.09180000"
+
+    asyncio.run(run())
+
+
+def test_order_preview_service_rejects_preview_below_venue_minimum_notional() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=9,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="tiny_paradex_leg",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0008,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=5.0,
+            capacity_fraction=0.25,
+            max_target_notional=5.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=5.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=5.0,
+            ),
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0919,
+            30_000,
+            0.0921,
+            25_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                }
+            },
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0004,
+            0.0918,
+            20_000,
+            0.0922,
+            18_000,
+            raw={
+                "price_tick_size": "0.0001",
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "max_order_size": "12000000",
+            },
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        with pytest.raises(ValueError, match="minimum notional"):
+            await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+                paper_trade,
+                slippage_tolerance_bps=10,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            )
 
     asyncio.run(run())
 

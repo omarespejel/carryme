@@ -23,17 +23,28 @@ async def _run_with_client(
 
 def test_extended_connector_parses_stats_and_top_of_book() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/stats"):
+        if request.url.path == "/api/v1/info/markets":
             return httpx.Response(
                 200,
                 json={
                     "status": "OK",
-                    "data": {
-                        "markPrice": "0.03448",
-                        "fundingRate": "0.000013",
-                        "openInterest": "280337.789214",
-                        "dailyVolume": "157165.809800",
-                    },
+                    "data": [
+                        {
+                            "name": "STRK-USD",
+                            "tradingConfig": {
+                                "minOrderSize": "10",
+                                "minOrderSizeChange": "1",
+                                "minPriceChange": "0.00001",
+                                "maxLimitOrderValue": "1250000",
+                            },
+                            "marketStats": {
+                                "markPrice": "0.03448",
+                                "fundingRate": "0.000013",
+                                "openInterest": "280337.789214",
+                                "dailyVolume": "157165.809800",
+                            },
+                        }
+                    ],
                 },
             )
         return httpx.Response(
@@ -58,6 +69,7 @@ def test_extended_connector_parses_stats_and_top_of_book() -> None:
         assert stats.funding_rate == 0.000013
         assert stats.open_interest == 280337.789214
         assert stats.daily_volume == 157165.8098
+        assert stats.raw["tradingConfig"]["minOrderSizeChange"] == "1"
         assert book.best_bid_price == 0.03448
         assert book.best_bid_size == 117410.0
         assert book.best_ask_price == 0.03449
@@ -83,6 +95,21 @@ def test_paradex_connector_parses_stats_and_top_of_book() -> None:
                     ]
                 },
             )
+        if request.url.path == "/v1/markets":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "symbol": "ARB-USD-PERP",
+                            "price_tick_size": "0.0001",
+                            "order_size_increment": "0.1",
+                            "min_notional": "10",
+                            "max_order_size": "12000000",
+                        }
+                    ]
+                },
+            )
         return httpx.Response(
             200,
             json={
@@ -104,6 +131,8 @@ def test_paradex_connector_parses_stats_and_top_of_book() -> None:
         assert stats.funding_rate == -0.00041270496476
         assert stats.open_interest == 1351727.4
         assert stats.daily_volume == 22989.54947000001
+        assert stats.raw["price_tick_size"] == "0.0001"
+        assert stats.raw["config"]["order_size_increment"] == "0.1"
         assert book.best_bid_price == 0.0913
         assert book.best_bid_size == 42584.8
         assert book.best_ask_price == 0.0919

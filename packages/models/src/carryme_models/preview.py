@@ -14,12 +14,18 @@ class VenueOrderPreview(BaseModel):
     fee_profile: str = Field(min_length=1)
     side: Literal["buy", "sell"]
     target_notional: float = Field(gt=0)
+    effective_notional: float | None = Field(default=None, gt=0)
     quantity: float = Field(gt=0)
     quantity_text: str = Field(min_length=1)
+    quantity_increment: float | None = Field(default=None, gt=0)
+    minimum_order_size: float | None = Field(default=None, gt=0)
+    minimum_notional: float | None = Field(default=None, gt=0)
     reference_price: float = Field(gt=0)
     reference_price_source: Literal["best_bid", "best_ask"]
     worst_acceptable_price: float = Field(gt=0)
     worst_price_text: str = Field(min_length=1)
+    price_increment: float | None = Field(default=None, gt=0)
+    max_order_value: float | None = Field(default=None, gt=0)
     order_type: Literal["limit"] = "limit"
     time_in_force: Literal["ioc"] = "ioc"
     post_only: bool = False

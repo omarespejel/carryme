@@ -19,19 +19,23 @@ class ExtendedPublicConnector(BaseHttpConnector):
         super().__init__(client)
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
-        payload = await self._request_json("GET", f"/api/v1/info/markets/{symbol}/stats")
+        payload = await self._request_json("GET", "/api/v1/info/markets", params={"market": symbol})
         if not isinstance(payload, dict):
-            raise ConnectorError("Extended market stats payload must be an object")
-        data = payload.get("data", {})
-        if not isinstance(data, dict):
-            raise ConnectorError("Extended market stats missing data object")
+            raise ConnectorError("Extended market metadata payload must be an object")
+        rows = payload.get("data", [])
+        if not isinstance(rows, list):
+            raise ConnectorError("Extended market metadata missing data list")
+        data = _find_market(rows, symbol)
+        market_stats = data.get("marketStats", {})
+        if not isinstance(market_stats, dict):
+            raise ConnectorError("Extended market metadata missing marketStats object")
         return MarketStats(
             venue=self.venue,
             symbol=symbol,
-            mark_price=parse_float(data.get("markPrice")),
-            funding_rate=parse_float(data.get("fundingRate")),
-            open_interest=parse_float(data.get("openInterest")),
-            daily_volume=parse_float(data.get("dailyVolume")),
+            mark_price=parse_float(market_stats.get("markPrice")),
+            funding_rate=parse_float(market_stats.get("fundingRate")),
+            open_interest=parse_float(market_stats.get("openInterest")),
+            daily_volume=parse_float(market_stats.get("dailyVolume")),
             raw=data,
         )
 
@@ -58,3 +62,12 @@ def _first_level(value: Any) -> dict[str, Any] | None:
         if isinstance(item, dict):
             return item
     return None
+
+
+def _find_market(rows: Any, symbol: str) -> dict[str, Any]:
+    if not isinstance(rows, list):
+        raise ConnectorError("Extended market data must be a list")
+    for row in rows:
+        if isinstance(row, dict) and row.get("name") == symbol:
+            return row
+    raise ConnectorError(f"Extended market {symbol} not found")
