@@ -129,10 +129,15 @@ class ParadexLiveExecutionService:
     ) -> ExecutionJournalEntry:
         timestamp = executed_at or datetime.now(UTC)
         request_timeout = httpx.Timeout(15.0, connect=5.0)
+        auth_usage = _paradex_auth_usage_for_fee_profile(leg.fee_profile)
+        token_provider = _token_provider_for_auth_usage(
+            default_provider=self.token_provider,
+            auth_usage=auth_usage,
+        )
 
         async with httpx.AsyncClient(base_url=self.base_url, timeout=request_timeout) as client:
-            system_config = await self.token_provider.fetch_system_config(client)
-            jwt_token = await self.token_provider.issue_jwt_token(
+            system_config = await token_provider.fetch_system_config(client)
+            jwt_token = await token_provider.issue_jwt_token(
                 account_address=self.account_address,
                 private_key=self.private_key,
                 client=client,
@@ -212,6 +217,7 @@ class ParadexLiveExecutionService:
                     target_notional=leg.target_notional,
                     status=leg_status,
                     simulated=False,
+                    auth_usage=auth_usage,
                     external_reference=external_reference,
                     request_payload=signed_payload,
                     response_payload=response_payload,
@@ -389,6 +395,23 @@ def _pick_external_reference(
     if isinstance(client_id, str) and client_id:
         return client_id
     return None
+
+
+def _paradex_auth_usage_for_fee_profile(fee_profile: str) -> str | None:
+    normalized = fee_profile.strip().lower()
+    if normalized == "retail":
+        return "interactive"
+    return None
+
+
+def _token_provider_for_auth_usage(
+    *,
+    default_provider: ParadexLiveTokenProvider,
+    auth_usage: str | None,
+) -> ParadexLiveTokenProvider:
+    if auth_usage == "interactive":
+        return ParadexJwtTokenProvider(token_usage="interactive")
+    return default_provider
 
 
 def _coerce_int(value: Any) -> int | None:

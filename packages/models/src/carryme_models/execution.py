@@ -18,6 +18,7 @@ class ExecutionLegResult(BaseModel):
     target_notional: float = Field(gt=0)
     status: Literal["accepted", "rejected", "submitted"]
     simulated: bool = True
+    auth_usage: str | None = None
     external_reference: str | None = None
     request_payload: Any | None = None
     response_payload: Any | None = None
