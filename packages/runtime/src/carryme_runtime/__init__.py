@@ -48,6 +48,7 @@ from carryme_runtime.preflight import (
     build_venue_execution_preflights,
 )
 from carryme_runtime.readiness import build_live_submission_readiness
+from carryme_runtime.route_stability import RouteStabilityService
 from carryme_runtime.universe import (
     OpportunityUniverseService,
     build_opportunity_record_from_universe_opportunity,
@@ -98,6 +99,7 @@ __all__ = [
     "OpportunityService",
     "UpstreamDataError",
     "OpportunityUniverseService",
+    "RouteStabilityService",
     "build_opportunity_record_from_universe_opportunity",
     "build_pair_spec_from_universe_opportunity",
     "fetch_live_snapshot",

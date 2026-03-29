@@ -37,6 +37,7 @@ from carryme_models import (
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
+    RouteStabilitySummary,
     ServiceHealth,
     TradingFeeProfile,
     VenueAccountPreflight,
@@ -70,6 +71,7 @@ from carryme_runtime import (
     ParadexCleanupPreviewService,
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
+    RouteStabilityService,
     UpstreamDataError,
     build_account_preflight_configs,
     build_execution_pair_status,
@@ -230,7 +232,10 @@ def _opportunity_universe_service_for_path(database_path: str) -> OpportunityUni
     """Return the live funding-universe discovery and ranking service."""
 
     return OpportunityUniverseService(
-        execution_quality_service=_execution_quality_service_for_path(database_path)
+        execution_quality_service=_execution_quality_service_for_path(database_path),
+        route_stability_service=RouteStabilityService(
+            history_store=_history_store_for_path(database_path)
+        ),
     )
 
 
@@ -248,6 +253,14 @@ def get_history_store(
     """Return the shared opportunity history store."""
 
     return _history_store_for_path(settings.database_path)
+
+
+def get_route_stability_service(
+    history_store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+) -> RouteStabilityService:
+    """Return the repeated-scan route-stability service."""
+
+    return RouteStabilityService(history_store=history_store)
 
 
 def get_candidate_alert_store(
@@ -3182,7 +3195,7 @@ def create_app() -> FastAPI:
             OpportunityUniverseService, Depends(get_opportunity_universe_service)
         ],
         venues: Annotated[list[str] | None, Query()] = None,
-        ranking: str = "execution_adjusted_quality_pnl",
+        ranking: str = "route_adjusted_quality_pnl",
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
@@ -3190,6 +3203,9 @@ def create_app() -> FastAPI:
         min_roundtrip_edge: float = 0.0,
         min_execution_quality_score: float = 0.0,
         min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.0,
+        min_route_presence_ratio: float = 0.0,
+        min_route_samples: int = 0,
         include_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_tags: Annotated[list[str] | None, Query()] = None,
@@ -3207,6 +3223,9 @@ def create_app() -> FastAPI:
                 min_roundtrip_edge=min_roundtrip_edge,
                 min_execution_quality_score=min_execution_quality_score,
                 min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
                 include_symbols=include_symbols,
                 exclude_symbols=exclude_symbols,
                 exclude_tags=exclude_tags,
@@ -3226,7 +3245,7 @@ def create_app() -> FastAPI:
             OpportunityUniverseService, Depends(get_opportunity_universe_service)
         ],
         venues: Annotated[list[str] | None, Query()] = None,
-        ranking: str = "execution_adjusted_quality_pnl",
+        ranking: str = "route_adjusted_quality_pnl",
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
@@ -3234,6 +3253,9 @@ def create_app() -> FastAPI:
         min_roundtrip_edge: float = 0.0,
         min_execution_quality_score: float = 0.0,
         min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.0,
+        min_route_presence_ratio: float = 0.0,
+        min_route_samples: int = 0,
         include_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_symbols: Annotated[list[str] | None, Query()] = None,
         exclude_tags: Annotated[list[str] | None, Query()] = None,
@@ -3252,6 +3274,9 @@ def create_app() -> FastAPI:
                 min_roundtrip_edge=min_roundtrip_edge,
                 min_execution_quality_score=min_execution_quality_score,
                 min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
                 include_symbols=include_symbols,
                 exclude_symbols=exclude_symbols,
                 exclude_tags=exclude_tags,
@@ -3294,6 +3319,42 @@ def create_app() -> FastAPI:
             short_venue=short_venue,
             long_venue=long_venue,
             min_sample_size=min_sample_size,
+            limit=limit,
+        )
+
+    @app.get(
+        "/v1/opportunities/route-stability",
+        response_model=list[RouteStabilitySummary],
+    )
+    def route_stability_routes(
+        service: Annotated[
+            RouteStabilityService, Depends(get_route_stability_service)
+        ],
+        canonical_symbol: str | None = None,
+        short_venue: str | None = None,
+        long_venue: str | None = None,
+        min_sample_size: int = 0,
+        min_presence_ratio: float = 0.0,
+        limit: int = 50,
+    ) -> list[RouteStabilitySummary]:
+        if min_sample_size < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="min_sample_size must be non-negative",
+            )
+        if min_presence_ratio < 0 or min_presence_ratio > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="min_presence_ratio must be between 0 and 1",
+            )
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return service.list_summaries(
+            canonical_symbol=canonical_symbol,
+            short_venue=short_venue,
+            long_venue=long_venue,
+            min_sample_size=min_sample_size,
+            min_presence_ratio=min_presence_ratio,
             limit=limit,
         )
 
