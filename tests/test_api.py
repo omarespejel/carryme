@@ -1714,6 +1714,8 @@ def test_live_execution_preflight_for_saved_paper_trade(tmp_path: Path) -> None:
     assert payload["ready"] is False
     assert {item["venue"] for item in payload["venues"]} == {"extended", "paradex"}
     assert "Venue paradex live execution is not enabled" in payload["blocking_reasons"]
+    extended_status = next(item for item in payload["venues"] if item["venue"] == "extended")
+    assert extended_status["ready"] is True
 
 
 def test_live_execution_preflight_returns_404_for_missing_paper_trade(
