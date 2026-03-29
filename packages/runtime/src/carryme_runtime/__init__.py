@@ -14,6 +14,10 @@ from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
 from carryme_runtime.intents import build_trade_intent
 from carryme_runtime.opportunities import OpportunityService, fetch_live_snapshot
 from carryme_runtime.order_preview import OrderPreviewService
+from carryme_runtime.paired_live_execution import (
+    PairedLiveExecutionCoordinator,
+    SingleVenueLiveExecutionService,
+)
 from carryme_runtime.paradex_live_execution import ParadexLiveExecutionService
 from carryme_runtime.preflight import (
     LiveExecutionConfigMap,
@@ -29,7 +33,9 @@ __all__ = [
     "LiveExecutionConfigMap",
     "MockExecutionAdapter",
     "OrderPreviewService",
+    "PairedLiveExecutionCoordinator",
     "ParadexLiveExecutionService",
+    "SingleVenueLiveExecutionService",
     "VenueAccountProbe",
     "build_paper_trade_execution_preflight",
     "build_trade_intent",

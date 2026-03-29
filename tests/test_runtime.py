@@ -15,6 +15,7 @@ from carryme_connectors import (
 from carryme_models import (
     CapacityEstimate,
     ExecutionJournalEntry,
+    ExecutionLegResult,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -40,6 +41,7 @@ from carryme_runtime import (
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
+    PairedLiveExecutionCoordinator,
     ParadexLiveExecutionService,
     VenueAccountProbe,
     build_live_submission_readiness,
@@ -1319,6 +1321,289 @@ def test_extended_live_execution_service_submits_confirmed_preview(
         assert entry.legs[0].response_payload is not None
         assert seen_request["id"] == "carryme-pt8-extended-sell"
         assert seen_request["fee"] == "0.00025"
+
+    asyncio.run(run())
+
+
+def test_paired_live_execution_coordinator_submits_both_legs() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=11,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+    confirmation = PreviewConfirmationEntry(
+        entry_id=9,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=11,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=11,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                    quantity=10881.0,
+                    quantity_text="10881.00000000",
+                    reference_price=0.0919,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0918,
+                    worst_price_text="0.09180000",
+                    endpoint_path_hint="/api/v1/user/order",
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD"},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    quantity=10845.9,
+                    quantity_text="10845.90000000",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0923,
+                    worst_price_text="0.09230000",
+                    endpoint_path_hint="/v1/orders",
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP"},
+                    notes=[],
+                ),
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    class StubService:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            return ExecutionJournalEntry(
+                executed_at=executed_at or datetime.now(UTC),
+                adapter=f"{self.venue}_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                    legs=[
+                        ExecutionLegResult(
+                            venue=self.venue,
+                            symbol=next(
+                                leg.symbol
+                                for leg in confirmation.preview.legs
+                                if leg.venue == self.venue
+                            ),
+                        fee_profile="default" if self.venue == "extended" else "pro",
+                        side="sell" if self.venue == "extended" else "buy",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference=f"{self.venue}-1",
+                    )
+                ],
+            )
+
+    async def run() -> None:
+        service = PairedLiveExecutionCoordinator(
+            services={
+                "extended": StubService("extended"),
+                "paradex": StubService("paradex"),
+            }
+        )
+        entry = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            first_venue="extended",
+        )
+        assert entry.status == "submitted"
+        assert entry.adapter == "paired_live:extended_then_paradex"
+        assert [leg.venue for leg in entry.legs] == ["extended", "paradex"]
+
+    asyncio.run(run())
+
+
+def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=12,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+    confirmation = PreviewConfirmationEntry(
+        entry_id=10,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=12,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=12,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                    quantity=10881.0,
+                    quantity_text="10881.00000000",
+                    reference_price=0.0919,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0918,
+                    worst_price_text="0.09180000",
+                    endpoint_path_hint="/api/v1/user/order",
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD"},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    quantity=10845.9,
+                    quantity_text="10845.90000000",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0923,
+                    worst_price_text="0.09230000",
+                    endpoint_path_hint="/v1/orders",
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP"},
+                    notes=[],
+                ),
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    class SuccessService:
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            return ExecutionJournalEntry(
+                executed_at=executed_at or datetime.now(UTC),
+                adapter="extended_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="extended-1",
+                    )
+                ],
+            )
+
+    class FailureService:
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            raise httpx.HTTPError("paradex reject")
+
+    async def run() -> None:
+        service = PairedLiveExecutionCoordinator(
+            services={
+                "extended": SuccessService(),
+                "paradex": FailureService(),
+            }
+        )
+        entry = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            first_venue="extended",
+        )
+        assert entry.status == "partial"
+        assert [leg.status for leg in entry.legs] == ["submitted", "rejected"]
+        assert entry.legs[1].response_payload == {"error": "paradex reject", "venue": "paradex"}
 
     asyncio.run(run())
 

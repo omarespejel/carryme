@@ -16,7 +16,7 @@ class ExecutionLegResult(BaseModel):
     fee_profile: str = Field(min_length=1)
     side: Literal["buy", "sell"]
     target_notional: float = Field(gt=0)
-    status: Literal["accepted", "rejected", "submitted"]
+    status: Literal["accepted", "rejected", "submitted", "partial"]
     simulated: bool = True
     external_reference: str | None = None
     request_payload: dict[str, Any] | None = None
@@ -31,7 +31,7 @@ class ExecutionJournalEntry(BaseModel):
     executed_at: datetime
     adapter: str = Field(min_length=1)
     mode: Literal["mock", "live"]
-    status: Literal["accepted", "rejected", "submitted"]
+    status: Literal["accepted", "rejected", "submitted", "partial"]
     paper_trade_id: int | None = None
     preview_hash: str | None = None
     confirmation_entry_id: int | None = None
