@@ -9,7 +9,13 @@ from carryme_models import (
     CleanupPreviewConfirmationEntry,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
+    ExecutionLegOrderState,
     ExecutionLegResult,
+    ExecutionObservationEntry,
+    ExecutionOrderState,
+    ExecutionPairStatus,
+    ExecutionReconciliation,
+    ExecutionVenueReconciliation,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -24,6 +30,7 @@ from carryme_storage import (
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionJournalStore,
+    ExecutionObservationStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     PreviewConfirmationStore,
@@ -1752,3 +1759,75 @@ def test_preview_confirmation_store_rejects_non_positive_limits(
 
     with pytest.raises(ValueError, match="limit must be at least 1"):
         store.list_recent(limit=invalid_limit)
+
+
+def test_execution_observation_store_appends_and_lists_recent(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+    entry = ExecutionObservationEntry(
+        observed_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+        context="guarded_pair_poll",
+        execution_entry_id=12,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        order_state=ExecutionOrderState(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            legs=[
+                ExecutionLegOrderState(
+                    venue="paradex",
+                    supported=True,
+                    observation_source="rest_poll",
+                    external_reference="order-1",
+                    derived_state="unfilled",
+                    order_status="CLOSED",
+                )
+            ],
+            notes=[],
+        ),
+        pair_status=ExecutionPairStatus(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            derived_state="unfilled",
+            recommended_action="no_action",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                legs=[],
+                notes=[],
+            ),
+            reconciliation=ExecutionReconciliation(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                status="submitted",
+                recommended_action="verify_fill_status",
+                matched_all_leg_symbols=False,
+                venues=[
+                    ExecutionVenueReconciliation(
+                        venue="extended",
+                        authenticated=True,
+                        ready=True,
+                        position_symbols=[],
+                        matched_leg_symbols=[],
+                        unmatched_leg_symbols=["ARB-USD"],
+                    )
+                ],
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    saved = store.append(entry)
+    results = store.list_recent(limit=10)
+
+    assert saved.entry_id is not None
+    assert len(results) == 1
+    assert results[0].entry_id == saved.entry_id
+    assert results[0].context == "guarded_pair_poll"
+    assert results[0].pair_status is not None
+    assert results[0].pair_status.derived_state == "unfilled"
+    assert store.latest_for_paper_trade(7) is not None

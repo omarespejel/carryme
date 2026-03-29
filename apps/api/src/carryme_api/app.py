@@ -16,6 +16,7 @@ from carryme_models import (
     CleanupPreviewConfirmationEntry,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
+    ExecutionObservationEntry,
     ExecutionOrderState,
     ExecutionPairStatus,
     ExecutionReconciliation,
@@ -73,6 +74,7 @@ from carryme_storage import (
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionJournalStore,
+    ExecutionObservationStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     PreviewConfirmationStore,
@@ -187,6 +189,14 @@ def get_candidate_alert_store(
     """Return the shared candidate alert store."""
 
     return _candidate_alert_store_for_path(settings.database_path)
+
+
+def get_execution_observation_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExecutionObservationStore:
+    """Return the shared execution observation store."""
+
+    return ExecutionObservationStore(settings.database_path)
 
 
 def get_watchlist_store(
@@ -702,6 +712,8 @@ async def _observe_pair_status_for_execution(
     settings: ApiSettings,
     account_service: AccountPreflightService,
     order_state_service: ExecutionOrderStateService,
+    observation_store: ExecutionObservationStore | None = None,
+    observation_context: str = "guarded_pair_poll",
     poll_attempts: int = 5,
     poll_interval_seconds: float = 2.0,
 ) -> ExecutionPairStatus:
@@ -730,6 +742,18 @@ async def _observe_pair_status_for_execution(
         except TimeoutError:
             continue
         last_status = build_execution_pair_status(execution, order_state, reconciliation)
+        if observation_store is not None:
+            observation_store.append(
+                ExecutionObservationEntry(
+                    observed_at=datetime.now(UTC),
+                    context=observation_context,
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=execution.paper_trade_id,
+                    preview_hash=execution.preview_hash,
+                    order_state=order_state,
+                    pair_status=last_status,
+                )
+            )
         if last_status.derived_state in {
             "hedged",
             "unfilled",
@@ -1084,6 +1108,25 @@ def create_app() -> FastAPI:
                 detail=f"No execution journal entry matched paper trade {paper_trade_id}",
             )
         return await service.observe_execution(execution)
+
+    @app.get(
+        "/v1/executions/observations/latest/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionObservationEntry,
+    )
+    def latest_execution_observation_for_paper_trade(
+        paper_trade_id: int,
+        store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
+    ) -> ExecutionObservationEntry:
+        observation = store.latest_for_paper_trade(paper_trade_id)
+        if observation is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No execution observation matched paper trade {paper_trade_id}",
+            )
+        return observation
 
     @app.get(
         "/v1/executions/reconciliation/latest/from-paper-trade/{paper_trade_id}",
@@ -2208,6 +2251,10 @@ def create_app() -> FastAPI:
             Depends(get_cleanup_preview_confirmation_store),
         ],
         execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        observation_store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
         account_preflight_service: Annotated[
             AccountPreflightService,
             Depends(get_account_preflight_service),
@@ -2328,6 +2375,7 @@ def create_app() -> FastAPI:
                 settings=settings,
                 account_service=account_preflight_service,
                 order_state_service=order_state_service,
+                observation_store=observation_store,
                 poll_attempts=poll_attempts,
                 poll_interval_seconds=poll_interval_seconds,
             )
@@ -2447,6 +2495,7 @@ def create_app() -> FastAPI:
                     settings=settings,
                     account_service=account_preflight_service,
                     order_state_service=order_state_service,
+                    observation_store=observation_store,
                     poll_attempts=poll_attempts,
                     poll_interval_seconds=poll_interval_seconds,
                 )
