@@ -389,6 +389,39 @@ def test_execution_alerts_endpoint_reads_saved_events(tmp_path: Path) -> None:
             ),
         )
     )
+    store.append(
+        ExecutionAlertEvent(
+            emitted_at=datetime(2026, 3, 29, 12, 6, tzinfo=UTC),
+            alert_type="review_required",
+            paper_trade_id=8,
+            preview_hash="other-preview-hash",
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=13,
+                paper_trade_id=8,
+                preview_hash="other-preview-hash",
+                derived_state="review_required",
+                recommended_action="manual_review_required",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=13,
+                    paper_trade_id=8,
+                    preview_hash="other-preview-hash",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=13,
+                    paper_trade_id=8,
+                    preview_hash="other-preview-hash",
+                    status="submitted",
+                    recommended_action="manual_review_required",
+                    matched_all_leg_symbols=False,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            ),
+        )
+    )
 
     from carryme_api.app import get_execution_alert_store
 
@@ -402,6 +435,7 @@ def test_execution_alerts_endpoint_reads_saved_events(tmp_path: Path) -> None:
     assert len(payload) == 1
     assert payload[0]["alert_type"] == "cleanup_needed"
     assert payload[0]["paper_trade_id"] == 7
+    assert all(item["paper_trade_id"] == 7 for item in payload)
 
 
 def test_latest_history_endpoint_deduplicates_by_label(tmp_path: Path) -> None:

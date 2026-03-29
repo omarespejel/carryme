@@ -1003,6 +1003,7 @@ def create_app() -> FastAPI:
         limit: int = 50,
         paper_trade_id: int | None = None,
     ) -> list[ExecutionAlertEvent]:
+        limit = _validated_history_limit("limit", limit)
         try:
             return store.list_recent(limit=limit, paper_trade_id=paper_trade_id)
         except ValueError as exc:

@@ -1707,7 +1707,6 @@ def test_observe_live_executions_once_realerts_after_recovery(tmp_path: Path) ->
         datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
     ]
 
-
 def test_worker_main_rejects_mutually_exclusive_modes(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

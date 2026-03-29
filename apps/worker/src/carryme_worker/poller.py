@@ -289,7 +289,7 @@ async def observe_live_executions_once(
                     preview_hash=execution.preview_hash,
                     order_state=order_state,
                     pair_status=pair_status,
-                )
+                ),
             )
         except Exception:
             logger.warning(
