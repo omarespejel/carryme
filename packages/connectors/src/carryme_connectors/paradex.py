@@ -29,6 +29,21 @@ class ParadexPublicConnector(BaseHttpConnector):
             base_backoff_seconds=base_backoff_seconds,
         )
 
+    async def list_market_symbols(self) -> list[str]:
+        payload = await self._request_json("GET", "/v1/markets", params={"market_status": "ACTIVE"})
+        if not isinstance(payload, dict):
+            raise ConnectorError("Paradex market list payload must be an object")
+        rows = payload.get("results", [])
+        if not isinstance(rows, list):
+            raise ConnectorError("Paradex market list missing results list")
+        symbols: list[str] = []
+        for row in rows:
+            if isinstance(row, dict):
+                symbol = row.get("symbol")
+                if isinstance(symbol, str) and symbol.endswith("-PERP"):
+                    symbols.append(symbol)
+        return symbols
+
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         summary_payload, market_payload = await asyncio.gather(
             self._request_json(

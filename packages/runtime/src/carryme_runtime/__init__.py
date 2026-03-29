@@ -47,6 +47,11 @@ from carryme_runtime.preflight import (
     build_venue_execution_preflights,
 )
 from carryme_runtime.readiness import build_live_submission_readiness
+from carryme_runtime.universe import (
+    OpportunityUniverseService,
+    build_portfolio_plan,
+    list_live_symbols,
+)
 
 __all__ = [
     "AccountPreflightConfigMap",
@@ -77,6 +82,7 @@ __all__ = [
     "build_live_execution_configs",
     "build_live_submission_readiness",
     "build_paper_trade_execution_preflight",
+    "build_portfolio_plan",
     "build_trade_intent",
     "build_venue_execution_preflights",
     "reconcile_execution",
@@ -87,6 +93,8 @@ __all__ = [
     "InvalidTradeCandidateError",
     "OpportunityService",
     "UpstreamDataError",
+    "OpportunityUniverseService",
     "fetch_live_snapshot",
     "filter_candidate_records",
+    "list_live_symbols",
 ]

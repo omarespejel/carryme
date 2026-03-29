@@ -28,6 +28,24 @@ class HyperliquidPublicConnector(BaseHttpConnector):
             base_backoff_seconds=base_backoff_seconds,
         )
 
+    async def list_market_symbols(self) -> list[str]:
+        payload = await self._request_json("POST", "/info", json_body={"type": "metaAndAssetCtxs"})
+        if not isinstance(payload, list) or len(payload) != 2:
+            raise ConnectorError("Hyperliquid metaAndAssetCtxs payload must be a two-item list")
+        universe, _contexts = payload
+        if not isinstance(universe, dict):
+            raise ConnectorError("Hyperliquid universe metadata must be an object")
+        rows = universe.get("universe", [])
+        if not isinstance(rows, list):
+            raise ConnectorError("Hyperliquid universe payload must be a list")
+        symbols: list[str] = []
+        for row in rows:
+            if isinstance(row, dict):
+                name = row.get("name")
+                if isinstance(name, str):
+                    symbols.append(name)
+        return symbols
+
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         payload = await self._request_json("POST", "/info", json_body={"type": "metaAndAssetCtxs"})
         if not isinstance(payload, list) or len(payload) != 2:

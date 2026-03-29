@@ -6,7 +6,12 @@ from typing import Any, cast
 import carryme_api.app as app_module
 import carryme_models as carryme_models_module
 import pytest
-from carryme_api.app import app, get_history_store, get_opportunity_service
+from carryme_api.app import (
+    app,
+    get_history_store,
+    get_opportunity_service,
+    get_opportunity_universe_service,
+)
 from carryme_api.config import ApiSettings
 from carryme_models import (
     CandidateAlertEvent,
@@ -26,6 +31,10 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    FundingUniverseOpportunity,
+    FundingUniverseOverlap,
+    FundingUniverseScan,
+    FundingUniverseVenueMarket,
     OpportunityRecord,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
@@ -182,6 +191,161 @@ def test_funding_pair_endpoint_maps_value_errors_to_bad_request() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Unsupported venue: nope"
+
+
+def test_funding_universe_endpoint_uses_service_dependency() -> None:
+    class StubUniverseService:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            return FundingUniverseScan(
+                venues=["extended", "paradex", "hyperliquid"],
+                ranking="quality_adjusted_roundtrip_pnl",
+                target_notional=5000.0,
+                overlap_count=2,
+                overlaps=[
+                    FundingUniverseOverlap(
+                        canonical_symbol="LIT-USD-PERP",
+                        venues=["extended", "paradex"],
+                        venue_symbols={
+                            "extended": "LIT-USD",
+                            "paradex": "LIT-USD-PERP",
+                        },
+                    )
+                ],
+                opportunities=[
+                    FundingUniverseOpportunity(
+                        opportunity=FundingArbOpportunity(
+                            canonical_symbol="LIT-USD-PERP",
+                            long_venue="paradex",
+                            short_venue="extended",
+                            long_fee_profile="pro",
+                            short_fee_profile="default",
+                            gross_daily_edge=0.0021,
+                            entry_cost_rate=0.00045,
+                            round_trip_cost_rate=0.0009,
+                            one_day_net_edge_after_entry=0.00165,
+                            one_day_net_edge_after_round_trip=0.0012,
+                            break_even_days_entry=0.214,
+                            break_even_days_round_trip=0.429,
+                            capacity=CapacityEstimate(
+                                short_bid_notional=1800.0,
+                                long_ask_notional=900.0,
+                                max_entry_notional=900.0,
+                                limiting_venue="paradex",
+                            ),
+                        ),
+                        venue_markets={
+                            "extended": FundingUniverseVenueMarket(
+                                venue="extended",
+                                symbol="LIT-USD",
+                                mark_price=0.83,
+                                daily_funding_rate=0.000312,
+                                open_interest=200_000,
+                                daily_volume=120_000,
+                                bid_notional=1800.0,
+                                ask_notional=900.0,
+                            ),
+                            "paradex": FundingUniverseVenueMarket(
+                                venue="paradex",
+                                symbol="LIT-USD-PERP",
+                                mark_price=0.831,
+                                daily_funding_rate=-0.0018,
+                                open_interest=150_000,
+                                daily_volume=110_000,
+                                bid_notional=1200.0,
+                                ask_notional=900.0,
+                            ),
+                        },
+                        min_daily_volume=110_000.0,
+                        min_open_interest=150_000.0,
+                        target_notional=5000.0,
+                        deployable_notional=900.0,
+                        estimated_one_day_pnl_after_entry=1.485,
+                        estimated_one_day_pnl_after_round_trip=1.08,
+                        quality_score=0.92,
+                    )
+                ],
+            )
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    client = TestClient(app)
+
+    response = client.get(
+        "/v1/opportunities/funding-universe",
+        params=[
+            ("venues", "extended"),
+            ("venues", "paradex"),
+            ("venues", "hyperliquid"),
+            ("target_notional", "5000"),
+        ],
+    )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["overlap_count"] == 2
+    assert payload["opportunities"][0]["opportunity"]["canonical_symbol"] == "LIT-USD-PERP"
+
+
+def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
+    class StubUniverseService:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            opportunity = FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                target_notional=5000.0,
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_entry=3.195,
+                estimated_one_day_pnl_after_round_trip=2.79,
+                quality_score=1.7,
+            )
+            return FundingUniverseScan(
+                venues=["extended", "paradex", "hyperliquid"],
+                ranking="quality_adjusted_roundtrip_pnl",
+                target_notional=5000.0,
+                overlap_count=1,
+                overlaps=[],
+                opportunities=[opportunity],
+            )
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    client = TestClient(app)
+
+    response = client.get(
+        "/v1/opportunities/funding-universe/portfolio",
+        params=[
+            ("venues", "extended"),
+            ("venues", "paradex"),
+            ("venues", "hyperliquid"),
+            ("target_notional", "5000"),
+            ("max_positions", "3"),
+        ],
+    )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["allocated_notional"] == 900.0
+    assert payload["entries"][0]["opportunity"]["opportunity"]["canonical_symbol"] == "ARB-USD-PERP"
 
 
 def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:

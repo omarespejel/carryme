@@ -16,6 +16,9 @@ class PublicVenueConnector(Protocol):
 
     venue: str
 
+    async def list_market_symbols(self) -> list[str]:
+        """Return all active perp symbols on the venue."""
+
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         """Return normalized market stats for a venue symbol."""
 
