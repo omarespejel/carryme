@@ -47,8 +47,11 @@ _VENUE_ORDER_SPECS: dict[str, VenueOrderSpec] = {
     ),
     "paradex": VenueOrderSpec(
         endpoint_path_hint="/v1/orders",
-        auth_scheme="subkey private key",
-        required_auth_env_vars=("CARRYME_API_PARADEX_PRIVATE_KEY",),
+        auth_scheme="main account address + subkey private key",
+        required_auth_env_vars=(
+            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+            "CARRYME_API_PARADEX_PRIVATE_KEY",
+        ),
         notes=(
             "Preview uses an IOC limit cap from the public best bid/ask.",
             (

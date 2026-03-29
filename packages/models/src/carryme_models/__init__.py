@@ -1,5 +1,9 @@
 """Shared models for the carryme workspace."""
 
+from carryme_models.account_preflight import (
+    PaperTradeAccountPreflight,
+    VenueAccountPreflight,
+)
 from carryme_models.confirmation import PreviewConfirmationEntry
 from carryme_models.execution import ExecutionJournalEntry, ExecutionLegResult
 from carryme_models.health import AppDescriptor, ServiceHealth
@@ -40,6 +44,7 @@ __all__ = [
     "MarketStats",
     "NormalizedMarketSnapshot",
     "OpportunityRecord",
+    "PaperTradeAccountPreflight",
     "PaperTradeEntry",
     "PaperTradeExecutionPreflight",
     "PaperTradeOrderPreview",
@@ -48,6 +53,7 @@ __all__ = [
     "TopOfBook",
     "TradeLegIntent",
     "TradingFeeProfile",
+    "VenueAccountPreflight",
     "VenueExecutionPreflight",
     "VenueOrderPreview",
     "WatchlistDocument",

@@ -14,17 +14,21 @@ from carryme_models import (
     FundingPairSpec,
     FundingPairTradeIntent,
     OpportunityRecord,
+    PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
     ServiceHealth,
     TradingFeeProfile,
+    VenueAccountPreflight,
     VenueExecutionPreflight,
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
+    AccountPreflightConfigMap,
+    AccountPreflightService,
     ConnectorError,
     ExecutionAdapter,
     LiveExecutionConfigMap,
@@ -120,6 +124,12 @@ def get_execution_adapter() -> ExecutionAdapter:
     return MockExecutionAdapter()
 
 
+def get_account_preflight_service() -> AccountPreflightService:
+    """Return the authenticated account-state preflight service."""
+
+    return AccountPreflightService()
+
+
 def get_order_preview_service() -> OrderPreviewService:
     """Return the unsigned live order preview service."""
 
@@ -140,6 +150,7 @@ def _build_live_execution_configs(settings: ApiSettings) -> LiveExecutionConfigM
         "paradex": {
             "enabled": settings.paradex_live_enabled,
             "credentials": {
+                "account_address": settings.paradex_account_address,
                 "private_key": settings.paradex_private_key,
             },
         },
@@ -148,6 +159,26 @@ def _build_live_execution_configs(settings: ApiSettings) -> LiveExecutionConfigM
             "credentials": {
                 "account_address": settings.hyperliquid_account_address,
                 "api_wallet_private_key": settings.hyperliquid_api_wallet_private_key,
+            },
+        },
+    }
+
+
+def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightConfigMap:
+    """Build the authenticated-read account probe config map from API settings."""
+
+    return {
+        "extended": {
+            "enabled": settings.extended_live_enabled,
+            "credentials": {
+                "api_key": settings.extended_api_key,
+            },
+        },
+        "paradex": {
+            "enabled": settings.paradex_live_enabled,
+            "credentials": {
+                "account_address": settings.paradex_account_address,
+                "bearer_token": settings.paradex_bearer_token,
             },
         },
     }
@@ -452,6 +483,37 @@ def create_app() -> FastAPI:
         return build_paper_trade_execution_preflight(
             paper_trade,
             _build_live_execution_configs(settings),
+        )
+
+    @app.get(
+        "/v1/executions/account-preflight/venues",
+        response_model=list[VenueAccountPreflight],
+    )
+    async def execution_account_preflight_venues(
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+    ) -> list[VenueAccountPreflight]:
+        return await service.probe_venues(_build_account_preflight_configs(settings))
+
+    @app.get(
+        "/v1/executions/account-preflight/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeAccountPreflight,
+    )
+    async def execution_account_preflight_for_paper_trade(
+        paper_trade_id: int,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+    ) -> PaperTradeAccountPreflight:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        return await service.probe_paper_trade(
+            paper_trade,
+            _build_account_preflight_configs(settings),
         )
 
     @app.get(

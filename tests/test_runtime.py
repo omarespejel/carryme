@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from carryme_models import (
@@ -7,22 +8,28 @@ from carryme_models import (
     ExecutionJournalEntry,
     FundingArbOpportunity,
     FundingPairSpec,
+    FundingPairTradeIntent,
     MarketStats,
     NormalizedMarketSnapshot,
     OpportunityRecord,
+    PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
     TopOfBook,
+    TradeLegIntent,
+    VenueAccountPreflight,
     VenueExecutionPreflight,
     VenueOrderPreview,
 )
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
+    AccountPreflightService,
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
+    VenueAccountProbe,
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
@@ -255,6 +262,7 @@ def test_build_venue_execution_preflights_reports_missing_credentials() -> None:
             "paradex": {
                 "enabled": True,
                 "credentials": {
+                    "account_address": "0xabc",
                     "private_key": "paradex-secret",
                 },
             },
@@ -274,6 +282,7 @@ def test_build_venue_execution_preflights_reports_missing_credentials() -> None:
     assert extended.ready is False
     assert "CARRYME_API_EXTENDED_API_KEY" in extended.missing_env_vars
     assert paradex.ready is True
+    assert paradex.missing_env_vars == []
 
 
 def test_build_paper_trade_execution_preflight_filters_to_trade_venues() -> None:
@@ -335,6 +344,7 @@ def test_build_paper_trade_execution_preflight_filters_to_trade_venues() -> None
             "paradex": {
                 "enabled": False,
                 "credentials": {
+                    "account_address": None,
                     "private_key": None,
                 },
             },
@@ -500,3 +510,104 @@ def test_require_confirmed_preview_returns_matching_entry() -> None:
 
     assert matched.entry_id == 3
     assert matched.preview.preview_hash == "preview-hash"
+
+
+def test_account_preflight_service_filters_to_trade_venues() -> None:
+    class StubProbe:
+        def __init__(self, result: VenueAccountPreflight) -> None:
+            self.result = result
+
+        async def probe(self, config: dict[str, object]) -> VenueAccountPreflight:
+            assert isinstance(config["enabled"], bool)
+            return self.result
+
+    service = AccountPreflightService(
+        probes=cast(
+            dict[str, VenueAccountProbe],
+            {
+            "extended": StubProbe(
+                VenueAccountPreflight(
+                    venue="extended",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_key",
+                    account_identifier="ext-subaccount",
+                    available_to_trade=1500.0,
+                )
+            ),
+            "paradex": StubProbe(
+                VenueAccountPreflight(
+                    venue="paradex",
+                    enabled=True,
+                    authenticated=False,
+                    ready=False,
+                    credential_mode="bearer_token",
+                    missing_env_vars=["CARRYME_API_PARADEX_BEARER_TOKEN"],
+                    blocking_reasons=[
+                        (
+                            "Venue paradex is missing required account credentials: "
+                            "CARRYME_API_PARADEX_BEARER_TOKEN"
+                        )
+                    ],
+                )
+            ),
+            },
+        ),
+    )
+    paper_trade = PaperTradeEntry(
+        entry_id=9,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    async def run() -> None:
+        preflight = await service.probe_paper_trade(
+            paper_trade,
+            {
+                "extended": {
+                    "enabled": True,
+                    "credentials": {"api_key": "extended-key"},
+                },
+                "paradex": {
+                    "enabled": True,
+                    "credentials": {
+                        "account_address": "0xabc",
+                        "bearer_token": None,
+                    },
+                },
+            },
+        )
+
+        assert isinstance(preflight, PaperTradeAccountPreflight)
+        assert preflight.paper_trade_id == 9
+        assert preflight.ready is False
+        assert {item.venue for item in preflight.venues} == {"extended", "paradex"}
+        assert any("paradex" in reason for reason in preflight.blocking_reasons)
+
+    asyncio.run(run())
