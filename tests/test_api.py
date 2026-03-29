@@ -4898,7 +4898,22 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     assert saved_executions[0].preview_hash == "cleanup-hash"
     assert saved_executions[0].confirmation_entry_id == cleanup_confirmations[0].entry_id
     assert saved_executions[1].preview_hash == "preview-hash"
-    latest_observation = observation_store.latest_for_paper_trade(paper_trade.entry_id or 0)
+    assert paper_trade.entry_id is not None
+    observations = [
+        entry
+        for entry in observation_store.list_recent(limit=10)
+        if entry.paper_trade_id == paper_trade.entry_id
+    ]
+    assert len(observations) >= 2
+    assert {entry.execution_entry_id for entry in observations} >= {
+        saved_executions[0].entry_id,
+        saved_executions[1].entry_id,
+    }
+    assert {entry.preview_hash for entry in observations} >= {
+        "preview-hash",
+        "cleanup-hash",
+    }
+    latest_observation = observation_store.latest_for_paper_trade(paper_trade.entry_id)
     assert latest_observation is not None
     assert latest_observation.execution_entry_id == saved_executions[0].entry_id
     assert latest_observation.preview_hash == "cleanup-hash"

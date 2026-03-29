@@ -125,6 +125,8 @@ class ExecutionObservationStore:
         """Return recent execution observation rows."""
 
         self.initialize()
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         query = """
             SELECT id, entry_json
             FROM execution_observation_entries

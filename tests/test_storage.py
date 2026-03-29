@@ -1923,3 +1923,14 @@ def test_execution_observation_store_normalizes_timestamps_to_utc(tmp_path: Path
     assert saved.observed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)
     assert latest is not None
     assert latest.observed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1])
+def test_execution_observation_store_rejects_non_positive_limits(
+    tmp_path: Path,
+    invalid_limit: int,
+) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        store.list_recent(limit=invalid_limit)
