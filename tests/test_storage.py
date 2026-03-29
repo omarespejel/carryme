@@ -1989,6 +1989,33 @@ def test_execution_observation_store_filters_by_paper_trade_id(tmp_path: Path) -
     assert latest_for_trade.entry_id == latest.entry_id
 
 
+def test_execution_observation_store_orders_ties_deterministically(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+    observed_at = datetime(2026, 3, 29, 13, 6, tzinfo=UTC)
+
+    for index, context in enumerate(["first", "second"], start=12):
+        store.append(
+            ExecutionObservationEntry(
+                observed_at=observed_at,
+                context=context,
+                execution_entry_id=index,
+                paper_trade_id=7,
+                preview_hash=f"preview-hash-{context}",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=index,
+                    paper_trade_id=7,
+                    preview_hash=f"preview-hash-{context}",
+                    legs=[],
+                    notes=[],
+                ),
+            )
+        )
+
+    results = store.list_recent(limit=2)
+
+    assert [entry.context for entry in results] == ["second", "first"]
+
+
 @pytest.mark.parametrize("invalid_limit", [0, -1])
 def test_execution_observation_store_rejects_non_positive_limits(
     tmp_path: Path,
