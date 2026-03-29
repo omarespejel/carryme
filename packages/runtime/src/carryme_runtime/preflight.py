@@ -119,7 +119,15 @@ LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
             ),
         ],
         "notes": [
-            "Hyperliquid live trading requires the account address and an API wallet private key.",
+            (
+                "Hyperliquid live trading requires the trading account address and an API "
+                "wallet private key."
+            ),
+            (
+                "If you trade through a subaccount or vault, also set the optional "
+                "CARRYME_API_HYPERLIQUID_VAULT_ADDRESS so signed exchange actions target "
+                "the correct account."
+            ),
         ],
     },
 }

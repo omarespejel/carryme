@@ -457,7 +457,11 @@ class HyperliquidAccountProbe:
                     (
                         "Hyperliquid live trading requires the trading account address and an "
                         "authorized API wallet private key."
-                    )
+                    ),
+                    (
+                        "If orders should target a subaccount or vault, configure the "
+                        "optional CARRYME_API_HYPERLIQUID_VAULT_ADDRESS for live execution."
+                    ),
                 ],
             )
 
@@ -542,6 +546,10 @@ class HyperliquidAccountProbe:
                         "Hyperliquid account preflight completed using the official SDK "
                         "Info.user_state/open_orders flow. Account reads are address-based; the "
                         "API wallet private key remains required for live submission."
+                    ),
+                    (
+                        "If this account is a subaccount or vault, live actions may also require "
+                        "CARRYME_API_HYPERLIQUID_VAULT_ADDRESS to target the correct account."
                     ),
                     f"Observed {len(open_orders)} currently open Hyperliquid orders.",
                 ],

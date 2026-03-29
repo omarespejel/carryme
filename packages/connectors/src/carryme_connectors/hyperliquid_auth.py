@@ -24,13 +24,19 @@ def build_hyperliquid_exchange(
     *,
     private_key: str,
     account_address: str | None = None,
+    vault_address: str | None = None,
     base_url: str = HYPERLIQUID_API_BASE_URL,
 ) -> Any:
-    """Return an official Hyperliquid Exchange client for live actions."""
+    """Return an official Hyperliquid Exchange client for live actions.
+
+    `account_address` is used for account-context reads in higher layers.
+    `vault_address` targets subaccount/vault actions when required by Hyperliquid.
+    """
 
     return Exchange(
         wallet=build_hyperliquid_wallet(private_key),
         base_url=base_url,
+        vault_address=vault_address,
         account_address=account_address,
     )
 

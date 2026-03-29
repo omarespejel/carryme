@@ -24,6 +24,7 @@ class HyperliquidLiveExecutionService:
 
     account_address: str
     api_wallet_private_key: str
+    vault_address: str | None = None
 
     async def submit_confirmed_preview(
         self,
@@ -85,6 +86,7 @@ class HyperliquidLiveExecutionService:
                 _submit_hyperliquid_order,
                 account_address=self.account_address,
                 api_wallet_private_key=self.api_wallet_private_key,
+                vault_address=self.vault_address,
                 leg=leg,
             )
         except Exception as exc:
@@ -131,11 +133,13 @@ def _submit_hyperliquid_order(
     *,
     account_address: str,
     api_wallet_private_key: str,
+    vault_address: str | None,
     leg: VenueOrderPreview,
 ) -> dict[str, Any]:
     exchange = build_hyperliquid_exchange(
         private_key=api_wallet_private_key,
         account_address=account_address,
+        vault_address=vault_address,
     )
     payload = leg.payload
     if not isinstance(payload, dict):

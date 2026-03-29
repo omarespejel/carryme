@@ -40,6 +40,7 @@ class HyperliquidCleanupPreviewService:
     """Build a reduce-only Hyperliquid close preview from live position state."""
 
     account_address: str
+    vault_address: str | None = None
     fetch_snapshot: SnapshotFetcher = fetch_live_snapshot
 
     async def preview_from_execution(
@@ -56,7 +57,7 @@ class HyperliquidCleanupPreviewService:
         target_leg = _select_open_hyperliquid_leg(entry, pair_status)
         position = await asyncio.to_thread(
             _fetch_hyperliquid_position,
-            self.account_address,
+            self.vault_address or self.account_address,
             target_leg.symbol,
         )
         preview_leg = await self._build_cleanup_leg(
