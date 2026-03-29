@@ -2391,6 +2391,10 @@ def test_execution_cleanup_preview_confirmation_endpoint_persists_confirmation(
     assert payload["paper_trade_id"] == paper_trade.entry_id
     assert payload["preview_hash"] == "cleanup-hash"
     assert payload["preview"]["reason"] == "close_open_leg"
+    stored_confirmations = cleanup_store.list_recent(limit=10, paper_trade_id=paper_trade.entry_id)
+    assert len(stored_confirmations) == 1
+    assert stored_confirmations[0].preview_hash == "cleanup-hash"
+    assert stored_confirmations[0].preview.reason == "close_open_leg"
 
 
 def test_execute_extended_cleanup_endpoint_submits_confirmed_cleanup_preview(
@@ -2642,6 +2646,11 @@ def test_execute_extended_cleanup_endpoint_submits_confirmed_cleanup_preview(
     assert payload["confirmation_entry_id"] == confirmation.entry_id
     assert payload["preview_hash"] == "cleanup-hash"
     assert payload["legs"][0]["external_reference"] == "cleanup-order-1"
+    stored_entries = execution_store.list_recent(limit=10)
+    assert len(stored_entries) == 2
+    assert stored_entries[0].paper_trade_id == paper_trade.entry_id
+    assert stored_entries[0].preview_hash == "cleanup-hash"
+    assert stored_entries[0].confirmation_entry_id == confirmation.entry_id
 
 
 def test_executions_endpoint_rejects_invalid_limit(tmp_path: Path) -> None:

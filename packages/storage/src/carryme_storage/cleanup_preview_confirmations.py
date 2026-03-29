@@ -14,6 +14,7 @@ class CleanupPreviewConfirmationStore:
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
+        self.initialize()
 
     def initialize(self) -> None:
         """Create the cleanup preview confirmation table if it does not exist."""
@@ -54,7 +55,6 @@ class CleanupPreviewConfirmationStore:
     def append(self, entry: CleanupPreviewConfirmationEntry) -> CleanupPreviewConfirmationEntry:
         """Append a cleanup preview confirmation entry and return it with its assigned id."""
 
-        self.initialize()
         with sqlite3.connect(self.database_path) as connection:
             cursor = connection.execute(
                 """
@@ -90,7 +90,6 @@ class CleanupPreviewConfirmationStore:
     ) -> list[CleanupPreviewConfirmationEntry]:
         """Return recent cleanup preview confirmation entries."""
 
-        self.initialize()
         clauses: list[str] = []
         values: list[object] = []
         if label:

@@ -147,6 +147,15 @@ def _preview_confirmation_store_for_path(database_path: str) -> PreviewConfirmat
     return PreviewConfirmationStore(database_path)
 
 
+@lru_cache
+def _cleanup_preview_confirmation_store_for_path(
+    database_path: str,
+) -> CleanupPreviewConfirmationStore:
+    """Return a shared cleanup preview confirmation store for the configured SQLite path."""
+
+    return CleanupPreviewConfirmationStore(database_path)
+
+
 def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
@@ -249,7 +258,7 @@ def get_cleanup_preview_confirmation_store(
 ) -> CleanupPreviewConfirmationStore:
     """Return the shared cleanup preview confirmation store."""
 
-    return CleanupPreviewConfirmationStore(settings.database_path)
+    return _cleanup_preview_confirmation_store_for_path(settings.database_path)
 
 
 # TODO: wire this provider to the future live execution adapter surface.
@@ -542,7 +551,18 @@ async def _ensure_extended_cleanup_live_ready(
         item.venue: item
         for item in build_venue_execution_preflights(build_live_execution_configs(settings))
     }
-    extended_execution = execution_statuses["extended"]
+    extended_execution = execution_statuses.get("extended")
+    if extended_execution is None:
+        raise HTTPException(
+            status_code=409,
+            detail=PaperTradeExecutionPreflight(
+                paper_trade_id=0,
+                label="extended_cleanup",
+                ready=False,
+                venues=[],
+                blocking_reasons=["Venue extended live execution is not configured"],
+            ).model_dump(mode="json"),
+        )
     execution_blockers: list[str] = []
     if not extended_execution.enabled:
         execution_blockers.append("Venue extended live execution is not enabled")
@@ -567,7 +587,18 @@ async def _ensure_extended_cleanup_live_ready(
         item.venue: item
         for item in await account_service.probe_venues(_build_account_preflight_configs(settings))
     }
-    extended_account = account_statuses["extended"]
+    extended_account = account_statuses.get("extended")
+    if extended_account is None:
+        raise HTTPException(
+            status_code=409,
+            detail=PaperTradeAccountPreflight(
+                paper_trade_id=0,
+                label="extended_cleanup",
+                ready=False,
+                venues=[],
+                blocking_reasons=["Venue extended account preflight is not configured"],
+            ).model_dump(mode="json"),
+        )
     account_blockers: list[str] = []
     if not extended_account.enabled:
         account_blockers.append("Venue extended account preflight is not enabled")
@@ -1040,6 +1071,7 @@ def create_app() -> FastAPI:
         label: str | None = None,
         paper_trade_id: int | None = None,
     ) -> list[CleanupPreviewConfirmationEntry]:
+        limit = _validated_history_limit("limit", limit)
         return store.list_recent(limit=limit, label=label, paper_trade_id=paper_trade_id)
 
     @app.post(
@@ -1070,6 +1102,9 @@ def create_app() -> FastAPI:
         ],
         note: str | None = None,
     ) -> CleanupPreviewConfirmationEntry:
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
         paper_trade, execution, _, cleanup_preview = await _build_cleanup_context_for_paper_trade(
             paper_trade_id=paper_trade_id,
             settings=settings,
@@ -1079,7 +1114,7 @@ def create_app() -> FastAPI:
             order_state_service=order_state_service,
             cleanup_service=cleanup_service,
         )
-        if cleanup_preview.preview_hash != preview_hash:
+        if cleanup_preview.preview_hash != normalized_preview_hash:
             raise HTTPException(
                 status_code=409,
                 detail="Preview hash did not match the current cleanup preview",
@@ -1088,7 +1123,7 @@ def create_app() -> FastAPI:
             confirmed_at=datetime.now(UTC),
             paper_trade_id=paper_trade.entry_id or paper_trade_id,
             label=paper_trade.intent.label,
-            preview_hash=cleanup_preview.preview_hash,
+            preview_hash=normalized_preview_hash,
             preview=cleanup_preview,
             note=note,
         )
@@ -1537,6 +1572,9 @@ def create_app() -> FastAPI:
             Depends(get_extended_live_execution_service),
         ],
     ) -> ExecutionJournalEntry:
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
         await _ensure_extended_cleanup_live_ready(
             settings=settings,
             account_service=account_service,
@@ -1550,7 +1588,7 @@ def create_app() -> FastAPI:
             order_state_service=order_state_service,
             cleanup_service=cleanup_service,
         )
-        if cleanup_preview.preview_hash != preview_hash:
+        if cleanup_preview.preview_hash != normalized_preview_hash:
             raise HTTPException(
                 status_code=409,
                 detail="Cleanup preview hash did not match the current cleanup preview",
@@ -1562,11 +1600,30 @@ def create_app() -> FastAPI:
         try:
             confirmation = require_confirmed_cleanup_preview(
                 paper_trade_id=paper_trade_id,
-                preview_hash=preview_hash,
+                preview_hash=normalized_preview_hash,
                 confirmations=confirmations,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Cleanup preview confirmation entry_id is required before live submission",
+            )
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            if existing_entry is not None:
+                raise HTTPException(status_code=409, detail=existing_entry.model_dump(mode="json"))
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A live submission is already reserved for this confirmed cleanup preview; "
+                    "manual reconciliation is required before retrying"
+                ),
+            )
         try:
             journal_entry = await live_service.submit_confirmed_cleanup_preview(
                 paper_trade=paper_trade,
@@ -1576,7 +1633,17 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return execution_store.append(journal_entry)
+        saved_entry = execution_store.append(journal_entry)
+        if saved_entry.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        execution_store.mark_live_submission_completed(
+            confirmation_entry_id=confirmation.entry_id,
+            execution_entry_id=saved_entry.entry_id,
+        )
+        return saved_entry
 
     @app.post(
         "/v1/executions/live/pair/from-paper-trade/{paper_trade_id}",
