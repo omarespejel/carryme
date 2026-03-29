@@ -8,6 +8,7 @@ import carryme_models as carryme_models_module
 import pytest
 from carryme_api.app import (
     app,
+    get_balance_accounting_service,
     get_execution_accounting_service,
     get_execution_quality_service,
     get_history_store,
@@ -45,6 +46,7 @@ from carryme_models import (
     OpportunityRecord,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
@@ -57,6 +59,7 @@ from carryme_models import (
     VenueOrderPreview,
 )
 from carryme_storage import (
+    BalanceSnapshotStore,
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
@@ -660,6 +663,132 @@ def test_upsert_route_approval_endpoint_uses_service_dependency() -> None:
     payload = response.json()
     assert payload["label"] == "arb_extended_paradex"
     assert payload["max_live_notional"] == 15.0
+
+
+def test_capture_balance_snapshots_for_paper_trade(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    snapshot_store = BalanceSnapshotStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 17, 0, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 16, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.001,
+                break_even_days_entry=0.5,
+                capacity_limit_notional=100.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        total_collateral=4.9,
+                        available_to_trade=4.9,
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                        total_collateral=14.8,
+                        available_to_trade=14.8,
+                        free_collateral=14.8,
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_balance_snapshot_store,
+        get_paper_trade_store,
+    )
+    from carryme_runtime import BalanceAccountingService
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_balance_snapshot_store] = lambda: snapshot_store
+    app.dependency_overrides[get_balance_accounting_service] = (
+        lambda: BalanceAccountingService(store=snapshot_store)
+    )
+    app.dependency_overrides[get_account_preflight_service] = (
+        lambda: StubAccountPreflightService()
+    )
+    client = TestClient(app)
+    response = client.post(
+        f"/v1/accounting/balance-snapshots/from-paper-trade/{paper_trade.entry_id}",
+        params={"stage": "pre_open", "note": "before canary"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 2
+    assert snapshot_store.list_recent(limit=10, paper_trade_id=paper_trade.entry_id)
+
+
+def test_balance_delta_endpoint_uses_service_dependency() -> None:
+    class StubBalanceAccountingService:
+        def summarize_paper_trade(self, paper_trade_id: int) -> PaperTradeBalanceDelta:
+            assert paper_trade_id == 7
+            return PaperTradeBalanceDelta(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                snapshot_count=4,
+                venue_count=2,
+                first_captured_at=datetime(2026, 3, 29, 17, 0, tzinfo=UTC),
+                latest_captured_at=datetime(2026, 3, 29, 17, 30, tzinfo=UTC),
+                total_collateral_delta=-0.23,
+                total_available_to_trade_delta=-0.23,
+                total_free_collateral_delta=-0.14,
+                venues=[],
+            )
+
+    app.dependency_overrides[get_balance_accounting_service] = (
+        lambda: StubBalanceAccountingService()
+    )
+    client = TestClient(app)
+    response = client.get("/v1/accounting/balance-delta/from-paper-trade/7")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == 7
+    assert payload["total_collateral_delta"] == -0.23
 
 
 def test_execution_quality_endpoint_uses_service_dependency() -> None:

@@ -44,6 +44,7 @@ from carryme_models import (
     PairClosePreviewConfirmationEntry,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
@@ -54,12 +55,14 @@ from carryme_models import (
     TopOfBook,
     TradeLegIntent,
     VenueAccountPreflight,
+    VenueBalanceSnapshot,
     VenueExecutionPreflight,
     VenueOrderPreview,
 )
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
     AccountPreflightService,
+    BalanceAccountingService,
     CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
     ExecutionAccountingService,
@@ -102,6 +105,7 @@ from carryme_runtime.account_preflight import (
 from carryme_runtime.execution_quality import ExecutionQualityService
 from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import (
+    BalanceSnapshotStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
@@ -10937,3 +10941,65 @@ def test_route_approval_service_filters_canaries_and_enforces_live_cap(
     assert service.require_live_approval(permitted_intent).max_live_notional == 12.0
     with pytest.raises(ValueError, match="approved cap"):
         service.require_live_approval(blocked_intent)
+
+
+def test_balance_accounting_service_summarizes_snapshots(tmp_path: Path) -> None:
+    store = BalanceSnapshotStore(tmp_path / "history.sqlite3")
+    service = BalanceAccountingService(store=store)
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="pre_open",
+            venue="extended",
+            total_collateral=4.99,
+            available_to_trade=4.99,
+            free_collateral=4.99,
+        )
+    )
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="pre_open",
+            venue="paradex",
+            total_collateral=15.0,
+            available_to_trade=15.0,
+            free_collateral=15.0,
+        )
+    )
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 20, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="post_close",
+            venue="extended",
+            total_collateral=4.90,
+            available_to_trade=4.90,
+            free_collateral=4.90,
+        )
+    )
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 20, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="post_close",
+            venue="paradex",
+            total_collateral=14.86,
+            available_to_trade=14.86,
+            free_collateral=14.86,
+        )
+    )
+
+    summary = service.summarize_paper_trade(7)
+
+    assert summary is not None
+    assert isinstance(summary, PaperTradeBalanceDelta)
+    assert summary.snapshot_count == 4
+    assert summary.venue_count == 2
+    assert summary.total_collateral_delta == pytest.approx(-0.23)
+    assert summary.venues[0].snapshot_count == 2

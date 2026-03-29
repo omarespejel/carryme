@@ -36,6 +36,7 @@ from carryme_models import (
     PairClosePreviewConfirmationEntry,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
@@ -47,6 +48,7 @@ from carryme_models import (
     ServiceHealth,
     TradingFeeProfile,
     VenueAccountPreflight,
+    VenueBalanceSnapshot,
     VenueExecutionPreflight,
     WatchlistDocument,
 )
@@ -54,6 +56,7 @@ from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
     AccountPreflightConfigMap,
     AccountPreflightService,
+    BalanceAccountingService,
     CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
     ConnectorError,
@@ -96,6 +99,7 @@ from carryme_runtime import (
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
+    BalanceSnapshotStore,
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
@@ -487,6 +491,22 @@ def get_route_approval_service(
     """Return the route approval service."""
 
     return RouteApprovalService(store=store)
+
+
+def get_balance_snapshot_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> BalanceSnapshotStore:
+    """Return the shared balance snapshot store."""
+
+    return BalanceSnapshotStore(settings.database_path)
+
+
+def get_balance_accounting_service(
+    store: Annotated[BalanceSnapshotStore, Depends(get_balance_snapshot_store)],
+) -> BalanceAccountingService:
+    """Return the balance accounting service."""
+
+    return BalanceAccountingService(store=store)
 
 
 def get_paradex_live_execution_service(
@@ -1388,6 +1408,92 @@ def create_app() -> FastAPI:
         payload: Annotated[RouteApprovalUpsert, Body()],
     ) -> RouteApprovalEntry:
         return service.upsert(label=label, payload=payload)
+
+    @app.get(
+        "/v1/accounting/balance-snapshots",
+        response_model=list[VenueBalanceSnapshot],
+    )
+    def balance_snapshots(
+        service: Annotated[
+            BalanceAccountingService,
+            Depends(get_balance_accounting_service),
+        ],
+        limit: int = 100,
+        paper_trade_id: int | None = None,
+        label: str | None = None,
+        stage: str | None = None,
+        venue: str | None = None,
+    ) -> list[VenueBalanceSnapshot]:
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return service.list_snapshots(
+            limit=limit,
+            paper_trade_id=paper_trade_id,
+            label=label,
+            stage=stage,
+            venue=venue,
+        )
+
+    @app.post(
+        "/v1/accounting/balance-snapshots/from-paper-trade/{paper_trade_id}",
+        response_model=list[VenueBalanceSnapshot],
+    )
+    async def capture_balance_snapshots_for_paper_trade(
+        paper_trade_id: int,
+        stage: str,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        account_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        service: Annotated[
+            BalanceAccountingService,
+            Depends(get_balance_accounting_service),
+        ],
+        note: str | None = None,
+    ) -> list[VenueBalanceSnapshot]:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        preflight = await account_service.probe_paper_trade(
+            paper_trade,
+            _build_account_preflight_configs(settings),
+        )
+        unauthenticated = [item.venue for item in preflight.venues if not item.authenticated]
+        if unauthenticated:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Balance snapshot capture requires authenticated venue reads for: "
+                    + ", ".join(sorted(unauthenticated))
+                ),
+            )
+        return service.capture_paper_trade(
+            paper_trade=paper_trade,
+            preflight=preflight,
+            stage=stage,
+            note=note,
+        )
+
+    @app.get(
+        "/v1/accounting/balance-delta/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeBalanceDelta,
+    )
+    def balance_delta_for_paper_trade(
+        paper_trade_id: int,
+        service: Annotated[
+            BalanceAccountingService,
+            Depends(get_balance_accounting_service),
+        ],
+    ) -> PaperTradeBalanceDelta:
+        summary = service.summarize_paper_trade(paper_trade_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="No balance snapshots found")
+        return summary
 
     @app.post("/v1/paper-trades/from-intent", response_model=PaperTradeEntry)
     def create_paper_trade_from_intent(

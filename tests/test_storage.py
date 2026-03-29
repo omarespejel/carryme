@@ -26,9 +26,11 @@ from carryme_models import (
     PreviewConfirmationEntry,
     RouteApprovalEntry,
     TradeLegIntent,
+    VenueBalanceSnapshot,
     VenueOrderPreview,
 )
 from carryme_storage import (
+    BalanceSnapshotStore,
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
@@ -2354,3 +2356,35 @@ def test_route_approval_store_upserts_and_reads_route(tmp_path: Path) -> None:
     assert loaded.max_live_notional == 40.0
     assert len(results) == 1
     assert results[0].label == "arb_extended_paradex"
+
+
+def test_balance_snapshot_store_appends_and_filters(tmp_path: Path) -> None:
+    store = BalanceSnapshotStore(tmp_path / "history.sqlite3")
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="pre_open",
+            venue="extended",
+            total_collateral=4.9,
+            available_to_trade=4.9,
+        )
+    )
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 5, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="post_close",
+            venue="extended",
+            total_collateral=4.85,
+            available_to_trade=4.85,
+        )
+    )
+
+    snapshots = store.list_recent(limit=10, paper_trade_id=7, venue="extended")
+
+    assert len(snapshots) == 2
+    assert snapshots[0].stage == "post_close"
+    assert snapshots[1].stage == "pre_open"
