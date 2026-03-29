@@ -10,13 +10,19 @@ from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
     FundingArbOpportunity,
+    FundingPairTradeIntent,
     OpportunityRecord,
     ServiceHealth,
     TradingFeeProfile,
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
-from carryme_runtime import ConnectorError, OpportunityService, UpstreamDataError
+from carryme_runtime import (
+    ConnectorError,
+    OpportunityService,
+    UpstreamDataError,
+    build_trade_intent,
+)
 from carryme_storage import CandidateAlertStore, OpportunityHistoryStore, WatchlistStore
 from fastapi import Body, Depends, FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
@@ -118,6 +124,52 @@ def _validated_non_negative_threshold(name: str, value: float) -> float:
     if value < 0:
         raise HTTPException(status_code=400, detail=f"{name} must be non-negative")
     return value
+
+
+def _validated_positive_threshold(name: str, value: float) -> float:
+    """Validate finite strictly positive query parameters."""
+
+    if not math.isfinite(value):
+        raise HTTPException(status_code=400, detail=f"{name} must be finite")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be greater than zero")
+    return value
+
+
+def _validated_fraction(name: str, value: float) -> float:
+    """Validate finite fractions constrained to the inclusive unit interval."""
+
+    if not math.isfinite(value):
+        raise HTTPException(status_code=400, detail=f"{name} must be finite")
+    if value <= 0 or value > 1:
+        raise HTTPException(status_code=400, detail=f"{name} must be within (0, 1]")
+    return value
+
+
+def _select_trade_intent_records(
+    records: list[OpportunityRecord],
+    *,
+    limit: int,
+    min_one_day_net_edge_after_entry: float,
+    min_capacity_notional: float,
+    max_break_even_days_entry: float | None,
+) -> list[OpportunityRecord]:
+    """Select ranked records that still clear the requested dry-run gates."""
+
+    latest = latest_records_by_label(records, limit=len(records))
+    candidates = filter_candidate_records(
+        latest,
+        min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+        min_capacity_notional=min_capacity_notional,
+    )
+    if max_break_even_days_entry is not None:
+        candidates = [
+            record
+            for record in candidates
+            if record.opportunity.break_even_days_entry is not None
+            and record.opportunity.break_even_days_entry <= max_break_even_days_entry
+        ]
+    return rank_history_records(candidates, limit=limit)
 
 
 def create_app() -> FastAPI:
@@ -239,6 +291,92 @@ def create_app() -> FastAPI:
             return store.list_recent(limit=limit, label=label)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/intents/funding-pairs", response_model=list[FundingPairTradeIntent])
+    def funding_pair_intents(
+        store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        limit: int = 20,
+        sample: int = 200,
+        label: str | None = None,
+        capacity_fraction: float = 0.25,
+        max_target_notional: float = 1000.0,
+        min_one_day_net_edge_after_entry: float = 0.0,
+        min_capacity_notional: float = 0.0,
+        max_break_even_days_entry: float | None = None,
+    ) -> list[FundingPairTradeIntent]:
+        limit = _validated_history_limit("limit", limit)
+        sample = max(limit, _validated_history_limit("sample", sample))
+        capacity_fraction = _validated_fraction("capacity_fraction", capacity_fraction)
+        max_target_notional = _validated_positive_threshold(
+            "max_target_notional",
+            max_target_notional,
+        )
+        min_one_day_net_edge_after_entry = _validated_non_negative_threshold(
+            "min_one_day_net_edge_after_entry",
+            min_one_day_net_edge_after_entry,
+        )
+        min_capacity_notional = _validated_non_negative_threshold(
+            "min_capacity_notional",
+            min_capacity_notional,
+        )
+        if max_break_even_days_entry is not None:
+            max_break_even_days_entry = _validated_non_negative_threshold(
+                "max_break_even_days_entry",
+                max_break_even_days_entry,
+            )
+        records = store.list_recent(limit=sample, label=label)
+        selected = _select_trade_intent_records(
+            records,
+            limit=limit,
+            min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+            min_capacity_notional=min_capacity_notional,
+            max_break_even_days_entry=max_break_even_days_entry,
+        )
+        intents: list[FundingPairTradeIntent] = []
+        for record in selected:
+            try:
+                intents.append(
+                    build_trade_intent(
+                        record,
+                        capacity_fraction=capacity_fraction,
+                        max_target_notional=max_target_notional,
+                        min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+                        min_capacity_notional=min_capacity_notional,
+                        max_break_even_days_entry=max_break_even_days_entry,
+                    )
+                )
+            except ValueError:
+                continue
+        return intents
+
+    @app.get("/v1/intents/funding-pair", response_model=FundingPairTradeIntent)
+    def funding_pair_intent(
+        store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        sample: int = 200,
+        label: str | None = None,
+        capacity_fraction: float = 0.25,
+        max_target_notional: float = 1000.0,
+        min_one_day_net_edge_after_entry: float = 0.0,
+        min_capacity_notional: float = 0.0,
+        max_break_even_days_entry: float | None = None,
+    ) -> FundingPairTradeIntent:
+        selected = funding_pair_intents(
+            store=store,
+            limit=1,
+            sample=sample,
+            label=label,
+            capacity_fraction=capacity_fraction,
+            max_target_notional=max_target_notional,
+            min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+            min_capacity_notional=min_capacity_notional,
+            max_break_even_days_entry=max_break_even_days_entry,
+        )
+        if not selected:
+            raise HTTPException(
+                status_code=404,
+                detail="No trade intent candidate matched the requested filters",
+            )
+        return selected[0]
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(

@@ -842,6 +842,214 @@ def test_candidate_dashboard_rejects_invalid_sample(tmp_path: Path) -> None:
     assert response.json()["detail"] == "sample must be at most 1000"
 
 
+def test_trade_intents_endpoint_builds_ranked_intents(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    fixtures = [
+        ("strk_extended_hyperliquid", "STRK-USD-PERP", "hyperliquid", "tier0", 0.0002, 3000.0),
+        ("arb_extended_paradex", "ARB-USD-PERP", "paradex", "pro", 0.0008, 4500.0),
+    ]
+    for label, symbol, long_venue, long_fee, entry_edge, capacity in fixtures:
+        store.append(
+            OpportunityRecord(
+                recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+                pair=FundingPairSpec(
+                    label=label,
+                    left_venue="extended",
+                    left_symbol="STRK-USD" if "STRK" in symbol else "ARB-USD",
+                    left_fee_profile="default",
+                    right_venue=long_venue,
+                    right_symbol="STRK" if "STRK" in symbol else "ARB-USD-PERP",
+                    right_fee_profile=long_fee,
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol=symbol,
+                    long_venue=long_venue,
+                    short_venue="extended",
+                    long_fee_profile=long_fee,
+                    short_fee_profile="default",
+                    gross_daily_edge=0.001,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=entry_edge,
+                    one_day_net_edge_after_round_trip=entry_edge - 0.0003,
+                    break_even_days_entry=0.5,
+                    break_even_days_round_trip=1.0,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=capacity + 500.0,
+                        long_ask_notional=capacity,
+                        max_entry_notional=capacity,
+                        limiting_venue=long_venue,
+                    ),
+                ),
+            )
+        )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get(
+            "/v1/intents/funding-pairs",
+            params={
+                "limit": 10,
+                "capacity_fraction": 0.25,
+                "max_target_notional": 1000.0,
+                "min_one_day_net_edge_after_entry": 0.0,
+                "min_capacity_notional": 1000.0,
+                "max_break_even_days_entry": 1.0,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 2
+    assert payload[0]["label"] == "arb_extended_paradex"
+    assert payload[0]["target_notional"] == 1000.0
+
+
+def test_trade_intent_endpoint_returns_not_found_when_thresholds_exclude_all(
+    tmp_path: Path,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=-0.0001,
+                one_day_net_edge_after_round_trip=-0.0004,
+                break_even_days_entry=0.8,
+                break_even_days_round_trip=1.6,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get(
+            "/v1/intents/funding-pair",
+            params={
+                "min_one_day_net_edge_after_entry": 0.0,
+                "min_capacity_notional": 1000.0,
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No trade intent candidate matched the requested filters"
+
+
+def test_trade_intents_endpoint_rejects_invalid_capacity_fraction(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get(
+            "/v1/intents/funding-pairs",
+            params={"capacity_fraction": 0.0},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "capacity_fraction must be within (0, 1]"
+
+
+def test_trade_intents_endpoint_rejects_invalid_sample(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get(
+            "/v1/intents/funding-pairs",
+            params={"sample": 1001},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "sample must be at most 1000"
+
+
+def test_trade_intents_endpoint_rejects_invalid_max_target_notional(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get(
+            "/v1/intents/funding-pairs",
+            params={"max_target_notional": 0.0},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "max_target_notional must be greater than zero"
+
+
+def test_trade_intent_endpoint_returns_not_found_when_break_even_days_are_missing(
+    tmp_path: Path,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=None,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get(
+            "/v1/intents/funding-pair",
+            params={"max_break_even_days_entry": 1.0},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "No trade intent candidate matched the requested filters"
+
+
 def test_funding_pair_endpoint_uses_service_dependency() -> None:
     class StubOpportunityService:
         async def score_pair(self, **_: str) -> FundingArbOpportunity:
