@@ -5038,6 +5038,7 @@ def test_paired_live_execution_endpoint_defaults_first_venue_to_auto(tmp_path: P
                         authenticated=True,
                         ready=True,
                         credential_mode="api_key",
+                        free_collateral=25.0,
                     ),
                     VenueAccountPreflight(
                         venue="paradex",
@@ -5045,6 +5046,7 @@ def test_paired_live_execution_endpoint_defaults_first_venue_to_auto(tmp_path: P
                         authenticated=True,
                         ready=True,
                         credential_mode="subkey_jwt",
+                        available_to_trade=25.0,
                     ),
                 ],
                 blocking_reasons=[],
