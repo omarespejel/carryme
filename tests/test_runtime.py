@@ -18,6 +18,7 @@ from carryme_models import (
     ExecutionLegOrderState,
     ExecutionLegResult,
     ExecutionOrderState,
+    ExecutionPairStatus,
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
     FundingArbOpportunity,
@@ -41,6 +42,7 @@ from carryme_models import (
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
     AccountPreflightService,
+    ExtendedCleanupPreviewService,
     ExtendedLiveExecutionService,
     MockExecutionAdapter,
     OpportunityService,
@@ -2174,3 +2176,158 @@ def test_build_execution_pair_status_marks_open_unhedged_pair_for_cleanup() -> N
     assert status.derived_state == "cleanup_needed"
     assert status.recommended_action == "close_open_leg"
     assert any("unfilled" in note.lower() for note in status.notes)
+
+
+def test_extended_cleanup_preview_service_builds_reduce_only_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=12,
+        executed_at=datetime(2026, 3, 29, 18, 0, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        confirmation_entry_id=3,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 3, 29, 17, 59, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 17, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0012,
+                break_even_days_entry=0.35,
+                capacity_limit_notional=1000.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="ext-order",
+            )
+        ],
+    )
+    pair_status = ExecutionPairStatus(
+        execution_entry_id=12,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        derived_state="cleanup_needed",
+        recommended_action="close_open_leg",
+        order_state=ExecutionOrderState(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            legs=[
+                ExecutionLegOrderState(
+                    venue="extended",
+                    supported=True,
+                    external_reference="ext-order",
+                    derived_state="unknown",
+                )
+            ],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            status="submitted",
+            recommended_action="verify_fill_status",
+            matched_all_leg_symbols=False,
+            venues=[
+                ExecutionVenueReconciliation(
+                    venue="extended",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=["ARB-USD"],
+                    matched_leg_symbols=["ARB-USD"],
+                    unmatched_leg_symbols=[],
+                )
+            ],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        assert venue == "extended"
+        assert symbol == "ARB-USD"
+        return _snapshot(
+            "extended",
+            "ARB-USD",
+            0.0002,
+            0.0894,
+            1_000,
+            0.0895,
+            1_000,
+            raw={
+                "tradingConfig": {
+                    "minOrderSize": "1",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1000",
+                }
+            },
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/user/positions"
+        assert request.headers["x-api-key"] == "api-key"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "market": "ARB-USD",
+                        "side": "SHORT",
+                        "size": "123",
+                    }
+                ]
+            },
+        )
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        service = ExtendedCleanupPreviewService(
+            api_key="api-key",
+            fetch_snapshot=fetch_snapshot,
+        )
+        preview = await service.preview_from_execution(entry=entry, pair_status=pair_status)
+        assert preview.reason == "close_open_leg"
+        assert preview.leg.symbol == "ARB-USD"
+        assert preview.leg.side == "buy"
+        assert preview.leg.reduce_only is True
+        assert preview.leg.quantity_text == "123"
+        assert preview.leg.worst_price_text == "0.0896"
+
+    asyncio.run(run())

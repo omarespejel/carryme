@@ -10,6 +10,7 @@ import httpx
 from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
+    ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionOrderState,
     ExecutionPairStatus,
@@ -37,6 +38,7 @@ from carryme_runtime import (
     ConnectorError,
     ExecutionAdapter,
     ExecutionOrderStateService,
+    ExtendedCleanupPreviewService,
     ExtendedLiveExecutionService,
     ExtendedOrderStateObserver,
     LiveExecutionConfigMap,
@@ -160,6 +162,14 @@ def get_extended_live_execution_service(
         api_key=settings.extended_api_key or "",
         stark_private_key=settings.extended_stark_private_key or "",
     )
+
+
+def get_extended_cleanup_preview_service(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExtendedCleanupPreviewService:
+    """Return the Extended cleanup-preview service."""
+
+    return ExtendedCleanupPreviewService(api_key=settings.extended_api_key or "")
 
 
 def get_execution_order_state_service(
@@ -720,6 +730,55 @@ def create_app() -> FastAPI:
         reconciliation = reconcile_execution(execution, account_preflight)
         order_state = await order_state_service.observe_execution(execution)
         return build_execution_pair_status(execution, order_state, reconciliation)
+
+    @app.get(
+        "/v1/executions/cleanup-preview/latest/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionCleanupPreview,
+    )
+    async def latest_execution_cleanup_preview_for_paper_trade(
+        paper_trade_id: int,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        account_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        order_state_service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+        cleanup_service: Annotated[
+            ExtendedCleanupPreviewService,
+            Depends(get_extended_cleanup_preview_service),
+        ],
+    ) -> ExecutionCleanupPreview:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        execution = execution_store.latest_for_paper_trade(paper_trade_id)
+        if execution is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No execution journal entry matched paper trade {paper_trade_id}",
+            )
+        account_preflight = await account_service.probe_paper_trade(
+            paper_trade,
+            _build_account_preflight_configs(settings),
+        )
+        reconciliation = reconcile_execution(execution, account_preflight)
+        order_state = await order_state_service.observe_execution(execution)
+        pair_status = build_execution_pair_status(execution, order_state, reconciliation)
+        try:
+            return await cleanup_service.preview_from_execution(
+                entry=execution,
+                pair_status=pair_status,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/v1/executions/preflight/venues", response_model=list[VenueExecutionPreflight])
     def execution_preflight_venues(

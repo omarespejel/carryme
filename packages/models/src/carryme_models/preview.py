@@ -47,3 +47,15 @@ class PaperTradeOrderPreview(BaseModel):
     slippage_tolerance_bps: int = Field(ge=0)
     preview_hash: str = Field(min_length=1)
     legs: list[VenueOrderPreview] = Field(min_length=1)
+
+
+class ExecutionCleanupPreview(BaseModel):
+    """A single-leg reduce-only cleanup order derived from live position state."""
+
+    execution_entry_id: int | None = None
+    paper_trade_id: int | None = None
+    generated_at: datetime
+    preview_hash: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    leg: VenueOrderPreview
+    notes: list[str] = Field(default_factory=list)
