@@ -7,7 +7,7 @@ from carryme_models.history import (
     OpportunityRecord,
     WatchlistDocument,
 )
-from carryme_models.intent import FundingPairTradeIntent, TradeLegIntent
+from carryme_models.intent import FundingPairTradeIntent, PaperTradeEntry, TradeLegIntent
 from carryme_models.market import MarketStats, TopOfBook
 from carryme_models.normalization import (
     FundingRateNormalization,
@@ -29,6 +29,7 @@ __all__ = [
     "MarketStats",
     "NormalizedMarketSnapshot",
     "OpportunityRecord",
+    "PaperTradeEntry",
     "ServiceHealth",
     "TopOfBook",
     "TradeLegIntent",

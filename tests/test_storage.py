@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -7,11 +7,15 @@ from carryme_models import (
     CapacityEstimate,
     FundingArbOpportunity,
     FundingPairSpec,
+    FundingPairTradeIntent,
     OpportunityRecord,
+    PaperTradeEntry,
+    TradeLegIntent,
 )
 from carryme_storage import (
     CandidateAlertStore,
     OpportunityHistoryStore,
+    PaperTradeStore,
     WatchlistStore,
     load_watchlist,
     save_watchlist,
@@ -312,6 +316,167 @@ def test_candidate_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:
     assert results[0].record.opportunity.canonical_symbol == "ARB-USD-PERP"
 
 
+def test_paper_trade_store_appends_and_lists_recent(tmp_path: Path) -> None:
+    store = PaperTradeStore(tmp_path / "history.sqlite3")
+    entry = PaperTradeEntry(
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="operator accepted candidate",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    store.append(entry)
+    results = store.list_recent(limit=10)
+
+    assert len(results) == 1
+    assert results[0].intent.label == "arb_extended_paradex"
+    assert results[0].note == "operator accepted candidate"
+
+
+def test_paper_trade_store_normalizes_created_at_to_utc(tmp_path: Path) -> None:
+    store = PaperTradeStore(tmp_path / "history.sqlite3")
+    saved = store.append(
+        PaperTradeEntry(
+            created_at=datetime(
+                2026,
+                3,
+                29,
+                16,
+                0,
+                tzinfo=timezone(timedelta(hours=3)),
+            ),
+            note="normalized timestamp",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    assert saved.created_at == datetime(2026, 3, 29, 13, 0, tzinfo=UTC)
+
+
+def test_paper_trade_store_rejects_naive_created_at(tmp_path: Path) -> None:
+    store = PaperTradeStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="created_at must be timezone-aware"):
+        store.append(
+            PaperTradeEntry(
+                created_at=datetime(2026, 3, 29, 13, 0),
+                note="naive timestamp",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            )
+        )
+
+
+def test_paper_trade_store_orders_ties_deterministically(tmp_path: Path) -> None:
+    store = PaperTradeStore(tmp_path / "history.sqlite3")
+    for note in ["first", "second"]:
+        store.append(
+            PaperTradeEntry(
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note=note,
+                intent=FundingPairTradeIntent(
+                    label=f"arb_extended_paradex_{note}",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            )
+        )
+
+    results = store.list_recent(limit=2)
+
+    assert [entry.note for entry in results] == ["second", "first"]
+
+
 def test_candidate_alert_store_normalizes_labels_on_read(tmp_path: Path) -> None:
     store = CandidateAlertStore(tmp_path / "history.sqlite3")
     store.append(
@@ -360,6 +525,17 @@ def test_candidate_alert_store_rejects_non_positive_limits(
     invalid_limit: int,
 ) -> None:
     store = CandidateAlertStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        store.list_recent(limit=invalid_limit)
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1])
+def test_paper_trade_store_rejects_non_positive_limits(
+    tmp_path: Path,
+    invalid_limit: int,
+) -> None:
+    store = PaperTradeStore(tmp_path / "history.sqlite3")
 
     with pytest.raises(ValueError, match="limit must be at least 1"):
         store.list_recent(limit=invalid_limit)

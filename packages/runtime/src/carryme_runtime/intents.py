@@ -5,6 +5,10 @@ from __future__ import annotations
 from carryme_models import FundingPairTradeIntent, OpportunityRecord, TradeLegIntent
 
 
+class InvalidTradeCandidateError(ValueError):
+    """Persisted opportunity cannot be transformed into a valid trade intent."""
+
+
 def build_trade_intent(
     record: OpportunityRecord,
     *,
@@ -17,11 +21,13 @@ def build_trade_intent(
     """Build a deterministic paired trade intent from a persisted opportunity record."""
 
     if capacity_fraction <= 0 or capacity_fraction > 1:
-        raise ValueError("capacity_fraction must be within (0, 1]")
+        raise InvalidTradeCandidateError("capacity_fraction must be within (0, 1]")
     if max_target_notional <= 0:
-        raise ValueError("max_target_notional must be greater than zero")
+        raise InvalidTradeCandidateError("max_target_notional must be greater than zero")
     if record.opportunity.one_day_net_edge_after_entry < min_one_day_net_edge_after_entry:
-        raise ValueError("Opportunity one-day net entry edge is below the configured threshold")
+        raise InvalidTradeCandidateError(
+            "Opportunity one-day net entry edge is below the configured threshold"
+        )
 
     capacity = (
         record.opportunity.capacity.max_entry_notional
@@ -29,23 +35,25 @@ def build_trade_intent(
         else None
     )
     if capacity is None or capacity <= 0:
-        raise ValueError("Opportunity does not include a usable capacity estimate")
+        raise InvalidTradeCandidateError("Opportunity does not include a usable capacity estimate")
     if capacity < min_capacity_notional:
-        raise ValueError("Opportunity capacity is below the configured threshold")
+        raise InvalidTradeCandidateError("Opportunity capacity is below the configured threshold")
 
     break_even_days_entry = record.opportunity.break_even_days_entry
     if max_break_even_days_entry is not None and break_even_days_entry is None:
-        raise ValueError("Opportunity missing break-even days entry")
+        raise InvalidTradeCandidateError("Opportunity missing break-even days entry")
     if (
         max_break_even_days_entry is not None
         and break_even_days_entry is not None
         and break_even_days_entry > max_break_even_days_entry
     ):
-        raise ValueError("Opportunity break-even days exceed the configured threshold")
+        raise InvalidTradeCandidateError(
+            "Opportunity break-even days exceed the configured threshold"
+        )
 
     target_notional = min(capacity * capacity_fraction, max_target_notional)
     if target_notional <= 0:
-        raise ValueError("Calculated target notional must be greater than zero")
+        raise InvalidTradeCandidateError("Calculated target notional must be greater than zero")
 
     label = record.pair.label or record.opportunity.canonical_symbol
     return FundingPairTradeIntent(

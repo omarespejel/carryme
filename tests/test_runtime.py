@@ -12,7 +12,7 @@ from carryme_models import (
     TopOfBook,
 )
 from carryme_normalizers import normalize_market_snapshot
-from carryme_runtime import OpportunityService, build_trade_intent
+from carryme_runtime import InvalidTradeCandidateError, OpportunityService, build_trade_intent
 
 
 def _snapshot(
@@ -156,7 +156,7 @@ def test_build_trade_intent_rejects_edge_below_threshold() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="one-day net entry edge"):
+    with pytest.raises(InvalidTradeCandidateError, match="one-day net entry edge"):
         build_trade_intent(
             record,
             capacity_fraction=0.25,
@@ -200,7 +200,7 @@ def test_build_trade_intent_rejects_invalid_capacity_fraction() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="capacity_fraction must be within"):
+    with pytest.raises(InvalidTradeCandidateError, match="capacity_fraction must be within"):
         build_trade_intent(
             record,
             capacity_fraction=0.0,
@@ -244,7 +244,7 @@ def test_build_trade_intent_rejects_capacity_fraction_above_one() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="capacity_fraction must be within"):
+    with pytest.raises(InvalidTradeCandidateError, match="capacity_fraction must be within"):
         build_trade_intent(
             record,
             capacity_fraction=1.5,
@@ -288,7 +288,7 @@ def test_build_trade_intent_rejects_non_positive_max_target_notional() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="max_target_notional"):
+    with pytest.raises(InvalidTradeCandidateError, match="max_target_notional"):
         build_trade_intent(
             record,
             capacity_fraction=0.25,
@@ -327,7 +327,7 @@ def test_build_trade_intent_rejects_missing_capacity_estimate() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="usable capacity estimate"):
+    with pytest.raises(InvalidTradeCandidateError, match="usable capacity estimate"):
         build_trade_intent(
             record,
             capacity_fraction=0.25,
@@ -371,7 +371,7 @@ def test_build_trade_intent_rejects_break_even_days_entry_above_max() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="break-even days exceed"):
+    with pytest.raises(InvalidTradeCandidateError, match="break-even days exceed"):
         build_trade_intent(
             record,
             capacity_fraction=0.25,
@@ -416,7 +416,7 @@ def test_build_trade_intent_rejects_zero_max_entry_notional() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="usable capacity estimate"):
+    with pytest.raises(InvalidTradeCandidateError, match="usable capacity estimate"):
         build_trade_intent(
             record,
             capacity_fraction=0.25,

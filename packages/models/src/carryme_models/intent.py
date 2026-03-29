@@ -30,3 +30,11 @@ class FundingPairTradeIntent(BaseModel):
     max_target_notional: float = Field(gt=0)
     long_leg: TradeLegIntent
     short_leg: TradeLegIntent
+
+
+class PaperTradeEntry(BaseModel):
+    """An append-only paper trade journal entry."""
+
+    created_at: datetime
+    intent: FundingPairTradeIntent
+    note: str | None = None

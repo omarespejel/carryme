@@ -2,6 +2,7 @@
 
 import math
 import os
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Annotated
 
@@ -12,6 +13,7 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairTradeIntent,
     OpportunityRecord,
+    PaperTradeEntry,
     ServiceHealth,
     TradingFeeProfile,
     WatchlistDocument,
@@ -19,11 +21,17 @@ from carryme_models import (
 from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
     ConnectorError,
+    InvalidTradeCandidateError,
     OpportunityService,
     UpstreamDataError,
     build_trade_intent,
 )
-from carryme_storage import CandidateAlertStore, OpportunityHistoryStore, WatchlistStore
+from carryme_storage import (
+    CandidateAlertStore,
+    OpportunityHistoryStore,
+    PaperTradeStore,
+    WatchlistStore,
+)
 from fastapi import Body, Depends, FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
 
@@ -73,6 +81,13 @@ def _watchlist_store_for_path(watchlist_path: str) -> WatchlistStore:
     return WatchlistStore(watchlist_path)
 
 
+@lru_cache
+def _paper_trade_store_for_path(database_path: str) -> PaperTradeStore:
+    """Return a shared paper trade journal wrapper for the configured SQLite path."""
+
+    return PaperTradeStore(database_path)
+
+
 def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
@@ -101,6 +116,14 @@ def get_watchlist_store(
     """Return the shared watchlist store."""
 
     return _watchlist_store_for_path(settings.watchlist_path)
+
+
+def get_paper_trade_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> PaperTradeStore:
+    """Return the shared paper trade journal store."""
+
+    return _paper_trade_store_for_path(settings.database_path)
 
 
 def _validated_history_limit(name: str, value: int) -> int:
@@ -170,6 +193,69 @@ def _select_trade_intent_records(
             and record.opportunity.break_even_days_entry <= max_break_even_days_entry
         ]
     return rank_history_records(candidates, limit=limit)
+
+
+def _build_trade_intent_candidates(
+    store: OpportunityHistoryStore,
+    *,
+    limit: int,
+    sample: int,
+    label: str | None,
+    capacity_fraction: float,
+    max_target_notional: float,
+    min_one_day_net_edge_after_entry: float,
+    min_capacity_notional: float,
+    max_break_even_days_entry: float | None,
+) -> list[FundingPairTradeIntent]:
+    """Build ranked dry-run trade intents from saved opportunity history."""
+
+    limit = _validated_history_limit("limit", limit)
+    sample = max(limit, _validated_history_limit("sample", sample))
+    candidate_sample = min(MAX_HISTORY_LIMIT, max(sample, limit * 4))
+    capacity_fraction = _validated_fraction("capacity_fraction", capacity_fraction)
+    max_target_notional = _validated_positive_threshold(
+        "max_target_notional",
+        max_target_notional,
+    )
+    min_one_day_net_edge_after_entry = _validated_non_negative_threshold(
+        "min_one_day_net_edge_after_entry",
+        min_one_day_net_edge_after_entry,
+    )
+    min_capacity_notional = _validated_non_negative_threshold(
+        "min_capacity_notional",
+        min_capacity_notional,
+    )
+    if max_break_even_days_entry is not None:
+        max_break_even_days_entry = _validated_non_negative_threshold(
+            "max_break_even_days_entry",
+            max_break_even_days_entry,
+        )
+    records = store.list_recent(limit=candidate_sample, label=label)
+    selected = _select_trade_intent_records(
+        records,
+        limit=candidate_sample,
+        min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+        min_capacity_notional=min_capacity_notional,
+        max_break_even_days_entry=max_break_even_days_entry,
+    )
+    intents: list[FundingPairTradeIntent] = []
+    for record in selected:
+        try:
+            intents.append(
+                build_trade_intent(
+                    record,
+                    capacity_fraction=capacity_fraction,
+                    max_target_notional=max_target_notional,
+                    min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+                    min_capacity_notional=min_capacity_notional,
+                    max_break_even_days_entry=max_break_even_days_entry,
+                )
+            )
+        except InvalidTradeCandidateError:
+            continue
+        if len(intents) == limit:
+            break
+    return intents
 
 
 def create_app() -> FastAPI:
@@ -280,6 +366,7 @@ def create_app() -> FastAPI:
         )
         return rank_history_records(candidates, limit=limit)
 
+
     @app.get("/v1/alerts/candidates", response_model=list[CandidateAlertEvent])
     def candidate_alerts(
         store: Annotated[CandidateAlertStore, Depends(get_candidate_alert_store)],
@@ -304,50 +391,17 @@ def create_app() -> FastAPI:
         min_capacity_notional: float = 0.0,
         max_break_even_days_entry: float | None = None,
     ) -> list[FundingPairTradeIntent]:
-        limit = _validated_history_limit("limit", limit)
-        sample = max(limit, _validated_history_limit("sample", sample))
-        capacity_fraction = _validated_fraction("capacity_fraction", capacity_fraction)
-        max_target_notional = _validated_positive_threshold(
-            "max_target_notional",
-            max_target_notional,
-        )
-        min_one_day_net_edge_after_entry = _validated_non_negative_threshold(
-            "min_one_day_net_edge_after_entry",
-            min_one_day_net_edge_after_entry,
-        )
-        min_capacity_notional = _validated_non_negative_threshold(
-            "min_capacity_notional",
-            min_capacity_notional,
-        )
-        if max_break_even_days_entry is not None:
-            max_break_even_days_entry = _validated_non_negative_threshold(
-                "max_break_even_days_entry",
-                max_break_even_days_entry,
-            )
-        records = store.list_recent(limit=sample, label=label)
-        selected = _select_trade_intent_records(
-            records,
+        return _build_trade_intent_candidates(
+            store,
             limit=limit,
+            sample=sample,
+            label=label,
+            capacity_fraction=capacity_fraction,
+            max_target_notional=max_target_notional,
             min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
             min_capacity_notional=min_capacity_notional,
             max_break_even_days_entry=max_break_even_days_entry,
         )
-        intents: list[FundingPairTradeIntent] = []
-        for record in selected:
-            try:
-                intents.append(
-                    build_trade_intent(
-                        record,
-                        capacity_fraction=capacity_fraction,
-                        max_target_notional=max_target_notional,
-                        min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
-                        min_capacity_notional=min_capacity_notional,
-                        max_break_even_days_entry=max_break_even_days_entry,
-                    )
-                )
-            except ValueError:
-                continue
-        return intents
 
     @app.get("/v1/intents/funding-pair", response_model=FundingPairTradeIntent)
     def funding_pair_intent(
@@ -377,6 +431,55 @@ def create_app() -> FastAPI:
                 detail="No trade intent candidate matched the requested filters",
             )
         return selected[0]
+
+    @app.get("/v1/paper-trades", response_model=list[PaperTradeEntry])
+    def paper_trades(
+        store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[PaperTradeEntry]:
+        limit = _validated_history_limit("limit", limit)
+        try:
+            return store.list_recent(limit=limit, label=label)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/paper-trades/from-intent", response_model=PaperTradeEntry)
+    def create_paper_trade_from_intent(
+        history_store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        sample: int = 200,
+        label: str | None = None,
+        capacity_fraction: float = 0.25,
+        max_target_notional: float = 1000.0,
+        min_one_day_net_edge_after_entry: float = 0.0,
+        min_capacity_notional: float = 0.0,
+        max_break_even_days_entry: float | None = None,
+        note: str | None = None,
+    ) -> PaperTradeEntry:
+        intents = _build_trade_intent_candidates(
+            history_store,
+            limit=1,
+            sample=sample,
+            label=label,
+            capacity_fraction=capacity_fraction,
+            max_target_notional=max_target_notional,
+            min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+            min_capacity_notional=min_capacity_notional,
+            max_break_even_days_entry=max_break_even_days_entry,
+        )
+        if not intents:
+            raise HTTPException(
+                status_code=404,
+                detail="No paper trade intent matched the requested filters",
+            )
+        entry = PaperTradeEntry(
+            created_at=datetime.now(UTC),
+            intent=intents[0],
+            note=note,
+        )
+        paper_store.append(entry)
+        return entry
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(
