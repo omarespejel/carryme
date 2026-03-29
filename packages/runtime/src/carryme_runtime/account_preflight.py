@@ -196,7 +196,7 @@ class ExtendedAccountProbe:
             try:
                 balance_count = _count_rows(balances, context="Extended balances")
             except UpstreamDataError as exc:
-                if isinstance(balance_rows, dict):
+                if _looks_like_extended_balance_summary(balance_rows):
                     balance_count = 0
                 elif balance_body:
                     raise UpstreamDataError(
@@ -487,6 +487,22 @@ def _unwrap_payload(value: dict[str, Any] | list[Any], *, context: str) -> dict[
             raise UpstreamDataError(f"{context} payload field {key!r} must be an object")
         return value
     raise UpstreamDataError(f"{context} payload must be an object")
+
+
+def _looks_like_extended_balance_summary(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(
+        key in value
+        for key in (
+            "equity",
+            "balance",
+            "totalCollateral",
+            "availableForTrade",
+            "availableBalance",
+            "available_to_trade",
+        )
+    )
 
 
 def _count_rows(value: dict[str, Any] | list[Any], *, context: str) -> int:

@@ -82,6 +82,8 @@ class ExtendedLiveExecutionService:
                 order_payload=leg.payload,
                 taker_fee_rate=api_fee_rate if api_fee_rate is not None else fee_rate,
             )
+            # Do not auto-retry live order writes: ambiguous transport failures require
+            # operator reconciliation to avoid duplicating venue-side submissions.
             response = await client.post(EXTENDED_ORDER_PATH, json=signed_payload)
 
         response_payload = _response_payload(response)

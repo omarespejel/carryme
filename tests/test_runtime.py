@@ -2988,6 +2988,7 @@ def test_extended_account_probe_uses_balance_payload_for_collateral(
         assert status.authenticated is True
         assert status.total_collateral == pytest.approx(4.989999)
         assert status.available_to_trade == pytest.approx(4.989999)
+        assert status.balance_count == 0
 
     asyncio.run(run())
 
