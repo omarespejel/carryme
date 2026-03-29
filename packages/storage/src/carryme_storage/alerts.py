@@ -34,10 +34,10 @@ def _normalize_event_payload(event: CandidateAlertEvent) -> dict[str, object]:
     return payload
 
 
-def _alert_identity_key(event: CandidateAlertEvent) -> str:
-    """Build a deterministic dedupe key for candidate alerts."""
+def _alert_identity_key(normalized_payload: dict[str, object]) -> str:
+    """Build a deterministic dedupe key from a normalized candidate alert payload."""
 
-    payload = _normalize_event_payload(event)
+    payload = dict(normalized_payload)
     payload.pop("raw_payload", None)
     return json.dumps(
         payload,
@@ -136,7 +136,7 @@ class CandidateAlertStore:
         record_payload = cast(dict[str, object], normalized_payload["record"])
         pair_payload = cast(dict[str, object], record_payload["pair"])
         normalized_label = cast(str | None, pair_payload["label"])
-        alert_key = _alert_identity_key(event)
+        alert_key = _alert_identity_key(normalized_payload)
         with sqlite3.connect(self.database_path) as connection:
             cursor = connection.execute(
                 """
