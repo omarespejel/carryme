@@ -1317,6 +1317,22 @@ def test_execution_observation_endpoint_reports_latest_snapshot(tmp_path: Path) 
             ),
         )
     )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 9, tzinfo=UTC),
+            context="guarded_pair_poll",
+            execution_entry_id=99,
+            paper_trade_id=8,
+            preview_hash="preview-hash-other-trade",
+            order_state=ExecutionOrderState(
+                execution_entry_id=99,
+                paper_trade_id=8,
+                preview_hash="preview-hash-other-trade",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
 
     from carryme_api.app import get_execution_observation_store
 
@@ -1328,6 +1344,7 @@ def test_execution_observation_endpoint_reports_latest_snapshot(tmp_path: Path) 
     assert response.status_code == 200
     payload = response.json()
     assert payload["entry_id"] == latest.entry_id
+    assert payload["paper_trade_id"] == 7
     assert payload["context"] == "guarded_pair_poll"
     assert payload["pair_status"]["derived_state"] == "review_required"
 

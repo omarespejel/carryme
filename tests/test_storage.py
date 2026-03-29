@@ -1925,6 +1925,70 @@ def test_execution_observation_store_normalizes_timestamps_to_utc(tmp_path: Path
     assert latest.observed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)
 
 
+def test_execution_observation_store_filters_by_paper_trade_id(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+    first = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+            context="trade-7",
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash-7",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash-7",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+    latest = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 8, tzinfo=UTC),
+            context="trade-7-latest",
+            execution_entry_id=14,
+            paper_trade_id=7,
+            preview_hash="preview-hash-7-newer",
+            order_state=ExecutionOrderState(
+                execution_entry_id=14,
+                paper_trade_id=7,
+                preview_hash="preview-hash-7-newer",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+    store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
+            context="trade-8",
+            execution_entry_id=13,
+            paper_trade_id=8,
+            preview_hash="preview-hash-8",
+            order_state=ExecutionOrderState(
+                execution_entry_id=13,
+                paper_trade_id=8,
+                preview_hash="preview-hash-8",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+
+    filtered = store.list_recent(limit=10, paper_trade_id=7)
+    latest_for_trade = store.latest_for_paper_trade(7)
+
+    assert first.entry_id is not None
+    assert latest.entry_id is not None
+    assert len(filtered) == 2
+    assert [entry.paper_trade_id for entry in filtered] == [7, 7]
+    assert [entry.entry_id for entry in filtered] == [latest.entry_id, first.entry_id]
+    assert [entry.context for entry in filtered] == ["trade-7-latest", "trade-7"]
+    assert latest_for_trade is not None
+    assert latest_for_trade.entry_id == latest.entry_id
+
+
 @pytest.mark.parametrize("invalid_limit", [0, -1])
 def test_execution_observation_store_rejects_non_positive_limits(
     tmp_path: Path,
