@@ -21,7 +21,7 @@ class ExecutionLegResult(BaseModel):
     external_reference: str | None = None
     request_payload: dict[str, Any] | None = None
     response_payload: dict[str, Any] | None = None
-    signature_timestamp: int | None = None
+    signature_timestamp_ms: int | None = None
     raw_payload: Any | None = None
 
 

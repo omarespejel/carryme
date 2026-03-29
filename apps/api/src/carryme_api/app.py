@@ -740,6 +740,8 @@ def create_app() -> FastAPI:
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get(
         "/v1/executions/preview/from-paper-trade/{paper_trade_id}",
@@ -884,19 +886,25 @@ def create_app() -> FastAPI:
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
 
-        readiness = await _build_readiness_for_paper_trade(
-            paper_trade=paper_trade,
-            preview_hash=preview_hash,
-            settings=settings,
-            confirmation_store=confirmation_store,
-            account_preflight_service=account_preflight_service,
-        )
+        normalized_preview_hash = preview_hash.strip()
+        try:
+            readiness = await _build_readiness_for_paper_trade(
+                paper_trade=paper_trade,
+                preview_hash=normalized_preview_hash,
+                settings=settings,
+                confirmation_store=confirmation_store,
+                account_preflight_service=account_preflight_service,
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not readiness.ready:
             raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
 
         confirmation = confirmation_store.find_latest_by_preview_hash(
             paper_trade_id=paper_trade_id,
-            preview_hash=preview_hash,
+            preview_hash=normalized_preview_hash,
         )
         if confirmation is None:
             raise HTTPException(
