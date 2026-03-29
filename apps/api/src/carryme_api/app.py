@@ -12,6 +12,7 @@ from carryme_models import (
     CandidateAlertEvent,
     ExecutionJournalEntry,
     ExecutionOrderState,
+    ExecutionPairStatus,
     ExecutionReconciliation,
     FundingArbOpportunity,
     FundingPairTradeIntent,
@@ -45,6 +46,7 @@ from carryme_runtime import (
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
     UpstreamDataError,
+    build_execution_pair_status,
     build_live_execution_configs,
     build_live_submission_readiness,
     build_paper_trade_execution_preflight,
@@ -840,6 +842,44 @@ def create_app() -> FastAPI:
             _build_account_preflight_configs(settings),
         )
         return reconcile_execution(execution, account_preflight)
+
+    @app.get(
+        "/v1/executions/pair-status/latest/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionPairStatus,
+    )
+    async def latest_execution_pair_status_for_paper_trade(
+        paper_trade_id: int,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        account_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        order_state_service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+    ) -> ExecutionPairStatus:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        execution = execution_store.latest_for_paper_trade(paper_trade_id)
+        if execution is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No execution journal entry matched paper trade {paper_trade_id}",
+            )
+        account_preflight = await account_service.probe_paper_trade(
+            paper_trade,
+            _build_account_preflight_configs(settings),
+        )
+        reconciliation = reconcile_execution(execution, account_preflight)
+        order_state = await order_state_service.observe_execution(execution)
+        return build_execution_pair_status(execution, order_state, reconciliation)
 
     @app.get("/v1/executions/preflight/venues", response_model=list[VenueExecutionPreflight])
     def execution_preflight_venues(
