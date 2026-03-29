@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -12,6 +13,7 @@ import httpx
 from carryme_connectors import (
     EXTENDED_API_BASE_URL,
     EXTENDED_ORDER_PATH,
+    ConnectorError,
     ExtendedPrivateConnector,
     build_signed_extended_order_payload,
 )
@@ -26,6 +28,8 @@ from carryme_normalizers import get_fee_profile
 
 from carryme_runtime.opportunities import SnapshotFetcher, fetch_live_snapshot
 
+_logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class ExtendedLiveExecutionService:
@@ -35,6 +39,12 @@ class ExtendedLiveExecutionService:
     stark_private_key: str
     fetch_snapshot: SnapshotFetcher = fetch_live_snapshot
     base_url: str = EXTENDED_API_BASE_URL
+
+    def __post_init__(self) -> None:
+        if not self.api_key.strip():
+            raise ValueError("Extended API key is required")
+        if not self.stark_private_key.strip():
+            raise ValueError("Extended Stark private key is required")
 
     async def submit_confirmed_preview(
         self,
@@ -63,18 +73,21 @@ class ExtendedLiveExecutionService:
                 connector.fetch_account(),
                 connector.fetch_fees(leg.symbol),
             )
+            api_fee_rate = _pick_taker_fee_rate(fees)
             signed_payload = build_signed_extended_order_payload(
                 api_key=self.api_key,
                 stark_private_key=self.stark_private_key,
                 account_payload=account,
-                market_payload=snapshot.market.raw,
+                market_payload=_require_market_payload(snapshot.market.raw, symbol=leg.symbol),
                 order_payload=leg.payload,
-                taker_fee_rate=_pick_taker_fee_rate(fees) or fee_rate,
+                taker_fee_rate=api_fee_rate if api_fee_rate is not None else fee_rate,
             )
+            # Do not auto-retry live order writes: ambiguous transport failures require
+            # operator reconciliation to avoid duplicating venue-side submissions.
             response = await client.post(EXTENDED_ORDER_PATH, json=signed_payload)
 
         response_payload = _response_payload(response)
-        accepted = 200 <= response.status_code < 300
+        accepted = _is_success_response(response_payload)
         leg_status: Literal["submitted", "rejected"] = "submitted" if accepted else "rejected"
         external_reference = _pick_external_reference(response_payload, signed_payload)
 
@@ -157,9 +170,15 @@ def _pick_external_reference(
 
 def _pick_taker_fee_rate(payload: dict[str, Any] | list[Any]) -> Decimal | None:
     if isinstance(payload, list):
+        _logger.warning(
+            "Extended fees payload returned a list; falling back to static fee profile"
+        )
         return None
     body = payload.get("data", payload)
     if not isinstance(body, dict):
+        _logger.warning(
+            "Extended fees payload body was not an object; falling back to static fee profile"
+        )
         return None
     for key in ("takerFee", "taker_fee", "takerFeeRate"):
         value = body.get(key)
@@ -167,3 +186,31 @@ def _pick_taker_fee_rate(payload: dict[str, Any] | list[Any]) -> Decimal | None:
             continue
         return Decimal(str(value))
     return None
+
+
+def _is_success_response(response_payload: dict[str, Any]) -> bool:
+    status_code = response_payload.get("status_code")
+    if not isinstance(status_code, int) or not 200 <= status_code < 300:
+        return False
+    if "error" in response_payload or "errors" in response_payload:
+        return False
+    status = response_payload.get("status")
+    if isinstance(status, str) and status.strip().lower() in {
+        "error",
+        "failed",
+        "fail",
+        "rejected",
+    }:
+        return False
+    code = response_payload.get("code")
+    if isinstance(code, int):
+        return code in {0, 200}
+    if isinstance(code, str):
+        return code.strip().lower() in {"0", "200", "ok", "success"}
+    return True
+
+
+def _require_market_payload(payload: dict[str, Any] | list[Any], *, symbol: str) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    raise ConnectorError(f"Extended market payload for {symbol} must be an object")

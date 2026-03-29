@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -20,6 +21,8 @@ from carryme_models import (
     PreviewConfirmationEntry,
     VenueOrderPreview,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 class ParadexLiveTokenProvider(Protocol):
@@ -64,8 +67,9 @@ class ParadexLiveExecutionService:
 
         leg = self._select_paradex_leg(confirmation)
         timestamp = executed_at or datetime.now(UTC)
+        request_timeout = httpx.Timeout(15.0, connect=5.0)
 
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=request_timeout) as client:
             system_config = await self.token_provider.fetch_system_config(client)
             jwt_token = await self.token_provider.issue_jwt_token(
                 account_address=self.account_address,
@@ -79,11 +83,50 @@ class ParadexLiveExecutionService:
                 order_payload=leg.payload,
                 recv_window_ms=self.recv_window_ms,
             )
-            response = await client.post(
-                PARADEX_ORDER_PATH,
-                headers={"Authorization": f"Bearer {jwt_token}"},
-                json=signed_payload,
-            )
+            try:
+                response = await client.post(
+                    PARADEX_ORDER_PATH,
+                    headers={"Authorization": f"Bearer {jwt_token}"},
+                    json=signed_payload,
+                    timeout=request_timeout,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                failure_payload = {
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                    "account_address": self.account_address,
+                    "recv_window_ms": self.recv_window_ms,
+                }
+                return ExecutionJournalEntry(
+                    executed_at=timestamp,
+                    adapter="paradex_live",
+                    mode="live",
+                    status="rejected",
+                    paper_trade_id=paper_trade.entry_id,
+                    preview_hash=confirmation.preview_hash,
+                    confirmation_entry_id=confirmation.entry_id,
+                    paper_trade=paper_trade,
+                    legs=[
+                        ExecutionLegResult(
+                            venue=leg.venue,
+                            symbol=leg.symbol,
+                            fee_profile=leg.fee_profile,
+                            side=leg.side,
+                            target_notional=leg.target_notional,
+                            status="rejected",
+                            simulated=False,
+                            external_reference=_pick_external_reference(
+                                failure_payload,
+                                signed_payload,
+                            ),
+                            request_payload=signed_payload,
+                            response_payload=failure_payload,
+                            signature_timestamp_ms=_coerce_int(
+                                signed_payload.get("signature_timestamp")
+                            ),
+                        )
+                    ],
+                )
 
         response_payload = _response_payload(response)
         accepted = 200 <= response.status_code < 300
@@ -111,7 +154,7 @@ class ParadexLiveExecutionService:
                     external_reference=external_reference,
                     request_payload=signed_payload,
                     response_payload=response_payload,
-                    signature_timestamp=_coerce_int(signed_payload.get("signature_timestamp")),
+                    signature_timestamp_ms=_coerce_int(signed_payload.get("signature_timestamp")),
                 )
             ],
         )
@@ -130,6 +173,7 @@ def _response_payload(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
     except ValueError:
+        _logger.warning("Paradex response was not JSON: status=%s", response.status_code)
         return {
             "status_code": response.status_code,
             "text": response.text,
@@ -139,6 +183,11 @@ def _response_payload(response: httpx.Response) -> dict[str, Any]:
             "status_code": response.status_code,
             **payload,
         }
+    _logger.warning(
+        "Paradex response JSON was not an object: status=%s type=%s",
+        response.status_code,
+        type(payload).__name__,
+    )
     return {
         "status_code": response.status_code,
         "payload": payload,
@@ -162,6 +211,9 @@ def _pick_external_reference(
 def _coerce_int(value: Any) -> int | None:
     if isinstance(value, int):
         return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
     return None
