@@ -2,6 +2,13 @@
 
 from carryme_connectors.base import ConnectorError, PublicVenueConnector
 from carryme_connectors.extended import ExtendedPublicConnector
+from carryme_connectors.extended_auth import (
+    EXTENDED_API_BASE_URL,
+    EXTENDED_MAINNET_DOMAIN,
+    EXTENDED_ORDER_PATH,
+    ExtendedStarknetDomain,
+    build_signed_extended_order_payload,
+)
 from carryme_connectors.extended_private import ExtendedPrivateConnector
 from carryme_connectors.hyperliquid import HyperliquidPublicConnector
 from carryme_connectors.paradex import ParadexPublicConnector
@@ -23,8 +30,12 @@ from carryme_connectors.paradex_private import ParadexPrivateConnector
 
 __all__ = [
     "ConnectorError",
+    "EXTENDED_API_BASE_URL",
+    "EXTENDED_MAINNET_DOMAIN",
+    "EXTENDED_ORDER_PATH",
     "ExtendedPublicConnector",
     "ExtendedPrivateConnector",
+    "ExtendedStarknetDomain",
     "HyperliquidPublicConnector",
     "PARADEX_API_BASE_URL",
     "PARADEX_AUTH_PATH",
@@ -37,6 +48,7 @@ __all__ = [
     "ParadexPrivateConnector",
     "ParadexSystemConfig",
     "PublicVenueConnector",
+    "build_signed_extended_order_payload",
     "build_paradex_auth_headers",
     "build_paradex_auth_request_path",
     "build_paradex_order_signature",

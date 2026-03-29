@@ -26,5 +26,12 @@ class ExtendedPrivateConnector(BaseHttpConnector):
     async def fetch_balances(self) -> dict[str, Any] | list[Any]:
         return await self._request_json("GET", "/api/v1/user/balance")
 
+    async def fetch_fees(self, symbol: str | None = None) -> dict[str, Any] | list[Any]:
+        params = {"market": symbol} if symbol else None
+        payload = await self._request_json("GET", "/api/v1/user/fees", params=params)
+        if not isinstance(payload, dict | list):
+            raise ConnectorError("Extended fees payload must be an object or list")
+        return payload
+
     async def fetch_positions(self) -> dict[str, Any] | list[Any]:
         return await self._request_json("GET", "/api/v1/user/positions")

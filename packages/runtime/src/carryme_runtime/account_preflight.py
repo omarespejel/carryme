@@ -186,6 +186,38 @@ class ExtendedAccountProbe:
                 )
         try:
             account_body = _unwrap_payload(account, context="Extended account")
+            balance_body: dict[str, Any] = {}
+            if isinstance(balances, dict):
+                try:
+                    balance_body = _unwrap_payload(balances, context="Extended balances")
+                except UpstreamDataError:
+                    balance_body = {}
+            balance_rows = balances.get("data") if isinstance(balances, dict) else None
+            try:
+                balance_count = _count_rows(balances, context="Extended balances")
+            except UpstreamDataError as exc:
+                if _looks_like_extended_balance_summary(balance_rows):
+                    balance_count = 0
+                elif balance_body:
+                    raise UpstreamDataError(
+                        "Extended balances row count was malformed despite a balance payload"
+                    ) from exc
+                else:
+                    raise
+            account_total_collateral = _pick_float(
+                account_body,
+                "equity",
+                "balance",
+                "totalCollateral",
+                context="Extended account",
+            )
+            account_available_to_trade = _pick_float(
+                account_body,
+                "availableForTrade",
+                "availableBalance",
+                "available_to_trade",
+                context="Extended account",
+            )
             return VenueAccountPreflight(
                 venue=self.venue,
                 enabled=enabled,
@@ -201,21 +233,29 @@ class ExtendedAccountProbe:
                     "address",
                 ),
                 account_status=_pick_string(account_body, "status", "accountStatus"),
-                total_collateral=_pick_float(
-                    account_body,
-                    "equity",
-                    "balance",
-                    "totalCollateral",
-                    context="Extended account",
+                total_collateral=(
+                    account_total_collateral
+                    if account_total_collateral is not None
+                    else _pick_float(
+                        balance_body,
+                        "equity",
+                        "balance",
+                        "totalCollateral",
+                        context="Extended balances",
+                    )
                 ),
-                available_to_trade=_pick_float(
-                    account_body,
-                    "availableForTrade",
-                    "availableBalance",
-                    "available_to_trade",
-                    context="Extended account",
+                available_to_trade=(
+                    account_available_to_trade
+                    if account_available_to_trade is not None
+                    else _pick_float(
+                        balance_body,
+                        "availableForTrade",
+                        "availableBalance",
+                        "available_to_trade",
+                        context="Extended balances",
+                    )
                 ),
-                balance_count=_count_rows(balances, context="Extended balances"),
+                balance_count=balance_count,
                 position_count=_count_rows(positions, context="Extended positions"),
                 notes=[
                     (
@@ -447,6 +487,22 @@ def _unwrap_payload(value: dict[str, Any] | list[Any], *, context: str) -> dict[
             raise UpstreamDataError(f"{context} payload field {key!r} must be an object")
         return value
     raise UpstreamDataError(f"{context} payload must be an object")
+
+
+def _looks_like_extended_balance_summary(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(
+        key in value
+        for key in (
+            "equity",
+            "balance",
+            "totalCollateral",
+            "availableForTrade",
+            "availableBalance",
+            "available_to_trade",
+        )
+    )
 
 
 def _count_rows(value: dict[str, Any] | list[Any], *, context: str) -> int:
