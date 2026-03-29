@@ -26,10 +26,10 @@ from carryme_runtime import (
     ConnectorError,
     ExecutionAdapter,
     InvalidTradeCandidateError,
-    LiveExecutionConfigMap,
     MockExecutionAdapter,
     OpportunityService,
     UpstreamDataError,
+    build_live_execution_configs,
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
@@ -196,33 +196,6 @@ def get_mock_execution_adapter() -> MockExecutionAdapter:
     """Return the adapter allowed for mock execution journal submissions."""
 
     return MockExecutionAdapter()
-
-
-def _build_live_execution_configs(settings: ApiSettings) -> LiveExecutionConfigMap:
-    """Build the current venue credential map from API settings."""
-
-    return {
-        "extended": {
-            "enabled": settings.extended_live_enabled,
-            "credentials": {
-                "api_key": settings.extended_api_key,
-                "stark_private_key": settings.extended_stark_private_key,
-            },
-        },
-        "paradex": {
-            "enabled": settings.paradex_live_enabled,
-            "credentials": {
-                "private_key": settings.paradex_private_key,
-            },
-        },
-        "hyperliquid": {
-            "enabled": settings.hyperliquid_live_enabled,
-            "credentials": {
-                "account_address": settings.hyperliquid_account_address,
-                "api_wallet_private_key": settings.hyperliquid_api_wallet_private_key,
-            },
-        },
-    }
 
 
 def _select_trade_intent_records(
@@ -552,7 +525,7 @@ def create_app() -> FastAPI:
     def execution_preflight_venues(
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
     ) -> list[VenueExecutionPreflight]:
-        return build_venue_execution_preflights(_build_live_execution_configs(settings))
+        return build_venue_execution_preflights(build_live_execution_configs(settings))
 
     @app.get(
         "/v1/executions/preflight/from-paper-trade/{paper_trade_id}",
@@ -571,7 +544,7 @@ def create_app() -> FastAPI:
             )
         return build_paper_trade_execution_preflight(
             paper_trade,
-            _build_live_execution_configs(settings),
+            build_live_execution_configs(settings),
         )
 
     @app.post(

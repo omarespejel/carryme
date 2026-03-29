@@ -7,12 +7,14 @@ from carryme_models import (
     ExecutionJournalEntry,
     FundingArbOpportunity,
     FundingPairSpec,
+    FundingPairTradeIntent,
     MarketStats,
     NormalizedMarketSnapshot,
     OpportunityRecord,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     TopOfBook,
+    TradeLegIntent,
     VenueExecutionPreflight,
 )
 from carryme_normalizers import normalize_market_snapshot
@@ -407,6 +409,146 @@ def test_build_paper_trade_execution_preflight_filters_to_trade_venues() -> None
     assert {item.venue for item in preflight.venues} == {"extended", "paradex"}
     assert preflight.ready is False
     assert any("paradex" in reason for reason in preflight.blocking_reasons)
+
+
+def test_build_paper_trade_execution_preflight_requires_persisted_entry_id() -> None:
+    intent = build_trade_intent(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="arb_extended_paradex",
+                left_venue="extended",
+                left_symbol="ARB-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="ARB-USD-PERP",
+                right_fee_profile="pro",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro",
+                short_fee_profile="default",
+                gross_daily_edge=0.001,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0008,
+                one_day_net_edge_after_round_trip=0.0005,
+                break_even_days_entry=0.5,
+                break_even_days_round_trip=1.0,
+                capacity=CapacityEstimate(
+                    short_bid_notional=5000.0,
+                    long_ask_notional=4500.0,
+                    max_entry_notional=4500.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        ),
+        capacity_fraction=0.25,
+        max_target_notional=1000.0,
+        min_one_day_net_edge_after_entry=0.0,
+        min_capacity_notional=1000.0,
+    )
+    paper_trade = PaperTradeEntry(
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=intent,
+    )
+
+    with pytest.raises(ValueError, match="paper_trade.entry_id must be set"):
+        build_paper_trade_execution_preflight(
+            paper_trade,
+            {
+                "extended": {
+                    "enabled": True,
+                    "credentials": {
+                        "api_key": "extended-key",
+                        "stark_private_key": "extended-stark",
+                    },
+                },
+                "paradex": {
+                    "enabled": True,
+                    "credentials": {
+                        "private_key": "paradex-secret",
+                    },
+                },
+                "hyperliquid": {
+                    "enabled": False,
+                    "credentials": {
+                        "account_address": None,
+                        "api_wallet_private_key": None,
+                    },
+                },
+            },
+        )
+
+
+def test_build_paper_trade_execution_preflight_skips_unknown_venues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    intent = FundingPairTradeIntent(
+        label="mystery_extended",
+        canonical_symbol="ARB-USD-PERP",
+        source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+        one_day_net_edge_after_entry=0.00055,
+        break_even_days_entry=0.45,
+        capacity_limit_notional=4500.0,
+        target_notional=1000.0,
+        capacity_fraction=0.25,
+        max_target_notional=1000.0,
+        long_leg=TradeLegIntent(
+            venue="mysterydex",
+            symbol="ARB-USD-PERP",
+            fee_profile="pro",
+            side="buy",
+            target_notional=1000.0,
+        ),
+        short_leg=TradeLegIntent(
+            venue="extended",
+            symbol="ARB-USD",
+            fee_profile="default",
+            side="sell",
+            target_notional=1000.0,
+        ),
+    )
+    paper_trade = PaperTradeEntry(
+        entry_id=5,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=intent,
+    )
+
+    with caplog.at_level("WARNING"):
+        preflight = build_paper_trade_execution_preflight(
+            paper_trade,
+            {
+                "extended": {
+                    "enabled": True,
+                    "credentials": {
+                        "api_key": "extended-key",
+                        "stark_private_key": "extended-stark",
+                    },
+                },
+                "paradex": {
+                    "enabled": True,
+                    "credentials": {
+                        "private_key": "paradex-secret",
+                    },
+                },
+                "hyperliquid": {
+                    "enabled": False,
+                    "credentials": {
+                        "account_address": None,
+                        "api_wallet_private_key": None,
+                    },
+                },
+            },
+        )
+
+    assert {item.venue for item in preflight.venues} == {"extended"}
+    assert "Venue mysterydex is not supported for live execution" in preflight.blocking_reasons
+    assert "Skipping unsupported live execution venue mysterydex" in caplog.text
 
 
 def test_build_trade_intent_rejects_invalid_capacity_fraction() -> None:

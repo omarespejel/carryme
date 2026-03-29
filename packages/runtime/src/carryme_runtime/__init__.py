@@ -8,6 +8,7 @@ from carryme_runtime.intents import InvalidTradeCandidateError, build_trade_inte
 from carryme_runtime.opportunities import OpportunityService, UpstreamDataError, fetch_live_snapshot
 from carryme_runtime.preflight import (
     LiveExecutionConfigMap,
+    build_live_execution_configs,
     build_paper_trade_execution_preflight,
     build_venue_execution_preflights,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "ExecutionAdapter",
     "LiveExecutionConfigMap",
     "MockExecutionAdapter",
+    "build_live_execution_configs",
     "build_paper_trade_execution_preflight",
     "build_trade_intent",
     "build_venue_execution_preflights",

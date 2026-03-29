@@ -1717,6 +1717,32 @@ def test_live_execution_preflight_for_saved_paper_trade(tmp_path: Path) -> None:
     assert {item["venue"] for item in payload["venues"]} == {"extended", "paradex"}
 
 
+def test_live_execution_preflight_returns_404_for_missing_paper_trade(
+    tmp_path: Path,
+) -> None:
+    from carryme_api.app import get_api_settings
+
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    client = TestClient(app)
+    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
+        get_api_settings,
+        lambda: ApiSettings(
+            extended_live_enabled=True,
+            extended_api_key="extended-key",
+            extended_stark_private_key="extended-stark",
+            paradex_live_enabled=True,
+            paradex_private_key="paradex-secret",
+            hyperliquid_live_enabled=False,
+            hyperliquid_account_address=None,
+            hyperliquid_api_wallet_private_key=None,
+        ),
+    ):
+        response = client.get("/v1/executions/preflight/from-paper-trade/999999")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Paper trade 999999 was not found"
+
+
 def test_funding_pair_endpoint_uses_service_dependency() -> None:
     class StubOpportunityService:
         async def score_pair(self, **_: str) -> FundingArbOpportunity:
