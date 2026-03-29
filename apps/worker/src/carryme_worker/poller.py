@@ -131,6 +131,7 @@ async def run_polling_loop(
 
     successful_cycles = 0
     failures = 0
+    consecutive_failures = 0
     saved_records = 0
 
     for attempt in range(1, iterations + 1):
@@ -142,6 +143,7 @@ async def run_polling_loop(
                 store=history_store,
             )
             successful_cycles += 1
+            consecutive_failures = 0
             saved_records += summary.saved_records
             logger_instance.info(
                 "completed poll cycle %s of %s with %s saved records",
@@ -153,9 +155,10 @@ async def run_polling_loop(
                 await sleep(settings.poll_interval_seconds)
         except Exception:
             failures += 1
+            consecutive_failures += 1
             backoff_seconds = min(
                 settings.max_backoff_seconds,
-                settings.poll_interval_seconds * (2 ** (failures - 1)),
+                settings.poll_interval_seconds * (2 ** (consecutive_failures - 1)),
             )
             logger_instance.exception(
                 "poll cycle %s of %s failed; backing off for %s seconds",

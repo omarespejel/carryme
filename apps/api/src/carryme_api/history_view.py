@@ -7,6 +7,74 @@ from html import escape
 from carryme_models import OpportunityRecord
 
 
+def _record_identity_key(record: OpportunityRecord) -> str:
+    """Build a stable identity key for configured pairs."""
+
+    if record.pair.label:
+        return record.pair.label
+    return "|".join(
+        [
+            record.pair.left_venue,
+            record.pair.left_symbol,
+            record.pair.left_fee_profile,
+            record.pair.right_venue,
+            record.pair.right_symbol,
+            record.pair.right_fee_profile,
+        ]
+    )
+
+
+def _display_label(record: OpportunityRecord) -> str:
+    """Render a readable label for configured and unlabeled pairs."""
+
+    if record.pair.label:
+        return record.pair.label
+    return (
+        f"{record.pair.left_venue}:{record.pair.left_symbol}"
+        f" ↔ {record.pair.right_venue}:{record.pair.right_symbol}"
+    )
+
+
+def _stale_sort_value(record: OpportunityRecord) -> float:
+    """Prefer non-stale books when ranking saved opportunities."""
+
+    is_stale = bool(record.opportunity.short_stale_book) or bool(record.opportunity.long_stale_book)
+    return 0.0 if is_stale else 1.0
+
+
+def _min_metric(left: float | None, right: float | None) -> float:
+    """Return the weaker side of a two-venue liquidity metric."""
+
+    values = [value for value in (left, right) if value is not None]
+    if not values:
+        return 0.0
+    return min(values)
+
+
+def _spread_sort_value(record: OpportunityRecord) -> float:
+    """Prefer tighter combined spreads when ranking opportunities."""
+
+    spreads = [
+        spread
+        for spread in (
+            record.opportunity.short_spread_rate,
+            record.opportunity.long_spread_rate,
+        )
+        if spread is not None
+    ]
+    if len(spreads) != 2:
+        return float("-inf")
+    return -sum(spreads)
+
+
+def _break_even_sort_value(record: OpportunityRecord) -> float:
+    """Prefer faster payback when entry edges tie."""
+
+    if record.opportunity.break_even_days_entry is None:
+        return float("-inf")
+    return -record.opportunity.break_even_days_entry
+
+
 def latest_records_by_label(
     records: list[OpportunityRecord],
     *,
@@ -17,11 +85,11 @@ def latest_records_by_label(
     selected: list[OpportunityRecord] = []
     seen_labels: set[str] = set()
     for record in records:
-        label = record.pair.label or record.opportunity.canonical_symbol
-        if label in seen_labels:
+        dedupe_key = _record_identity_key(record)
+        if dedupe_key in seen_labels:
             continue
         selected.append(record)
-        seen_labels.add(label)
+        seen_labels.add(dedupe_key)
         if len(selected) >= limit:
             break
     return selected
@@ -38,12 +106,24 @@ def rank_history_records(
         records,
         key=lambda record: (
             record.opportunity.one_day_net_edge_after_entry,
+            _stale_sort_value(record),
+            record.opportunity.one_day_net_edge_after_round_trip,
+            _min_metric(
+                record.opportunity.short_open_interest,
+                record.opportunity.long_open_interest,
+            ),
+            _min_metric(
+                record.opportunity.short_daily_volume,
+                record.opportunity.long_daily_volume,
+            ),
+            _spread_sort_value(record),
             (
                 record.opportunity.capacity.max_entry_notional
                 if record.opportunity.capacity
                 and record.opportunity.capacity.max_entry_notional is not None
                 else -1.0
             ),
+            _break_even_sort_value(record),
             record.recorded_at.timestamp(),
         ),
         reverse=True,
@@ -57,9 +137,7 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
     latest = latest_records_by_label(records, limit=20)
     ranked = rank_history_records(latest, limit=20)
     total_rows = len(records)
-    tracked_labels = len(
-        {record.pair.label or record.opportunity.canonical_symbol for record in records}
-    )
+    tracked_labels = len({_record_identity_key(record) for record in records})
     best_entry_edge = ranked[0].opportunity.one_day_net_edge_after_entry if ranked else 0.0
 
     rows = "\n".join(_render_row(record) for record in ranked)
@@ -68,7 +146,8 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
 
     subtitle = (
         "Persisted funding opportunities ranked by current one-day net "
-        "entry edge using the latest saved row for each configured label."
+        "entry edge with tie-breakers for stale books, exit economics, "
+        "liquidity, spreads, and recency."
     )
     stats_markup = "\n".join(
         [
@@ -190,7 +269,7 @@ def render_dashboard(records: list[OpportunityRecord]) -> str:
 
 
 def _render_row(record: OpportunityRecord) -> str:
-    label = escape(record.pair.label or record.opportunity.canonical_symbol)
+    label = escape(_display_label(record))
     symbol = escape(record.opportunity.canonical_symbol)
     short_venue = escape(record.opportunity.short_venue)
     long_venue = escape(record.opportunity.long_venue)

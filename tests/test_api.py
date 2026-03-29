@@ -284,6 +284,76 @@ def test_latest_history_endpoint_deduplicates_by_label(tmp_path: Path) -> None:
     assert payload[0]["recorded_at"] == "2026-03-29T01:00:00Z"
 
 
+def test_latest_history_endpoint_keeps_distinct_unlabeled_pairs(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    fixtures = [
+        (
+            datetime(2026, 3, 29, 0, 0, tzinfo=UTC),
+            "extended",
+            "default",
+            "hyperliquid",
+            "tier0",
+        ),
+        (
+            datetime(2026, 3, 29, 1, 0, tzinfo=UTC),
+            "extended",
+            "maker",
+            "paradex",
+            "pro",
+        ),
+    ]
+    for recorded_at, left_venue, left_fee_profile, right_venue, right_fee_profile in fixtures:
+        store.append(
+            OpportunityRecord(
+                recorded_at=recorded_at,
+                pair=FundingPairSpec(
+                    label=None,
+                    left_venue=left_venue,
+                    left_symbol="STRK-USD",
+                    left_fee_profile=left_fee_profile,
+                    right_venue=right_venue,
+                    right_symbol="STRK" if right_venue == "hyperliquid" else "STRK-USD-PERP",
+                    right_fee_profile=right_fee_profile,
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="STRK-USD-PERP",
+                    long_venue=right_venue,
+                    short_venue=left_venue,
+                    long_fee_profile=right_fee_profile,
+                    short_fee_profile=left_fee_profile,
+                    gross_daily_edge=0.0005,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=0.0002,
+                    one_day_net_edge_after_round_trip=-0.0001,
+                    break_even_days_entry=0.6,
+                    break_even_days_round_trip=1.2,
+                ),
+            )
+        )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs/latest", params={"limit": 10})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 2
+    identities = {
+        (
+            item["pair"]["left_venue"],
+            item["pair"]["left_fee_profile"],
+            item["pair"]["right_venue"],
+            item["pair"]["right_fee_profile"],
+        )
+        for item in payload
+    }
+    assert identities == {
+        ("extended", "default", "hyperliquid", "tier0"),
+        ("extended", "maker", "paradex", "pro"),
+    }
+
+
 def test_latest_history_endpoint_rejects_excessive_sample(tmp_path: Path) -> None:
     store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
 
@@ -348,6 +418,102 @@ def test_ranked_history_endpoint_sorts_best_entry_edge_first(tmp_path: Path) -> 
     payload = response.json()
     assert payload[0]["pair"]["label"] == "arb_extended_paradex"
     assert payload[1]["pair"]["label"] == "strk_extended_hyperliquid"
+
+
+def test_ranked_history_endpoint_penalizes_stale_thin_books(tmp_path: Path) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    fixtures = [
+        (
+            "safe_pair",
+            0.0005,
+            0.0003,
+            0.0001,
+            0.0001,
+            1_000_000.0,
+            1_000_000.0,
+            500_000.0,
+            500_000.0,
+            False,
+            False,
+        ),
+        (
+            "risky_pair",
+            0.0005,
+            -0.0002,
+            0.01,
+            0.01,
+            100.0,
+            100.0,
+            1_000.0,
+            1_000.0,
+            True,
+            False,
+        ),
+    ]
+    for (
+        label,
+        entry_edge,
+        round_trip_edge,
+        short_spread,
+        long_spread,
+        short_oi,
+        long_oi,
+        short_volume,
+        long_volume,
+        short_stale,
+        long_stale,
+    ) in fixtures:
+        store.append(
+            OpportunityRecord(
+                recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+                pair=FundingPairSpec(
+                    label=label,
+                    left_venue="extended",
+                    left_symbol="STRK-USD",
+                    left_fee_profile="default",
+                    right_venue="hyperliquid",
+                    right_symbol="STRK",
+                    right_fee_profile="tier0",
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="STRK-USD-PERP",
+                    long_venue="hyperliquid",
+                    short_venue="extended",
+                    long_fee_profile="tier0",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.001,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=entry_edge,
+                    one_day_net_edge_after_round_trip=round_trip_edge,
+                    break_even_days_entry=0.5,
+                    break_even_days_round_trip=1.0,
+                    short_spread_rate=short_spread,
+                    long_spread_rate=long_spread,
+                    short_daily_volume=short_volume,
+                    long_daily_volume=long_volume,
+                    short_open_interest=short_oi,
+                    long_open_interest=long_oi,
+                    short_stale_book=short_stale,
+                    long_stale_book=long_stale,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=5000.0,
+                        long_ask_notional=4500.0,
+                        max_entry_notional=4500.0,
+                        limiting_venue="hyperliquid",
+                    ),
+                ),
+            )
+        )
+
+    client = TestClient(app)
+    with _dependency_override(get_history_store, lambda: store):
+        response = client.get("/v1/history/funding-pairs/ranked", params={"limit": 10})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload[0]["pair"]["label"] == "safe_pair"
+    assert payload[1]["pair"]["label"] == "risky_pair"
 
 
 def test_dashboard_renders_saved_history(tmp_path: Path) -> None:

@@ -58,8 +58,9 @@ def main() -> None:
     """Run one poll cycle or print worker health."""
 
     parser = argparse.ArgumentParser(prog="carryme-worker")
-    parser.add_argument("--once", action="store_true", help="Poll the configured watchlist once")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="Poll the configured watchlist once")
+    mode.add_argument(
         "--iterations",
         type=int,
         default=None,
