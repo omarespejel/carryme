@@ -22,6 +22,7 @@ from carryme_models import (
     ExecutionQualitySummary,
     FundingArbOpportunity,
     FundingPairSpec,
+    FundingUniverseCanaryCandidate,
     FundingUniverseOpportunity,
     FundingUniverseOverlap,
     FundingUniversePortfolioEntry,
@@ -109,6 +110,62 @@ class OpportunityUniverseService:
     snapshot_retry_backoff_seconds: float = 0.25
     execution_quality_service: ExecutionQualityService | None = None
     route_stability_service: RouteStabilityService | None = None
+
+    async def scan_canary_candidates(
+        self,
+        *,
+        venues: list[str],
+        fee_profile_overrides: dict[str, str] | None = None,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.35,
+        min_route_presence_ratio: float = 0.35,
+        min_route_samples: int = 2,
+        include_symbols: list[str] | None = None,
+        exclude_symbols: list[str] | None = None,
+        exclude_tags: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[FundingUniverseCanaryCandidate]:
+        scan = await self.scan(
+            venues=venues,
+            ranking="route_adjusted_quality_pnl",
+            fee_profile_overrides=fee_profile_overrides,
+            target_notional=target_notional,
+            min_capacity_notional=min_capacity_notional,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+            min_execution_quality_score=min_execution_quality_score,
+            min_execution_samples=min_execution_samples,
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+            include_symbols=include_symbols,
+            exclude_symbols=exclude_symbols,
+            exclude_tags=exclude_tags or ["meme", "political"],
+            limit=limit,
+        )
+        candidates: list[FundingUniverseCanaryCandidate] = []
+        for opportunity in scan.opportunities:
+            deployable = opportunity.deployable_notional or 0.0
+            if deployable <= 0:
+                continue
+            modeled_round_trip_pnl = opportunity.estimated_one_day_pnl_after_round_trip or 0.0
+            if modeled_round_trip_pnl <= 0:
+                continue
+            candidates.append(
+                FundingUniverseCanaryCandidate(
+                    opportunity=opportunity,
+                    suggested_canary_notional=min(canary_max_notional, deployable),
+                )
+            )
+        return candidates
 
     async def scan(
         self,

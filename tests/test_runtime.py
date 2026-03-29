@@ -31,6 +31,7 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    FundingUniverseCanaryCandidate,
     FundingUniverseOpportunity,
     FundingUniverseScan,
     FundingUniverseVenueMarket,
@@ -657,6 +658,85 @@ def test_opportunity_universe_service_excludes_away_from_top_interactive_liquidi
         candidate = scan.opportunities[0]
         assert candidate.paradex_fastfill_share == pytest.approx(0.0)
         assert candidate.paradex_fastfill_eligible_notional == pytest.approx(0.0)
+
+    asyncio.run(run())
+
+
+def test_opportunity_universe_service_scan_canary_candidates_uses_policy_defaults() -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD", "TRUMP-USD"],
+        "paradex": ["ARB-USD-PERP", "TRUMP-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.09,
+            20_000,
+            0.0901,
+            18_000,
+            daily_volume=200_000,
+            open_interest=500_000,
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0006,
+            0.09,
+            18_000,
+            0.0901,
+            17_000,
+            daily_volume=180_000,
+            open_interest=450_000,
+        ),
+        ("extended", "TRUMP-USD"): _snapshot(
+            "extended",
+            "TRUMP-USD",
+            0.000013,
+            10.0,
+            500,
+            10.1,
+            400,
+            daily_volume=100_000,
+            open_interest=300_000,
+        ),
+        ("paradex", "TRUMP-USD-PERP"): _snapshot(
+            "paradex",
+            "TRUMP-USD-PERP",
+            -0.0008,
+            10.0,
+            400,
+            10.1,
+            300,
+            daily_volume=90_000,
+            open_interest=250_000,
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+        )
+        candidates = await service.scan_canary_candidates(
+            venues=["extended", "paradex"],
+            canary_max_notional=25.0,
+            min_route_stability_weight=0.0,
+            min_route_presence_ratio=0.0,
+            min_route_samples=0,
+        )
+
+        assert len(candidates) == 1
+        assert isinstance(candidates[0], FundingUniverseCanaryCandidate)
+        assert candidates[0].opportunity.opportunity.canonical_symbol == "ARB-USD-PERP"
+        assert candidates[0].suggested_canary_notional == pytest.approx(25.0)
 
     asyncio.run(run())
 
