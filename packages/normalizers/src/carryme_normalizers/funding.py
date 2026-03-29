@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
-from carryme_models.normalization import FundingRateNormalization
-
-AccrualStyle = Literal["continuous", "scheduled"]
+from carryme_models.normalization import (
+    AccrualStyle,
+    FundingRateNormalization,
+    SettlementTiming,
+)
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,8 @@ class FundingRule:
     payment_interval_hours: float | None
     formula_interval_hours: float | None
     accrual_style: AccrualStyle
+    settlement_timing: SettlementTiming
+    settlement_interval_hours: float | None
     notes: tuple[str, ...]
 
 
@@ -25,6 +28,8 @@ FUNDING_RULES: dict[str, FundingRule] = {
         payment_interval_hours=1.0,
         formula_interval_hours=8.0,
         accrual_style="scheduled",
+        settlement_timing="fixed_utc_windows",
+        settlement_interval_hours=1.0,
         notes=(
             "Funding is charged hourly on Extended.",
             "The funding formula uses an 8 hour realization period.",
@@ -35,6 +40,8 @@ FUNDING_RULES: dict[str, FundingRule] = {
         payment_interval_hours=1.0,
         formula_interval_hours=8.0,
         accrual_style="scheduled",
+        settlement_timing="fixed_utc_windows",
+        settlement_interval_hours=1.0,
         notes=(
             "Funding is paid every hour on Hyperliquid.",
             "The funding formula applies to an 8 hour rate and settles one eighth per hour.",
@@ -45,6 +52,8 @@ FUNDING_RULES: dict[str, FundingRule] = {
         payment_interval_hours=None,
         formula_interval_hours=8.0,
         accrual_style="continuous",
+        settlement_timing="rolling",
+        settlement_interval_hours=None,
         notes=(
             "Funding accrues continuously on Paradex and realizes when the position changes.",
             "The funding premium represents an 8 hour amount.",
@@ -74,6 +83,8 @@ def normalize_funding_rate(venue: str, raw_rate: float | None) -> FundingRateNor
         payment_interval_hours=rule.payment_interval_hours,
         formula_interval_hours=rule.formula_interval_hours,
         accrual_style=rule.accrual_style,
+        settlement_timing=rule.settlement_timing,
+        settlement_interval_hours=rule.settlement_interval_hours,
         hourly_rate=hourly_rate,
         daily_rate=daily_rate,
         notes=list(rule.notes),

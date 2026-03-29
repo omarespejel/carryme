@@ -1,8 +1,14 @@
 """API configuration models."""
 
+import logging
 from functools import lru_cache
+from pathlib import Path
 
+from carryme_runtime.preflight import LIVE_EXECUTION_VENUE_SPECS
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class ApiSettings(BaseSettings):
@@ -24,6 +30,38 @@ class ApiSettings(BaseSettings):
         env_prefix="CARRYME_API_",
         extra="ignore",
     )
+
+    @field_validator("watchlist_path")
+    @classmethod
+    def validate_watchlist_path(cls, value: str) -> str:
+        """Resolve the configured watchlist path while allowing first-write creation."""
+
+        candidate = Path(value).expanduser()
+        resolved = candidate if candidate.is_absolute() else (Path.cwd() / candidate).resolve()
+        if resolved.exists() and not resolved.is_file():
+            raise ValueError(f"watchlist_path exists but is not a file: {resolved}")
+        return str(resolved)
+
+    @model_validator(mode="after")
+    def warn_on_enabled_live_execution_without_credentials(self) -> "ApiSettings":
+        """Warn operators when live execution flags are enabled without credentials."""
+
+        for spec in LIVE_EXECUTION_VENUE_SPECS.values():
+            flag_name = spec["enabled_setting"]
+            if not getattr(self, flag_name):
+                continue
+            missing = [
+                attribute_name
+                for attribute_name in spec["credential_settings"].values()
+                if not getattr(self, attribute_name)
+            ]
+            if missing:
+                logger.warning(
+                    "%s is enabled but missing live credentials: %s",
+                    flag_name,
+                    ", ".join(missing),
+                )
+        return self
 
 
 @lru_cache

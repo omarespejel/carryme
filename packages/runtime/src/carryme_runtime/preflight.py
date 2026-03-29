@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import NamedTuple, TypedDict
 
 from carryme_models import (
@@ -10,6 +11,8 @@ from carryme_models import (
     PaperTradeExecutionPreflight,
     VenueExecutionPreflight,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class VenueCredentialConfig(TypedDict):
@@ -20,6 +23,7 @@ class VenueCredentialConfig(TypedDict):
 
 
 LiveExecutionConfigMap = dict[str, VenueCredentialConfig]
+
 
 class RequirementSpec(NamedTuple):
     """One required credential for a live venue."""
@@ -33,12 +37,19 @@ class RequirementSpec(NamedTuple):
 class VenueSpec(TypedDict):
     """Static preflight specification for one supported venue."""
 
+    enabled_setting: str
+    credential_settings: dict[str, str]
     requirements: list[RequirementSpec]
     notes: list[str]
 
 
-_VENUE_SPECS: dict[str, VenueSpec] = {
+LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
     "extended": {
+        "enabled_setting": "extended_live_enabled",
+        "credential_settings": {
+            "api_key": "extended_api_key",
+            "stark_private_key": "extended_stark_private_key",
+        },
         "requirements": [
             RequirementSpec(
                 "api_key",
@@ -61,6 +72,10 @@ _VENUE_SPECS: dict[str, VenueSpec] = {
         ],
     },
     "paradex": {
+        "enabled_setting": "paradex_live_enabled",
+        "credential_settings": {
+            "private_key": "paradex_private_key",
+        },
         "requirements": [
             RequirementSpec(
                 "private_key",
@@ -77,6 +92,11 @@ _VENUE_SPECS: dict[str, VenueSpec] = {
         ],
     },
     "hyperliquid": {
+        "enabled_setting": "hyperliquid_live_enabled",
+        "credential_settings": {
+            "account_address": "hyperliquid_account_address",
+            "api_wallet_private_key": "hyperliquid_api_wallet_private_key",
+        },
         "requirements": [
             RequirementSpec(
                 "account_address",
@@ -98,13 +118,28 @@ _VENUE_SPECS: dict[str, VenueSpec] = {
 }
 
 
+def build_live_execution_configs(settings: object) -> LiveExecutionConfigMap:
+    """Build live execution config directly from the shared venue specification."""
+
+    configs: LiveExecutionConfigMap = {}
+    for venue, spec in LIVE_EXECUTION_VENUE_SPECS.items():
+        configs[venue] = {
+            "enabled": bool(getattr(settings, spec["enabled_setting"])),
+            "credentials": {
+                key: getattr(settings, attribute_name)
+                for key, attribute_name in spec["credential_settings"].items()
+            },
+        }
+    return configs
+
+
 def build_venue_execution_preflights(
     configs: LiveExecutionConfigMap,
 ) -> list[VenueExecutionPreflight]:
     """Build live-readiness status for all supported venues."""
 
     statuses: list[VenueExecutionPreflight] = []
-    for venue, spec in _VENUE_SPECS.items():
+    for venue, spec in LIVE_EXECUTION_VENUE_SPECS.items():
         config = configs.get(venue, {"enabled": False, "credentials": {}})
         credentials = config["credentials"]
         requirements = [
@@ -139,15 +174,30 @@ def build_paper_trade_execution_preflight(
 ) -> PaperTradeExecutionPreflight:
     """Build live-readiness status for the exact venues touched by a saved paper trade."""
 
+    if paper_trade.entry_id is None:
+        raise ValueError("paper_trade.entry_id must be set for preflight")
+
     all_statuses = {item.venue: item for item in build_venue_execution_preflights(configs)}
     venue_names = [paper_trade.intent.long_leg.venue, paper_trade.intent.short_leg.venue]
-    selected_names: list[str] = []
+    selected: list[VenueExecutionPreflight] = []
     for venue in venue_names:
-        if venue not in selected_names:
-            selected_names.append(venue)
-    selected = [all_statuses[venue] for venue in selected_names]
+        if any(status.venue == venue for status in selected):
+            continue
+        status = all_statuses.get(venue)
+        if status is None:
+            logger.warning(
+                "Skipping unsupported live execution venue %s for paper trade %s",
+                venue,
+                paper_trade.entry_id,
+            )
+            continue
+        selected.append(status)
 
-    blocking_reasons: list[str] = []
+    blocking_reasons = [
+        f"Venue {venue} is not supported for live execution"
+        for venue in venue_names
+        if venue not in all_statuses
+    ]
     for status in selected:
         if not status.enabled:
             blocking_reasons.append(f"Venue {status.venue} live execution is not enabled")
@@ -158,7 +208,7 @@ def build_paper_trade_execution_preflight(
             )
 
     return PaperTradeExecutionPreflight(
-        paper_trade_id=paper_trade.entry_id or 0,
+        paper_trade_id=paper_trade.entry_id,
         label=paper_trade.intent.label,
         ready=not blocking_reasons,
         venues=selected,

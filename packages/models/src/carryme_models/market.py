@@ -1,5 +1,6 @@
 """Market data models shared across venue connectors."""
 
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -19,9 +20,31 @@ class MarketStats(BaseModel):
 
     venue: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
-    mark_price: float | None = None
-    funding_rate: float | None = None
-    open_interest: float | None = None
-    daily_volume: float | None = None
-    top_of_book: TopOfBook | None = None
-    raw: dict[str, Any] = Field(default_factory=dict)
+    captured_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="UTC timestamp when the market snapshot was captured.",
+    )
+    mark_price: float | None = Field(
+        default=None,
+        description="Mark price quoted in the venue's quote currency.",
+    )
+    funding_rate: float | None = Field(
+        default=None,
+        description="Funding rate in venue-native units; normalize before cross-venue comparison.",
+    )
+    open_interest: float | None = Field(
+        default=None,
+        description="Open interest in venue-native units reported by the source venue.",
+    )
+    daily_volume: float | None = Field(
+        default=None,
+        description="Rolling 24h volume in venue-native units reported by the source venue.",
+    )
+    top_of_book: TopOfBook | None = Field(
+        default=None,
+        description="Best bid/ask snapshot captured with the market stats when available.",
+    )
+    raw: dict[str, Any] | list[Any] = Field(
+        default_factory=dict,
+        description="Raw response payload captured from the source venue.",
+    )
