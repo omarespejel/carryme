@@ -46,6 +46,8 @@ def build_signed_extended_order_payload(
 
     if not api_key:
         raise ConnectorError("Extended API key is required to build a signed order")
+    if not stark_private_key:
+        raise ConnectorError("Extended Stark private key is required to build a signed order")
 
     account_body = _unwrap_payload(account_payload, "Extended account")
     market_body = _unwrap_payload(market_payload, "Extended market")
