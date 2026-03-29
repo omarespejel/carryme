@@ -50,6 +50,14 @@ from carryme_models.preview import (
     VenueOrderPreview,
 )
 from carryme_models.readiness import LiveSubmissionReadiness
+from carryme_models.universe import (
+    FundingUniverseOpportunity,
+    FundingUniverseOverlap,
+    FundingUniversePortfolioEntry,
+    FundingUniversePortfolioPlan,
+    FundingUniverseScan,
+    FundingUniverseVenueMarket,
+)
 
 __all__ = [
     "AppDescriptor",
@@ -72,6 +80,12 @@ __all__ = [
     "FundingRateNormalization",
     "FundingArbOpportunity",
     "FundingPairTradeIntent",
+    "FundingUniverseOpportunity",
+    "FundingUniverseOverlap",
+    "FundingUniversePortfolioEntry",
+    "FundingUniversePortfolioPlan",
+    "FundingUniverseScan",
+    "FundingUniverseVenueMarket",
     "GuardedPairExecutionResult",
     "LiveSubmissionReadiness",
     "MarketIdentity",

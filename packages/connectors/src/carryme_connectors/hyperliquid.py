@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 from carryme_models.market import MarketStats, TopOfBook
 
-from carryme_connectors.base import BaseHttpConnector, ConnectorError, parse_float
+from carryme_connectors.base import (
+    BaseHttpConnector,
+    ConnectorError,
+    normalize_market_symbols,
+    parse_float,
+)
+
+_logger = logging.getLogger(__name__)
 
 
 class HyperliquidPublicConnector(BaseHttpConnector):
@@ -27,6 +35,28 @@ class HyperliquidPublicConnector(BaseHttpConnector):
             max_attempts=max_attempts,
             base_backoff_seconds=base_backoff_seconds,
         )
+
+    async def list_market_symbols(self) -> list[str]:
+        payload = await self._request_json("POST", "/info", json_body={"type": "metaAndAssetCtxs"})
+        if not isinstance(payload, list) or len(payload) != 2:
+            raise ConnectorError("Hyperliquid metaAndAssetCtxs payload must be a two-item list")
+        universe, _contexts = payload
+        if not isinstance(universe, dict):
+            raise ConnectorError("Hyperliquid universe metadata must be an object")
+        rows = universe.get("universe", [])
+        if not isinstance(rows, list):
+            raise ConnectorError("Hyperliquid universe payload must be a list")
+        symbols: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                _logger.warning("Hyperliquid universe row was not an object: %r", row)
+                raise ConnectorError("Hyperliquid universe rows must be objects")
+            name = row.get("name")
+            if not isinstance(name, str):
+                _logger.warning("Hyperliquid universe row missing name string: %r", row)
+                raise ConnectorError("Hyperliquid universe row missing name string")
+            symbols.append(name)
+        return normalize_market_symbols(symbols)
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         payload = await self._request_json("POST", "/info", json_body={"type": "metaAndAssetCtxs"})

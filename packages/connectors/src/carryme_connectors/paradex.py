@@ -8,7 +8,12 @@ from typing import Any
 import httpx
 from carryme_models.market import MarketStats, TopOfBook
 
-from carryme_connectors.base import BaseHttpConnector, ConnectorError, parse_float
+from carryme_connectors.base import (
+    BaseHttpConnector,
+    ConnectorError,
+    normalize_market_symbols,
+    parse_float,
+)
 
 
 class ParadexPublicConnector(BaseHttpConnector):
@@ -28,6 +33,25 @@ class ParadexPublicConnector(BaseHttpConnector):
             max_attempts=max_attempts,
             base_backoff_seconds=base_backoff_seconds,
         )
+
+    async def list_market_symbols(self) -> list[str]:
+        payload = await self._request_json("GET", "/v1/markets", params={"market_status": "ACTIVE"})
+        if not isinstance(payload, dict):
+            raise ConnectorError("Paradex market list payload must be an object")
+        rows = payload.get("results", [])
+        if not isinstance(rows, list):
+            raise ConnectorError("Paradex market list missing results list")
+        symbols: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ConnectorError("Paradex market row must be an object")
+            symbol = row.get("symbol")
+            if not isinstance(symbol, str):
+                raise ConnectorError("Paradex market row missing symbol string")
+            normalized_symbol = symbol.strip().upper()
+            if normalized_symbol.endswith("-PERP"):
+                symbols.append(normalized_symbol)
+        return normalize_market_symbols(symbols)
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         summary_payload, market_payload = await asyncio.gather(

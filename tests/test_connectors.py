@@ -274,6 +274,89 @@ def test_hyperliquid_connector_parses_stats_and_top_of_book() -> None:
     asyncio.run(_run_with_client("https://api.hyperliquid.xyz", handler, exercise))
 
 
+def test_extended_connector_lists_deterministic_perp_symbols() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"name": "strk-usd"},
+                    {"name": "LIT-USD"},
+                    {"name": "LIT-USD"},
+                    {"name": "SPOT_ONLY"},
+                ]
+            },
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ExtendedPublicConnector(client)
+        assert await connector.list_market_symbols() == ["LIT-USD", "STRK-USD"]
+
+    asyncio.run(_run_with_client("https://api.starknet.extended.exchange", handler, exercise))
+
+
+def test_paradex_connector_lists_deterministic_symbols_and_rejects_malformed_rows() -> None:
+    def malformed_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": ["bad-row"]})
+
+    async def exercise_malformed(client: httpx.AsyncClient) -> None:
+        connector = ParadexPublicConnector(client)
+        with pytest.raises(ConnectorError, match="market row must be an object"):
+            await connector.list_market_symbols()
+
+    asyncio.run(
+        _run_with_client("https://api.prod.paradex.trade", malformed_handler, exercise_malformed)
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"symbol": "strk-usd-perp"},
+                    {"symbol": "ARB-USD-PERP"},
+                    {"symbol": "ARB-USD-PERP"},
+                    {"symbol": "ARB-USD"},
+                ]
+            },
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ParadexPublicConnector(client)
+        assert await connector.list_market_symbols() == ["ARB-USD-PERP", "STRK-USD-PERP"]
+
+    asyncio.run(_run_with_client("https://api.prod.paradex.trade", handler, exercise))
+
+
+def test_hyperliquid_connector_lists_deterministic_symbols_and_rejects_malformed_rows() -> None:
+    def malformed_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"universe": ["bad-row"]}, []])
+
+    async def exercise_malformed(client: httpx.AsyncClient) -> None:
+        connector = HyperliquidPublicConnector(client)
+        with pytest.raises(ConnectorError, match="rows must be objects"):
+            await connector.list_market_symbols()
+
+    asyncio.run(
+        _run_with_client("https://api.hyperliquid.xyz", malformed_handler, exercise_malformed)
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"universe": [{"name": "strk"}, {"name": "BTC"}, {"name": "BTC"}]},
+                [{}, {}, {}],
+            ],
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = HyperliquidPublicConnector(client)
+        assert await connector.list_market_symbols() == ["BTC", "STRK"]
+
+    asyncio.run(_run_with_client("https://api.hyperliquid.xyz", handler, exercise))
+
+
 def test_connector_requires_async_client() -> None:
     async def exercise() -> None:
         connector = ExtendedPublicConnector()

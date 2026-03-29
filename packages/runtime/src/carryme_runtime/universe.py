@@ -1,0 +1,418 @@
+"""Funding-universe discovery and ranking services."""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import math
+from dataclasses import dataclass, field
+from typing import Literal, Protocol
+
+import httpx
+from carryme_connectors import (
+    ExtendedPublicConnector,
+    HyperliquidPublicConnector,
+    ParadexPublicConnector,
+    PublicVenueConnector,
+)
+from carryme_models import (
+    FundingArbOpportunity,
+    FundingUniverseOpportunity,
+    FundingUniverseOverlap,
+    FundingUniversePortfolioEntry,
+    FundingUniversePortfolioPlan,
+    FundingUniverseScan,
+    FundingUniverseVenueMarket,
+    NormalizedMarketSnapshot,
+)
+from carryme_normalizers import get_fee_profile, normalize_symbol
+from carryme_scoring import score_funding_pair
+
+from carryme_runtime.opportunities import (
+    VENUE_REGISTRY,
+    SnapshotFetcher,
+    UpstreamDataError,
+    fetch_live_snapshot,
+)
+
+UniverseRanking = Literal[
+    "roundtrip_edge",
+    "entry_edge",
+    "roundtrip_pnl",
+    "entry_pnl",
+    "quality_adjusted_roundtrip_pnl",
+]
+
+
+class VenueSymbolLister(Protocol):
+    """Interface for listing active perp symbols on a venue."""
+
+    async def __call__(self, venue: str) -> list[str]: ...
+
+
+DEFAULT_FEE_PROFILES: dict[str, str] = {
+    "extended": "default",
+    "hyperliquid": "tier0",
+    "paradex": "pro",
+}
+
+
+def _default_universe_fee_profiles() -> dict[str, str]:
+    return {venue: DEFAULT_FEE_PROFILES.get(venue, "default") for venue in VENUE_REGISTRY}
+
+
+@dataclass
+class OpportunityUniverseService:
+    """Discover overlapping markets and rank the live funding universe."""
+
+    list_symbols: VenueSymbolLister = field(default_factory=lambda: list_live_symbols)
+    fetch_snapshot: SnapshotFetcher = field(default_factory=lambda: fetch_live_snapshot)
+    default_fee_profiles: dict[str, str] = field(default_factory=_default_universe_fee_profiles)
+
+    async def scan(
+        self,
+        *,
+        venues: list[str],
+        ranking: UniverseRanking = "quality_adjusted_roundtrip_pnl",
+        target_notional: float = 5_000.0,
+        min_capacity_notional: float = 0.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        limit: int = 20,
+    ) -> FundingUniverseScan:
+        normalized_venues = _normalize_venues(venues)
+        overlaps = await self.discover_overlaps(normalized_venues)
+        snapshots = await self._fetch_overlapping_snapshots(overlaps)
+
+        opportunities: list[FundingUniverseOpportunity] = []
+        for overlap in overlaps:
+            entries = [
+                (venue, symbol, snapshots[(venue, symbol)])
+                for venue, symbol in overlap.venue_symbols.items()
+                if (venue, symbol) in snapshots
+            ]
+            for (left_venue, _left_symbol, left), (
+                right_venue,
+                _right_symbol,
+                right,
+            ) in itertools.combinations(entries, 2):
+                scored = _build_universe_opportunity(
+                    left=left,
+                    right=right,
+                    left_fee_profile=self.default_fee_profiles[left_venue],
+                    right_fee_profile=self.default_fee_profiles[right_venue],
+                    target_notional=target_notional,
+                )
+                if not _passes_filters(
+                    scored,
+                    min_capacity_notional=min_capacity_notional,
+                    min_daily_volume=min_daily_volume,
+                    min_open_interest=min_open_interest,
+                    min_roundtrip_edge=min_roundtrip_edge,
+                ):
+                    continue
+                opportunities.append(scored)
+
+        ranked = sorted(
+            opportunities,
+            key=lambda item: _ranking_value(item, ranking),
+            reverse=True,
+        )
+        if limit > 0:
+            ranked = ranked[:limit]
+
+        return FundingUniverseScan(
+            venues=normalized_venues,
+            ranking=ranking,
+            target_notional=target_notional,
+            overlap_count=len(overlaps),
+            overlaps=overlaps,
+            opportunities=ranked,
+        )
+
+    async def discover_overlaps(self, venues: list[str]) -> list[FundingUniverseOverlap]:
+        symbol_lists = await asyncio.gather(*(self.list_symbols(venue) for venue in venues))
+        by_canonical_symbol: dict[str, dict[str, str]] = {}
+        for venue, symbols in zip(venues, symbol_lists, strict=True):
+            for symbol in symbols:
+                try:
+                    identity = normalize_symbol(venue, symbol)
+                except ValueError:
+                    continue
+                by_canonical_symbol.setdefault(identity.canonical_symbol, {})[venue] = symbol
+
+        overlaps = [
+            FundingUniverseOverlap(
+                canonical_symbol=canonical_symbol,
+                venues=sorted(venue_symbols),
+                venue_symbols=dict(sorted(venue_symbols.items())),
+            )
+            for canonical_symbol, venue_symbols in by_canonical_symbol.items()
+            if len(venue_symbols) >= 2
+        ]
+        overlaps.sort(key=lambda item: item.canonical_symbol)
+        return overlaps
+
+    async def _fetch_overlapping_snapshots(
+        self,
+        overlaps: list[FundingUniverseOverlap],
+    ) -> dict[tuple[str, str], NormalizedMarketSnapshot]:
+        tasks = {
+            (venue, symbol): asyncio.create_task(self.fetch_snapshot(venue, symbol))
+            for overlap in overlaps
+            for venue, symbol in overlap.venue_symbols.items()
+        }
+        snapshots: dict[tuple[str, str], NormalizedMarketSnapshot] = {}
+        for key, task in tasks.items():
+            try:
+                snapshots[key] = await task
+            except (ValueError, UpstreamDataError, httpx.HTTPError):
+                continue
+        return snapshots
+
+
+async def list_live_symbols(venue: str) -> list[str]:
+    """List active perp symbols on a supported venue."""
+
+    key = venue.strip().lower()
+    venue_config = VENUE_REGISTRY.get(key)
+    if venue_config is None:
+        raise ValueError(f"Unsupported venue: {venue}")
+    base_url, _connector_factory = venue_config
+
+    async with httpx.AsyncClient(base_url=base_url, timeout=20.0) as client:
+        connector = _build_connector(key, client)
+        return await connector.list_market_symbols()
+
+
+def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnector:
+    if venue == "extended":
+        return ExtendedPublicConnector(client)
+    if venue == "hyperliquid":
+        return HyperliquidPublicConnector(client)
+    if venue == "paradex":
+        return ParadexPublicConnector(client)
+    raise ValueError(f"Unsupported venue: {venue}")
+
+
+def _build_universe_opportunity(
+    *,
+    left: NormalizedMarketSnapshot,
+    right: NormalizedMarketSnapshot,
+    left_fee_profile: str,
+    right_fee_profile: str,
+    target_notional: float,
+) -> FundingUniverseOpportunity:
+    opportunity = score_funding_pair(
+        left,
+        right,
+        get_fee_profile(left.identity.venue, left_fee_profile),
+        get_fee_profile(right.identity.venue, right_fee_profile),
+    )
+    venue_markets = {
+        left.identity.venue: _venue_market(left),
+        right.identity.venue: _venue_market(right),
+    }
+    min_daily_volume = _min_metric(list(venue_markets.values()), "daily_volume")
+    min_open_interest = _min_metric(list(venue_markets.values()), "open_interest")
+    deployable_notional = _deployable_notional(opportunity, target_notional)
+    pnl_after_entry = (
+        deployable_notional * opportunity.one_day_net_edge_after_entry
+        if deployable_notional is not None
+        else None
+    )
+    pnl_after_round_trip = (
+        deployable_notional * opportunity.one_day_net_edge_after_round_trip
+        if deployable_notional is not None
+        else None
+    )
+    quality_score = _quality_score(
+        estimated_one_day_pnl_after_round_trip=pnl_after_round_trip,
+        deployable_notional=deployable_notional,
+        min_daily_volume=min_daily_volume,
+        min_open_interest=min_open_interest,
+    )
+    return FundingUniverseOpportunity(
+        opportunity=opportunity,
+        venue_markets=venue_markets,
+        min_daily_volume=min_daily_volume,
+        min_open_interest=min_open_interest,
+        target_notional=target_notional,
+        deployable_notional=deployable_notional,
+        estimated_one_day_pnl_after_entry=pnl_after_entry,
+        estimated_one_day_pnl_after_round_trip=pnl_after_round_trip,
+        quality_score=quality_score,
+    )
+
+
+def _venue_market(snapshot: NormalizedMarketSnapshot) -> FundingUniverseVenueMarket:
+    book = snapshot.market.top_of_book
+    bid_notional = None
+    ask_notional = None
+    if book is not None:
+        if book.best_bid_price is not None and book.best_bid_size is not None:
+            bid_notional = book.best_bid_price * book.best_bid_size
+        if book.best_ask_price is not None and book.best_ask_size is not None:
+            ask_notional = book.best_ask_price * book.best_ask_size
+    return FundingUniverseVenueMarket(
+        venue=snapshot.identity.venue,
+        symbol=snapshot.identity.venue_symbol,
+        mark_price=snapshot.market.mark_price,
+        daily_funding_rate=snapshot.funding.daily_rate,
+        open_interest=snapshot.market.open_interest,
+        daily_volume=snapshot.market.daily_volume,
+        bid_notional=bid_notional,
+        ask_notional=ask_notional,
+    )
+
+
+def _min_metric(markets: list[FundingUniverseVenueMarket], field_name: str) -> float | None:
+    values: list[float] = []
+    for market in markets:
+        value = getattr(market, field_name)
+        if isinstance(value, int | float):
+            values.append(float(value))
+    if not values:
+        return None
+    return min(values)
+
+
+def _deployable_notional(
+    opportunity: FundingArbOpportunity,
+    target_notional: float,
+) -> float | None:
+    if opportunity.capacity is None or opportunity.capacity.max_entry_notional is None:
+        return None
+    return min(target_notional, opportunity.capacity.max_entry_notional)
+
+
+def _quality_score(
+    *,
+    estimated_one_day_pnl_after_round_trip: float | None,
+    deployable_notional: float | None,
+    min_daily_volume: float | None,
+    min_open_interest: float | None,
+) -> float | None:
+    if estimated_one_day_pnl_after_round_trip is None:
+        return None
+    if estimated_one_day_pnl_after_round_trip <= 0:
+        return estimated_one_day_pnl_after_round_trip
+
+    volume_factor = _bounded_log_factor(min_daily_volume, normalization=5.0)
+    oi_factor = _bounded_log_factor(min_open_interest, normalization=6.0)
+    depth_factor = _bounded_log_factor(deployable_notional, normalization=4.0)
+    return estimated_one_day_pnl_after_round_trip * volume_factor * oi_factor * depth_factor
+
+
+def _bounded_log_factor(value: float | None, *, normalization: float) -> float:
+    if value is None or value <= 0:
+        return 0.0
+    return min(math.log10(1.0 + value) / normalization, 1.0)
+
+
+def _passes_filters(
+    opportunity: FundingUniverseOpportunity,
+    *,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+) -> bool:
+    deployable_notional = opportunity.deployable_notional or 0.0
+    if deployable_notional < min_capacity_notional:
+        return False
+    if (opportunity.min_daily_volume or 0.0) < min_daily_volume:
+        return False
+    if (opportunity.min_open_interest or 0.0) < min_open_interest:
+        return False
+    return opportunity.opportunity.one_day_net_edge_after_round_trip >= min_roundtrip_edge
+
+
+def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRanking) -> float:
+    if ranking == "roundtrip_edge":
+        return opportunity.opportunity.one_day_net_edge_after_round_trip
+    if ranking == "entry_edge":
+        return opportunity.opportunity.one_day_net_edge_after_entry
+    if ranking == "roundtrip_pnl":
+        return opportunity.estimated_one_day_pnl_after_round_trip or float("-inf")
+    if ranking == "entry_pnl":
+        return opportunity.estimated_one_day_pnl_after_entry or float("-inf")
+    return opportunity.quality_score or float("-inf")
+
+
+def _normalize_venues(venues: list[str]) -> list[str]:
+    if not venues:
+        raise ValueError("At least one venue must be selected")
+    normalized = sorted({venue.strip().lower() for venue in venues if venue.strip()})
+    if len(normalized) < 2:
+        raise ValueError("At least two venues are required for funding universe scans")
+    unsupported = [venue for venue in normalized if venue not in VENUE_REGISTRY]
+    if unsupported:
+        joined = ", ".join(sorted(unsupported))
+        raise ValueError(f"Unsupported venue(s): {joined}")
+    return normalized
+
+
+def build_portfolio_plan(
+    scan: FundingUniverseScan,
+    *,
+    target_notional: float,
+    max_positions: int = 5,
+    min_selected_notional: float = 0.0,
+    one_position_per_symbol: bool = True,
+) -> FundingUniversePortfolioPlan:
+    """Greedily allocate capital across the ranked universe opportunities."""
+
+    if target_notional < 0:
+        raise ValueError("target_notional must be non-negative")
+    if max_positions <= 0:
+        raise ValueError("max_positions must be positive")
+    if min_selected_notional < 0:
+        raise ValueError("min_selected_notional must be non-negative")
+
+    remaining = target_notional
+    selected_symbols: set[str] = set()
+    entries: list[FundingUniversePortfolioEntry] = []
+    total_entry_pnl = 0.0
+    total_round_trip_pnl = 0.0
+
+    for opportunity in scan.opportunities:
+        if remaining <= 0 or len(entries) >= max_positions:
+            break
+        canonical_symbol = opportunity.opportunity.canonical_symbol
+        if one_position_per_symbol and canonical_symbol in selected_symbols:
+            continue
+        available = opportunity.deployable_notional or 0.0
+        selected_notional = min(remaining, available)
+        if selected_notional < min_selected_notional:
+            continue
+
+        entry_edge = opportunity.opportunity.one_day_net_edge_after_entry
+        round_trip_edge = opportunity.opportunity.one_day_net_edge_after_round_trip
+        entry_pnl = selected_notional * entry_edge
+        round_trip_pnl = selected_notional * round_trip_edge
+
+        entries.append(
+            FundingUniversePortfolioEntry(
+                opportunity=opportunity,
+                selected_notional=selected_notional,
+                estimated_one_day_pnl_after_entry=entry_pnl,
+                estimated_one_day_pnl_after_round_trip=round_trip_pnl,
+            )
+        )
+        remaining -= selected_notional
+        total_entry_pnl += entry_pnl
+        total_round_trip_pnl += round_trip_pnl
+        selected_symbols.add(canonical_symbol)
+
+    allocated = target_notional - remaining
+    return FundingUniversePortfolioPlan(
+        ranking=scan.ranking,
+        target_notional=target_notional,
+        allocated_notional=allocated,
+        unused_notional=max(remaining, 0.0),
+        estimated_one_day_pnl_after_entry=total_entry_pnl,
+        estimated_one_day_pnl_after_round_trip=total_round_trip_pnl,
+        entries=entries,
+    )

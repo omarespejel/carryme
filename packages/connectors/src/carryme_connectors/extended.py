@@ -8,7 +8,12 @@ from typing import Any
 import httpx
 from carryme_models.market import MarketStats, TopOfBook
 
-from carryme_connectors.base import BaseHttpConnector, ConnectorError, parse_float
+from carryme_connectors.base import (
+    BaseHttpConnector,
+    ConnectorError,
+    normalize_market_symbols,
+    parse_float,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -30,6 +35,25 @@ class ExtendedPublicConnector(BaseHttpConnector):
             max_attempts=max_attempts,
             base_backoff_seconds=base_backoff_seconds,
         )
+
+    async def list_market_symbols(self) -> list[str]:
+        payload = await self._request_json("GET", "/api/v1/info/markets")
+        if not isinstance(payload, dict):
+            raise ConnectorError("Extended markets payload must be an object")
+        rows = payload.get("data", [])
+        if not isinstance(rows, list):
+            raise ConnectorError("Extended markets payload missing data list")
+        symbols: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ConnectorError("Extended market rows must be objects")
+            name = row.get("name")
+            if not isinstance(name, str):
+                raise ConnectorError("Extended market row missing name string")
+            normalized_name = name.strip().upper()
+            if normalized_name.endswith("-USD"):
+                symbols.append(normalized_name)
+        return normalize_market_symbols(symbols)
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         payload = await self._request_json("GET", "/api/v1/info/markets", params={"market": symbol})

@@ -25,6 +25,8 @@ from carryme_models import (
     ExecutionReconciliation,
     FundingArbOpportunity,
     FundingPairTradeIntent,
+    FundingUniversePortfolioPlan,
+    FundingUniverseScan,
     GuardedPairExecutionResult,
     LiveSubmissionReadiness,
     OpportunityRecord,
@@ -58,6 +60,7 @@ from carryme_runtime import (
     InvalidTradeCandidateError,
     MockExecutionAdapter,
     OpportunityService,
+    OpportunityUniverseService,
     OrderPreviewService,
     PairCloseLiveExecutionCoordinator,
     PairClosePreviewService,
@@ -71,6 +74,7 @@ from carryme_runtime import (
     build_live_execution_configs,
     build_live_submission_readiness,
     build_paper_trade_execution_preflight,
+    build_portfolio_plan,
     build_trade_intent,
     build_venue_execution_preflights,
     reconcile_execution,
@@ -199,6 +203,13 @@ def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
     return OpportunityService()
+
+
+@lru_cache
+def get_opportunity_universe_service() -> OpportunityUniverseService:
+    """Return the live funding-universe discovery and ranking service."""
+
+    return OpportunityUniverseService()
 
 
 def get_history_store(
@@ -1756,7 +1767,7 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         if preview.preview_hash != normalized_preview_hash:
@@ -1883,7 +1894,7 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         saved_entry = execution_store.append(journal_entry)
@@ -3134,6 +3145,74 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/opportunities/funding-universe", response_model=FundingUniverseScan)
+    async def funding_universe(
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
+        venues: list[str] | None = None,
+        ranking: str = "quality_adjusted_roundtrip_pnl",
+        target_notional: float = 5_000.0,
+        min_capacity_notional: float = 0.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        limit: int = 20,
+    ) -> FundingUniverseScan:
+        try:
+            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            return await service.scan(
+                venues=selected_venues,
+                ranking=ranking,  # type: ignore[arg-type]
+                target_notional=target_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/opportunities/funding-universe/portfolio",
+        response_model=FundingUniversePortfolioPlan,
+    )
+    async def funding_universe_portfolio(
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
+        venues: list[str] | None = None,
+        ranking: str = "quality_adjusted_roundtrip_pnl",
+        target_notional: float = 5_000.0,
+        min_capacity_notional: float = 0.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        max_positions: int = 5,
+        min_selected_notional: float = 0.0,
+    ) -> FundingUniversePortfolioPlan:
+        try:
+            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            scan = await service.scan(
+                venues=selected_venues,
+                ranking=ranking,  # type: ignore[arg-type]
+                target_notional=target_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                limit=max_positions * 5,
+            )
+            return build_portfolio_plan(
+                scan,
+                target_notional=target_notional,
+                max_positions=max_positions,
+                min_selected_notional=min_selected_notional,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
 
