@@ -411,8 +411,7 @@ async def run_supervised_execution_observation_loop(
             consecutive_failures += 1
             backoff_seconds = min(
                 settings.execution_observation_max_backoff_seconds,
-                settings.execution_observation_interval_seconds
-                * (2 ** (consecutive_failures - 1)),
+                settings.execution_observation_interval_seconds * (2 ** (consecutive_failures - 1)),
             )
             loop_logger.exception(
                 "supervised execution observation cycle %s failed; backing off for %s seconds",
@@ -699,8 +698,10 @@ def _build_order_state_observers(
     observers: dict[str, ExecutionLegOrderObserver] = {}
     if settings.extended_live_enabled and settings.extended_api_key:
         observers["extended"] = ExtendedOrderStateObserver(api_key=settings.extended_api_key)
-    if settings.paradex_live_enabled and settings.paradex_account_address and (
-        settings.paradex_private_key or settings.paradex_bearer_token
+    if (
+        settings.paradex_live_enabled
+        and settings.paradex_account_address
+        and (settings.paradex_private_key or settings.paradex_bearer_token)
     ):
         observers["paradex"] = ParadexOrderStateObserver(
             account_address=settings.paradex_account_address,

@@ -1415,6 +1415,7 @@ def test_observe_live_executions_once_emits_deduped_cleanup_alert(tmp_path: Path
     assert alerts[0].preview_hash == "preview-hash"
     assert alerts[0].pair_status.derived_state == "cleanup_needed"
 
+
 def test_observe_live_executions_once_retries_without_duplicate_alerts_after_atomic_failure(
     tmp_path: Path,
 ) -> None:
@@ -1931,6 +1932,7 @@ def test_observe_live_executions_once_realerts_after_recovery(tmp_path: Path) ->
         datetime(2026, 3, 29, 13, 8, tzinfo=UTC),
         datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
     ]
+
 
 def test_worker_main_rejects_mutually_exclusive_modes(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -2680,8 +2682,10 @@ def test_worker_main_prints_supervised_summary_as_json(
         settings: WorkerSettings,
         *,
         stop_event: asyncio.Event | None = None,
+        max_iterations: int | None = None,
     ) -> PollLoopSummary:
         assert stop_event is not None
+        assert max_iterations is None
         return PollLoopSummary(
             attempts=2,
             successful_cycles=1,
