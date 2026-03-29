@@ -1,0 +1,332 @@
+"""Paradex authenticated JWT helpers built from the official subkey auth flow."""
+
+from __future__ import annotations
+
+import functools
+import hashlib
+import math
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+from Crypto.Hash import keccak
+from ecdsa.rfc6979 import generate_k  # type: ignore[import-untyped]
+from starknet_crypto_py import pedersen_hash, sign
+
+from carryme_connectors.base import ConnectorError
+
+PARADEX_API_BASE_URL = "https://api.prod.paradex.trade"
+PARADEX_SYSTEM_CONFIG_PATH = "/v1/system/config"
+PARADEX_AUTH_PATH = "/v1/auth"
+PARADEX_AUTH_TOKEN_LIFETIME_SECONDS = 24 * 60 * 60
+STARK_FIELD_MASK = (1 << 250) - 1
+STARK_CURVE_ORDER = 0x800000000000010FFFFFFFFFFFFFFFFB781126DCAE7B2321E66A241ADC64D2F
+
+_AUTH_TYPES: dict[str, list[dict[str, str]]] = {
+    "StarkNetDomain": [
+        {"name": "name", "type": "felt"},
+        {"name": "chainId", "type": "felt"},
+        {"name": "version", "type": "felt"},
+    ],
+    "Request": [
+        {"name": "method", "type": "felt"},
+        {"name": "path", "type": "felt"},
+        {"name": "body", "type": "felt"},
+        {"name": "timestamp", "type": "felt"},
+        {"name": "expiration", "type": "felt"},
+    ],
+}
+
+
+@dataclass(frozen=True)
+class ParadexSystemConfig:
+    """Minimal Paradex system config required for JWT issuance."""
+
+    starknet_chain_id: str
+
+
+class ParadexJwtTokenProvider:
+    """Mint short-lived Paradex JWTs directly from the trading subkey."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str = PARADEX_API_BASE_URL,
+        system_config_path: str = PARADEX_SYSTEM_CONFIG_PATH,
+        auth_path: str = PARADEX_AUTH_PATH,
+        token_lifetime_seconds: int = PARADEX_AUTH_TOKEN_LIFETIME_SECONDS,
+    ) -> None:
+        self._base_url = base_url
+        self._system_config_path = system_config_path
+        self._auth_path = auth_path
+        self._token_lifetime_seconds = token_lifetime_seconds
+
+    async def fetch_system_config(
+        self,
+        client: httpx.AsyncClient | None = None,
+    ) -> ParadexSystemConfig:
+        """Return the live system config required for signature domain building."""
+
+        payload = await self._request_json(client, "GET", self._system_config_path)
+        if not isinstance(payload, dict):
+            raise ConnectorError("Paradex system config payload must be an object")
+        chain_id = payload.get("starknet_chain_id")
+        if not isinstance(chain_id, str) or not chain_id:
+            raise ConnectorError("Paradex system config missing starknet_chain_id")
+        return ParadexSystemConfig(starknet_chain_id=chain_id)
+
+    async def issue_jwt_token(
+        self,
+        *,
+        account_address: str,
+        private_key: str,
+        client: httpx.AsyncClient | None = None,
+        now: int | None = None,
+    ) -> str:
+        """Issue a short-lived Paradex JWT for authenticated REST reads/writes."""
+
+        config = await self.fetch_system_config(client)
+        issued_at = int(time.time()) if now is None else now
+        expires_at = issued_at + self._token_lifetime_seconds
+        headers = build_paradex_auth_headers(
+            account_address=account_address,
+            private_key=private_key,
+            starknet_chain_id=config.starknet_chain_id,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            auth_path=self._auth_path,
+        )
+        payload = await self._request_json(client, "POST", self._auth_path, headers=headers)
+        if not isinstance(payload, dict):
+            raise ConnectorError("Paradex auth payload must be an object")
+        jwt_token = payload.get("jwt_token")
+        if not isinstance(jwt_token, str) or not jwt_token:
+            raise ConnectorError("Paradex auth response missing jwt_token")
+        return jwt_token
+
+    async def _request_json(
+        self,
+        client: httpx.AsyncClient | None,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        if client is not None:
+            response = await client.request(method, path, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict | list):
+                raise ConnectorError("Paradex returned an unexpected payload shape")
+            return payload
+
+        async with httpx.AsyncClient(base_url=self._base_url, timeout=15.0) as owned_client:
+            response = await owned_client.request(method, path, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict | list):
+                raise ConnectorError("Paradex returned an unexpected payload shape")
+            return payload
+
+
+def build_paradex_auth_headers(
+    *,
+    account_address: str,
+    private_key: str,
+    starknet_chain_id: str,
+    issued_at: int,
+    expires_at: int,
+    auth_path: str = PARADEX_AUTH_PATH,
+) -> dict[str, str]:
+    """Build the official Paradex `/v1/auth` signature headers."""
+
+    account_address_int = _parse_hex_value(account_address, "Paradex account address")
+    private_key_int = _parse_hex_value(private_key, "Paradex private key")
+    chain_id_int = int.from_bytes(starknet_chain_id.encode("utf-8"), "big")
+    typed_data = _build_auth_typed_data(
+        account_address=account_address_int,
+        domain={
+            "name": "Paradex",
+            "chainId": hex(chain_id_int),
+            "version": "1",
+        },
+        primary_type="Request",
+        message={
+            "method": "POST",
+            "path": auth_path,
+            "body": "",
+            "timestamp": issued_at,
+            "expiration": expires_at,
+        },
+        types=_AUTH_TYPES,
+    )
+    k = _generate_k_rfc6979(typed_data.message_hash, private_key_int)
+    signature = sign(private_key=private_key_int, msg_hash=typed_data.message_hash, seed=k)
+    flattened_signature = f'["{signature[0]}","{signature[1]}"]'
+    return {
+        "PARADEX-STARKNET-ACCOUNT": account_address,
+        "PARADEX-STARKNET-SIGNATURE": flattened_signature,
+        "PARADEX-TIMESTAMP": str(issued_at),
+        "PARADEX-SIGNATURE-EXPIRATION": str(expires_at),
+    }
+
+
+def _parse_hex_value(value: str, label: str) -> int:
+    try:
+        return int(value, 16)
+    except ValueError as exc:  # pragma: no cover - defensive only
+        raise ConnectorError(f"{label} must be a hex string") from exc
+
+
+@dataclass(frozen=True)
+class AuthTypedData:
+    """Minimal typed-data container for Paradex auth signing."""
+
+    message_hash: int
+
+
+def _build_auth_typed_data(
+    *,
+    account_address: int,
+    domain: Mapping[str, int | str],
+    primary_type: str,
+    message: Mapping[str, int | str],
+    types: dict[str, list[dict[str, str]]],
+) -> AuthTypedData:
+    full_message_hash = _compute_hash_on_elements(
+        [
+            _encode_shortstring("StarkNet Message"),
+            _struct_hash(types, "StarkNetDomain", domain),
+            account_address,
+            _struct_hash(types, primary_type, message),
+        ]
+    )
+    return AuthTypedData(message_hash=full_message_hash)
+
+
+def _struct_hash(
+    types: dict[str, list[dict[str, str]]],
+    type_name: str,
+    data: Mapping[str, int | str],
+) -> int:
+    return _compute_hash_on_elements(
+        [_type_hash(types, type_name), *_encode_data(types, type_name, data)]
+    )
+
+
+def _type_hash(types: dict[str, list[dict[str, str]]], type_name: str) -> int:
+    return _get_selector_from_name(_encode_type(types, type_name))
+
+
+def _encode_data(
+    types: dict[str, list[dict[str, str]]],
+    type_name: str,
+    data: Mapping[str, int | str],
+) -> list[int]:
+    values: list[int] = []
+    for param in types[type_name]:
+        values.append(_encode_value(types, param["type"], data[param["name"]]))
+    return values
+
+
+def _encode_value(
+    types: dict[str, list[dict[str, str]]],
+    type_name: str,
+    value: Any,
+) -> int:
+    if _is_pointer(type_name) and isinstance(value, list):
+        stripped_type = _strip_pointer(type_name)
+        if stripped_type in types:
+            struct_items = [
+                _struct_hash(types, stripped_type, item)
+                for item in value
+                if isinstance(item, dict)
+            ]
+            return _compute_hash_on_elements(struct_items)
+        return _compute_hash_on_elements([int(_get_hex(item), 16) for item in value])
+
+    if type_name in types and isinstance(value, dict):
+        return _struct_hash(types, type_name, value)
+
+    return int(_get_hex(value), 16)
+
+
+def _encode_type(types: dict[str, list[dict[str, str]]], type_name: str) -> str:
+    primary, *dependencies = _get_dependencies(types, type_name)
+    ordered = [primary, *sorted(dependencies)]
+
+    def render_dependency(name: str) -> str:
+        rendered = [f"{item['name']}:{item['type']}" for item in types[name]]
+        return f"{name}({','.join(rendered)})"
+
+    return "".join(render_dependency(name) for name in ordered)
+
+
+def _get_dependencies(types: dict[str, list[dict[str, str]]], type_name: str) -> list[str]:
+    if type_name not in types:
+        return []
+
+    dependencies: set[str] = set()
+
+    def collect_deps(current: str) -> None:
+        for param in types[current]:
+            param_type = _strip_pointer(param["type"])
+            if param_type in types and param_type not in dependencies:
+                dependencies.add(param_type)
+                collect_deps(param_type)
+
+    collect_deps(type_name)
+    return [type_name, *list(dependencies)]
+
+
+def _compute_hash_on_elements(data: Sequence[int]) -> int:
+    return functools.reduce(pedersen_hash, [*data, len(data)], 0)
+
+
+def _get_selector_from_name(name: str) -> int:
+    digest = keccak.new(digest_bits=256, data=name.encode("ascii")).digest()
+    return int.from_bytes(digest, "big") & STARK_FIELD_MASK
+
+
+def _get_hex(value: int | str) -> str:
+    if isinstance(value, int):
+        return hex(value)
+    if value.startswith("0x"):
+        return value
+    if value.isnumeric():
+        return hex(int(value))
+    return hex(_encode_shortstring(value))
+
+
+def _encode_shortstring(value: str) -> int:
+    if not value:
+        return 0
+    encoded = value.encode("ascii")
+    if len(encoded) > 31:
+        raise ConnectorError("Short string values must be 31 ASCII bytes or fewer")
+    return int.from_bytes(encoded, "big")
+
+
+def _is_pointer(value: str) -> bool:
+    return bool(value) and value.endswith("*")
+
+
+def _strip_pointer(value: str) -> str:
+    return value[:-1] if _is_pointer(value) else value
+
+
+def _generate_k_rfc6979(msg_hash: int, private_key: int) -> int:
+    """Replicate StarkWare's RFC6979 nonce derivation used by official clients."""
+
+    if 1 <= msg_hash.bit_length() % 8 <= 4 and msg_hash.bit_length() >= 248:
+        msg_hash *= 16
+    return int(
+        generate_k(
+            STARK_CURVE_ORDER,
+            private_key,
+            hashlib.sha256,
+            msg_hash.to_bytes(math.ceil(msg_hash.bit_length() / 8), "big"),
+        )
+    )

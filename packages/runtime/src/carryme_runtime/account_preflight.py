@@ -11,6 +11,7 @@ import httpx
 from carryme_connectors import (
     ConnectorError,
     ExtendedPrivateConnector,
+    ParadexJwtTokenProvider,
     ParadexPrivateConnector,
 )
 from carryme_connectors.base import parse_float
@@ -38,6 +39,19 @@ class VenueAccountProbe(Protocol):
     """Protocol for one venue-specific authenticated account probe."""
 
     async def probe(self, config: VenueAccountConfig) -> VenueAccountPreflight: ...
+
+
+class ParadexJwtTokenIssuer(Protocol):
+    """Protocol for issuing short-lived Paradex JWTs."""
+
+    async def issue_jwt_token(
+        self,
+        *,
+        account_address: str,
+        private_key: str,
+        client: httpx.AsyncClient | None = None,
+        now: int | None = None,
+    ) -> str: ...
 
 
 ACCOUNT_CONNECTOR_BASE_URLS: dict[str, str] = {
@@ -220,33 +234,64 @@ class ParadexAccountProbe:
 
     venue = "paradex"
 
+    def __init__(self, token_provider: ParadexJwtTokenIssuer | None = None) -> None:
+        self._token_provider = token_provider or ParadexJwtTokenProvider()
+
     async def probe(self, config: VenueAccountConfig) -> VenueAccountPreflight:
         enabled = bool(config["enabled"])
-        bearer_token = config["credentials"].get("bearer_token")
         account_address = config["credentials"].get("account_address")
+        bearer_token = config["credentials"].get("bearer_token")
+        private_key = config["credentials"].get("private_key")
         missing = []
-        if not bearer_token:
-            missing.append("CARRYME_API_PARADEX_BEARER_TOKEN")
         if not account_address:
             missing.append("CARRYME_API_PARADEX_ACCOUNT_ADDRESS")
+        if not bearer_token and not private_key:
+            missing.append("CARRYME_API_PARADEX_PRIVATE_KEY")
         if not enabled or missing:
             return VenueAccountPreflight(
                 venue=self.venue,
                 enabled=enabled,
                 authenticated=False,
                 ready=False,
-                credential_mode="bearer_token",
+                credential_mode="subkey_jwt",
                 missing_env_vars=missing,
                 blocking_reasons=_blocking_reasons(enabled, missing, self.venue),
                 notes=[
                     (
-                        "Paradex authenticated account reads currently use a bearer/JWT token "
-                        "plus the main account address."
+                        "Paradex authenticated account reads derive a short-lived JWT from the "
+                        "main account address plus the trading subkey private key. "
+                        "A bearer token can still be supplied as an override."
                     )
                 ],
             )
 
-        headers = {"Authorization": f"Bearer {cast(str, bearer_token)}"}
+        credential_mode = "bearer_token" if bearer_token else "subkey_jwt"
+        try:
+            if bearer_token:
+                jwt_token = cast(str, bearer_token)
+            else:
+                async with httpx.AsyncClient(
+                    base_url=ACCOUNT_CONNECTOR_BASE_URLS[self.venue],
+                    timeout=15.0,
+                ) as auth_client:
+                    jwt_token = await self._token_provider.issue_jwt_token(
+                        account_address=cast(str, account_address),
+                        private_key=cast(str, private_key),
+                        client=auth_client,
+                    )
+        except (ConnectorError, httpx.HTTPError) as exc:
+            return VenueAccountPreflight(
+                venue=self.venue,
+                enabled=enabled,
+                authenticated=False,
+                ready=False,
+                credential_mode=credential_mode,
+                missing_env_vars=[],
+                blocking_reasons=[f"Paradex JWT issuance failed: {exc}"],
+                notes=["Check the Paradex account address and trading subkey private key."],
+            )
+
+        headers = {"Authorization": f"Bearer {jwt_token}"}
         async with httpx.AsyncClient(
             base_url=ACCOUNT_CONNECTOR_BASE_URLS[self.venue],
             headers=headers,
@@ -265,10 +310,10 @@ class ParadexAccountProbe:
                     enabled=enabled,
                     authenticated=False,
                     ready=False,
-                    credential_mode="bearer_token",
+                    credential_mode=credential_mode,
                     missing_env_vars=[],
                     blocking_reasons=[f"Paradex authenticated read failed: {exc}"],
-                    notes=["Check the Paradex bearer token and account address."],
+                    notes=["Check the Paradex credentials and target account state."],
                 )
         try:
             account_body = _unwrap_payload(account, context="Paradex account")
@@ -292,7 +337,7 @@ class ParadexAccountProbe:
                 enabled=enabled,
                 authenticated=True,
                 ready=True,
-                credential_mode="bearer_token",
+                credential_mode=credential_mode,
                 account_identifier=account_identifier,
                 account_status=_pick_string(account_body, "status", "account_status"),
                 total_collateral=_pick_float(
@@ -310,7 +355,12 @@ class ParadexAccountProbe:
                 ),
                 balance_count=_count_rows(balances, context="Paradex balances"),
                 position_count=_count_rows(positions, context="Paradex positions"),
-                notes=["Paradex account preflight completed using authenticated private GETs."],
+                notes=[
+                    (
+                        "Paradex account preflight completed using authenticated private GETs "
+                        f"with {credential_mode}."
+                    )
+                ],
             )
         except (UpstreamDataError, ValidationError) as exc:
             return VenueAccountPreflight(
@@ -318,7 +368,7 @@ class ParadexAccountProbe:
                 enabled=enabled,
                 authenticated=False,
                 ready=False,
-                credential_mode="bearer_token",
+                credential_mode=credential_mode,
                 blocking_reasons=[f"Paradex authenticated read returned malformed payload: {exc}"],
                 notes=[
                     "Paradex authenticated read succeeded but returned malformed account data."

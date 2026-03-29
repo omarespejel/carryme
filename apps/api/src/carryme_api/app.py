@@ -239,7 +239,6 @@ def get_mock_execution_adapter() -> MockExecutionAdapter:
 
     return MockExecutionAdapter()
 
-
 def get_account_preflight_service() -> AccountPreflightService:
     """Return the authenticated account-state preflight service."""
 
@@ -267,6 +266,7 @@ def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightC
             "credentials": {
                 "account_address": settings.paradex_account_address,
                 "bearer_token": settings.paradex_bearer_token,
+                "private_key": settings.paradex_private_key,
             },
         },
     }
