@@ -1199,7 +1199,7 @@ def test_execution_order_state_endpoint_reports_latest_leg_state(tmp_path: Path)
 
 def test_execution_observation_endpoint_reports_latest_snapshot(tmp_path: Path) -> None:
     observation_store = ExecutionObservationStore(tmp_path / "history.sqlite3")
-    saved = observation_store.append(
+    observation_store.append(
         ExecutionObservationEntry(
             observed_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
             context="guarded_pair_poll",
@@ -1258,6 +1258,65 @@ def test_execution_observation_endpoint_reports_latest_snapshot(tmp_path: Path) 
             ),
         )
     )
+    latest = observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 8, tzinfo=UTC),
+            context="guarded_pair_poll",
+            execution_entry_id=13,
+            paper_trade_id=7,
+            preview_hash="preview-hash-newer",
+            order_state=ExecutionOrderState(
+                execution_entry_id=13,
+                paper_trade_id=7,
+                preview_hash="preview-hash-newer",
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="paradex",
+                        supported=True,
+                        observation_source="rest_poll",
+                        external_reference="order-2",
+                        derived_state="open",
+                        order_status="OPEN",
+                    )
+                ],
+                notes=[],
+            ),
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=13,
+                paper_trade_id=7,
+                preview_hash="preview-hash-newer",
+                derived_state="review_required",
+                recommended_action="wait_for_fill",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=13,
+                    paper_trade_id=7,
+                    preview_hash="preview-hash-newer",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=13,
+                    paper_trade_id=7,
+                    preview_hash="preview-hash-newer",
+                    status="submitted",
+                    recommended_action="verify_fill_status",
+                    matched_all_leg_symbols=True,
+                    venues=[
+                        ExecutionVenueReconciliation(
+                            venue="paradex",
+                            authenticated=True,
+                            ready=True,
+                            position_symbols=["ARB-USD-PERP"],
+                            matched_leg_symbols=["ARB-USD-PERP"],
+                            unmatched_leg_symbols=[],
+                        )
+                    ],
+                    notes=[],
+                ),
+                notes=[],
+            ),
+        )
+    )
 
     from carryme_api.app import get_execution_observation_store
 
@@ -1268,9 +1327,9 @@ def test_execution_observation_endpoint_reports_latest_snapshot(tmp_path: Path) 
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["entry_id"] == saved.entry_id
+    assert payload["entry_id"] == latest.entry_id
     assert payload["context"] == "guarded_pair_poll"
-    assert payload["pair_status"]["derived_state"] == "unfilled"
+    assert payload["pair_status"]["derived_state"] == "review_required"
 
 
 def test_observe_pair_status_persists_observation_entries(tmp_path: Path) -> None:

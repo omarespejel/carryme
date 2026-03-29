@@ -27,6 +27,7 @@ from carryme_runtime import (
     HyperliquidOrderStateObserver,
     OpportunityService,
     ParadexOrderStateObserver,
+    build_account_preflight_configs,
     build_execution_pair_status,
     filter_candidate_records,
     reconcile_execution,
@@ -43,6 +44,7 @@ from carryme_storage import (
 from carryme_worker.config import WorkerSettings
 
 logger = logging.getLogger(__name__)
+OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
 
 
 class PairScorer(Protocol):
@@ -218,27 +220,42 @@ async def observe_live_executions_once(
         seen_paper_trade_ids.add(execution.paper_trade_id)
         scanned_executions += 1
 
-        account_preflight = await account_probe_service.probe_paper_trade(
-            execution.paper_trade,
-            _build_account_preflight_configs(settings),
-        )
-        order_state = await state_service.observe_execution(execution)
-        pair_status = build_execution_pair_status(
-            execution,
-            order_state,
-            reconcile_execution(execution, account_preflight),
-        )
-        history_store.append(
-            ExecutionObservationEntry(
-                observed_at=timestamp,
-                context="worker_execution_monitor",
-                execution_entry_id=execution.entry_id,
-                paper_trade_id=execution.paper_trade_id,
-                preview_hash=execution.preview_hash,
-                order_state=order_state,
-                pair_status=pair_status,
+        try:
+            account_preflight = await asyncio.wait_for(
+                account_probe_service.probe_paper_trade(
+                    execution.paper_trade,
+                    _build_account_preflight_configs(settings),
+                ),
+                timeout=OBSERVATION_CALL_TIMEOUT_SECONDS,
             )
-        )
+            order_state = await asyncio.wait_for(
+                state_service.observe_execution(execution),
+                timeout=OBSERVATION_CALL_TIMEOUT_SECONDS,
+            )
+            pair_status = build_execution_pair_status(
+                execution,
+                order_state,
+                reconcile_execution(execution, account_preflight),
+            )
+            history_store.append(
+                ExecutionObservationEntry(
+                    observed_at=timestamp,
+                    context="worker_execution_monitor",
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=execution.paper_trade_id,
+                    preview_hash=execution.preview_hash,
+                    order_state=order_state,
+                    pair_status=pair_status,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Failed to observe execution entry_id=%s paper_trade_id=%s",
+                execution.entry_id,
+                execution.paper_trade_id,
+                exc_info=True,
+            )
+            continue
         observed_executions += 1
         saved_observations += 1
 
@@ -493,29 +510,17 @@ async def run_supervised_polling_loop(
 
 
 def _build_account_preflight_configs(settings: WorkerSettings) -> AccountPreflightConfigMap:
-    return {
-        "extended": {
-            "enabled": settings.extended_live_enabled,
-            "credentials": {
-                "api_key": settings.extended_api_key,
-            },
-        },
-        "paradex": {
-            "enabled": settings.paradex_live_enabled,
-            "credentials": {
-                "account_address": settings.paradex_account_address,
-                "bearer_token": settings.paradex_bearer_token,
-                "private_key": settings.paradex_private_key,
-            },
-        },
-        "hyperliquid": {
-            "enabled": settings.hyperliquid_live_enabled,
-            "credentials": {
-                "account_address": settings.hyperliquid_account_address,
-                "api_wallet_private_key": settings.hyperliquid_api_wallet_private_key,
-            },
-        },
-    }
+    return build_account_preflight_configs(
+        extended_live_enabled=settings.extended_live_enabled,
+        extended_api_key=settings.extended_api_key,
+        paradex_live_enabled=settings.paradex_live_enabled,
+        paradex_account_address=settings.paradex_account_address,
+        paradex_private_key=settings.paradex_private_key,
+        paradex_bearer_token=settings.paradex_bearer_token,
+        hyperliquid_live_enabled=settings.hyperliquid_live_enabled,
+        hyperliquid_account_address=settings.hyperliquid_account_address,
+        hyperliquid_api_wallet_private_key=settings.hyperliquid_api_wallet_private_key,
+    )
 
 
 def _build_order_state_observers(
@@ -535,6 +540,7 @@ def _build_order_state_observers(
     if settings.hyperliquid_account_address and settings.hyperliquid_api_wallet_private_key:
         observers["hyperliquid"] = HyperliquidOrderStateObserver(
             account_address=settings.hyperliquid_account_address,
+            vault_address=settings.hyperliquid_vault_address,
         )
     return observers
 

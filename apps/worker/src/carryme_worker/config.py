@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
@@ -22,7 +22,7 @@ class WorkerSettings(BaseSettings):
     stop_signals: tuple[Literal["SIGINT", "SIGTERM"], ...] = ("SIGINT", "SIGTERM")
     database_path: str = "data/carryme.sqlite3"
     watchlist_path: str = "config/watchlists/default.json"
-    execution_observation_limit: int = 20
+    execution_observation_limit: int = Field(default=20, gt=0)
     extended_live_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices(
@@ -79,6 +79,13 @@ class WorkerSettings(BaseSettings):
             "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
         ),
     )
+    hyperliquid_vault_address: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_HYPERLIQUID_VAULT_ADDRESS",
+            "CARRYME_API_HYPERLIQUID_VAULT_ADDRESS",
+        ),
+    )
     hyperliquid_api_wallet_private_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -90,6 +97,7 @@ class WorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CARRYME_WORKER_",
         extra="ignore",
+        populate_by_name=True,
     )
 
     @field_validator("watchlist_path")
@@ -102,3 +110,26 @@ class WorkerSettings(BaseSettings):
         if not resolved.is_file():
             raise ValueError(f"watchlist_path does not exist or is not a file: {resolved}")
         return str(resolved)
+
+    @model_validator(mode="after")
+    def validate_live_credentials(self) -> "WorkerSettings":
+        """Fail fast when live venue observation is enabled without required credentials."""
+
+        missing: list[str] = []
+        if self.extended_live_enabled and not self.extended_api_key:
+            missing.append("extended_api_key")
+        if self.paradex_live_enabled:
+            if not self.paradex_account_address:
+                missing.append("paradex_account_address")
+            if not (self.paradex_private_key or self.paradex_bearer_token):
+                missing.append("paradex_private_key|paradex_bearer_token")
+        if self.hyperliquid_live_enabled:
+            if not self.hyperliquid_account_address:
+                missing.append("hyperliquid_account_address")
+            if not self.hyperliquid_api_wallet_private_key:
+                missing.append("hyperliquid_api_wallet_private_key")
+        if missing:
+            raise ValueError(
+                "Missing required live credentials for enabled venues: " + ", ".join(missing)
+            )
+        return self

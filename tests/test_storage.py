@@ -1822,12 +1822,37 @@ def test_execution_observation_store_appends_and_lists_recent(tmp_path: Path) ->
     )
 
     saved = store.append(entry)
+    assert entry.pair_status is not None
+    pair_status = entry.pair_status
+    newer = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
+            context="worker_execution_monitor",
+            execution_entry_id=13,
+            paper_trade_id=7,
+            preview_hash="preview-hash-newer",
+            order_state=entry.order_state,
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=13,
+                paper_trade_id=7,
+                preview_hash="preview-hash-newer",
+                derived_state="review_required",
+                recommended_action="wait_for_fill",
+                order_state=pair_status.order_state,
+                reconciliation=pair_status.reconciliation,
+                notes=[],
+            ),
+        )
+    )
     results = store.list_recent(limit=10)
+    latest = store.latest_for_paper_trade(7)
 
     assert saved.entry_id is not None
-    assert len(results) == 1
-    assert results[0].entry_id == saved.entry_id
-    assert results[0].context == "guarded_pair_poll"
+    assert newer.entry_id is not None
+    assert len(results) == 2
+    assert results[0].entry_id == newer.entry_id
+    assert results[0].context == "worker_execution_monitor"
     assert results[0].pair_status is not None
-    assert results[0].pair_status.derived_state == "unfilled"
-    assert store.latest_for_paper_trade(7) is not None
+    assert results[0].pair_status.derived_state == "review_required"
+    assert latest is not None
+    assert latest.entry_id == newer.entry_id

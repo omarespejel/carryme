@@ -6,6 +6,7 @@ from carryme_runtime.account_preflight import (
     AccountPreflightConfigMap,
     AccountPreflightService,
     VenueAccountProbe,
+    build_account_preflight_configs,
 )
 from carryme_runtime.candidates import filter_candidate_records
 from carryme_runtime.cleanup_live_execution import CleanupLiveExecutionRouter
@@ -47,6 +48,7 @@ from carryme_runtime.readiness import build_live_submission_readiness
 __all__ = [
     "AccountPreflightConfigMap",
     "AccountPreflightService",
+    "build_account_preflight_configs",
     "CleanupLiveExecutionRouter",
     "CleanupPreviewRouter",
     "ExecutionAdapter",

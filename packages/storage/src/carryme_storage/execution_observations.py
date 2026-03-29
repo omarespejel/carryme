@@ -129,7 +129,7 @@ class ExecutionObservationStore:
             params = (paper_trade_id, limit)
         else:
             params = (limit,)
-        query += " ORDER BY observed_at DESC LIMIT ?"
+        query += " ORDER BY observed_at DESC, id DESC LIMIT ?"
 
         with sqlite3.connect(self.database_path) as connection:
             rows = connection.execute(query, params).fetchall()

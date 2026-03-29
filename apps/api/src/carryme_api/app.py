@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 from datetime import UTC, datetime
@@ -60,6 +61,7 @@ from carryme_runtime import (
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
     UpstreamDataError,
+    build_account_preflight_configs,
     build_execution_pair_status,
     build_live_execution_configs,
     build_live_submission_readiness,
@@ -99,6 +101,7 @@ DEFAULT_APP_ENVIRONMENT = "development"
 APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
 MAX_HISTORY_LIMIT = 1000
 PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
+logger = logging.getLogger(__name__)
 
 
 class ConfirmPreviewRequest(BaseModel):
@@ -169,6 +172,13 @@ def _cleanup_preview_confirmation_store_for_path(
     return CleanupPreviewConfirmationStore(database_path)
 
 
+@lru_cache
+def _execution_observation_store_for_path(database_path: str) -> ExecutionObservationStore:
+    """Return a shared execution observation store for the configured SQLite path."""
+
+    return ExecutionObservationStore(database_path)
+
+
 def get_opportunity_service() -> OpportunityService:
     """Return the live opportunity scoring service."""
 
@@ -196,7 +206,7 @@ def get_execution_observation_store(
 ) -> ExecutionObservationStore:
     """Return the shared execution observation store."""
 
-    return ExecutionObservationStore(settings.database_path)
+    return _execution_observation_store_for_path(settings.database_path)
 
 
 def get_watchlist_store(
@@ -450,32 +460,21 @@ def get_order_preview_service() -> OrderPreviewService:
 
     return OrderPreviewService()
 
+
 def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightConfigMap:
     """Build the authenticated-read account probe config map from API settings."""
 
-    return {
-        "extended": {
-            "enabled": settings.extended_live_enabled,
-            "credentials": {
-                "api_key": settings.extended_api_key,
-            },
-        },
-        "paradex": {
-            "enabled": settings.paradex_live_enabled,
-            "credentials": {
-                "account_address": settings.paradex_account_address,
-                "bearer_token": settings.paradex_bearer_token,
-                "private_key": settings.paradex_private_key,
-            },
-        },
-        "hyperliquid": {
-            "enabled": settings.hyperliquid_live_enabled,
-            "credentials": {
-                "account_address": settings.hyperliquid_account_address,
-                "api_wallet_private_key": settings.hyperliquid_api_wallet_private_key,
-            },
-        },
-    }
+    return build_account_preflight_configs(
+        extended_live_enabled=settings.extended_live_enabled,
+        extended_api_key=settings.extended_api_key,
+        paradex_live_enabled=settings.paradex_live_enabled,
+        paradex_account_address=settings.paradex_account_address,
+        paradex_private_key=settings.paradex_private_key,
+        paradex_bearer_token=settings.paradex_bearer_token,
+        hyperliquid_live_enabled=settings.hyperliquid_live_enabled,
+        hyperliquid_account_address=settings.hyperliquid_account_address,
+        hyperliquid_api_wallet_private_key=settings.hyperliquid_api_wallet_private_key,
+    )
 
 
 async def _build_readiness_for_paper_trade(
@@ -743,17 +742,29 @@ async def _observe_pair_status_for_execution(
             continue
         last_status = build_execution_pair_status(execution, order_state, reconciliation)
         if observation_store is not None:
-            observation_store.append(
-                ExecutionObservationEntry(
-                    observed_at=datetime.now(UTC),
-                    context=observation_context,
-                    execution_entry_id=execution.entry_id,
-                    paper_trade_id=execution.paper_trade_id,
-                    preview_hash=execution.preview_hash,
-                    order_state=order_state,
-                    pair_status=last_status,
+            try:
+                observation_store.append(
+                    ExecutionObservationEntry(
+                        observed_at=datetime.now(UTC),
+                        context=observation_context,
+                        execution_entry_id=execution.entry_id,
+                        paper_trade_id=execution.paper_trade_id,
+                        preview_hash=execution.preview_hash,
+                        order_state=order_state,
+                        pair_status=last_status,
+                    )
                 )
-            )
+            except Exception:
+                logger.warning(
+                    (
+                        "Failed to persist execution observation for "
+                        "entry_id=%s paper_trade_id=%s preview_hash=%s"
+                    ),
+                    execution.entry_id,
+                    execution.paper_trade_id,
+                    execution.preview_hash,
+                    exc_info=True,
+                )
         if last_status.derived_state in {
             "hedged",
             "unfilled",
