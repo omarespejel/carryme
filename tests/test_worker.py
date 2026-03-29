@@ -10,6 +10,7 @@ import pytest
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
+    ExecutionAlertEvent,
     ExecutionJournalEntry,
     ExecutionLegOrderState,
     ExecutionLegResult,
@@ -213,7 +214,8 @@ def test_worker_execution_observation_payload() -> None:
             scanned_executions=2,
             observed_executions=1,
             saved_observations=1,
-            saved_alerts=0,
+            saved_alerts=1,
+            sent_notifications=1,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -222,7 +224,8 @@ def test_worker_execution_observation_payload() -> None:
         "scanned_executions": 2,
         "observed_executions": 1,
         "saved_observations": 1,
-        "saved_alerts": 0,
+        "saved_alerts": 1,
+        "sent_notifications": 1,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -237,6 +240,7 @@ def test_worker_execution_observation_loop_payload() -> None:
             observed_executions=4,
             saved_observations=4,
             saved_alerts=1,
+            sent_notifications=1,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -249,6 +253,7 @@ def test_worker_execution_observation_loop_payload() -> None:
         "observed_executions": 4,
         "saved_observations": 4,
         "saved_alerts": 1,
+        "sent_notifications": 1,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -941,6 +946,7 @@ def test_observe_live_executions_once_persists_latest_live_snapshots(tmp_path: P
     assert summary.observed_executions == 1
     assert summary.saved_observations == 1
     assert summary.saved_alerts == 0
+    assert summary.sent_notifications == 0
     assert latest is not None
     assert latest.context == "worker_execution_monitor"
     assert latest.order_state.legs[0].observation_source == "rest_poll"
@@ -1391,6 +1397,13 @@ def test_observe_live_executions_once_emits_deduped_cleanup_alert(tmp_path: Path
                 notes=[],
             )
 
+    notified_events: list[str] = []
+
+    class StubAlertNotifier:
+        async def notify(self, event: ExecutionAlertEvent) -> None:
+            alert = cast(ExecutionAlertEvent, event)
+            notified_events.append(alert.alert_type)
+
     for index in range(2):
         summary = asyncio.run(
             observe_live_executions_once(
@@ -1398,6 +1411,7 @@ def test_observe_live_executions_once_emits_deduped_cleanup_alert(tmp_path: Path
                 execution_store=execution_store,
                 observation_store=observation_store,
                 alert_sink=alert_store,
+                alert_notifier=StubAlertNotifier(),
                 account_service=cast(AccountPreflightService, StubAccountService()),
                 order_state_service=cast(ExecutionOrderStateService, StubOrderStateService()),
                 now=datetime(2026, 3, 29, 13, 6 + index, tzinfo=UTC),
@@ -1409,6 +1423,7 @@ def test_observe_live_executions_once_emits_deduped_cleanup_alert(tmp_path: Path
     alerts = alert_store.list_recent(limit=10, paper_trade_id=7)
 
     assert len(alerts) == 1
+    assert notified_events == ["cleanup_needed"]
     assert alerts[0].emitted_at == datetime(2026, 3, 29, 13, 6, tzinfo=UTC)
     assert alerts[0].alert_type == "cleanup_needed"
     assert alerts[0].paper_trade_id == 7
@@ -2000,16 +2015,20 @@ def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_pat
         execution_store: object | None = None,
         observation_store: object | None = None,
         alert_sink: object | None = None,
+        alert_notifier: object | None = None,
         account_service: object | None = None,
         order_state_service: object | None = None,
+        logger: object | None = None,
         now: datetime | None = None,
     ) -> ExecutionObservationSummary:
         assert settings_arg is settings
         assert execution_store is stub_execution_store
         assert observation_store is stub_observation_store
         assert alert_sink is stub_alert_sink
+        assert alert_notifier is not None
         assert account_service is stable_account_service
         assert order_state_service is stable_order_state_service
+        _ = logger
         assert now is None
         calls.append(1)
         return ExecutionObservationSummary(
@@ -2017,6 +2036,7 @@ def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_pat
             observed_executions=1,
             saved_observations=1,
             saved_alerts=1,
+            sent_notifications=1,
             database_path=settings.database_path,
         )
 
@@ -2052,6 +2072,7 @@ def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_pat
     assert summary.observed_executions == 2
     assert summary.saved_observations == 2
     assert summary.saved_alerts == 2
+    assert summary.sent_notifications == 2
     assert calls == [1, 1]
     assert sleeps == [3.0]
 
@@ -2103,6 +2124,7 @@ def test_run_supervised_execution_observation_loop_applies_backoff(tmp_path: Pat
             observed_executions=1,
             saved_observations=1,
             saved_alerts=0,
+            sent_notifications=0,
             database_path=settings.database_path,
         ),
     ]
@@ -2113,16 +2135,20 @@ def test_run_supervised_execution_observation_loop_applies_backoff(tmp_path: Pat
         execution_store: object | None = None,
         observation_store: object | None = None,
         alert_sink: object | None = None,
+        alert_notifier: object | None = None,
         account_service: object | None = None,
         order_state_service: object | None = None,
+        logger: object | None = None,
         now: datetime | None = None,
     ) -> ExecutionObservationSummary:
         assert settings_arg is settings
         _ = execution_store
         _ = observation_store
         _ = alert_sink
+        assert alert_notifier is not None
         assert account_service is stable_account_service
         assert order_state_service is stable_order_state_service
+        _ = logger
         assert now is None
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -2155,6 +2181,7 @@ def test_run_supervised_execution_observation_loop_applies_backoff(tmp_path: Pat
     assert summary.observed_executions == 1
     assert summary.saved_observations == 1
     assert summary.saved_alerts == 0
+    assert summary.sent_notifications == 0
     assert sleeps == [2.0]
 
 

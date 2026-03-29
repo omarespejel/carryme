@@ -81,6 +81,7 @@ def build_execution_observation_payload(
         "observed_executions": summary.observed_executions,
         "saved_observations": summary.saved_observations,
         "saved_alerts": summary.saved_alerts,
+        "sent_notifications": summary.sent_notifications,
         "database_path": summary.database_path,
     }
 
@@ -98,6 +99,7 @@ def build_execution_observation_loop_payload(
         "observed_executions": summary.observed_executions,
         "saved_observations": summary.saved_observations,
         "saved_alerts": summary.saved_alerts,
+        "sent_notifications": summary.sent_notifications,
         "database_path": summary.database_path,
     }
 

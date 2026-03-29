@@ -46,6 +46,7 @@ from carryme_storage import (
 )
 
 from carryme_worker.config import WorkerSettings
+from carryme_worker.notifications import ExecutionAlertNotifier
 
 logger = logging.getLogger(__name__)
 OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
@@ -122,6 +123,7 @@ class ExecutionObservationSummary:
     observed_executions: int
     saved_observations: int
     saved_alerts: int
+    sent_notifications: int
     database_path: str
 
 
@@ -136,6 +138,7 @@ class ExecutionObservationLoopSummary:
     observed_executions: int
     saved_observations: int
     saved_alerts: int
+    sent_notifications: int
     database_path: str
 
 
@@ -225,8 +228,10 @@ async def observe_live_executions_once(
     execution_store: ExecutionJournalStore | None = None,
     observation_store: ExecutionObservationStore | None = None,
     alert_sink: ExecutionAlertSink | None = None,
+    alert_notifier: ExecutionAlertNotifier | None = None,
     account_service: AccountPreflightService | None = None,
     order_state_service: ExecutionOrderStateService | None = None,
+    logger: logging.Logger | None = None,
     now: datetime | None = None,
 ) -> ExecutionObservationSummary:
     """Observe recent live executions once and persist append-only snapshots."""
@@ -238,6 +243,7 @@ async def observe_live_executions_once(
     state_service = order_state_service or ExecutionOrderStateService(
         observers=_build_order_state_observers(settings)
     )
+    loop_logger = logger or logging.getLogger("carryme.worker")
     timestamp = now or datetime.now(UTC)
     recent_live_executions = _list_recent_live_executions(
         journal_store,
@@ -248,6 +254,7 @@ async def observe_live_executions_once(
     observed_executions = 0
     saved_observations = 0
     saved_alerts = 0
+    sent_notifications = 0
     for execution in recent_live_executions:
         scanned_executions += 1
 
@@ -311,14 +318,27 @@ async def observe_live_executions_once(
                 )
                 saved_alerts += int(alert_saved)
             else:
+                alert_saved = False
                 if alert_event is not None:
-                    saved_alerts += int(
-                        execution_alert_sink.append_if_changed(
-                            alert_event,
-                            previous_pair_status=previous_pair_status,
-                        )
+                    alert_saved = execution_alert_sink.append_if_changed(
+                        alert_event,
+                        previous_pair_status=previous_pair_status,
                     )
+                    saved_alerts += int(alert_saved)
                 history_store.append(observation_entry)
+            if alert_event is not None and alert_saved and alert_notifier is not None:
+                try:
+                    await alert_notifier.notify(alert_event)
+                    sent_notifications += 1
+                except Exception:
+                    loop_logger.exception(
+                        (
+                            "execution alert notification failed for paper_trade_id=%s "
+                            "preview_hash=%s"
+                        ),
+                        execution.paper_trade_id,
+                        execution.preview_hash,
+                    )
         except Exception:
             logger.warning(
                 "Failed to observe execution entry_id=%s paper_trade_id=%s",
@@ -335,6 +355,7 @@ async def observe_live_executions_once(
         observed_executions=observed_executions,
         saved_observations=saved_observations,
         saved_alerts=saved_alerts,
+        sent_notifications=sent_notifications,
         database_path=settings.database_path,
     )
 
@@ -345,6 +366,7 @@ async def run_supervised_execution_observation_loop(
     execution_store: ExecutionJournalStore | None = None,
     observation_store: ExecutionObservationStore | None = None,
     alert_sink: ExecutionAlertSink | None = None,
+    alert_notifier: ExecutionAlertNotifier | None = None,
     account_service: AccountPreflightService | None = None,
     order_state_service: ExecutionOrderStateService | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -365,7 +387,12 @@ async def run_supervised_execution_observation_loop(
         observers=_build_order_state_observers(settings)
     )
     loop_logger = logger or logging.getLogger("carryme.worker")
+    execution_notifier = alert_notifier
     supervised_stop_event = stop_event or asyncio.Event()
+    if execution_notifier is None:
+        from carryme_worker.notifications import build_execution_alert_notifier
+
+        execution_notifier = build_execution_alert_notifier(settings, logger=loop_logger)
 
     attempts = 0
     successful_cycles = 0
@@ -374,6 +401,7 @@ async def run_supervised_execution_observation_loop(
     observed_executions = 0
     saved_observations = 0
     saved_alerts = 0
+    sent_notifications = 0
     consecutive_failures = 0
 
     while not supervised_stop_event.is_set():
@@ -385,8 +413,10 @@ async def run_supervised_execution_observation_loop(
                 execution_store=journal_store,
                 observation_store=history_store,
                 alert_sink=execution_alert_sink,
+                alert_notifier=execution_notifier,
                 account_service=account_probe_service,
                 order_state_service=state_service,
+                logger=loop_logger,
             )
             successful_cycles += 1
             consecutive_failures = 0
@@ -394,15 +424,18 @@ async def run_supervised_execution_observation_loop(
             observed_executions += summary.observed_executions
             saved_observations += summary.saved_observations
             saved_alerts += summary.saved_alerts
+            sent_notifications += summary.sent_notifications
             loop_logger.info(
                 (
                     "completed supervised execution observation cycle %s with "
-                    "%s observed executions, %s saved observations, and %s saved alerts"
+                    "%s observed executions, %s saved observations, %s saved alerts, "
+                    "and %s sent notifications"
                 ),
                 attempts,
                 summary.observed_executions,
                 summary.saved_observations,
                 summary.saved_alerts,
+                summary.sent_notifications,
             )
             if max_iterations is not None and attempts >= max_iterations:
                 break
@@ -443,6 +476,7 @@ async def run_supervised_execution_observation_loop(
         observed_executions=observed_executions,
         saved_observations=saved_observations,
         saved_alerts=saved_alerts,
+        sent_notifications=sent_notifications,
         database_path=settings.database_path,
     )
 
