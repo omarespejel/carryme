@@ -13,7 +13,9 @@ from carryme_models import (
     FundingPairTradeIntent,
     OpportunityRecord,
     PaperTradeEntry,
+    PaperTradeOrderPreview,
     TradeLegIntent,
+    VenueOrderPreview,
 )
 from carryme_storage import (
     CandidateAlertStore,
@@ -1006,3 +1008,113 @@ def test_live_execution_preflight_for_saved_paper_trade(tmp_path: Path) -> None:
     assert payload["paper_trade_id"] == paper_trade.entry_id
     assert payload["ready"] is False
     assert {item["venue"] for item in payload["venues"]} == {"extended", "paradex"}
+
+
+def test_order_preview_endpoint_returns_saved_paper_trade_preview(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    class StubOrderPreviewService:
+        async def preview_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            *,
+            slippage_tolerance_bps: int = 10,
+        ) -> PaperTradeOrderPreview:
+            return PaperTradeOrderPreview(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=slippage_tolerance_bps,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        quantity=10_845.986984815618,
+                        quantity_text="10845.98698482",
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.092292,
+                        worst_price_text="0.09229200",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        post_only=False,
+                        reduce_only=False,
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                        auth_scheme="subkey private key",
+                        payload={
+                            "market": "ARB-USD-PERP",
+                            "side": "BUY",
+                        },
+                        notes=[],
+                    )
+                ],
+            )
+
+    from carryme_api.app import get_order_preview_service, get_paper_trade_store
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_order_preview_service] = lambda: StubOrderPreviewService()
+    client = TestClient(app)
+    response = client.get(
+        f"/v1/executions/preview/from-paper-trade/{paper_trade.entry_id}",
+        params={"slippage_tolerance_bps": 12},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["slippage_tolerance_bps"] == 12
+    assert payload["legs"][0]["venue"] == "paradex"
+    assert payload["legs"][0]["endpoint_path_hint"] == "/v1/orders"
+
+
+def test_order_preview_endpoint_returns_not_found_for_missing_trade(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+
+    from carryme_api.app import get_paper_trade_store
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    client = TestClient(app)
+    response = client.get("/v1/executions/preview/from-paper-trade/999")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Paper trade 999 was not found"

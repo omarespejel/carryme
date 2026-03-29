@@ -6,6 +6,7 @@ from carryme_runtime.candidates import filter_candidate_records
 from carryme_runtime.execution import ExecutionAdapter, MockExecutionAdapter
 from carryme_runtime.intents import build_trade_intent
 from carryme_runtime.opportunities import OpportunityService, fetch_live_snapshot
+from carryme_runtime.order_preview import OrderPreviewService
 from carryme_runtime.preflight import (
     LiveExecutionConfigMap,
     build_paper_trade_execution_preflight,
@@ -16,6 +17,7 @@ __all__ = [
     "ExecutionAdapter",
     "LiveExecutionConfigMap",
     "MockExecutionAdapter",
+    "OrderPreviewService",
     "build_paper_trade_execution_preflight",
     "build_trade_intent",
     "build_venue_execution_preflights",

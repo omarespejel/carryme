@@ -12,6 +12,7 @@ from carryme_models import (
     OpportunityRecord,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
+    PaperTradeOrderPreview,
     TopOfBook,
     VenueExecutionPreflight,
 )
@@ -19,6 +20,7 @@ from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
     MockExecutionAdapter,
     OpportunityService,
+    OrderPreviewService,
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
@@ -348,3 +350,100 @@ def test_build_paper_trade_execution_preflight_filters_to_trade_venues() -> None
     assert {item.venue for item in preflight.venues} == {"extended", "paradex"}
     assert preflight.ready is False
     assert any("paradex" in reason for reason in preflight.blocking_reasons)
+
+
+def test_order_preview_service_builds_per_venue_templates() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=5,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=build_trade_intent(
+            OpportunityRecord(
+                recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+                pair=FundingPairSpec(
+                    label="arb_extended_paradex",
+                    left_venue="extended",
+                    left_symbol="ARB-USD",
+                    left_fee_profile="default",
+                    right_venue="paradex",
+                    right_symbol="ARB-USD-PERP",
+                    right_fee_profile="pro",
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.001,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=0.0008,
+                    one_day_net_edge_after_round_trip=0.0005,
+                    break_even_days_entry=0.5,
+                    break_even_days_round_trip=1.0,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=5000.0,
+                        long_ask_notional=4500.0,
+                        max_entry_notional=4500.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+            ),
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            min_one_day_net_edge_after_entry=0.0,
+            min_capacity_notional=1000.0,
+        ),
+    )
+
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended", "ARB-USD", 0.0002, 0.0919, 30_000, 0.0921, 25_000
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex", "ARB-USD-PERP", -0.0004, 0.0918, 20_000, 0.0922, 18_000
+        ),
+    }
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        preview = await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
+            paper_trade,
+            slippage_tolerance_bps=10,
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+        )
+
+        assert isinstance(preview, PaperTradeOrderPreview)
+        assert preview.paper_trade_id == 5
+        assert preview.label == "arb_extended_paradex"
+        assert preview.slippage_tolerance_bps == 10
+        assert preview.preview_hash
+        assert len(preview.legs) == 2
+
+        legs = {item.venue: item for item in preview.legs}
+        paradex = legs["paradex"]
+        extended = legs["extended"]
+
+        assert paradex.side == "buy"
+        assert paradex.reference_price == pytest.approx(0.0922)
+        assert paradex.worst_acceptable_price == pytest.approx(0.0922922)
+        assert paradex.quantity == pytest.approx(1000.0 / 0.0922)
+        assert paradex.time_in_force == "ioc"
+        assert paradex.http_method == "POST"
+        assert paradex.endpoint_path_hint == "/v1/orders"
+        assert paradex.payload["market"] == "ARB-USD-PERP"
+        assert paradex.payload["side"] == "BUY"
+
+        assert extended.side == "sell"
+        assert extended.reference_price == pytest.approx(0.0919)
+        assert extended.worst_acceptable_price == pytest.approx(0.0918081)
+        assert extended.quantity == pytest.approx(1000.0 / 0.0919)
+        assert extended.time_in_force == "ioc"
+        assert extended.http_method == "POST"
+        assert extended.payload["symbol"] == "ARB-USD"
+        assert extended.payload["side"] == "SELL"
+
+    asyncio.run(run())
