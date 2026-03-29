@@ -120,6 +120,14 @@ class ParadexPublicConnector(BaseHttpConnector):
             best_ask_interactive_size=best_ask_interactive[1],
         )
 
+    async def fetch_system_state(self) -> dict[str, Any]:
+        """Fetch the current public Paradex system state."""
+
+        payload = await self._request_json("GET", "/v1/system/state")
+        if not isinstance(payload, dict):
+            raise ConnectorError("Paradex system-state payload must be an object")
+        return payload
+
 
 def _find_market(rows: Any, symbol: str) -> dict[str, Any]:
     if not isinstance(rows, list):

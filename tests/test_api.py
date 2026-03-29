@@ -18,6 +18,7 @@ from carryme_api.app import (
     get_opportunity_universe_service,
     get_route_approval_service,
     get_route_stability_service,
+    get_system_state_service,
 )
 from carryme_api.config import ApiSettings
 from carryme_models import (
@@ -53,6 +54,7 @@ from carryme_models import (
     PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeOrderPreview,
+    PaperTradeSystemState,
     PreviewConfirmationEntry,
     RouteAccountingSummary,
     RouteApprovalEntry,
@@ -61,6 +63,7 @@ from carryme_models import (
     TradeLegIntent,
     VenueAccountPreflight,
     VenueOrderPreview,
+    VenueSystemState,
 )
 from carryme_storage import (
     ApprovedCanaryAlertStore,
@@ -6063,6 +6066,132 @@ def test_preview_confirmations_endpoint_lists_saved_entries(tmp_path: Path) -> N
     assert payload[0]["paper_trade_id"] == 7
 
 
+def test_execution_system_state_venues_endpoint_returns_probe_results() -> None:
+    class StubSystemStateService:
+        async def probe_venues(
+            self, configs: dict[str, dict[str, bool]]
+        ) -> list[VenueSystemState]:
+            assert configs["paradex"]["enabled"] is True
+            return [
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                )
+            ]
+
+    from carryme_api.app import get_api_settings
+
+    app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        paradex_live_enabled=True
+    )
+    client = TestClient(app)
+    response = client.get("/v1/executions/system-state/venues")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == [
+        {
+            "venue": "paradex",
+            "enabled": True,
+            "checked": True,
+            "healthy": True,
+            "status": "ok",
+            "blocking_reasons": [],
+            "notes": [],
+        }
+    ]
+
+
+def test_execution_system_state_for_paper_trade_endpoint_returns_status(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+
+    class StubSystemStateService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, dict[str, bool]],
+        ) -> PaperTradeSystemState:
+            assert paper_trade.entry_id == 1
+            assert configs["paradex"]["enabled"] is True
+            return PaperTradeSystemState(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    from carryme_api.app import get_api_settings, get_paper_trade_store
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        paradex_live_enabled=True,
+    )
+    client = TestClient(app)
+    response = client.get(
+        f"/v1/executions/system-state/from-paper-trade/{paper_trade.entry_id}"
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["ready"] is True
+    assert payload["venues"][1]["status"] == "ok"
+
+
 def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
@@ -6181,6 +6310,35 @@ def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> No
                 ],
             )
 
+    class StubSystemStateService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, dict[str, bool]],
+        ) -> PaperTradeSystemState:
+            assert configs["paradex"]["enabled"] is True
+            return PaperTradeSystemState(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
     from carryme_api.app import (
         get_account_preflight_service,
         get_api_settings,
@@ -6190,7 +6348,12 @@ def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> No
 
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
-    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_account_preflight_service] = (
+        lambda: StubAccountPreflightService()
+    )
+    app.dependency_overrides[get_system_state_service] = (
+        lambda: StubSystemStateService()
+    )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -6327,6 +6490,33 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
                 blocking_reasons=[],
             )
 
+    class StubSystemStateService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, dict[str, bool]],
+        ) -> PaperTradeSystemState:
+            return PaperTradeSystemState(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                    VenueSystemState(
+                        venue="hyperliquid",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
     from carryme_api.app import (
         get_account_preflight_service,
         get_api_settings,
@@ -6336,7 +6526,12 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
 
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
-    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_account_preflight_service] = (
+        lambda: StubAccountPreflightService()
+    )
+    app.dependency_overrides[get_system_state_service] = (
+        lambda: StubSystemStateService()
+    )
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -6359,6 +6554,166 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
     assert payload["blocking_reasons"] == [
         "Venue hyperliquid has no usable collateral for the confirmed 11.00 notional preview"
     ]
+
+
+def test_live_submission_readiness_endpoint_blocks_degraded_paradex_system_state(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+    confirmation_store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label="arb_extended_paradex",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=11.0,
+                        quantity=120.0,
+                        quantity_text="120.00000000",
+                        reference_price=0.0915,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.0916,
+                        worst_price_text="0.09160000",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=[
+                            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                            "CARRYME_API_PARADEX_PRIVATE_KEY",
+                        ],
+                        auth_scheme="main account address + subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[],
+                blocking_reasons=[],
+            )
+
+    class StubSystemStateService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, dict[str, bool]],
+        ) -> PaperTradeSystemState:
+            assert configs["paradex"]["enabled"] is True
+            return PaperTradeSystemState(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=False,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=False,
+                        status="maintenance",
+                        blocking_reasons=["Paradex system state is maintenance"],
+                    ),
+                ],
+                blocking_reasons=["Paradex system state is maintenance"],
+            )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_api_settings,
+        get_paper_trade_store,
+        get_preview_confirmation_store,
+    )
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
+    app.dependency_overrides[get_account_preflight_service] = (
+        lambda: StubAccountPreflightService()
+    )
+    app.dependency_overrides[get_system_state_service] = (
+        lambda: StubSystemStateService()
+    )
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="paradex-private",
+    )
+    client = TestClient(app)
+    response = client.get(
+        f"/v1/executions/readiness/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "preview-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["system_state"]["venues"][1]["status"] == "maintenance"
+    assert "Paradex system state is maintenance" in payload["blocking_reasons"]
 
 
 class _AllowAllRouteApprovalService:

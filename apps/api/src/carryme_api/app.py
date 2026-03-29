@@ -44,6 +44,7 @@ from carryme_models import (
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
+    PaperTradeSystemState,
     PreviewConfirmationEntry,
     RouteAccountingSummary,
     RouteApprovalEntry,
@@ -54,6 +55,7 @@ from carryme_models import (
     VenueAccountPreflight,
     VenueBalanceSnapshot,
     VenueExecutionPreflight,
+    VenueSystemState,
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
@@ -87,6 +89,8 @@ from carryme_runtime import (
     ParadexOrderStateObserver,
     RouteApprovalService,
     RouteStabilityService,
+    SystemStateConfigMap,
+    SystemStateService,
     UpstreamDataError,
     build_account_preflight_configs,
     build_execution_pair_status,
@@ -360,6 +364,12 @@ def _validate_route_stability_filters(
             status_code=400,
             detail="min_route_samples must be non-negative",
         )
+
+
+def get_system_state_service() -> SystemStateService:
+    """Return the live venue system-state service."""
+
+    return SystemStateService()
 
 
 def get_candidate_alert_store(
@@ -755,6 +765,22 @@ def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightC
     )
 
 
+def _build_system_state_configs(settings: ApiSettings) -> SystemStateConfigMap:
+    """Build the public system-state config map from API settings."""
+
+    return {
+        "extended": {
+            "enabled": settings.extended_live_enabled,
+        },
+        "paradex": {
+            "enabled": settings.paradex_live_enabled,
+        },
+        "hyperliquid": {
+            "enabled": settings.hyperliquid_live_enabled,
+        },
+    }
+
+
 async def _build_readiness_for_paper_trade(
     *,
     paper_trade: PaperTradeEntry,
@@ -762,6 +788,7 @@ async def _build_readiness_for_paper_trade(
     settings: ApiSettings,
     confirmation_store: PreviewConfirmationStore,
     account_preflight_service: AccountPreflightService,
+    system_state_service: SystemStateService,
 ) -> LiveSubmissionReadiness:
     normalized_preview_hash = preview_hash.strip()
     if not normalized_preview_hash:
@@ -774,6 +801,10 @@ async def _build_readiness_for_paper_trade(
         paper_trade,
         _build_account_preflight_configs(settings),
     )
+    system_state = await system_state_service.probe_paper_trade(
+        paper_trade,
+        _build_system_state_configs(settings),
+    )
     confirmation = confirmation_store.find_latest_by_preview_hash(
         paper_trade_id=paper_trade.entry_id or 0,
         preview_hash=normalized_preview_hash,
@@ -785,6 +816,7 @@ async def _build_readiness_for_paper_trade(
         confirmations=[] if confirmation is None else [confirmation],
         execution_preflight=execution_preflight,
         account_preflight=account_preflight,
+        system_state=system_state,
     )
 
 
@@ -796,6 +828,7 @@ async def _build_venue_scoped_readiness_for_paper_trade(
     settings: ApiSettings,
     confirmation_store: PreviewConfirmationStore,
     account_preflight_service: AccountPreflightService,
+    system_state_service: SystemStateService,
 ) -> tuple[LiveSubmissionReadiness, PreviewConfirmationEntry | None]:
     normalized_preview_hash = preview_hash.strip()
     if not normalized_preview_hash:
@@ -850,6 +883,29 @@ async def _build_venue_scoped_readiness_for_paper_trade(
         blocking_reasons=account_blockers,
     )
 
+    system_state_all = await system_state_service.probe_paper_trade(
+        paper_trade,
+        _build_system_state_configs(settings),
+    )
+    system_statuses = {item.venue: item for item in system_state_all.venues}
+    selected_system = system_statuses.get(venue)
+    system_blockers: list[str] = []
+    system_venues: list[VenueSystemState] = []
+    if selected_system is None:
+        system_blockers.append(f"Venue {venue} system state did not return a status")
+    else:
+        system_venues.append(selected_system)
+        if not selected_system.enabled:
+            system_blockers.append(f"Venue {venue} system state check is not enabled")
+        system_blockers.extend(selected_system.blocking_reasons)
+    system_state = PaperTradeSystemState(
+        paper_trade_id=paper_trade.entry_id or 0,
+        label=paper_trade.intent.label,
+        ready=not system_blockers,
+        venues=system_venues,
+        blocking_reasons=system_blockers,
+    )
+
     confirmation = confirmation_store.find_latest_by_preview_hash(
         paper_trade_id=paper_trade.entry_id or 0,
         preview_hash=normalized_preview_hash,
@@ -862,6 +918,7 @@ async def _build_venue_scoped_readiness_for_paper_trade(
             confirmations=[] if confirmation is None else [confirmation],
             execution_preflight=execution_preflight,
             account_preflight=account_preflight,
+            system_state=system_state,
         ),
         confirmation,
     )
@@ -1379,6 +1436,7 @@ async def _run_guarded_canary_lifecycle(
     observation_store: ExecutionObservationStore,
     settings: ApiSettings,
     account_preflight_service: AccountPreflightService,
+    system_state_service: SystemStateService,
     balance_service: BalanceAccountingService,
     order_preview_service: OrderPreviewService,
     order_state_service: ExecutionOrderStateService,
@@ -1428,6 +1486,7 @@ async def _run_guarded_canary_lifecycle(
         settings=settings,
         confirmation_store=confirmation_store,
         account_preflight_service=account_preflight_service,
+        system_state_service=system_state_service,
     )
     if not readiness.ready:
         raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
@@ -2926,6 +2985,37 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get(
+        "/v1/executions/system-state/venues",
+        response_model=list[VenueSystemState],
+    )
+    async def execution_system_state_venues(
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        service: Annotated[SystemStateService, Depends(get_system_state_service)],
+    ) -> list[VenueSystemState]:
+        return await service.probe_venues(_build_system_state_configs(settings))
+
+    @app.get(
+        "/v1/executions/system-state/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeSystemState,
+    )
+    async def execution_system_state_for_paper_trade(
+        paper_trade_id: int,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        service: Annotated[SystemStateService, Depends(get_system_state_service)],
+    ) -> PaperTradeSystemState:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        return await service.probe_paper_trade(
+            paper_trade,
+            _build_system_state_configs(settings),
+        )
+
+    @app.get(
         "/v1/executions/readiness/from-paper-trade/{paper_trade_id}",
         response_model=LiveSubmissionReadiness,
     )
@@ -2939,6 +3029,10 @@ def create_app() -> FastAPI:
             Depends(get_preview_confirmation_store),
         ],
         service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
         response: Response,
     ) -> LiveSubmissionReadiness:
         response.headers["Cache-Control"] = "no-store"
@@ -2955,6 +3049,7 @@ def create_app() -> FastAPI:
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=service,
+                system_state_service=system_state_service,
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -3096,6 +3191,10 @@ def create_app() -> FastAPI:
             AccountPreflightService,
             Depends(get_account_preflight_service),
         ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
         service: Annotated[
             ParadexLiveExecutionService,
             Depends(get_paradex_live_execution_service),
@@ -3120,6 +3219,7 @@ def create_app() -> FastAPI:
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
+                system_state_service=system_state_service,
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -3206,6 +3306,10 @@ def create_app() -> FastAPI:
             AccountPreflightService,
             Depends(get_account_preflight_service),
         ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
         service: Annotated[
             ExtendedLiveExecutionService,
             Depends(get_extended_live_execution_service),
@@ -3230,6 +3334,7 @@ def create_app() -> FastAPI:
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
+                system_state_service=system_state_service,
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -3316,6 +3421,10 @@ def create_app() -> FastAPI:
             AccountPreflightService,
             Depends(get_account_preflight_service),
         ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
         service: Annotated[
             HyperliquidLiveExecutionService,
             Depends(get_hyperliquid_live_execution_service),
@@ -3340,6 +3449,7 @@ def create_app() -> FastAPI:
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
+                system_state_service=system_state_service,
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -3732,6 +3842,10 @@ def create_app() -> FastAPI:
             AccountPreflightService,
             Depends(get_account_preflight_service),
         ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
         service: Annotated[
             PairedLiveExecutionCoordinator,
             Depends(get_paired_live_execution_coordinator),
@@ -3756,6 +3870,7 @@ def create_app() -> FastAPI:
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
+                system_state_service=system_state_service,
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -3853,6 +3968,10 @@ def create_app() -> FastAPI:
             AccountPreflightService,
             Depends(get_account_preflight_service),
         ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
         order_state_service: Annotated[
             ExecutionOrderStateService,
             Depends(get_execution_order_state_service),
@@ -3900,6 +4019,7 @@ def create_app() -> FastAPI:
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
+                system_state_service=system_state_service,
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -4613,6 +4733,10 @@ def create_app() -> FastAPI:
             AccountPreflightService,
             Depends(get_account_preflight_service),
         ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
         balance_service: Annotated[
             BalanceAccountingService,
             Depends(get_balance_accounting_service),
@@ -4713,6 +4837,7 @@ def create_app() -> FastAPI:
             observation_store=observation_store,
             settings=settings,
             account_preflight_service=account_preflight_service,
+            system_state_service=system_state_service,
             balance_service=balance_service,
             order_preview_service=order_preview_service,
             order_state_service=order_state_service,
@@ -4764,6 +4889,10 @@ def create_app() -> FastAPI:
         account_preflight_service: Annotated[
             AccountPreflightService,
             Depends(get_account_preflight_service),
+        ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
         ],
         balance_service: Annotated[
             BalanceAccountingService,
@@ -4864,6 +4993,7 @@ def create_app() -> FastAPI:
             observation_store=observation_store,
             settings=settings,
             account_preflight_service=account_preflight_service,
+            system_state_service=system_state_service,
             balance_service=balance_service,
             order_preview_service=order_preview_service,
             order_state_service=order_state_service,

@@ -48,6 +48,7 @@ from carryme_models import (
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
+    PaperTradeSystemState,
     PreviewConfirmationEntry,
     RouteAccountingSummary,
     RouteApprovalEntry,
@@ -58,6 +59,7 @@ from carryme_models import (
     VenueBalanceSnapshot,
     VenueExecutionPreflight,
     VenueOrderPreview,
+    VenueSystemState,
 )
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
@@ -103,6 +105,7 @@ from carryme_runtime.account_preflight import (
     _row_represents_open_position,
 )
 from carryme_runtime.execution_quality import ExecutionQualityService
+from carryme_runtime.system_state import ParadexSystemStateProbe, SystemStateService
 from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import (
     BalanceSnapshotStore,
@@ -3187,6 +3190,184 @@ def test_build_live_submission_readiness_blocks_only_zero_collateral_venues() ->
     assert readiness.blocking_reasons == [
         "Venue hyperliquid has no usable collateral for the confirmed 11.00 notional preview"
     ]
+
+
+def test_build_live_submission_readiness_blocks_degraded_system_state() -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=9,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=7,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                    quantity=120.0,
+                    quantity_text="120.00000000",
+                    reference_price=0.0915,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0916,
+                    worst_price_text="0.09160000",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[
+                        "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                        "CARRYME_API_PARADEX_PRIVATE_KEY",
+                    ],
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP"},
+                    notes=[],
+                )
+            ],
+        ),
+    )
+
+    readiness = build_live_submission_readiness(
+        paper_trade_id=7,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        confirmations=[confirmation],
+        execution_preflight=PaperTradeExecutionPreflight(
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[],
+            blocking_reasons=[],
+        ),
+        account_preflight=PaperTradeAccountPreflight(
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[],
+            blocking_reasons=[],
+        ),
+        system_state=PaperTradeSystemState(
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            ready=False,
+            venues=[
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=False,
+                    status="maintenance",
+                    blocking_reasons=["Paradex system state is maintenance"],
+                )
+            ],
+            blocking_reasons=["Paradex system state is maintenance"],
+        ),
+    )
+
+    assert readiness.ready is False
+    assert readiness.system_state is not None
+    assert "Paradex system state is maintenance" in readiness.blocking_reasons
+
+
+def test_paradex_system_state_probe_accepts_ok_status() -> None:
+    class StubConnector:
+        def __init__(self, client: httpx.AsyncClient) -> None:
+            _ = client
+
+        async def fetch_system_state(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+    probe = ParadexSystemStateProbe(connector_factory=cast(Any, StubConnector))
+
+    status = asyncio.run(probe.probe({"enabled": True}))
+
+    assert status.venue == "paradex"
+    assert status.checked is True
+    assert status.healthy is True
+    assert status.status == "ok"
+    assert status.blocking_reasons == []
+
+
+def test_system_state_service_scopes_to_paper_trade_venues() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=7,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.001,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=100.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+
+    class StubProbe:
+        def __init__(self, venue: str, healthy: bool) -> None:
+            self.venue = venue
+            self.healthy = healthy
+
+        async def probe(self, config: dict[str, bool]) -> VenueSystemState:
+            return VenueSystemState(
+                venue=self.venue,
+                enabled=config["enabled"],
+                checked=True,
+                healthy=self.healthy,
+                status="ok" if self.healthy else "maintenance",
+                blocking_reasons=[] if self.healthy else [f"{self.venue} unavailable"],
+            )
+
+    service = SystemStateService(
+        probes=cast(
+            Any,
+            {
+                "extended": StubProbe("extended", True),
+                "paradex": StubProbe("paradex", False),
+                "hyperliquid": StubProbe("hyperliquid", True),
+            },
+        ),
+    )
+
+    result = asyncio.run(
+        service.probe_paper_trade(
+            paper_trade,
+            {
+                "extended": {"enabled": True},
+                "paradex": {"enabled": True},
+                "hyperliquid": {"enabled": True},
+            },
+        )
+    )
+
+    assert result.paper_trade_id == 7
+    assert [item.venue for item in result.venues] == ["paradex", "extended"]
+    assert result.ready is False
+    assert result.blocking_reasons == ["paradex unavailable"]
 
 
 def test_build_trade_intent_sizes_by_capacity_fraction_and_cap() -> None:

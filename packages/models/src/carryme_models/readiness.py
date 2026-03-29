@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 from carryme_models.account_preflight import PaperTradeAccountPreflight
 from carryme_models.preflight import PaperTradeExecutionPreflight
+from carryme_models.system_state import PaperTradeSystemState
 
 
 class LiveSubmissionReadiness(BaseModel):
@@ -17,4 +18,5 @@ class LiveSubmissionReadiness(BaseModel):
     ready: bool
     execution_preflight: PaperTradeExecutionPreflight
     account_preflight: PaperTradeAccountPreflight
+    system_state: PaperTradeSystemState | None = None
     blocking_reasons: list[str] = Field(default_factory=list)
