@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 from Crypto.Hash import keccak
 from ecdsa.rfc6979 import generate_k  # type: ignore[import-untyped]
-from starknet_crypto_py import pedersen_hash, sign
+from starknet_crypto_py import get_public_key, pedersen_hash, sign
 
 from carryme_connectors.base import ConnectorError
 
@@ -90,6 +90,10 @@ class ParadexJwtTokenProvider:
         config = await self.fetch_system_config(client)
         issued_at = int(time.time()) if now is None else now
         expires_at = issued_at + self._token_lifetime_seconds
+        auth_path = build_paradex_auth_request_path(
+            private_key=private_key,
+            auth_path=self._auth_path,
+        )
         headers = build_paradex_auth_headers(
             account_address=account_address,
             private_key=private_key,
@@ -98,7 +102,7 @@ class ParadexJwtTokenProvider:
             expires_at=expires_at,
             auth_path=self._auth_path,
         )
-        payload = await self._request_json(client, "POST", self._auth_path, headers=headers)
+        payload = await self._request_json(client, "POST", auth_path, headers=headers)
         if not isinstance(payload, dict):
             raise ConnectorError("Paradex auth payload must be an object")
         jwt_token = payload.get("jwt_token")
@@ -129,6 +133,18 @@ class ParadexJwtTokenProvider:
             if not isinstance(payload, dict | list):
                 raise ConnectorError("Paradex returned an unexpected payload shape")
             return payload
+
+
+def build_paradex_auth_request_path(
+    *,
+    private_key: str,
+    auth_path: str = PARADEX_AUTH_PATH,
+) -> str:
+    """Return the Paradex auth endpoint path that includes the subkey public key."""
+
+    private_key_int = _parse_hex_value(private_key, "Paradex private key")
+    public_key_int = get_public_key(private_key_int)
+    return f"{auth_path}/{hex(public_key_int)}"
 
 
 def build_paradex_auth_headers(

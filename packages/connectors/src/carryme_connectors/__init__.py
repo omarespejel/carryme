@@ -13,6 +13,7 @@ from carryme_connectors.paradex_auth import (
     ParadexJwtTokenProvider,
     ParadexSystemConfig,
     build_paradex_auth_headers,
+    build_paradex_auth_request_path,
 )
 from carryme_connectors.paradex_private import ParadexPrivateConnector
 
@@ -31,4 +32,5 @@ __all__ = [
     "ParadexSystemConfig",
     "PublicVenueConnector",
     "build_paradex_auth_headers",
+    "build_paradex_auth_request_path",
 ]
