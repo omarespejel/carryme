@@ -1,7 +1,7 @@
 import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -2530,7 +2530,7 @@ def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> No
                 extended_live_enabled=True,
                 extended_api_key="extended-key",
                 extended_stark_private_key="extended-stark",
-                paradex_live_enabled=True,
+                paradex_live_enabled=False,
                 paradex_account_address="0xabc",
                 paradex_private_key="paradex-private",
                 paradex_bearer_token=None,
@@ -2547,7 +2547,323 @@ def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> No
     assert payload["paper_trade_id"] == paper_trade.entry_id
     assert payload["confirmed_preview"] is True
     assert payload["ready"] is False
+    assert "Venue paradex live execution is not enabled" in payload["blocking_reasons"]
     assert "CARRYME_API_PARADEX_BEARER_TOKEN" in str(payload["blocking_reasons"])
+
+
+def test_live_submission_readiness_endpoint_reports_unconfirmed_preview(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+    confirmation_store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label=paper_trade.intent.label,
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        quantity=10_845.0,
+                        quantity_text="10845.00000000",
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.09231064,
+                        worst_price_text="0.09231064",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=[
+                            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                            "CARRYME_API_PARADEX_PRIVATE_KEY",
+                        ],
+                        auth_scheme="main account address + subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=False,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=False,
+                        ready=False,
+                        credential_mode="bearer_token",
+                        missing_env_vars=["CARRYME_API_PARADEX_BEARER_TOKEN"],
+                        blocking_reasons=[
+                            (
+                                "Venue paradex is missing required account credentials: "
+                                "CARRYME_API_PARADEX_BEARER_TOKEN"
+                            )
+                        ],
+                    ),
+                ],
+                blocking_reasons=[
+                    (
+                        "Venue paradex is missing required account credentials: "
+                        "CARRYME_API_PARADEX_BEARER_TOKEN"
+                    )
+                ],
+            )
+
+    from carryme_api.app import get_account_preflight_service, get_preview_confirmation_store
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(get_preview_confirmation_store, lambda: confirmation_store),
+        _dependency_override(get_account_preflight_service, lambda: StubAccountPreflightService()),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=False,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-private",
+                paradex_bearer_token=None,
+            ),
+        ),
+    ):
+        response = client.get(
+            f"/v1/executions/readiness/from-paper-trade/{paper_trade.entry_id}",
+            params={"preview_hash": "wrong-hash"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["confirmed_preview"] is False
+    assert payload["ready"] is False
+    assert "No preview confirmation matched" in str(payload["blocking_reasons"])
+    assert "Venue paradex live execution is not enabled" in payload["blocking_reasons"]
+    assert "CARRYME_API_PARADEX_BEARER_TOKEN" in str(payload["blocking_reasons"])
+
+
+def test_live_submission_readiness_endpoint_finds_matching_hash_beyond_recent_window(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    def append_confirmation(
+        *,
+        preview_hash: str,
+        confirmed_at: datetime,
+    ) -> None:
+        confirmation_store.append(
+            PreviewConfirmationEntry(
+                confirmed_at=confirmed_at,
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                preview_hash=preview_hash,
+                preview=PaperTradeOrderPreview(
+                    paper_trade_id=paper_trade.entry_id or 0,
+                    label=paper_trade.intent.label,
+                    generated_at=confirmed_at - timedelta(minutes=5),
+                    slippage_tolerance_bps=12,
+                    preview_hash=preview_hash,
+                    legs=[
+                        VenueOrderPreview(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                            fee_profile="pro",
+                            side="buy",
+                            target_notional=1000.0,
+                            quantity=10_845.0,
+                            quantity_text="10845.00000000",
+                            reference_price=0.0922,
+                            reference_price_source="best_ask",
+                            worst_acceptable_price=0.09231064,
+                            worst_price_text="0.09231064",
+                            order_type="limit",
+                            time_in_force="ioc",
+                            http_method="POST",
+                            endpoint_path_hint="/v1/orders",
+                            required_auth_env_vars=[
+                                "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                                "CARRYME_API_PARADEX_PRIVATE_KEY",
+                            ],
+                            auth_scheme="main account address + subkey private key",
+                            payload={"market": "ARB-USD-PERP"},
+                            notes=[],
+                        )
+                    ],
+                ),
+                note="operator confirmed",
+            )
+        )
+
+    append_confirmation(
+        preview_hash="preview-hash",
+        confirmed_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+    )
+    for index in range(60):
+        append_confirmation(
+            preview_hash=f"other-preview-{index}",
+            confirmed_at=datetime(2026, 3, 29, 13, 1, tzinfo=UTC) + timedelta(minutes=index),
+        )
+
+    class ReadyAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="bearer_token",
+                    ),
+                ],
+            )
+
+    from carryme_api.app import get_account_preflight_service, get_preview_confirmation_store
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(get_preview_confirmation_store, lambda: confirmation_store),
+        _dependency_override(
+            get_account_preflight_service,
+            lambda: ReadyAccountPreflightService(),
+        ),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=True,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-private",
+                paradex_bearer_token="paradex-bearer",
+            ),
+        ),
+    ):
+        response = client.get(
+            f"/v1/executions/readiness/from-paper-trade/{paper_trade.entry_id}",
+            params={"preview_hash": "preview-hash"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["confirmed_preview"] is True
+    assert payload["confirmation_entry_id"] is not None
+    assert payload["ready"] is True
+    assert payload["blocking_reasons"] == []
 
 
 def test_preview_confirmations_endpoint_rejects_non_positive_limit(tmp_path: Path) -> None:

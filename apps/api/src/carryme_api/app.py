@@ -683,6 +683,9 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
         execution_preflight = build_paper_trade_execution_preflight(
             paper_trade,
             build_live_execution_configs(settings),
@@ -691,15 +694,15 @@ def create_app() -> FastAPI:
             paper_trade,
             _build_account_preflight_configs(settings),
         )
-        confirmations = confirmation_store.list_recent(
-            limit=50,
+        confirmation = confirmation_store.find_latest_by_preview_hash(
             paper_trade_id=paper_trade_id,
+            preview_hash=normalized_preview_hash,
         )
         return build_live_submission_readiness(
             paper_trade_id=paper_trade_id,
             label=paper_trade.intent.label,
-            preview_hash=preview_hash,
-            confirmations=confirmations,
+            preview_hash=normalized_preview_hash,
+            confirmations=[] if confirmation is None else [confirmation],
             execution_preflight=execution_preflight,
             account_preflight=account_preflight,
         )

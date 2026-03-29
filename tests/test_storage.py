@@ -1033,6 +1033,148 @@ def test_preview_confirmation_store_appends_and_lists_recent(tmp_path: Path) -> 
     assert entries[0].preview.preview_hash == "preview-hash"
 
 
+def test_preview_confirmation_store_finds_latest_by_trade_and_hash(tmp_path: Path) -> None:
+    store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        quantity=10_845.0,
+                        quantity_text="10845.00000000",
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.09231064,
+                        worst_price_text="0.09231064",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                        auth_scheme="subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+    latest = store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 11, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        quantity=10_845.0,
+                        quantity_text="10845.00000000",
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.09231064,
+                        worst_price_text="0.09231064",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                        auth_scheme="subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator reconfirmed",
+        )
+    )
+    store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            preview_hash="other-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="other-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        quantity=10_845.0,
+                        quantity_text="10845.00000000",
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.09231064,
+                        worst_price_text="0.09231064",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                        auth_scheme="subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator confirmed other hash",
+        )
+    )
+
+    found = store.find_latest_by_preview_hash(
+        paper_trade_id=7,
+        preview_hash=" preview-hash ",
+    )
+
+    assert found is not None
+    assert found.entry_id == latest.entry_id
+    assert found.preview_hash == "preview-hash"
+
+
+def test_preview_confirmation_store_returns_none_for_missing_hash(tmp_path: Path) -> None:
+    store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+
+    assert (
+        store.find_latest_by_preview_hash(
+            paper_trade_id=7,
+            preview_hash="missing-hash",
+        )
+        is None
+    )
+
+
 def test_preview_confirmation_store_normalizes_labels_and_hashes(tmp_path: Path) -> None:
     store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
     store.append(
