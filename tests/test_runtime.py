@@ -9,6 +9,7 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    LiveSubmissionReadiness,
     MarketStats,
     NormalizedMarketSnapshot,
     OpportunityRecord,
@@ -30,6 +31,7 @@ from carryme_runtime import (
     OpportunityService,
     OrderPreviewService,
     VenueAccountProbe,
+    build_live_submission_readiness,
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
@@ -93,6 +95,81 @@ def test_opportunity_service_scores_from_fetcher() -> None:
         assert opportunity.long_venue == "hyperliquid"
 
     asyncio.run(run())
+
+
+def test_build_live_submission_readiness_requires_confirmation_and_preflights() -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=7,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=5,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=5,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    quantity=10_845.0,
+                    quantity_text="10845.00000000",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09231064,
+                    worst_price_text="0.09231064",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[
+                        "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                        "CARRYME_API_PARADEX_PRIVATE_KEY",
+                    ],
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP"},
+                    notes=[],
+                )
+            ],
+        ),
+    )
+
+    readiness = build_live_submission_readiness(
+        paper_trade_id=5,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        confirmations=[confirmation],
+        execution_preflight=PaperTradeExecutionPreflight(
+            paper_trade_id=5,
+            label="arb_extended_paradex",
+            ready=False,
+            venues=[],
+            blocking_reasons=["Venue paradex live execution is not enabled"],
+        ),
+        account_preflight=PaperTradeAccountPreflight(
+            paper_trade_id=5,
+            label="arb_extended_paradex",
+            ready=False,
+            venues=[],
+            blocking_reasons=[
+                (
+                    "Venue paradex is missing required account credentials: "
+                    "CARRYME_API_PARADEX_BEARER_TOKEN"
+                )
+            ],
+        ),
+    )
+
+    assert isinstance(readiness, LiveSubmissionReadiness)
+    assert readiness.confirmed_preview is True
+    assert readiness.confirmation_entry_id == 7
+    assert readiness.ready is False
+    assert "Venue paradex live execution is not enabled" in readiness.blocking_reasons
 
 
 def test_build_trade_intent_sizes_by_capacity_fraction_and_cap() -> None:

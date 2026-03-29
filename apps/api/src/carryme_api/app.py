@@ -13,6 +13,7 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    LiveSubmissionReadiness,
     OpportunityRecord,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
@@ -35,6 +36,7 @@ from carryme_runtime import (
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
+    build_live_submission_readiness,
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
@@ -514,6 +516,48 @@ def create_app() -> FastAPI:
         return await service.probe_paper_trade(
             paper_trade,
             _build_account_preflight_configs(settings),
+        )
+
+    @app.get(
+        "/v1/executions/readiness/from-paper-trade/{paper_trade_id}",
+        response_model=LiveSubmissionReadiness,
+    )
+    async def execution_readiness_for_paper_trade(
+        paper_trade_id: int,
+        preview_hash: str,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+    ) -> LiveSubmissionReadiness:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        execution_preflight = build_paper_trade_execution_preflight(
+            paper_trade,
+            _build_live_execution_configs(settings),
+        )
+        account_preflight = await service.probe_paper_trade(
+            paper_trade,
+            _build_account_preflight_configs(settings),
+        )
+        confirmations = confirmation_store.list_recent(
+            limit=50,
+            paper_trade_id=paper_trade_id,
+        )
+        return build_live_submission_readiness(
+            paper_trade_id=paper_trade_id,
+            label=paper_trade.intent.label,
+            preview_hash=preview_hash,
+            confirmations=confirmations,
+            execution_preflight=execution_preflight,
+            account_preflight=account_preflight,
         )
 
     @app.get(
