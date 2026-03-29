@@ -192,6 +192,12 @@ def get_execution_adapter() -> ExecutionAdapter:
     return MockExecutionAdapter()
 
 
+def get_mock_execution_adapter() -> MockExecutionAdapter:
+    """Return the adapter allowed for mock execution journal submissions."""
+
+    return MockExecutionAdapter()
+
+
 def _build_live_execution_configs(settings: ApiSettings) -> LiveExecutionConfigMap:
     """Build the current venue credential map from API settings."""
 
@@ -576,7 +582,7 @@ def create_app() -> FastAPI:
         paper_trade_id: int,
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
         execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
-        adapter: Annotated[ExecutionAdapter, Depends(get_execution_adapter)],
+        adapter: Annotated[MockExecutionAdapter, Depends(get_mock_execution_adapter)],
     ) -> ExecutionJournalEntry:
         paper_trade = paper_store.get(paper_trade_id)
         if paper_trade is None:
