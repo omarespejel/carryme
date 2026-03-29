@@ -488,9 +488,18 @@ class HyperliquidAccountProbe:
         positions = state.get("assetPositions")
         if not isinstance(positions, list):
             positions = []
-        withdrawable = _pick_float(state, "withdrawable")
+        withdrawable = _pick_float(
+            state,
+            "withdrawable",
+            context="hyperliquid withdrawable balance",
+        )
         total_collateral = (
-            _pick_float(margin_summary, "accountValue", "totalRawUsd")
+            _pick_float(
+                margin_summary,
+                "accountValue",
+                "totalRawUsd",
+                context="hyperliquid account collateral",
+            )
             or withdrawable
         )
         return VenueAccountPreflight(
