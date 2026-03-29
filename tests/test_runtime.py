@@ -1,8 +1,11 @@
 import asyncio
+import json
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 
+import httpx
 import pytest
+from carryme_connectors import ParadexJwtTokenProvider, build_paradex_auth_headers
 from carryme_models import (
     CapacityEstimate,
     ExecutionJournalEntry,
@@ -37,6 +40,7 @@ from carryme_runtime import (
     build_venue_execution_preflights,
     require_confirmed_preview,
 )
+from carryme_runtime.account_preflight import ParadexAccountProbe
 
 
 def _snapshot(
@@ -686,5 +690,138 @@ def test_account_preflight_service_filters_to_trade_venues() -> None:
         assert preflight.ready is False
         assert {item.venue for item in preflight.venues} == {"extended", "paradex"}
         assert any("paradex" in reason for reason in preflight.blocking_reasons)
+
+    asyncio.run(run())
+
+
+def test_build_paradex_auth_headers_returns_official_header_shape() -> None:
+    headers = build_paradex_auth_headers(
+        account_address="0x123",
+        private_key="0x456",
+        starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+        issued_at=1_700_000_000,
+        expires_at=1_700_086_400,
+    )
+
+    assert headers["PARADEX-STARKNET-ACCOUNT"] == "0x123"
+    assert headers["PARADEX-TIMESTAMP"] == "1700000000"
+    assert headers["PARADEX-SIGNATURE-EXPIRATION"] == "1700086400"
+    signature = json.loads(headers["PARADEX-STARKNET-SIGNATURE"])
+    assert isinstance(signature, list)
+    assert len(signature) == 2
+    assert all(isinstance(item, str) and item.isdigit() for item in signature)
+
+
+def test_paradex_jwt_token_provider_fetches_config_and_authenticates() -> None:
+    requests: list[tuple[str, str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, dict(request.headers)))
+        if request.url.path == "/v1/system/config":
+            return httpx.Response(
+                200,
+                json={"starknet_chain_id": "PRIVATE_SN_PARACLEAR_MAINNET"},
+            )
+        if request.url.path == "/v1/auth":
+            assert request.headers["PARADEX-STARKNET-ACCOUNT"] == "0x123"
+            assert request.headers["PARADEX-TIMESTAMP"] == "1700000000"
+            assert request.headers["PARADEX-SIGNATURE-EXPIRATION"] == "1700086400"
+            signature = json.loads(request.headers["PARADEX-STARKNET-SIGNATURE"])
+            assert len(signature) == 2
+            return httpx.Response(200, json={"jwt_token": "jwt-token"})
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    async def run() -> None:
+        provider = ParadexJwtTokenProvider()
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(
+            base_url="https://api.prod.paradex.trade",
+            transport=transport,
+        ) as client:
+            token = await provider.issue_jwt_token(
+                account_address="0x123",
+                private_key="0x456",
+                client=client,
+                now=1_700_000_000,
+            )
+        assert token == "jwt-token"
+        assert [item[:2] for item in requests] == [
+            ("GET", "/v1/system/config"),
+            ("POST", "/v1/auth"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_paradex_account_probe_requires_private_key_or_bearer_override() -> None:
+    async def run() -> None:
+        probe = ParadexAccountProbe()
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xabc",
+                    "private_key": None,
+                    "bearer_token": None,
+                },
+            }
+        )
+        assert status.authenticated is False
+        assert status.ready is False
+        assert status.credential_mode == "subkey_jwt"
+        assert status.missing_env_vars == ["CARRYME_API_PARADEX_PRIVATE_KEY"]
+
+    asyncio.run(run())
+
+
+def test_paradex_account_probe_uses_subkey_jwt_when_bearer_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubTokenProvider:
+        async def issue_jwt_token(
+            self,
+            *,
+            account_address: str,
+            private_key: str,
+            client: httpx.AsyncClient | None = None,
+            now: int | None = None,
+        ) -> str:
+            assert account_address == "0xabc"
+            assert private_key == "0x123"
+            return "derived-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer derived-token"
+        if request.url.path == "/v1/account":
+            return httpx.Response(200, json={"account": "0xabc", "status": "ACTIVE"})
+        if request.url.path == "/v1/balance":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/v1/positions":
+            return httpx.Response(200, json=[])
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        probe = ParadexAccountProbe(token_provider=StubTokenProvider())
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xabc",
+                    "private_key": "0x123",
+                    "bearer_token": None,
+                },
+            }
+        )
+        assert status.authenticated is True
+        assert status.ready is True
+        assert status.credential_mode == "subkey_jwt"
+        assert status.account_identifier == "0xabc"
 
     asyncio.run(run())
