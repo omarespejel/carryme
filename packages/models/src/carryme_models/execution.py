@@ -128,7 +128,14 @@ class ExecutionPairStatus(BaseModel):
     execution_entry_id: int | None = None
     paper_trade_id: int | None = None
     preview_hash: str | None = None
-    derived_state: Literal["hedged", "pending", "unfilled", "cleanup_needed", "review_required"]
+    derived_state: Literal[
+        "hedged",
+        "pending",
+        "unfilled",
+        "closed",
+        "cleanup_needed",
+        "review_required",
+    ]
     recommended_action: str = Field(min_length=1)
     order_state: ExecutionOrderState
     reconciliation: ExecutionReconciliation
