@@ -1,8 +1,9 @@
 """FastAPI application factory for carryme."""
 
-from __future__ import annotations
-
+import math
+import os
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Annotated
 
 import httpx
@@ -10,7 +11,6 @@ from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
     FundingArbOpportunity,
-    FundingPairSpec,
     FundingPairTradeIntent,
     OpportunityRecord,
     PaperTradeEntry,
@@ -19,14 +19,19 @@ from carryme_models import (
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
-from carryme_runtime import ConnectorError, OpportunityService, build_trade_intent
+from carryme_runtime import (
+    ConnectorError,
+    OpportunityService,
+    UpstreamDataError,
+    build_trade_intent,
+)
 from carryme_storage import (
     CandidateAlertStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     WatchlistStore,
 )
-from fastapi import Body, Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
 
 from carryme_api.config import ApiSettings, get_api_settings
@@ -40,7 +45,46 @@ from carryme_api.history_view import (
 
 APP_NAME = "carryme-api"
 APP_VERSION = "0.1.0"
-APP_ENVIRONMENT = "development"
+DEFAULT_APP_ENVIRONMENT = "development"
+APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
+MAX_HISTORY_LIMIT = 1000
+
+
+def get_app_environment() -> str:
+    """Return the runtime environment exposed by the API health endpoints."""
+
+    return (
+        os.getenv(APP_ENVIRONMENT_VARIABLE, DEFAULT_APP_ENVIRONMENT).strip()
+        or DEFAULT_APP_ENVIRONMENT
+    )
+
+
+@lru_cache
+def _history_store_for_path(database_path: str) -> OpportunityHistoryStore:
+    """Return a shared store wrapper for the configured SQLite path."""
+
+    return OpportunityHistoryStore(database_path)
+
+
+@lru_cache
+def _candidate_alert_store_for_path(database_path: str) -> CandidateAlertStore:
+    """Return a shared candidate alert store for the configured SQLite path."""
+
+    return CandidateAlertStore(database_path)
+
+
+@lru_cache
+def _watchlist_store_for_path(watchlist_path: str) -> WatchlistStore:
+    """Return a shared watchlist store for the configured watchlist path."""
+
+    return WatchlistStore(watchlist_path)
+
+
+@lru_cache
+def _paper_trade_store_for_path(database_path: str) -> PaperTradeStore:
+    """Return a shared paper trade journal wrapper for the configured SQLite path."""
+
+    return PaperTradeStore(database_path)
 
 
 def get_opportunity_service() -> OpportunityService:
@@ -54,7 +98,7 @@ def get_history_store(
 ) -> OpportunityHistoryStore:
     """Return the shared opportunity history store."""
 
-    return OpportunityHistoryStore(settings.database_path)
+    return _history_store_for_path(settings.database_path)
 
 
 def get_candidate_alert_store(
@@ -62,7 +106,7 @@ def get_candidate_alert_store(
 ) -> CandidateAlertStore:
     """Return the shared candidate alert store."""
 
-    return CandidateAlertStore(settings.database_path)
+    return _candidate_alert_store_for_path(settings.database_path)
 
 
 def get_watchlist_store(
@@ -70,7 +114,7 @@ def get_watchlist_store(
 ) -> WatchlistStore:
     """Return the shared watchlist store."""
 
-    return WatchlistStore(settings.watchlist_path)
+    return _watchlist_store_for_path(settings.watchlist_path)
 
 
 def get_paper_trade_store(
@@ -78,7 +122,50 @@ def get_paper_trade_store(
 ) -> PaperTradeStore:
     """Return the shared paper trade journal store."""
 
-    return PaperTradeStore(settings.database_path)
+    return _paper_trade_store_for_path(settings.database_path)
+
+
+def _validated_history_limit(name: str, value: int) -> int:
+    """Validate bounded positive query parameters for history views."""
+
+    if value < 1:
+        raise HTTPException(status_code=400, detail=f"{name} must be at least 1")
+    if value > MAX_HISTORY_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be at most {MAX_HISTORY_LIMIT}",
+        )
+    return value
+
+
+def _validated_non_negative_threshold(name: str, value: float) -> float:
+    """Validate bounded numeric query parameters for candidate filters."""
+
+    if not math.isfinite(value):
+        raise HTTPException(status_code=400, detail=f"{name} must be finite")
+    if value < 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be non-negative")
+    return value
+
+
+def _validated_positive_threshold(name: str, value: float) -> float:
+    """Validate finite strictly positive query parameters."""
+
+    if not math.isfinite(value):
+        raise HTTPException(status_code=400, detail=f"{name} must be finite")
+    if value <= 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be greater than zero")
+    return value
+
+
+def _validated_fraction(name: str, value: float) -> float:
+    """Validate finite fractions constrained to the inclusive unit interval."""
+
+    if not math.isfinite(value):
+        raise HTTPException(status_code=400, detail=f"{name} must be finite")
+    if value <= 0 or value > 1:
+        raise HTTPException(status_code=400, detail=f"{name} must be within (0, 1]")
+    return value
 
 
 def _select_trade_intent_records(
@@ -121,8 +208,26 @@ def _build_trade_intent_candidates(
 ) -> list[FundingPairTradeIntent]:
     """Build ranked dry-run trade intents from saved opportunity history."""
 
-    if sample < limit:
-        sample = limit
+    limit = _validated_history_limit("limit", limit)
+    sample = max(limit, _validated_history_limit("sample", sample))
+    capacity_fraction = _validated_fraction("capacity_fraction", capacity_fraction)
+    max_target_notional = _validated_positive_threshold(
+        "max_target_notional",
+        max_target_notional,
+    )
+    min_one_day_net_edge_after_entry = _validated_non_negative_threshold(
+        "min_one_day_net_edge_after_entry",
+        min_one_day_net_edge_after_entry,
+    )
+    min_capacity_notional = _validated_non_negative_threshold(
+        "min_capacity_notional",
+        min_capacity_notional,
+    )
+    if max_break_even_days_entry is not None:
+        max_break_even_days_entry = _validated_non_negative_threshold(
+            "max_break_even_days_entry",
+            max_break_even_days_entry,
+        )
     records = store.list_recent(limit=sample, label=label)
     selected = _select_trade_intent_records(
         records,
@@ -155,7 +260,7 @@ def create_app() -> FastAPI:
             service=AppDescriptor(
                 name=APP_NAME,
                 version=APP_VERSION,
-                environment=APP_ENVIRONMENT,
+                environment=get_app_environment(),
             )
         )
 
@@ -174,15 +279,18 @@ def create_app() -> FastAPI:
     def watchlist(
         store: Annotated[WatchlistStore, Depends(get_watchlist_store)],
     ) -> WatchlistDocument:
-        return WatchlistDocument(pairs=store.load())
+        try:
+            pairs = store.load()
+        except FileNotFoundError:
+            pairs = []
+        return WatchlistDocument(pairs=pairs)
 
     @app.put("/v1/watchlist", response_model=WatchlistDocument)
     def replace_watchlist(
         document: Annotated[WatchlistDocument, Body(...)],
         store: Annotated[WatchlistStore, Depends(get_watchlist_store)],
     ) -> WatchlistDocument:
-        pairs = [FundingPairSpec.model_validate(item) for item in document.pairs]
-        return WatchlistDocument(pairs=store.replace(pairs))
+        return WatchlistDocument(pairs=store.replace(document.pairs))
 
     @app.get("/v1/history/funding-pairs", response_model=list[OpportunityRecord])
     def history(
@@ -190,6 +298,7 @@ def create_app() -> FastAPI:
         limit: int = 50,
         label: str | None = None,
     ) -> list[OpportunityRecord]:
+        limit = _validated_history_limit("limit", limit)
         try:
             return store.list_recent(limit=limit, label=label)
         except ValueError as exc:
@@ -202,8 +311,8 @@ def create_app() -> FastAPI:
         sample: int = 200,
         label: str | None = None,
     ) -> list[OpportunityRecord]:
-        if sample < limit:
-            sample = limit
+        limit = _validated_history_limit("limit", limit)
+        sample = max(limit, _validated_history_limit("sample", sample))
         records = store.list_recent(limit=sample, label=label)
         return latest_records_by_label(records, limit=limit)
 
@@ -214,8 +323,8 @@ def create_app() -> FastAPI:
         sample: int = 200,
         label: str | None = None,
     ) -> list[OpportunityRecord]:
-        if sample < limit:
-            sample = limit
+        limit = _validated_history_limit("limit", limit)
+        sample = max(limit, _validated_history_limit("sample", sample))
         records = store.list_recent(limit=sample, label=label)
         latest = latest_records_by_label(records, limit=sample)
         return rank_history_records(latest, limit=limit)
@@ -229,8 +338,16 @@ def create_app() -> FastAPI:
         min_one_day_net_edge_after_entry: float = 0.0,
         min_capacity_notional: float = 0.0,
     ) -> list[OpportunityRecord]:
-        if sample < limit:
-            sample = limit
+        limit = _validated_history_limit("limit", limit)
+        sample = max(limit, _validated_history_limit("sample", sample))
+        min_one_day_net_edge_after_entry = _validated_non_negative_threshold(
+            "min_one_day_net_edge_after_entry",
+            min_one_day_net_edge_after_entry,
+        )
+        min_capacity_notional = _validated_non_negative_threshold(
+            "min_capacity_notional",
+            min_capacity_notional,
+        )
         records = store.list_recent(limit=sample, label=label)
         latest = latest_records_by_label(records, limit=sample)
         candidates = filter_candidate_records(
@@ -240,12 +357,14 @@ def create_app() -> FastAPI:
         )
         return rank_history_records(candidates, limit=limit)
 
+
     @app.get("/v1/alerts/candidates", response_model=list[CandidateAlertEvent])
     def candidate_alerts(
         store: Annotated[CandidateAlertStore, Depends(get_candidate_alert_store)],
         limit: int = 50,
         label: str | None = None,
     ) -> list[CandidateAlertEvent]:
+        limit = _validated_history_limit("limit", limit)
         try:
             return store.list_recent(limit=limit, label=label)
         except ValueError as exc:
@@ -310,7 +429,11 @@ def create_app() -> FastAPI:
         limit: int = 50,
         label: str | None = None,
     ) -> list[PaperTradeEntry]:
-        return store.list_recent(limit=limit, label=label)
+        limit = _validated_history_limit("limit", limit)
+        try:
+            return store.list_recent(limit=limit, label=label)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/v1/paper-trades/from-intent", response_model=PaperTradeEntry)
     def create_paper_trade_from_intent(
@@ -355,6 +478,7 @@ def create_app() -> FastAPI:
         sample: int = 200,
         label: str | None = None,
     ) -> HTMLResponse:
+        sample = _validated_history_limit("sample", sample)
         records = store.list_recent(limit=sample, label=label)
         return HTMLResponse(render_dashboard(records))
 
@@ -366,6 +490,15 @@ def create_app() -> FastAPI:
         min_one_day_net_edge_after_entry: float = 0.0,
         min_capacity_notional: float = 0.0,
     ) -> HTMLResponse:
+        sample = _validated_history_limit("sample", sample)
+        min_one_day_net_edge_after_entry = _validated_non_negative_threshold(
+            "min_one_day_net_edge_after_entry",
+            min_one_day_net_edge_after_entry,
+        )
+        min_capacity_notional = _validated_non_negative_threshold(
+            "min_capacity_notional",
+            min_capacity_notional,
+        )
         records = store.list_recent(limit=sample, label=label)
         return HTMLResponse(
             render_candidate_dashboard(
@@ -383,10 +516,11 @@ def create_app() -> FastAPI:
         right_venue: str,
         right_symbol: str,
         right_fee_profile: str,
+        response: Response,
         service: Annotated[OpportunityService, Depends(get_opportunity_service)],
     ) -> FundingArbOpportunity:
         try:
-            return await service.score_pair(
+            opportunity = await service.score_pair(
                 left_venue=left_venue,
                 left_symbol=left_symbol,
                 left_fee_profile=left_fee_profile,
@@ -394,10 +528,12 @@ def create_app() -> FastAPI:
                 right_symbol=right_symbol,
                 right_fee_profile=right_fee_profile,
             )
+            response.headers["Cache-Control"] = "no-store"
+            return opportunity
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
 

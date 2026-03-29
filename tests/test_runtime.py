@@ -164,3 +164,86 @@ def test_build_trade_intent_rejects_edge_below_threshold() -> None:
             min_one_day_net_edge_after_entry=0.0,
             min_capacity_notional=500.0,
         )
+
+
+def test_build_trade_intent_rejects_invalid_capacity_fraction() -> None:
+    record = OpportunityRecord(
+        recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+        pair=FundingPairSpec(
+            label="strk_extended_hyperliquid",
+            left_venue="extended",
+            left_symbol="STRK-USD",
+            left_fee_profile="default",
+            right_venue="hyperliquid",
+            right_symbol="STRK",
+            right_fee_profile="tier0",
+        ),
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="STRK-USD-PERP",
+            long_venue="hyperliquid",
+            short_venue="extended",
+            long_fee_profile="tier0",
+            short_fee_profile="default",
+            gross_daily_edge=0.0005,
+            entry_cost_rate=0.0003,
+            round_trip_cost_rate=0.0006,
+            one_day_net_edge_after_entry=0.0002,
+            one_day_net_edge_after_round_trip=-0.0001,
+            break_even_days_entry=0.6,
+            break_even_days_round_trip=1.2,
+            capacity=CapacityEstimate(
+                short_bid_notional=4000.0,
+                long_ask_notional=3000.0,
+                max_entry_notional=3000.0,
+                limiting_venue="hyperliquid",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="capacity_fraction must be within"):
+        build_trade_intent(
+            record,
+            capacity_fraction=0.0,
+            max_target_notional=1000.0,
+            min_one_day_net_edge_after_entry=0.0,
+            min_capacity_notional=500.0,
+        )
+
+
+def test_build_trade_intent_rejects_missing_capacity_estimate() -> None:
+    record = OpportunityRecord(
+        recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+        pair=FundingPairSpec(
+            label="strk_extended_hyperliquid",
+            left_venue="extended",
+            left_symbol="STRK-USD",
+            left_fee_profile="default",
+            right_venue="hyperliquid",
+            right_symbol="STRK",
+            right_fee_profile="tier0",
+        ),
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="STRK-USD-PERP",
+            long_venue="hyperliquid",
+            short_venue="extended",
+            long_fee_profile="tier0",
+            short_fee_profile="default",
+            gross_daily_edge=0.0005,
+            entry_cost_rate=0.0003,
+            round_trip_cost_rate=0.0006,
+            one_day_net_edge_after_entry=0.0002,
+            one_day_net_edge_after_round_trip=-0.0001,
+            break_even_days_entry=0.6,
+            break_even_days_round_trip=1.2,
+            capacity=None,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="usable capacity estimate"):
+        build_trade_intent(
+            record,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            min_one_day_net_edge_after_entry=0.0,
+            min_capacity_notional=500.0,
+        )
