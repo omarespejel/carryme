@@ -946,8 +946,6 @@ def test_run_supervised_universe_scan_loop_applies_backoff(tmp_path: Path) -> No
     assert summary.saved_records == 2
     assert summary.alert_events == 1
     assert sleeps == [2.0]
-
-
 def test_run_polling_loop_applies_backoff_and_saves_after_retry(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(

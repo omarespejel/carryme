@@ -35,6 +35,7 @@ from carryme_runtime import (
     ParadexOrderStateObserver,
     RouteStabilityService,
     build_account_preflight_configs,
+    RouteStabilityService,
     build_execution_pair_status,
     build_opportunity_record_from_universe_opportunity,
     filter_candidate_records,
@@ -337,6 +338,106 @@ async def scan_funding_universe_once(
         alert_events=alert_events,
         database_path=settings.database_path,
         records=persisted_records,
+    )
+
+
+async def run_supervised_universe_scan_loop(
+    settings: WorkerSettings,
+    *,
+    scanner: UniverseScanner | None = None,
+    store: OpportunityHistoryStore | None = None,
+    alert_sink: CandidateAlertSink | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> UniverseScanLoopSummary:
+    """Run supervised funding-universe scans until stopped or capped."""
+
+    if max_iterations is not None and max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
+    history_store = store or OpportunityHistoryStore(settings.database_path)
+    candidate_alert_sink = alert_sink or CandidateAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    supervised_stop_event = stop_event or asyncio.Event()
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    overlap_count = 0
+    scanned_opportunities = 0
+    saved_records = 0
+    alert_events = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised universe scan cycle %s", attempts)
+        try:
+            summary = await scan_funding_universe_once(
+                settings,
+                scanner=scanner,
+                store=history_store,
+                alert_sink=candidate_alert_sink,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            overlap_count += summary.overlap_count
+            scanned_opportunities += summary.scanned_opportunities
+            saved_records += summary.saved_records
+            alert_events += summary.alert_events
+            loop_logger.info(
+                (
+                    "completed supervised universe scan cycle %s with %s overlaps, "
+                    "%s ranked opportunities, %s saved records, and %s alerts"
+                ),
+                attempts,
+                summary.overlap_count,
+                summary.scanned_opportunities,
+                summary.saved_records,
+                summary.alert_events,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                settings.universe_scan_interval_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.universe_scan_max_backoff_seconds,
+                settings.universe_scan_interval_seconds * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "supervised universe scan cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                backoff_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+
+    return UniverseScanLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        overlap_count=overlap_count,
+        scanned_opportunities=scanned_opportunities,
+        saved_records=saved_records,
+        alert_events=alert_events,
+        database_path=settings.database_path,
     )
 
 
