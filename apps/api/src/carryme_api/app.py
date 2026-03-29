@@ -376,7 +376,12 @@ def create_app() -> FastAPI:
         limit: int = 50,
         label: str | None = None,
     ) -> list[ExecutionJournalEntry]:
-        return store.list_recent(limit=limit, label=label)
+        if limit < 1:
+            raise HTTPException(status_code=400, detail="limit must be at least 1")
+        try:
+            return store.list_recent(limit=limit, label=label)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post(
         "/v1/executions/mock/from-paper-trade/{paper_trade_id}",

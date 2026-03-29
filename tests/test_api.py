@@ -923,3 +923,17 @@ def test_executions_endpoint_lists_saved_entries(tmp_path: Path) -> None:
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["paper_trade_id"] == 7
+
+
+def test_executions_endpoint_rejects_invalid_limit(tmp_path: Path) -> None:
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    from carryme_api.app import get_execution_journal_store
+
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    client = TestClient(app)
+    response = client.get("/v1/executions", params={"limit": 0})
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at least 1"

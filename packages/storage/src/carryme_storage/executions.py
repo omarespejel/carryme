@@ -86,6 +86,8 @@ class ExecutionJournalStore:
     ) -> list[ExecutionJournalEntry]:
         """Return recent execution journal entries."""
 
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         self.initialize()
         query = """
             SELECT id, entry_json

@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
@@ -309,3 +310,14 @@ def test_execution_journal_store_appends_and_lists_recent(tmp_path: Path) -> Non
     assert results[0].entry_id == saved.entry_id
     assert results[0].paper_trade_id == 7
     assert results[0].legs[0].external_reference == "mock:7:buy"
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1])
+def test_execution_journal_store_rejects_non_positive_limits(
+    tmp_path: Path,
+    invalid_limit: int,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        store.list_recent(limit=invalid_limit)
