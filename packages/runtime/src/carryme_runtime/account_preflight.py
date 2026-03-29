@@ -323,7 +323,15 @@ class ParadexAccountProbe:
                 "account_address",
                 "starknet_account",
                 "id",
-            ) or account_address
+            )
+            if account_identifier is None:
+                raise UpstreamDataError(
+                    "Paradex account payload is missing an account identifier"
+                )
+            if account_identifier.casefold() != cast(str, account_address).casefold():
+                raise UpstreamDataError(
+                    "Paradex account payload did not match the configured account address"
+                )
             return VenueAccountPreflight(
                 venue=self.venue,
                 enabled=enabled,

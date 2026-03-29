@@ -1441,6 +1441,52 @@ def test_extended_account_probe_blocks_malformed_balance_payload(
     asyncio.run(run())
 
 
+def test_paradex_account_probe_blocks_mismatched_account_identifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/account":
+            return httpx.Response(200, json={"account": "0xdef", "status": "ACTIVE"})
+        if request.url.path == "/v1/balance":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/v1/positions":
+            return httpx.Response(200, json=[])
+        raise AssertionError(f"unexpected path: {request.url.path}")
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(
+            *args,
+            transport=httpx.MockTransport(handler),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(account_preflight_runtime.httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        status = await ParadexAccountProbe().probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xabc",
+                    "bearer_token": "paradex-bearer",
+                },
+            }
+        )
+
+        assert status.authenticated is False
+        assert status.ready is False
+        assert status.blocking_reasons == [
+            (
+                "Paradex authenticated read returned malformed payload: "
+                "Paradex account payload did not match the configured account address"
+            )
+        ]
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     ("paper_trade_id", "preview_hash"),
     [

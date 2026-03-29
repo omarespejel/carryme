@@ -2551,6 +2551,7 @@ def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> No
     assert payload["ready"] is False
     assert "Venue paradex live execution is not enabled" in payload["blocking_reasons"]
     assert "CARRYME_API_PARADEX_BEARER_TOKEN" in str(payload["blocking_reasons"])
+    assert response.headers["Cache-Control"] == "no-store"
 
 
 def test_live_submission_readiness_endpoint_reports_unconfirmed_preview(
@@ -2706,6 +2707,7 @@ def test_live_submission_readiness_endpoint_reports_unconfirmed_preview(
     assert "No preview confirmation matched" in str(payload["blocking_reasons"])
     assert "Venue paradex live execution is not enabled" in payload["blocking_reasons"]
     assert "CARRYME_API_PARADEX_BEARER_TOKEN" in str(payload["blocking_reasons"])
+    assert response.headers["Cache-Control"] == "no-store"
 
 
 def test_live_submission_readiness_endpoint_finds_matching_hash_beyond_recent_window(
@@ -2866,6 +2868,84 @@ def test_live_submission_readiness_endpoint_finds_matching_hash_beyond_recent_wi
     assert payload["confirmation_entry_id"] is not None
     assert payload["ready"] is True
     assert payload["blocking_reasons"] == []
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_live_submission_readiness_endpoint_maps_account_preflight_errors_to_bad_gateway(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    class FailingAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id is not None
+            assert "paradex" in configs
+            raise UpstreamDataError("account preflight upstream failure")
+
+    from carryme_api.app import get_account_preflight_service
+
+    client = TestClient(app)
+    with (
+        _dependency_override(get_paper_trade_store, lambda: paper_store),
+        _dependency_override(
+            get_account_preflight_service,
+            lambda: FailingAccountPreflightService(),
+        ),
+        _dependency_override(
+            get_api_settings,
+            lambda: ApiSettings(
+                extended_live_enabled=True,
+                extended_api_key="extended-key",
+                extended_stark_private_key="extended-stark",
+                paradex_live_enabled=True,
+                paradex_account_address="0xabc",
+                paradex_private_key="paradex-private",
+                paradex_bearer_token=None,
+            ),
+        ),
+    ):
+        response = client.get(
+            f"/v1/executions/readiness/from-paper-trade/{paper_trade.entry_id}",
+            params={"preview_hash": "preview-hash"},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "account preflight upstream failure"
 
 
 def test_preview_confirmations_endpoint_rejects_non_positive_limit(tmp_path: Path) -> None:

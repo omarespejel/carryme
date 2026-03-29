@@ -676,7 +676,9 @@ def create_app() -> FastAPI:
             Depends(get_preview_confirmation_store),
         ],
         service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+        response: Response,
     ) -> LiveSubmissionReadiness:
+        response.headers["Cache-Control"] = "no-store"
         paper_trade = paper_store.get(paper_trade_id)
         if paper_trade is None:
             raise HTTPException(
@@ -690,10 +692,13 @@ def create_app() -> FastAPI:
             paper_trade,
             build_live_execution_configs(settings),
         )
-        account_preflight = await service.probe_paper_trade(
-            paper_trade,
-            _build_account_preflight_configs(settings),
-        )
+        try:
+            account_preflight = await service.probe_paper_trade(
+                paper_trade,
+                _build_account_preflight_configs(settings),
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         confirmation = confirmation_store.find_latest_by_preview_hash(
             paper_trade_id=paper_trade_id,
             preview_hash=normalized_preview_hash,
