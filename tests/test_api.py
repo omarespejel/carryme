@@ -1046,9 +1046,7 @@ def test_execution_reconciliation_endpoint_reports_latest_execution_state(tmp_pa
 
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     client = TestClient(app)
     response = client.get(
         f"/v1/executions/reconciliation/latest/from-paper-trade/{paper_trade.entry_id}"
@@ -1310,9 +1308,7 @@ def test_execution_pair_status_endpoint_reports_cleanup_needed(tmp_path: Path) -
     app.dependency_overrides[get_execution_order_state_service] = (
         lambda: StubExecutionOrderStateService()
     )
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     client = TestClient(app)
     assert paper_trade.entry_id is not None
     response = client.get(
@@ -1513,12 +1509,8 @@ def test_execution_cleanup_preview_endpoint_returns_reduce_only_preview(tmp_path
     app.dependency_overrides[get_execution_order_state_service] = (
         lambda: StubExecutionOrderStateService()
     )
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
-    app.dependency_overrides[get_cleanup_preview_service] = (
-        lambda: StubCleanupPreviewService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     client = TestClient(app)
     assert paper_trade.entry_id is not None
     response = client.get(
@@ -1697,12 +1689,8 @@ def test_execution_cleanup_preview_confirmation_endpoint_persists_confirmation(
     app.dependency_overrides[get_execution_order_state_service] = (
         lambda: StubExecutionOrderStateService()
     )
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
-    app.dependency_overrides[get_cleanup_preview_service] = (
-        lambda: StubCleanupPreviewService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     client = TestClient(app)
     assert paper_trade.entry_id is not None
     response = client.post(
@@ -1716,6 +1704,10 @@ def test_execution_cleanup_preview_confirmation_endpoint_persists_confirmation(
     assert payload["paper_trade_id"] == paper_trade.entry_id
     assert payload["preview_hash"] == "cleanup-hash"
     assert payload["preview"]["reason"] == "close_open_leg"
+    stored_confirmations = cleanup_store.list_recent(limit=10, paper_trade_id=paper_trade.entry_id)
+    assert len(stored_confirmations) == 1
+    assert stored_confirmations[0].preview_hash == "cleanup-hash"
+    assert stored_confirmations[0].preview.reason == "close_open_leg"
 
 
 def test_execute_extended_cleanup_endpoint_submits_confirmed_cleanup_preview(
@@ -1946,12 +1938,8 @@ def test_execute_extended_cleanup_endpoint_submits_confirmed_cleanup_preview(
     app.dependency_overrides[get_execution_order_state_service] = (
         lambda: StubExecutionOrderStateService()
     )
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
-    app.dependency_overrides[get_cleanup_preview_service] = (
-        lambda: StubCleanupPreviewService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_extended_live_execution_service] = (
         lambda: StubExtendedLiveExecutionService()
     )
@@ -1969,6 +1957,11 @@ def test_execute_extended_cleanup_endpoint_submits_confirmed_cleanup_preview(
     assert payload["confirmation_entry_id"] == confirmation.entry_id
     assert payload["preview_hash"] == "cleanup-hash"
     assert payload["legs"][0]["external_reference"] == "cleanup-order-1"
+    stored_entries = execution_store.list_recent(limit=10)
+    assert len(stored_entries) == 2
+    assert stored_entries[0].paper_trade_id == paper_trade.entry_id
+    assert stored_entries[0].preview_hash == "cleanup-hash"
+    assert stored_entries[0].confirmation_entry_id == confirmation.entry_id
 
 
 def test_execute_paradex_cleanup_endpoint_submits_confirmed_cleanup_preview(
@@ -2200,12 +2193,8 @@ def test_execute_paradex_cleanup_endpoint_submits_confirmed_cleanup_preview(
     app.dependency_overrides[get_execution_order_state_service] = (
         lambda: StubExecutionOrderStateService()
     )
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
-    app.dependency_overrides[get_cleanup_preview_service] = (
-        lambda: StubCleanupPreviewService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_paradex_live_execution_service] = (
         lambda: StubParadexLiveExecutionService()
     )
@@ -2223,6 +2212,34 @@ def test_execute_paradex_cleanup_endpoint_submits_confirmed_cleanup_preview(
     assert payload["confirmation_entry_id"] == confirmation.entry_id
     assert payload["preview_hash"] == "cleanup-hash"
     assert payload["legs"][0]["external_reference"] == "cleanup-order-2"
+
+
+def test_executions_endpoint_rejects_invalid_limit(tmp_path: Path) -> None:
+    from carryme_api.app import get_execution_journal_store
+
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    response = client.get("/v1/executions", params={"limit": 0})
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at least 1"
+
+
+def test_executions_endpoint_rejects_limit_above_history_cap(tmp_path: Path) -> None:
+    from carryme_api.app import get_execution_journal_store
+
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    client = TestClient(app)
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    response = client.get("/v1/executions", params={"limit": 1001})
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at most 1000"
 
 
 def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None:
@@ -2450,9 +2467,7 @@ def test_account_preflight_for_saved_paper_trade_uses_service_dependency(tmp_pat
     )
 
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -2673,7 +2688,7 @@ def test_preview_confirmation_endpoint_persists_matching_preview(tmp_path: Path)
     client = TestClient(app)
     response = client.post(
         f"/v1/executions/preview-confirmations/from-paper-trade/{paper_trade.entry_id}",
-        params={
+        json={
             "preview_hash": "preview-hash",
             "slippage_tolerance_bps": 12,
             "note": "operator confirmed",
@@ -2773,14 +2788,13 @@ def test_preview_confirmation_endpoint_rejects_hash_mismatch(tmp_path: Path) -> 
     client = TestClient(app)
     response = client.post(
         f"/v1/executions/preview-confirmations/from-paper-trade/{paper_trade.entry_id}",
-        params={"preview_hash": "wrong-hash"},
+        json={"preview_hash": "wrong-hash"},
     )
     app.dependency_overrides.clear()
 
     assert response.status_code == 409
     assert (
-        response.json()["detail"]
-        == "Preview hash did not match the current unsigned order preview"
+        response.json()["detail"] == "Preview hash did not match the current unsigned order preview"
     )
 
 
@@ -2966,9 +2980,7 @@ def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> No
 
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -3143,7 +3155,7 @@ def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pat
                         external_reference="order-1",
                         request_payload={"market": "ARB-USD-PERP"},
                         response_payload={"id": "order-1", "status": "NEW"},
-                        signature_timestamp=1_700_000_000_000,
+                        signature_timestamp_ms=1_700_000_000_000,
                     )
                 ],
             )
@@ -3160,9 +3172,7 @@ def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pat
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
     app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_paradex_live_execution_service] = (
         lambda: StubParadexLiveExecutionService()
     )
@@ -3352,9 +3362,7 @@ def test_extended_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pa
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
     app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_extended_live_execution_service] = (
         lambda: StubExtendedLiveExecutionService()
     )
@@ -3564,9 +3572,7 @@ def test_paired_live_execution_endpoint_submits_both_legs(tmp_path: Path) -> Non
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
     app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )

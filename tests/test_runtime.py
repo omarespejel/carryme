@@ -62,6 +62,7 @@ from carryme_runtime import (
     build_trade_intent,
     build_venue_execution_preflights,
     reconcile_execution,
+    require_confirmed_cleanup_preview,
     require_confirmed_preview,
 )
 from carryme_runtime.account_preflight import (
@@ -755,33 +756,33 @@ def test_account_preflight_service_filters_to_trade_venues() -> None:
         probes=cast(
             dict[str, VenueAccountProbe],
             {
-            "extended": StubProbe(
-                VenueAccountPreflight(
-                    venue="extended",
-                    enabled=True,
-                    authenticated=True,
-                    ready=True,
-                    credential_mode="api_key",
-                    account_identifier="ext-subaccount",
-                    available_to_trade=1500.0,
-                )
-            ),
-            "paradex": StubProbe(
-                VenueAccountPreflight(
-                    venue="paradex",
-                    enabled=True,
-                    authenticated=False,
-                    ready=False,
-                    credential_mode="bearer_token",
-                    missing_env_vars=["CARRYME_API_PARADEX_BEARER_TOKEN"],
-                    blocking_reasons=[
-                        (
-                            "Venue paradex is missing required account credentials: "
-                            "CARRYME_API_PARADEX_BEARER_TOKEN"
-                        )
-                    ],
-                )
-            ),
+                "extended": StubProbe(
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        account_identifier="ext-subaccount",
+                        available_to_trade=1500.0,
+                    )
+                ),
+                "paradex": StubProbe(
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=False,
+                        ready=False,
+                        credential_mode="bearer_token",
+                        missing_env_vars=["CARRYME_API_PARADEX_BEARER_TOKEN"],
+                        blocking_reasons=[
+                            (
+                                "Venue paradex is missing required account credentials: "
+                                "CARRYME_API_PARADEX_BEARER_TOKEN"
+                            )
+                        ],
+                    )
+                ),
             },
         ),
     )
@@ -1786,14 +1787,14 @@ def test_paired_live_execution_coordinator_submits_both_legs() -> None:
                 preview_hash=confirmation.preview_hash,
                 confirmation_entry_id=confirmation.entry_id,
                 paper_trade=paper_trade,
-                    legs=[
-                        ExecutionLegResult(
-                            venue=self.venue,
-                            symbol=next(
-                                leg.symbol
-                                for leg in confirmation.preview.legs
-                                if leg.venue == self.venue
-                            ),
+                legs=[
+                    ExecutionLegResult(
+                        venue=self.venue,
+                        symbol=next(
+                            leg.symbol
+                            for leg in confirmation.preview.legs
+                            if leg.venue == self.venue
+                        ),
                         fee_profile="default" if self.venue == "extended" else "pro",
                         side="sell" if self.venue == "extended" else "buy",
                         target_notional=1000.0,
@@ -3079,3 +3080,148 @@ def test_cleanup_live_execution_router_dispatches_to_preview_venue() -> None:
         assert entry.legs[0].venue == "paradex"
 
     asyncio.run(run())
+
+
+def test_extended_live_execution_service_rejects_cleanup_for_wrong_venue() -> None:
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0891,
+                worst_price_text="0.08910000",
+                reduce_only=True,
+                endpoint_path_hint="/v1/orders",
+                required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                auth_scheme="subkey private key",
+                payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    service = ExtendedLiveExecutionService(api_key="extended-key", stark_private_key="0x123")
+
+    with pytest.raises(ValueError, match="Cleanup confirmation must target Extended venue"):
+        service._select_extended_cleanup_leg(confirmation)
+
+
+def test_extended_live_execution_service_rejects_non_reduce_only_cleanup() -> None:
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.0,
+                quantity_text="123",
+                reference_price=0.0894,
+                reference_price_source="best_ask",
+                worst_acceptable_price=0.0895,
+                worst_price_text="0.0895",
+                reduce_only=False,
+                endpoint_path_hint="/api/v1/user/order",
+                required_auth_env_vars=["CARRYME_API_EXTENDED_API_KEY"],
+                auth_scheme="api key + Stark signing key",
+                payload={"symbol": "ARB-USD", "reduce_only": False},
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    service = ExtendedLiveExecutionService(api_key="extended-key", stark_private_key="0x123")
+
+    with pytest.raises(
+        ValueError,
+        match="Cleanup confirmation must be reduce-only before live execution",
+    ):
+        service._select_extended_cleanup_leg(confirmation)
+
+
+@pytest.mark.parametrize(
+    ("paper_trade_id", "preview_hash"),
+    [
+        (6, "cleanup-hash"),
+        (5, "wrong-hash"),
+    ],
+)
+def test_require_confirmed_cleanup_preview_rejects_mismatches(
+    paper_trade_id: int,
+    preview_hash: str,
+) -> None:
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=3,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=5,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=12,
+            paper_trade_id=5,
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.0,
+                quantity_text="123",
+                reference_price=0.0894,
+                reference_price_source="best_ask",
+                worst_acceptable_price=0.0895,
+                worst_price_text="0.0895",
+                reduce_only=True,
+                endpoint_path_hint="/api/v1/user/order",
+                required_auth_env_vars=["CARRYME_API_EXTENDED_API_KEY"],
+                auth_scheme="api key + Stark signing key",
+                payload={"symbol": "ARB-USD", "reduce_only": True},
+                notes=[],
+            ),
+            notes=[],
+        ),
+        note="operator confirmed",
+    )
+
+    with pytest.raises(ValueError, match="No cleanup preview confirmation matched"):
+        require_confirmed_cleanup_preview(
+            paper_trade_id=paper_trade_id,
+            preview_hash=preview_hash,
+            confirmations=[confirmation],
+        )
