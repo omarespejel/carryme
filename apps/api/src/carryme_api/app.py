@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 import httpx
@@ -12,13 +13,19 @@ from carryme_models import (
     FundingPairSpec,
     FundingPairTradeIntent,
     OpportunityRecord,
+    PaperTradeEntry,
     ServiceHealth,
     TradingFeeProfile,
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
 from carryme_runtime import ConnectorError, OpportunityService, build_trade_intent
-from carryme_storage import CandidateAlertStore, OpportunityHistoryStore, WatchlistStore
+from carryme_storage import (
+    CandidateAlertStore,
+    OpportunityHistoryStore,
+    PaperTradeStore,
+    WatchlistStore,
+)
 from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
@@ -66,6 +73,14 @@ def get_watchlist_store(
     return WatchlistStore(settings.watchlist_path)
 
 
+def get_paper_trade_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> PaperTradeStore:
+    """Return the shared paper trade journal store."""
+
+    return PaperTradeStore(settings.database_path)
+
+
 def _select_trade_intent_records(
     records: list[OpportunityRecord],
     *,
@@ -90,6 +105,43 @@ def _select_trade_intent_records(
             and record.opportunity.break_even_days_entry <= max_break_even_days_entry
         ]
     return rank_history_records(candidates, limit=limit)
+
+
+def _build_trade_intent_candidates(
+    store: OpportunityHistoryStore,
+    *,
+    limit: int,
+    sample: int,
+    label: str | None,
+    capacity_fraction: float,
+    max_target_notional: float,
+    min_one_day_net_edge_after_entry: float,
+    min_capacity_notional: float,
+    max_break_even_days_entry: float | None,
+) -> list[FundingPairTradeIntent]:
+    """Build ranked dry-run trade intents from saved opportunity history."""
+
+    if sample < limit:
+        sample = limit
+    records = store.list_recent(limit=sample, label=label)
+    selected = _select_trade_intent_records(
+        records,
+        limit=limit,
+        min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+        min_capacity_notional=min_capacity_notional,
+        max_break_even_days_entry=max_break_even_days_entry,
+    )
+    return [
+        build_trade_intent(
+            record,
+            capacity_fraction=capacity_fraction,
+            max_target_notional=max_target_notional,
+            min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+            min_capacity_notional=min_capacity_notional,
+            max_break_even_days_entry=max_break_even_days_entry,
+        )
+        for record in selected
+    ]
 
 
 def create_app() -> FastAPI:
@@ -211,27 +263,17 @@ def create_app() -> FastAPI:
         min_capacity_notional: float = 0.0,
         max_break_even_days_entry: float | None = None,
     ) -> list[FundingPairTradeIntent]:
-        if sample < limit:
-            sample = limit
-        records = store.list_recent(limit=sample, label=label)
-        selected = _select_trade_intent_records(
-            records,
+        return _build_trade_intent_candidates(
+            store,
             limit=limit,
+            sample=sample,
+            label=label,
+            capacity_fraction=capacity_fraction,
+            max_target_notional=max_target_notional,
             min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
             min_capacity_notional=min_capacity_notional,
             max_break_even_days_entry=max_break_even_days_entry,
         )
-        return [
-            build_trade_intent(
-                record,
-                capacity_fraction=capacity_fraction,
-                max_target_notional=max_target_notional,
-                min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
-                min_capacity_notional=min_capacity_notional,
-                max_break_even_days_entry=max_break_even_days_entry,
-            )
-            for record in selected
-        ]
 
     @app.get("/v1/intents/funding-pair", response_model=FundingPairTradeIntent)
     def funding_pair_intent(
@@ -261,6 +303,51 @@ def create_app() -> FastAPI:
                 detail="No trade intent candidate matched the requested filters",
             )
         return selected[0]
+
+    @app.get("/v1/paper-trades", response_model=list[PaperTradeEntry])
+    def paper_trades(
+        store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[PaperTradeEntry]:
+        return store.list_recent(limit=limit, label=label)
+
+    @app.post("/v1/paper-trades/from-intent", response_model=PaperTradeEntry)
+    def create_paper_trade_from_intent(
+        history_store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        sample: int = 200,
+        label: str | None = None,
+        capacity_fraction: float = 0.25,
+        max_target_notional: float = 1000.0,
+        min_one_day_net_edge_after_entry: float = 0.0,
+        min_capacity_notional: float = 0.0,
+        max_break_even_days_entry: float | None = None,
+        note: str | None = None,
+    ) -> PaperTradeEntry:
+        intents = _build_trade_intent_candidates(
+            history_store,
+            limit=1,
+            sample=sample,
+            label=label,
+            capacity_fraction=capacity_fraction,
+            max_target_notional=max_target_notional,
+            min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
+            min_capacity_notional=min_capacity_notional,
+            max_break_even_days_entry=max_break_even_days_entry,
+        )
+        if not intents:
+            raise HTTPException(
+                status_code=404,
+                detail="No paper trade intent matched the requested filters",
+            )
+        entry = PaperTradeEntry(
+            created_at=datetime.now(UTC),
+            intent=intents[0],
+            note=note,
+        )
+        paper_store.append(entry)
+        return entry
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(

@@ -7,9 +7,17 @@ from carryme_models import (
     CapacityEstimate,
     FundingArbOpportunity,
     FundingPairSpec,
+    FundingPairTradeIntent,
     OpportunityRecord,
+    PaperTradeEntry,
+    TradeLegIntent,
 )
-from carryme_storage import CandidateAlertStore, OpportunityHistoryStore, WatchlistStore
+from carryme_storage import (
+    CandidateAlertStore,
+    OpportunityHistoryStore,
+    PaperTradeStore,
+    WatchlistStore,
+)
 from fastapi.testclient import TestClient
 
 
@@ -674,3 +682,113 @@ def test_trade_intent_endpoint_returns_not_found_when_thresholds_exclude_all(
 
     assert response.status_code == 404
     assert response.json()["detail"] == "No trade intent candidate matched the requested filters"
+
+
+def test_create_paper_trade_from_intent_persists_entry(tmp_path: Path) -> None:
+    history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    history_store.append(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="arb_extended_paradex",
+                left_venue="extended",
+                left_symbol="ARB-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="ARB-USD-PERP",
+                right_fee_profile="pro",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro",
+                short_fee_profile="default",
+                gross_daily_edge=0.001,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0008,
+                one_day_net_edge_after_round_trip=0.0005,
+                break_even_days_entry=0.5,
+                break_even_days_round_trip=1.0,
+                capacity=CapacityEstimate(
+                    short_bid_notional=5000.0,
+                    long_ask_notional=4500.0,
+                    max_entry_notional=4500.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+
+    from carryme_api.app import get_paper_trade_store
+
+    app.dependency_overrides[get_history_store] = lambda: history_store
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    client = TestClient(app)
+    response = client.post(
+        "/v1/paper-trades/from-intent",
+        params={
+            "capacity_fraction": 0.25,
+            "max_target_notional": 1000.0,
+            "min_one_day_net_edge_after_entry": 0.0,
+            "min_capacity_notional": 1000.0,
+            "max_break_even_days_entry": 1.0,
+            "note": "operator accepted candidate",
+        },
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"]["label"] == "arb_extended_paradex"
+    assert payload["note"] == "operator accepted candidate"
+    assert len(paper_store.list_recent(limit=10)) == 1
+
+
+def test_paper_trades_endpoint_lists_saved_entries(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    from carryme_api.app import get_paper_trade_store
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    client = TestClient(app)
+    response = client.get("/v1/paper-trades")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["intent"]["label"] == "arb_extended_paradex"
