@@ -1,10 +1,18 @@
 """Helpers for gating future live submission on explicit preview confirmation."""
 
-from carryme_models import CleanupPreviewConfirmationEntry, PreviewConfirmationEntry
+from carryme_models import (
+    CleanupPreviewConfirmationEntry,
+    PairClosePreviewConfirmationEntry,
+    PreviewConfirmationEntry,
+)
 
 
 def _require_confirmation[
-    ConfirmationEntryT: (PreviewConfirmationEntry, CleanupPreviewConfirmationEntry)
+    ConfirmationEntryT: (
+        PreviewConfirmationEntry,
+        CleanupPreviewConfirmationEntry,
+        PairClosePreviewConfirmationEntry,
+    )
 ](
     *,
     paper_trade_id: int,
@@ -54,4 +62,20 @@ def require_confirmed_cleanup_preview(
         preview_hash=preview_hash,
         confirmations=confirmations,
         label="cleanup preview confirmation",
+    )
+
+
+def require_confirmed_pair_close_preview(
+    *,
+    paper_trade_id: int,
+    preview_hash: str,
+    confirmations: list[PairClosePreviewConfirmationEntry],
+) -> PairClosePreviewConfirmationEntry:
+    """Return the matching pair-close confirmation entry or raise when none exists."""
+
+    return _require_confirmation(
+        paper_trade_id=paper_trade_id,
+        preview_hash=preview_hash,
+        confirmations=confirmations,
+        label="pair-close preview confirmation",
     )

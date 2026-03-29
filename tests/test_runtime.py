@@ -21,6 +21,7 @@ from carryme_models import (
     ExecutionLegOrderState,
     ExecutionLegResult,
     ExecutionOrderState,
+    ExecutionPairClosePreview,
     ExecutionPairStatus,
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
@@ -31,6 +32,7 @@ from carryme_models import (
     MarketStats,
     NormalizedMarketSnapshot,
     OpportunityRecord,
+    PairClosePreviewConfirmationEntry,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
@@ -55,6 +57,8 @@ from carryme_runtime import (
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
+    PairCloseLiveExecutionCoordinator,
+    PairClosePreviewService,
     PairedLiveExecutionCoordinator,
     ParadexCleanupPreviewService,
     ParadexLiveExecutionService,
@@ -75,6 +79,7 @@ from carryme_runtime.account_preflight import (
     ParadexAccountProbe,
     _extract_balance_assets,
     _extract_position_symbols,
+    _row_represents_open_position,
 )
 
 
@@ -1441,12 +1446,8 @@ def test_hyperliquid_account_probe_rejects_malformed_sdk_payload(
         assert result.venue == "hyperliquid"
         assert result.authenticated is False
         assert result.ready is False
-        assert any(
-            "malformed payload" in reason for reason in result.blocking_reasons
-        )
-        assert any(
-            "malformed account data" in note for note in result.notes
-        )
+        assert any("malformed payload" in reason for reason in result.blocking_reasons)
+        assert any("malformed account data" in note for note in result.notes)
 
     asyncio.run(run())
 
@@ -2768,13 +2769,25 @@ def test_paradex_live_execution_service_submits_confirmed_cleanup_preview(
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer jwt-token"
-        assert request.url.path == "/v1/orders"
-        payload = json.loads(request.content.decode("utf-8"))
-        seen_request.update(payload)
-        assert payload["market"] == "ARB-USD-PERP"
-        assert payload["side"] == "SELL"
-        assert payload["flags"] == ["REDUCE_ONLY"]
-        return httpx.Response(201, json={"id": "cleanup-order-1", "status": "NEW"})
+        if request.url.path == "/v1/orders":
+            payload = json.loads(request.content.decode("utf-8"))
+            seen_request.update(payload)
+            assert payload["market"] == "ARB-USD-PERP"
+            assert payload["side"] == "SELL"
+            assert payload["flags"] == ["REDUCE_ONLY"]
+            return httpx.Response(201, json={"id": "cleanup-order-1", "status": "NEW"})
+        assert request.url.path == "/v1/orders/cleanup-order-1"
+        return httpx.Response(
+            200,
+            json={
+                "id": "cleanup-order-1",
+                "market": "ARB-USD-PERP",
+                "status": "NEW",
+                "remaining_size": "123.1",
+                "size": "123.1",
+                "client_id": "carryme-cleanup-pt8-paradex-sell",
+            },
+        )
 
     real_async_client = httpx.AsyncClient
 
@@ -3727,9 +3740,7 @@ def test_paired_live_execution_coordinator_supports_hyperliquid_leg() -> None:
                 leg.symbol for leg in confirmation.preview.legs if leg.venue == self.venue
             )
             fee_profile = "default" if self.venue == "extended" else "tier0"
-            side: Literal["buy", "sell"] = (
-                "sell" if self.venue == "extended" else "buy"
-            )
+            side: Literal["buy", "sell"] = "sell" if self.venue == "extended" else "buy"
             return ExecutionJournalEntry(
                 executed_at=executed_at or datetime.now(UTC),
                 adapter=f"{self.venue}_live",
@@ -3963,6 +3974,19 @@ def test_account_preflight_extracts_balance_assets_and_position_symbols() -> Non
 
     assert _extract_balance_assets(balances) == ["USDC", "ETH"]
     assert _extract_position_symbols(positions) == ["ARB-USD-PERP", "STRK-USD"]
+
+
+def test_account_preflight_ignores_closed_or_zero_size_positions() -> None:
+    positions = {
+        "results": [
+            {"market": "ARB-USD-PERP", "status": "CLOSED", "size": "0"},
+            {"symbol": "STRK-USD", "status": "OPEN", "size": "25"},
+            {"ticker": "ETH-USD-PERP", "size": "0"},
+            {"market": "SOL-USD-PERP", "size": "-3"},
+        ]
+    }
+
+    assert _extract_position_symbols(positions) == ["STRK-USD", "SOL-USD-PERP"]
 
 
 def test_reconcile_execution_marks_partial_and_missing_leg_symbols() -> None:
@@ -5389,6 +5413,98 @@ def test_build_execution_pair_status_does_not_mark_non_reduce_only_as_closed() -
     assert any("reported a fill" in note.lower() for note in status.notes)
 
 
+def test_build_execution_pair_status_marks_single_leg_cleanup_as_cleanup_needed() -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=34,
+        executed_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+        adapter="paradex_cleanup_live",
+        mode="live",
+        status="submitted",
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash",
+        confirmation_entry_id=12,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 3, 29, 19, 50, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 19, 45, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0012,
+                break_even_days_entry=0.35,
+                capacity_limit_notional=1000.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=21.0,
+                status="submitted",
+                simulated=False,
+                external_reference="cleanup-order",
+                request_payload={"reduce_only": True},
+            )
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=34,
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash",
+        legs=[
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="cleanup-order",
+                derived_state="unfilled",
+            )
+        ],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=34,
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=True,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=["ARB-USD-PERP"],
+                matched_leg_symbols=["ARB-USD-PERP"],
+                unmatched_leg_symbols=[],
+            )
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "cleanup_needed"
+    assert status.recommended_action == "close_open_leg"
+
+
 def test_extended_cleanup_preview_service_builds_reduce_only_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5866,6 +5982,169 @@ def test_paradex_cleanup_preview_service_logs_schema_fallbacks(
     assert "fallback symbol key" in caplog.text
 
 
+def test_paradex_cleanup_preview_service_uses_live_position_direction_over_execution_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=12,
+        executed_at=datetime(2026, 3, 29, 18, 0, tzinfo=UTC),
+        adapter="paired_cleanup:paradex_then_extended",
+        mode="live",
+        status="submitted",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        confirmation_entry_id=3,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 3, 29, 17, 59, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 17, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0012,
+                break_even_days_entry=0.35,
+                capacity_limit_notional=1000.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-close-order",
+            )
+        ],
+    )
+    pair_status = ExecutionPairStatus(
+        execution_entry_id=12,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        derived_state="cleanup_needed",
+        recommended_action="close_open_leg",
+        order_state=ExecutionOrderState(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            legs=[
+                ExecutionLegOrderState(
+                    venue="paradex",
+                    supported=True,
+                    external_reference="pdx-close-order",
+                    derived_state="unfilled",
+                )
+            ],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            status="submitted",
+            recommended_action="verify_fill_status",
+            matched_all_leg_symbols=False,
+            venues=[
+                ExecutionVenueReconciliation(
+                    venue="paradex",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=["ARB-USD-PERP"],
+                    matched_leg_symbols=["ARB-USD-PERP"],
+                    unmatched_leg_symbols=[],
+                )
+            ],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        assert venue == "paradex"
+        assert symbol == "ARB-USD-PERP"
+        return _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0002,
+            0.0892,
+            1_000,
+            0.0893,
+            1_000,
+            raw={
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "price_tick_size": "0.0001",
+                "max_order_size": "12000000",
+            },
+        )
+
+    class StubTokenProvider:
+        async def issue_jwt_token(
+            self,
+            *,
+            account_address: str,
+            private_key: str,
+            client: httpx.AsyncClient | None = None,
+            now: int | None = None,
+        ) -> str:
+            return "jwt-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "market": "ARB-USD-PERP",
+                        "size": "-123.1",
+                    }
+                ]
+            },
+        )
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        service = ParadexCleanupPreviewService(
+            account_address="0xabc",
+            private_key="0x123",
+            token_provider=StubTokenProvider(),
+            fetch_snapshot=fetch_snapshot,
+        )
+        preview = await service.preview_from_execution(entry=entry, pair_status=pair_status)
+        assert preview.leg.side == "buy"
+
+    asyncio.run(run())
+
+
+def test_row_represents_open_position_checks_all_numeric_quantity_fields() -> None:
+    assert _row_represents_open_position({"size": "0", "qty": "1"}) is True
+    assert _row_represents_open_position({"size": "0", "qty": "0"}) is False
+
+
 def test_hyperliquid_cleanup_preview_service_builds_reduce_only_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6165,6 +6444,7 @@ def test_hyperliquid_cleanup_preview_service_prefers_vault_address_when_configur
 
     asyncio.run(run())
 
+
 def test_cleanup_preview_router_dispatches_to_paradex_when_paradex_leg_is_open() -> None:
     entry = ExecutionJournalEntry(
         entry_id=12,
@@ -6293,6 +6573,842 @@ def test_cleanup_preview_router_dispatches_to_paradex_when_paradex_leg_is_open()
         preview = await router.preview_from_execution(entry=entry, pair_status=pair_status)
         assert preview.leg.venue == "paradex"
         assert preview.leg.side == "sell"
+
+    asyncio.run(run())
+
+
+def test_pair_close_preview_service_builds_reduce_only_pair_close() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    entry = ExecutionJournalEntry(
+        entry_id=12,
+        executed_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        adapter="paired_live:paradex_then_extended",
+        mode="live",
+        status="submitted",
+        paper_trade_id=paper_trade.entry_id,
+        preview_hash="preview-hash",
+        confirmation_entry_id=3,
+        paper_trade=paper_trade,
+        legs=[
+            ExecutionLegResult(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="ext-order",
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order",
+            ),
+        ],
+    )
+    pair_status = ExecutionPairStatus(
+        execution_entry_id=12,
+        paper_trade_id=8,
+        preview_hash="preview-hash",
+        derived_state="hedged",
+        recommended_action="monitor_open_hedge",
+        order_state=ExecutionOrderState(
+            execution_entry_id=12,
+            paper_trade_id=8,
+            preview_hash="preview-hash",
+            legs=[],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=12,
+            paper_trade_id=8,
+            preview_hash="preview-hash",
+            status="submitted",
+            recommended_action="monitor_open_hedge",
+            matched_all_leg_symbols=True,
+            venues=[
+                ExecutionVenueReconciliation(
+                    venue="paradex",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=["ARB-USD-PERP"],
+                    matched_leg_symbols=["ARB-USD-PERP"],
+                    unmatched_leg_symbols=[],
+                ),
+                ExecutionVenueReconciliation(
+                    venue="extended",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=["ARB-USD"],
+                    matched_leg_symbols=["ARB-USD"],
+                    unmatched_leg_symbols=[],
+                ),
+            ],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    class StubExtendedService:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int = 10,
+        ) -> ExecutionCleanupPreview:
+            assert pair_status.recommended_action == "close_open_leg"
+            return ExecutionCleanupPreview(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                generated_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+                preview_hash="cleanup-extended",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.0,
+                    quantity_text="124",
+                    reference_price=0.0881,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0882,
+                    worst_price_text="0.0882",
+                    reduce_only=True,
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[],
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+                notes=["extended close"],
+            )
+
+    class StubParadexService:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int = 10,
+        ) -> ExecutionCleanupPreview:
+            assert pair_status.recommended_action == "close_open_leg"
+            return ExecutionCleanupPreview(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                generated_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+                preview_hash="cleanup-paradex",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.4,
+                    quantity_text="124.40000000",
+                    reference_price=0.0885,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0884,
+                    worst_price_text="0.08840000",
+                    reduce_only=True,
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[],
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                    notes=[],
+                ),
+                notes=["paradex close"],
+            )
+
+    async def run() -> None:
+        service = PairClosePreviewService(
+            services={
+                "extended": StubExtendedService(),
+                "paradex": StubParadexService(),
+            }
+        )
+        preview = await service.preview_from_execution(entry=entry, pair_status=pair_status)
+        assert preview.reason == "close_pair"
+        assert [leg.venue for leg in preview.legs] == ["paradex", "extended"]
+        assert all(leg.reduce_only for leg in preview.legs)
+
+    asyncio.run(run())
+
+
+def test_pair_close_preview_service_rejects_flat_positions_on_both_venues() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    entry = ExecutionJournalEntry(
+        entry_id=12,
+        executed_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        adapter="paired_live:paradex_then_extended",
+        mode="live",
+        status="submitted",
+        paper_trade_id=paper_trade.entry_id,
+        preview_hash="preview-hash",
+        confirmation_entry_id=3,
+        paper_trade=paper_trade,
+        legs=[
+            ExecutionLegResult(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="ext-order",
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order",
+            ),
+        ],
+    )
+    pair_status = ExecutionPairStatus(
+        execution_entry_id=12,
+        paper_trade_id=8,
+        preview_hash="preview-hash",
+        derived_state="hedged",
+        recommended_action="monitor_open_hedge",
+        order_state=ExecutionOrderState(
+            execution_entry_id=12,
+            paper_trade_id=8,
+            preview_hash="preview-hash",
+            legs=[],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=12,
+            paper_trade_id=8,
+            preview_hash="preview-hash",
+            status="submitted",
+            recommended_action="monitor_open_hedge",
+            matched_all_leg_symbols=True,
+            venues=[
+                ExecutionVenueReconciliation(
+                    venue="paradex",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=[],
+                    matched_leg_symbols=[],
+                    unmatched_leg_symbols=["ARB-USD-PERP"],
+                ),
+                ExecutionVenueReconciliation(
+                    venue="extended",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=[],
+                    matched_leg_symbols=[],
+                    unmatched_leg_symbols=["ARB-USD"],
+                ),
+            ],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    class StubCloseService:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int = 10,
+        ) -> ExecutionCleanupPreview:
+            raise AssertionError("close preview should not be built when both venues are flat")
+
+    async def run() -> None:
+        service = PairClosePreviewService(
+            services={
+                "extended": StubCloseService(),
+                "paradex": StubCloseService(),
+            }
+        )
+        with pytest.raises(
+            ValueError, match="Pair close preview requires exactly two open legs across all venues"
+        ):
+            await service.preview_from_execution(entry=entry, pair_status=pair_status)
+
+    asyncio.run(run())
+
+
+def test_pair_close_live_execution_coordinator_submits_both_legs() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    confirmation = PairClosePreviewConfirmationEntry(
+        entry_id=22,
+        confirmed_at=datetime(2026, 3, 29, 13, 20, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="pair-close-hash",
+        preview=ExecutionPairClosePreview(
+            execution_entry_id=12,
+            paper_trade_id=8,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="pair-close-hash",
+            reason="close_pair",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.4,
+                    quantity_text="124.40000000",
+                    reference_price=0.0885,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0884,
+                    worst_price_text="0.08840000",
+                    reduce_only=True,
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[],
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.0,
+                    quantity_text="124",
+                    reference_price=0.0881,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0882,
+                    worst_price_text="0.0882",
+                    reduce_only=True,
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[],
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+            ],
+            notes=[],
+        ),
+    )
+
+    class StubParadexService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            assert confirmation.preview.leg.venue == "paradex"
+            return ExecutionJournalEntry(
+                executed_at=executed_at or datetime(2026, 3, 29, 13, 21, tzinfo=UTC),
+                adapter="paradex_cleanup_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="sell",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="pdx-close",
+                    )
+                ],
+            )
+
+    class StubExtendedService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            assert confirmation.preview.leg.venue == "extended"
+            return ExecutionJournalEntry(
+                executed_at=executed_at or datetime(2026, 3, 29, 13, 21, tzinfo=UTC),
+                adapter="extended_cleanup_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="buy",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="ext-close",
+                    )
+                ],
+            )
+
+    async def run() -> None:
+        coordinator = PairCloseLiveExecutionCoordinator(
+            services={
+                "extended": StubExtendedService(),
+                "paradex": StubParadexService(),
+            }
+        )
+        entry = await coordinator.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+        )
+        assert entry.adapter == "paired_cleanup:paradex_then_extended"
+        assert entry.status == "submitted"
+        assert [leg.venue for leg in entry.legs] == ["paradex", "extended"]
+
+    asyncio.run(run())
+
+
+def test_pair_close_live_execution_coordinator_rejects_mismatched_confirmation_trade() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    confirmation = PairClosePreviewConfirmationEntry(
+        entry_id=22,
+        confirmed_at=datetime(2026, 3, 29, 13, 20, tzinfo=UTC),
+        paper_trade_id=99,
+        label="arb_extended_paradex",
+        preview_hash="pair-close-hash",
+        preview=ExecutionPairClosePreview(
+            execution_entry_id=12,
+            paper_trade_id=99,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="pair-close-hash",
+            reason="close_pair",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.4,
+                    quantity_text="124.40000000",
+                    reference_price=0.0885,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0884,
+                    worst_price_text="0.08840000",
+                    reduce_only=True,
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[],
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.0,
+                    quantity_text="124",
+                    reference_price=0.0881,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0882,
+                    worst_price_text="0.0882",
+                    reduce_only=True,
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[],
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+            ],
+            notes=[],
+        ),
+    )
+
+    async def run() -> None:
+        coordinator = PairCloseLiveExecutionCoordinator(services={})
+        with pytest.raises(ValueError, match="does not belong to this paper trade"):
+            await coordinator.submit_confirmed_preview(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+            )
+
+    asyncio.run(run())
+
+
+def test_pair_close_live_execution_coordinator_rejects_reordered_first_venue_override() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    confirmation = PairClosePreviewConfirmationEntry(
+        entry_id=22,
+        confirmed_at=datetime(2026, 3, 29, 13, 20, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="pair-close-hash",
+        preview=ExecutionPairClosePreview(
+            execution_entry_id=12,
+            paper_trade_id=8,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="pair-close-hash",
+            reason="close_pair",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.4,
+                    quantity_text="124.40000000",
+                    reference_price=0.0885,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0884,
+                    worst_price_text="0.08840000",
+                    reduce_only=True,
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[],
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.0,
+                    quantity_text="124",
+                    reference_price=0.0881,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0882,
+                    worst_price_text="0.0882",
+                    reduce_only=True,
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[],
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+            ],
+            notes=[],
+        ),
+    )
+
+    async def run() -> None:
+        coordinator = PairCloseLiveExecutionCoordinator(services={})
+        with pytest.raises(ValueError, match="must preserve the confirmed venue order"):
+            await coordinator.submit_confirmed_preview(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+                first_venue="extended",
+            )
+
+    asyncio.run(run())
+
+
+def test_pair_close_live_execution_coordinator_rejects_non_reduce_only_leg() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    confirmation = PairClosePreviewConfirmationEntry(
+        entry_id=22,
+        confirmed_at=datetime(2026, 3, 29, 13, 20, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="pair-close-hash",
+        preview=ExecutionPairClosePreview(
+            execution_entry_id=12,
+            paper_trade_id=8,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="pair-close-hash",
+            reason="close_pair",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.4,
+                    quantity_text="124.40000000",
+                    reference_price=0.0885,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0884,
+                    worst_price_text="0.08840000",
+                    reduce_only=False,
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[],
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP", "reduce_only": False},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=124.0,
+                    quantity_text="124",
+                    reference_price=0.0881,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0882,
+                    worst_price_text="0.0882",
+                    reduce_only=True,
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[],
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+            ],
+            notes=[],
+        ),
+    )
+
+    class StubParadexService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            raise AssertionError("non-reduce-only preview should be rejected before dispatch")
+
+    class StubExtendedService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            raise AssertionError("non-reduce-only preview should be rejected before dispatch")
+
+    async def run() -> None:
+        coordinator = PairCloseLiveExecutionCoordinator(
+            services={
+                "extended": StubExtendedService(),
+                "paradex": StubParadexService(),
+            }
+        )
+        entry = await coordinator.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+        )
+        assert entry.status == "rejected"
+        assert entry.legs[0].venue == "paradex"
+        assert entry.legs[0].response_payload is not None
+        assert "reduce-only" in str(entry.legs[0].response_payload["error"])
 
     asyncio.run(run())
 

@@ -13,6 +13,7 @@ from carryme_runtime.cleanup_live_execution import CleanupLiveExecutionRouter
 from carryme_runtime.cleanup_preview import CleanupPreviewRouter
 from carryme_runtime.confirmation import (
     require_confirmed_cleanup_preview,
+    require_confirmed_pair_close_preview,
     require_confirmed_preview,
 )
 from carryme_runtime.execution import ExecutionAdapter, MockExecutionAdapter
@@ -31,6 +32,8 @@ from carryme_runtime.hyperliquid_live_execution import HyperliquidLiveExecutionS
 from carryme_runtime.intents import InvalidTradeCandidateError, build_trade_intent
 from carryme_runtime.opportunities import OpportunityService, UpstreamDataError, fetch_live_snapshot
 from carryme_runtime.order_preview import OrderPreviewService
+from carryme_runtime.pair_close_live_execution import PairCloseLiveExecutionCoordinator
+from carryme_runtime.pair_close_preview import PairClosePreviewService
 from carryme_runtime.paired_live_execution import (
     PairedLiveExecutionCoordinator,
     SingleVenueLiveExecutionService,
@@ -63,6 +66,8 @@ __all__ = [
     "LiveExecutionConfigMap",
     "MockExecutionAdapter",
     "OrderPreviewService",
+    "PairCloseLiveExecutionCoordinator",
+    "PairClosePreviewService",
     "PairedLiveExecutionCoordinator",
     "ParadexCleanupPreviewService",
     "ParadexLiveExecutionService",
@@ -76,11 +81,12 @@ __all__ = [
     "build_venue_execution_preflights",
     "reconcile_execution",
     "require_confirmed_cleanup_preview",
+    "require_confirmed_pair_close_preview",
+    "require_confirmed_preview",
     "ConnectorError",
     "InvalidTradeCandidateError",
     "OpportunityService",
     "UpstreamDataError",
     "fetch_live_snapshot",
     "filter_candidate_records",
-    "require_confirmed_preview",
 ]
