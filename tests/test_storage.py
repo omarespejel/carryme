@@ -12,13 +12,17 @@ from carryme_models import (
     FundingPairTradeIntent,
     OpportunityRecord,
     PaperTradeEntry,
+    PaperTradeOrderPreview,
+    PreviewConfirmationEntry,
     TradeLegIntent,
+    VenueOrderPreview,
 )
 from carryme_storage import (
     CandidateAlertStore,
     ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
+    PreviewConfirmationStore,
     WatchlistStore,
     load_watchlist,
     save_watchlist,
@@ -933,6 +937,205 @@ def test_execution_journal_store_rejects_non_positive_limits(
     invalid_limit: int,
 ) -> None:
     store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        store.list_recent(limit=invalid_limit)
+
+
+def test_preview_confirmation_store_appends_and_lists_recent(tmp_path: Path) -> None:
+    store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        quantity=10_845.0,
+                        quantity_text="10845.00000000",
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.09231064,
+                        worst_price_text="0.09231064",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                        auth_scheme="subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+    store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 11, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        quantity=10_845.0,
+                        quantity_text="10845.00000000",
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.09231064,
+                        worst_price_text="0.09231064",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                        auth_scheme="subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator reconfirmed",
+        )
+    )
+
+    entries = store.list_recent(limit=10)
+
+    assert len(entries) == 2
+    assert entries[0].confirmed_at > entries[1].confirmed_at
+    assert entries[0].paper_trade_id == 7
+    assert entries[1].paper_trade_id == 7
+    assert entries[1].preview.preview_hash == "preview-hash"
+    assert entries[0].preview.preview_hash == "preview-hash"
+
+
+def test_preview_confirmation_store_normalizes_labels_and_hashes(tmp_path: Path) -> None:
+    store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=7,
+            label="  arb_extended_paradex  ",
+            preview_hash=" preview-hash ",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        quantity=10_845.0,
+                        quantity_text="10845.00000000",
+                        reference_price=0.0922,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.09231064,
+                        worst_price_text="0.09231064",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                        auth_scheme="subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+
+    entries = store.list_recent(limit=10, label="arb_extended_paradex")
+
+    assert len(entries) == 1
+    assert entries[0].label == "arb_extended_paradex"
+    assert entries[0].preview_hash == "preview-hash"
+    assert entries[0].preview.preview_hash == "preview-hash"
+
+
+def test_preview_confirmation_store_rejects_preview_identifier_mismatches(
+    tmp_path: Path,
+) -> None:
+    store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="preview.paper_trade_id must match paper_trade_id"):
+        store.append(
+            PreviewConfirmationEntry(
+                confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                preview_hash="preview-hash",
+                preview=PaperTradeOrderPreview(
+                    paper_trade_id=8,
+                    label="arb_extended_paradex",
+                    generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                    slippage_tolerance_bps=12,
+                    preview_hash="preview-hash",
+                    legs=[
+                        VenueOrderPreview(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                            fee_profile="pro",
+                            side="buy",
+                            target_notional=1000.0,
+                            quantity=10_845.0,
+                            quantity_text="10845.00000000",
+                            reference_price=0.0922,
+                            reference_price_source="best_ask",
+                            worst_acceptable_price=0.09231064,
+                            worst_price_text="0.09231064",
+                            order_type="limit",
+                            time_in_force="ioc",
+                            http_method="POST",
+                            endpoint_path_hint="/v1/orders",
+                            required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                            auth_scheme="subkey private key",
+                            payload={"market": "ARB-USD-PERP"},
+                            notes=[],
+                        )
+                    ],
+                ),
+                note="operator confirmed",
+            )
+        )
+
+
+@pytest.mark.parametrize("invalid_limit", [0, -1])
+def test_preview_confirmation_store_rejects_non_positive_limits(
+    tmp_path: Path,
+    invalid_limit: int,
+) -> None:
+    store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
 
     with pytest.raises(ValueError, match="limit must be at least 1"):
         store.list_recent(limit=invalid_limit)

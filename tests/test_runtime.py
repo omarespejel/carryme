@@ -14,9 +14,11 @@ from carryme_models import (
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
+    PreviewConfirmationEntry,
     TopOfBook,
     TradeLegIntent,
     VenueExecutionPreflight,
+    VenueOrderPreview,
 )
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
@@ -27,6 +29,7 @@ from carryme_runtime import (
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
+    require_confirmed_preview,
 )
 
 
@@ -907,4 +910,112 @@ def test_build_trade_intent_rejects_zero_max_entry_notional() -> None:
             max_target_notional=1000.0,
             min_one_day_net_edge_after_entry=0.0,
             min_capacity_notional=0.0,
+        )
+
+
+def test_require_confirmed_preview_returns_matching_entry() -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=3,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=5,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=5,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    quantity=10_845.0,
+                    quantity_text="10845.00000000",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09231064,
+                    worst_price_text="0.09231064",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                    auth_scheme="subkey private key",
+                    payload={"market": "ARB-USD-PERP"},
+                    notes=[],
+                )
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    matched = require_confirmed_preview(
+        paper_trade_id=5,
+        preview_hash="preview-hash",
+        confirmations=[confirmation],
+    )
+
+    assert matched.entry_id == 3
+    assert matched.preview.preview_hash == "preview-hash"
+
+
+@pytest.mark.parametrize(
+    ("paper_trade_id", "preview_hash"),
+    [
+        (6, "preview-hash"),
+        (5, "wrong-hash"),
+    ],
+)
+def test_require_confirmed_preview_rejects_mismatches(
+    paper_trade_id: int,
+    preview_hash: str,
+) -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=3,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=5,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=5,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    quantity=10_845.0,
+                    quantity_text="10845.00000000",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09231064,
+                    worst_price_text="0.09231064",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                    auth_scheme="subkey private key",
+                    payload={"market": "ARB-USD-PERP"},
+                    notes=[],
+                )
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    with pytest.raises(ValueError, match="No preview confirmation matched"):
+        require_confirmed_preview(
+            paper_trade_id=paper_trade_id,
+            preview_hash=preview_hash,
+            confirmations=[confirmation],
         )

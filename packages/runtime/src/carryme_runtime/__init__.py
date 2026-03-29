@@ -3,6 +3,7 @@
 from carryme_connectors import ConnectorError
 
 from carryme_runtime.candidates import filter_candidate_records
+from carryme_runtime.confirmation import require_confirmed_preview
 from carryme_runtime.execution import ExecutionAdapter, MockExecutionAdapter
 from carryme_runtime.intents import InvalidTradeCandidateError, build_trade_intent
 from carryme_runtime.opportunities import OpportunityService, UpstreamDataError, fetch_live_snapshot
@@ -29,4 +30,5 @@ __all__ = [
     "UpstreamDataError",
     "fetch_live_snapshot",
     "filter_candidate_records",
+    "require_confirmed_preview",
 ]
