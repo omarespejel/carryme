@@ -52,9 +52,10 @@ async def fetch_live_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapsh
 
     async with httpx.AsyncClient(base_url=base_url, timeout=15.0) as client:
         connector = _build_connector(key, client)
-
-        stats = await connector.fetch_market_stats(symbol)
-        book = await connector.fetch_top_of_book(symbol)
+        stats, book = await asyncio.gather(
+            connector.fetch_market_stats(symbol),
+            connector.fetch_top_of_book(symbol),
+        )
 
     market = stats.model_copy(update={"top_of_book": book})
     try:

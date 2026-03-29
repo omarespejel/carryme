@@ -1,6 +1,7 @@
 import asyncio
 from typing import cast
 
+import httpx
 import pytest
 from carryme_api.app import app, get_opportunity_service
 from carryme_api.opportunities import (
@@ -224,6 +225,32 @@ def test_funding_pair_endpoint_maps_upstream_data_errors_to_bad_gateway() -> Non
     assert response.json()["detail"] == "malformed upstream payload"
 
 
+def test_funding_pair_endpoint_maps_httpx_errors_to_bad_gateway() -> None:
+    class FailingOpportunityService:
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            raise httpx.ConnectError("connection refused")
+
+    app.dependency_overrides[get_opportunity_service] = lambda: FailingOpportunityService()
+    client = TestClient(app)
+
+    response = client.get(
+        "/v1/opportunities/funding-pair",
+        params={
+            "left_venue": "extended",
+            "left_symbol": "STRK-USD",
+            "left_fee_profile": "default",
+            "right_venue": "hyperliquid",
+            "right_symbol": "STRK",
+            "right_fee_profile": "tier0",
+        },
+    )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 502
+    assert "connection refused" in response.json()["detail"]
+
+
 def test_opportunity_service_validates_fee_profiles_before_network_calls() -> None:
     class CountingFetcher:
         def __init__(self) -> None:
@@ -367,3 +394,49 @@ def test_fetch_live_snapshot_rejects_upstream_symbol_mismatch(
 
     with pytest.raises(UpstreamDataError, match="symbol mismatch"):
         asyncio.run(fetch_live_snapshot("extended", "STRK-USD"))
+
+
+def test_fetch_live_snapshot_fetches_stats_and_book_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CoordinatedConnector:
+        def __init__(self) -> None:
+            self.started: list[str] = []
+            self.release_both = asyncio.Event()
+
+        async def fetch_market_stats(self, _symbol: str) -> MarketStats:
+            self.started.append("stats")
+            if len(self.started) == 2:
+                self.release_both.set()
+            await asyncio.wait_for(self.release_both.wait(), timeout=0.1)
+            return MarketStats(
+                venue="extended",
+                symbol="STRK-USD",
+                mark_price=0.03455,
+                funding_rate=0.0002,
+                open_interest=1_000_000,
+                daily_volume=500_000,
+            )
+
+        async def fetch_top_of_book(self, _symbol: str) -> TopOfBook:
+            self.started.append("book")
+            if len(self.started) == 2:
+                self.release_both.set()
+            await asyncio.wait_for(self.release_both.wait(), timeout=0.1)
+            return TopOfBook(
+                best_bid_price=0.0345,
+                best_bid_size=100_000,
+                best_ask_price=0.0346,
+                best_ask_size=80_000,
+            )
+
+    connector = CoordinatedConnector()
+    monkeypatch.setattr(
+        "carryme_api.opportunities._build_connector",
+        lambda _venue, _client: connector,
+    )
+
+    snapshot = asyncio.run(fetch_live_snapshot("extended", "STRK-USD"))
+
+    assert set(connector.started) == {"stats", "book"}
+    assert snapshot.identity.canonical_symbol == "STRK-USD-PERP"
