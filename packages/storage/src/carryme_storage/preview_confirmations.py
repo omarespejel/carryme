@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC
 from pathlib import Path
 
 from carryme_models import PreviewConfirmationEntry
@@ -55,6 +56,27 @@ class PreviewConfirmationStore:
         """Append a preview confirmation entry and return it with its assigned id."""
 
         self.initialize()
+        if entry.confirmed_at.tzinfo is None or entry.confirmed_at.utcoffset() is None:
+            raise ValueError("confirmed_at must be timezone-aware")
+        normalized_label = entry.label.strip()
+        if not normalized_label:
+            raise ValueError("label must be non-empty")
+        normalized_preview_hash = entry.preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        normalized_entry = entry.model_copy(
+            update={
+                "confirmed_at": entry.confirmed_at.astimezone(UTC),
+                "label": normalized_label,
+                "preview_hash": normalized_preview_hash,
+                "preview": entry.preview.model_copy(
+                    update={
+                        "label": normalized_label,
+                        "preview_hash": normalized_preview_hash,
+                    }
+                ),
+            }
+        )
         with sqlite3.connect(self.database_path) as connection:
             cursor = connection.execute(
                 """
@@ -67,16 +89,16 @@ class PreviewConfirmationStore:
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    entry.confirmed_at.isoformat(),
-                    entry.paper_trade_id,
-                    entry.label,
-                    entry.preview_hash,
-                    entry.model_dump_json(),
+                    normalized_entry.confirmed_at.isoformat(),
+                    normalized_entry.paper_trade_id,
+                    normalized_label,
+                    normalized_preview_hash,
+                    normalized_entry.model_dump_json(),
                 ),
             )
         return PreviewConfirmationEntry.model_validate(
             {
-                **entry.model_dump(mode="json"),
+                **normalized_entry.model_dump(mode="json"),
                 "entry_id": cursor.lastrowid,
             }
         )
@@ -90,12 +112,15 @@ class PreviewConfirmationStore:
     ) -> list[PreviewConfirmationEntry]:
         """Return recent preview confirmation entries."""
 
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         self.initialize()
+        normalized_label = label.strip() if label is not None else None
         clauses: list[str] = []
         values: list[object] = []
-        if label:
+        if normalized_label:
             clauses.append("label = ?")
-            values.append(label)
+            values.append(normalized_label)
         if paper_trade_id is not None:
             clauses.append("paper_trade_id = ?")
             values.append(paper_trade_id)
@@ -105,7 +130,7 @@ class PreviewConfirmationStore:
         """
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY confirmed_at DESC LIMIT ?"
+        query += " ORDER BY confirmed_at DESC, id DESC LIMIT ?"
         values.append(limit)
 
         with sqlite3.connect(self.database_path) as connection:

@@ -15,8 +15,18 @@ class ParadexPublicConnector(BaseHttpConnector):
 
     venue = "paradex"
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        super().__init__(client)
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        max_attempts: int = 3,
+        base_backoff_seconds: float = 0.1,
+    ) -> None:
+        super().__init__(
+            client,
+            max_attempts=max_attempts,
+            base_backoff_seconds=base_backoff_seconds,
+        )
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         payload = await self._request_json("GET", "/v1/markets/summary", params={"market": symbol})
@@ -31,7 +41,7 @@ class ParadexPublicConnector(BaseHttpConnector):
             funding_rate=parse_float(row.get("funding_rate")),
             open_interest=parse_float(row.get("open_interest")),
             daily_volume=parse_float(row.get("volume_24h")),
-            raw=row,
+            raw=payload,
         )
 
     async def fetch_top_of_book(self, symbol: str) -> TopOfBook:

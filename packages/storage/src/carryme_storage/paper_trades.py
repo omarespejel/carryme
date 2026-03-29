@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC
 from pathlib import Path
 
 from carryme_models import PaperTradeEntry
@@ -48,6 +49,11 @@ class PaperTradeStore:
         """Append a paper trade entry and return it with its assigned id."""
 
         self.initialize()
+        if entry.created_at.tzinfo is None or entry.created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+        normalized_entry = entry.model_copy(
+            update={"created_at": entry.created_at.astimezone(UTC)}
+        )
         with sqlite3.connect(self.database_path) as connection:
             cursor = connection.execute(
                 """
@@ -59,15 +65,15 @@ class PaperTradeStore:
                 ) VALUES (?, ?, ?, ?)
                 """,
                 (
-                    entry.created_at.isoformat(),
-                    entry.intent.label,
-                    entry.intent.canonical_symbol,
-                    entry.model_dump_json(),
+                    normalized_entry.created_at.isoformat(),
+                    normalized_entry.intent.label,
+                    normalized_entry.intent.canonical_symbol,
+                    normalized_entry.model_dump_json(),
                 ),
             )
         return PaperTradeEntry.model_validate(
             {
-                **entry.model_dump(mode="json"),
+                **normalized_entry.model_dump(mode="json"),
                 "entry_id": cursor.lastrowid,
             }
         )
@@ -105,6 +111,8 @@ class PaperTradeStore:
     ) -> list[PaperTradeEntry]:
         """Return recent paper trade journal entries."""
 
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         self.initialize()
         query = """
             SELECT id, entry_json
@@ -116,7 +124,7 @@ class PaperTradeStore:
             params = (label, limit)
         else:
             params = (limit,)
-        query += " ORDER BY created_at DESC LIMIT ?"
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
 
         with sqlite3.connect(self.database_path) as connection:
             rows = connection.execute(query, params).fetchall()
