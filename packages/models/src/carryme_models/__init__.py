@@ -4,7 +4,7 @@ from carryme_models.account_preflight import (
     PaperTradeAccountPreflight,
     VenueAccountPreflight,
 )
-from carryme_models.confirmation import PreviewConfirmationEntry
+from carryme_models.confirmation import CleanupPreviewConfirmationEntry, PreviewConfirmationEntry
 from carryme_models.execution import (
     ExecutionJournalEntry,
     ExecutionLegOrderState,
@@ -46,6 +46,7 @@ __all__ = [
     "AppDescriptor",
     "CapacityEstimate",
     "CandidateAlertEvent",
+    "CleanupPreviewConfirmationEntry",
     "CredentialRequirementStatus",
     "ExecutionJournalEntry",
     "ExecutionLegResult",

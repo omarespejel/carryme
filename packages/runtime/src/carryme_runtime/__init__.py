@@ -8,7 +8,10 @@ from carryme_runtime.account_preflight import (
     VenueAccountProbe,
 )
 from carryme_runtime.candidates import filter_candidate_records
-from carryme_runtime.confirmation import require_confirmed_preview
+from carryme_runtime.confirmation import (
+    require_confirmed_cleanup_preview,
+    require_confirmed_preview,
+)
 from carryme_runtime.execution import ExecutionAdapter, MockExecutionAdapter
 from carryme_runtime.execution_order_state import (
     ExecutionOrderStateService,
@@ -55,6 +58,7 @@ __all__ = [
     "build_venue_execution_preflights",
     "build_live_submission_readiness",
     "reconcile_execution",
+    "require_confirmed_cleanup_preview",
     "require_confirmed_preview",
     "ConnectorError",
     "ExtendedLiveExecutionService",

@@ -14,6 +14,8 @@ from carryme_connectors import (
 )
 from carryme_models import (
     CapacityEstimate,
+    CleanupPreviewConfirmationEntry,
+    ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionLegOrderState,
     ExecutionLegResult,
@@ -1340,6 +1342,191 @@ def test_extended_live_execution_service_submits_confirmed_preview(
         assert entry.legs[0].response_payload is not None
         assert seen_request["id"] == "carryme-pt8-extended-sell"
         assert seen_request["fee"] == "0.00025"
+
+    asyncio.run(run())
+
+
+def test_extended_live_execution_service_submits_confirmed_cleanup_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_request: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/user/account/info":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "OK",
+                    "data": {
+                        "accountId": 258270,
+                        "status": "ACTIVE",
+                        "l2Key": (
+                            "0x61c5e7e8339b7d56f197f54ea91b776776690e3232313de0f2ecbd0ef76f466"
+                        ),
+                        "l2Vault": "10002",
+                    },
+                },
+            )
+        if request.url.path == "/api/v1/user/fees":
+            return httpx.Response(
+                200,
+                json={"status": "OK", "data": {"makerFee": "0", "takerFee": "0.00025"}},
+            )
+        if request.url.path == "/api/v1/user/order":
+            payload = json.loads(request.content.decode("utf-8"))
+            seen_request.update(payload)
+            assert payload["side"] == "BUY"
+            assert payload["reduceOnly"] is True
+            return httpx.Response(
+                200,
+                json={
+                    "status": "OK",
+                    "data": {"id": 654, "externalId": payload["id"]},
+                },
+            )
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=10.9962,
+                effective_notional=10.9962,
+                quantity=123.0,
+                quantity_text="123",
+                quantity_increment=1.0,
+                minimum_order_size=10.0,
+                minimum_notional=0.918,
+                reference_price=0.0894,
+                reference_price_source="best_ask",
+                worst_acceptable_price=0.0895,
+                worst_price_text="0.0895",
+                price_increment=0.0001,
+                max_order_value=1250000.0,
+                reduce_only=True,
+                endpoint_path_hint="/api/v1/user/order",
+                required_auth_env_vars=[
+                    "CARRYME_API_EXTENDED_API_KEY",
+                    "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
+                ],
+                auth_scheme="api key + Stark signing key",
+                payload={
+                    "symbol": "ARB-USD",
+                    "side": "BUY",
+                    "type": "LIMIT",
+                    "size": "123",
+                    "price": "0.0895",
+                    "time_in_force": "IOC",
+                    "client_order_id": "carryme-cleanup-pt8-buy",
+                    "reduce_only": True,
+                },
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    async def fetch_snapshot(_: str, __: str) -> NormalizedMarketSnapshot:
+        return _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.0894,
+            42_584.8,
+            0.0895,
+            42_473.0,
+            raw={
+                "name": "ARB-USD",
+                "assetName": "ARB",
+                "assetPrecision": 0,
+                "collateralAssetName": "USD",
+                "collateralAssetPrecision": 6,
+                "active": True,
+                "tradingConfig": {
+                    "minOrderSize": "10",
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                    "maxLimitOrderValue": "1250000",
+                },
+                "l2Config": {
+                    "type": "STARKX",
+                    "collateralId": "0x1",
+                    "syntheticId": "0x4152422d3100000000000000000000",
+                    "syntheticResolution": 10,
+                    "collateralResolution": 1000000,
+                },
+            },
+        )
+
+    async def run() -> None:
+        service = ExtendedLiveExecutionService(
+            api_key="extended-key",
+            stark_private_key="0x7a7ff6fd3cab02ccdcd4a572563f5976f8976899b03a39773795a3c486d4986",
+            fetch_snapshot=cast(Any, fetch_snapshot),
+        )
+        entry = await service.submit_confirmed_cleanup_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+        )
+        assert entry.adapter == "extended_cleanup_live"
+        assert entry.mode == "live"
+        assert entry.status == "submitted"
+        assert entry.preview_hash == "cleanup-hash"
+        assert entry.confirmation_entry_id == 11
+        assert entry.legs[0].status == "submitted"
+        assert entry.legs[0].external_reference == "carryme-cleanup-pt8-buy"
+        assert seen_request["id"] == "carryme-cleanup-pt8-buy"
+        assert seen_request["reduceOnly"] is True
 
     asyncio.run(run())
 
