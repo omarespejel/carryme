@@ -19,6 +19,9 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    FundingUniverseOpportunity,
+    FundingUniverseScan,
+    FundingUniverseVenueMarket,
     OpportunityRecord,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
@@ -40,6 +43,7 @@ from carryme_worker.main import (
     build_execution_observation_payload,
     build_health_payload,
     build_loop_payload,
+    build_universe_scan_payload,
 )
 from carryme_worker.main import (
     main as worker_main,
@@ -50,6 +54,7 @@ from carryme_worker.poller import (
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
+    UniverseScanSummary,
     _build_order_state_observers,
     install_signal_handlers,
     observe_live_executions_once,
@@ -57,6 +62,7 @@ from carryme_worker.poller import (
     run_polling_loop,
     run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
+    scan_funding_universe_once,
     summarize_candidates,
 )
 from pydantic import ValidationError
@@ -70,6 +76,16 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CARRYME_WORKER_SCORE_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_MIN_CANDIDATE_ENTRY_EDGE", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_MIN_CANDIDATE_CAPACITY_NOTIONAL", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_VENUES", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_RANKING", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_TARGET_NOTIONAL", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_MIN_CAPACITY_NOTIONAL", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_MIN_DAILY_VOLUME", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_MIN_OPEN_INTEREST", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_MIN_ROUNDTRIP_EDGE", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_MIN_EXECUTION_QUALITY_SCORE", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_MIN_EXECUTION_SAMPLES", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_LIMIT", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_STOP_SIGNALS", raising=False)
 
 
@@ -86,6 +102,14 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.score_timeout_seconds == 30.0
     assert settings.min_candidate_entry_edge == 0.0
     assert settings.min_candidate_capacity_notional == 0.0
+    assert settings.universe_scan_venues == ("extended", "paradex", "hyperliquid")
+    assert settings.universe_scan_ranking == "execution_adjusted_quality_pnl"
+    assert settings.universe_scan_target_notional == 5_000.0
+    assert settings.universe_scan_min_capacity_notional == 250.0
+    assert settings.universe_scan_min_daily_volume == 10_000.0
+    assert settings.universe_scan_min_open_interest == 50_000.0
+    assert settings.universe_scan_min_execution_samples == 0
+    assert settings.universe_scan_limit == 10
     assert settings.stop_signals == ("SIGINT", "SIGTERM")
     assert settings.database_path == "data/carryme.sqlite3"
     assert Path(settings.watchlist_path).is_file()
@@ -205,6 +229,26 @@ def test_worker_candidate_payload() -> None:
     assert payload == {
         "total_records": 3,
         "candidate_records": 1,
+    }
+
+
+def test_worker_universe_scan_payload() -> None:
+    payload = build_universe_scan_payload(
+        UniverseScanSummary(
+            overlap_count=94,
+            scanned_opportunities=10,
+            saved_records=10,
+            alert_events=2,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "overlap_count": 94,
+        "scanned_opportunities": 10,
+        "saved_records": 10,
+        "alert_events": 2,
+        "database_path": "tmp/history.sqlite3",
     }
 
 
@@ -565,6 +609,103 @@ def test_poll_watchlist_once_handles_empty_watchlist(tmp_path: Path) -> None:
     assert summary.saved_records == 0
     assert summary.failed_records == 0
     assert store.list_recent() == []
+
+
+def test_scan_funding_universe_once_saves_ranked_history_and_alerts(tmp_path: Path) -> None:
+    class StubUniverseScanner:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            return FundingUniverseScan(
+                venues=["extended", "paradex"],
+                ranking="execution_adjusted_quality_pnl",
+                target_notional=5000.0,
+                overlap_count=1,
+                overlaps=[],
+                opportunities=[
+                    FundingUniverseOpportunity(
+                        opportunity=FundingArbOpportunity(
+                            canonical_symbol="ARB-USD-PERP",
+                            long_venue="paradex",
+                            short_venue="extended",
+                            long_fee_profile="pro",
+                            short_fee_profile="default",
+                            gross_daily_edge=0.004,
+                            entry_cost_rate=0.00045,
+                            round_trip_cost_rate=0.0009,
+                            one_day_net_edge_after_entry=0.00355,
+                            one_day_net_edge_after_round_trip=0.0031,
+                            break_even_days_entry=0.2,
+                            break_even_days_round_trip=0.3,
+                            capacity=CapacityEstimate(
+                                short_bid_notional=1400.0,
+                                long_ask_notional=900.0,
+                                max_entry_notional=900.0,
+                                limiting_venue="paradex",
+                            ),
+                        ),
+                        venue_markets={
+                            "extended": FundingUniverseVenueMarket(
+                                venue="extended",
+                                symbol="ARB-USD",
+                                mark_price=0.091,
+                                daily_funding_rate=0.000312,
+                                open_interest=200_000,
+                                daily_volume=150_000,
+                                bid_notional=1400.0,
+                                ask_notional=1600.0,
+                            ),
+                            "paradex": FundingUniverseVenueMarket(
+                                venue="paradex",
+                                symbol="ARB-USD-PERP",
+                                mark_price=0.0911,
+                                daily_funding_rate=-0.0037,
+                                open_interest=180_000,
+                                daily_volume=140_000,
+                                bid_notional=1200.0,
+                                ask_notional=900.0,
+                            ),
+                        },
+                        min_daily_volume=140_000.0,
+                        min_open_interest=180_000.0,
+                        target_notional=5000.0,
+                        deployable_notional=900.0,
+                        estimated_one_day_pnl_after_entry=3.195,
+                        estimated_one_day_pnl_after_round_trip=2.79,
+                        quality_score=1.7,
+                    )
+                ],
+            )
+
+    events: list[CandidateAlertEvent] = []
+
+    class StubCandidateAlertSink:
+        def append(self, event: CandidateAlertEvent) -> None:
+            events.append(event)
+
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        min_candidate_entry_edge=0.001,
+        min_candidate_capacity_notional=500.0,
+    )
+    store = OpportunityHistoryStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_funding_universe_once(
+            settings,
+            scanner=StubUniverseScanner(),
+            store=store,
+            alert_sink=StubCandidateAlertSink(),
+            now=datetime(2026, 3, 29, 19, 0, tzinfo=UTC),
+        )
+    )
+
+    history = store.list_recent(limit=10)
+    assert summary.overlap_count == 1
+    assert summary.scanned_opportunities == 1
+    assert summary.saved_records == 1
+    assert summary.alert_events == 1
+    assert len(history) == 1
+    assert history[0].pair.label == "arb_extended_paradex"
+    assert len(events) == 1
 
 
 def test_run_polling_loop_applies_backoff_and_saves_after_retry(tmp_path: Path) -> None:
@@ -1979,6 +2120,21 @@ def test_worker_main_rejects_observation_mode_with_other_modes(
     assert "only supported with the looped worker modes" in stderr
 
 
+def test_worker_main_rejects_universe_scan_mode_with_iterations(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--scan-universe-once", "--iterations", "2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        worker_main()
+
+    _, stderr = capsys.readouterr()
+    assert "only supported with the looped worker modes" in stderr
+
+
 def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text('{"pairs": []}')
@@ -2888,5 +3044,42 @@ def test_worker_main_prints_execution_observation_summary_as_json(
         "saved_observations": 2,
         "saved_alerts": 1,
         "sent_notifications": 1,
+        "database_path": settings.database_path,
+    }
+
+
+def test_worker_main_prints_universe_scan_summary_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    async def fake_scan(settings: WorkerSettings) -> UniverseScanSummary:
+        return UniverseScanSummary(
+            overlap_count=2,
+            scanned_opportunities=4,
+            saved_records=3,
+            alert_events=2,
+            database_path=settings.database_path,
+        )
+
+    monkeypatch.setattr("carryme_worker.main.WorkerSettings", lambda: settings)
+    monkeypatch.setattr("carryme_worker.main.scan_funding_universe_once", fake_scan)
+    monkeypatch.setattr("sys.argv", ["carryme-worker", "--scan-universe-once"])
+
+    worker_main()
+
+    stdout, _ = capsys.readouterr()
+    assert json.loads(stdout) == {
+        "overlap_count": 2,
+        "scanned_opportunities": 4,
+        "saved_records": 3,
+        "alert_events": 2,
         "database_path": settings.database_path,
     }

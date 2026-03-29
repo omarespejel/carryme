@@ -14,12 +14,14 @@ from carryme_worker.poller import (
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
+    UniverseScanSummary,
     install_signal_handlers,
     observe_live_executions_once,
     poll_watchlist_once,
     run_polling_loop,
     run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
+    scan_funding_universe_once,
 )
 
 APP_NAME = "carryme-worker"
@@ -71,6 +73,18 @@ def build_candidate_payload(summary: CandidateRecordSummary) -> dict[str, int]:
     }
 
 
+def build_universe_scan_payload(summary: UniverseScanSummary) -> dict[str, int | str]:
+    """Build a deterministic summary payload for one universe scan."""
+
+    return {
+        "overlap_count": summary.overlap_count,
+        "scanned_opportunities": summary.scanned_opportunities,
+        "saved_records": summary.saved_records,
+        "alert_events": summary.alert_events,
+        "database_path": summary.database_path,
+    }
+
+
 def build_execution_observation_payload(
     summary: ExecutionObservationSummary,
 ) -> dict[str, int | str]:
@@ -111,6 +125,11 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="Poll the configured watchlist once")
     mode.add_argument(
+        "--scan-universe-once",
+        action="store_true",
+        help="Scan the configured live funding universe once",
+    )
+    mode.add_argument(
         "--observe-executions-once",
         action="store_true",
         help="Observe recent live executions once and persist snapshots",
@@ -135,7 +154,9 @@ def main() -> None:
 
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be at least 1")
-    if args.iterations is not None and (args.once or args.observe_executions_once):
+    if args.iterations is not None and (
+        args.once or args.scan_universe_once or args.observe_executions_once
+    ):
         parser.error("--iterations is only supported with the looped worker modes")
 
     settings = WorkerSettings()
@@ -143,6 +164,10 @@ def main() -> None:
     if args.once:
         summary = asyncio.run(poll_watchlist_once(settings))
         print(json.dumps(build_cycle_payload(summary), indent=2))
+        return
+    if args.scan_universe_once:
+        universe_summary = asyncio.run(scan_funding_universe_once(settings))
+        print(json.dumps(build_universe_scan_payload(universe_summary), indent=2))
         return
     if args.observe_executions_once:
         observation_summary = asyncio.run(observe_live_executions_once(settings))

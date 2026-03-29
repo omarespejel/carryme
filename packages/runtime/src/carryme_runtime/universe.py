@@ -537,3 +537,37 @@ def _execution_weight(opportunity: FundingUniverseOpportunity) -> float:
     ):
         return adjusted_pnl / raw_pnl
     return 1.0
+
+
+def build_pair_spec_from_universe_opportunity(
+    opportunity: FundingUniverseOpportunity,
+) -> FundingPairSpec:
+    """Convert a universe opportunity into a reusable pair spec."""
+
+    scored = opportunity.opportunity
+    short_market = opportunity.venue_markets[scored.short_venue]
+    long_market = opportunity.venue_markets[scored.long_venue]
+    base_asset = scored.canonical_symbol.split("-", 1)[0].lower()
+    return FundingPairSpec(
+        label=f"{base_asset}_{scored.short_venue}_{scored.long_venue}",
+        left_venue=scored.short_venue,
+        left_symbol=short_market.symbol,
+        left_fee_profile=scored.short_fee_profile,
+        right_venue=scored.long_venue,
+        right_symbol=long_market.symbol,
+        right_fee_profile=scored.long_fee_profile,
+    )
+
+
+def build_opportunity_record_from_universe_opportunity(
+    *,
+    recorded_at: datetime,
+    opportunity: FundingUniverseOpportunity,
+) -> OpportunityRecord:
+    """Convert a universe opportunity into a persisted opportunity record."""
+
+    return OpportunityRecord(
+        recorded_at=recorded_at,
+        pair=build_pair_spec_from_universe_opportunity(opportunity),
+        opportunity=opportunity.opportunity,
+    )
