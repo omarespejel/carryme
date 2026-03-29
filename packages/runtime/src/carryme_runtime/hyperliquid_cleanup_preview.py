@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from carryme_connectors import (
     ConnectorError,
@@ -128,7 +128,10 @@ class HyperliquidCleanupPreviewService:
         quantity = _snap_quantity(quantity, constraints.quantity_increment)
         if quantity <= 0:
             raise ValueError(f"Hyperliquid cleanup quantity snapped to zero for {symbol}")
-        sz_decimals = _raw_int(snapshot.market.raw, "szDecimals")
+        raw = snapshot.market.raw
+        if not isinstance(raw, dict):
+            raise ValueError(f"Hyperliquid is missing metadata required to format {symbol}")
+        sz_decimals = _raw_int(cast(dict[str, object], raw), "szDecimals")
         if sz_decimals is None:
             raise ValueError(f"Hyperliquid is missing szDecimals metadata for {symbol}")
         quantity, quantity_text = format_hyperliquid_size(quantity, sz_decimals=sz_decimals)
