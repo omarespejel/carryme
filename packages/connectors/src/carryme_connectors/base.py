@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
@@ -17,7 +18,7 @@ class PublicVenueConnector(Protocol):
     venue: str
 
     async def list_market_symbols(self) -> list[str]:
-        """Return all active perp symbols on the venue."""
+        """Return all active perp symbols on the venue in deterministic order."""
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         """Return normalized market stats for a venue symbol."""
@@ -130,6 +131,13 @@ class BaseHttpConnector:
         if delay_seconds is None:
             delay_seconds = self._base_backoff_seconds * (2 ** (attempt - 1))
         await asyncio.sleep(delay_seconds)
+
+
+def normalize_market_symbols(symbols: Iterable[str]) -> list[str]:
+    """Return unique, normalized symbols in deterministic order."""
+
+    normalized = {symbol.strip().upper() for symbol in symbols if symbol.strip()}
+    return sorted(normalized)
 
 
 def parse_float(value: Any) -> float | None:

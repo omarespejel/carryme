@@ -1,6 +1,8 @@
 """Funding-universe discovery and ranking models."""
 
-from pydantic import BaseModel, Field
+import math
+
+from pydantic import BaseModel, Field, model_validator
 
 from carryme_models.opportunity import FundingArbOpportunity
 
@@ -9,8 +11,8 @@ class FundingUniverseOverlap(BaseModel):
     """A canonical perp that exists on at least two venues."""
 
     canonical_symbol: str = Field(min_length=1)
-    venues: list[str] = Field(default_factory=list)
-    venue_symbols: dict[str, str] = Field(default_factory=dict)
+    venues: list[str] = Field(default_factory=list, min_length=2)
+    venue_symbols: dict[str, str] = Field(default_factory=dict, min_length=2)
 
 
 class FundingUniverseVenueMarket(BaseModel):
@@ -18,12 +20,12 @@ class FundingUniverseVenueMarket(BaseModel):
 
     venue: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
-    mark_price: float | None = None
+    mark_price: float | None = Field(default=None, ge=0)
     daily_funding_rate: float | None = None
-    open_interest: float | None = None
-    daily_volume: float | None = None
-    bid_notional: float | None = None
-    ask_notional: float | None = None
+    open_interest: float | None = Field(default=None, ge=0)
+    daily_volume: float | None = Field(default=None, ge=0)
+    bid_notional: float | None = Field(default=None, ge=0)
+    ask_notional: float | None = Field(default=None, ge=0)
 
 
 class FundingUniverseOpportunity(BaseModel):
@@ -31,8 +33,8 @@ class FundingUniverseOpportunity(BaseModel):
 
     opportunity: FundingArbOpportunity
     venue_markets: dict[str, FundingUniverseVenueMarket] = Field(default_factory=dict)
-    min_daily_volume: float | None = None
-    min_open_interest: float | None = None
+    min_daily_volume: float | None = Field(default=None, ge=0)
+    min_open_interest: float | None = Field(default=None, ge=0)
     target_notional: float | None = Field(default=None, ge=0)
     deployable_notional: float | None = Field(default=None, ge=0)
     estimated_one_day_pnl_after_entry: float | None = None
@@ -70,3 +72,16 @@ class FundingUniversePortfolioPlan(BaseModel):
     estimated_one_day_pnl_after_entry: float
     estimated_one_day_pnl_after_round_trip: float
     entries: list[FundingUniversePortfolioEntry] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_totals(self) -> "FundingUniversePortfolioPlan":
+        if not math.isclose(
+            self.target_notional,
+            self.allocated_notional + self.unused_notional,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "Portfolio plan target_notional must equal allocated_notional + unused_notional"
+            )
+        return self

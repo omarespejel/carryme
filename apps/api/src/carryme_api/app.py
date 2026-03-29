@@ -205,6 +205,7 @@ def get_opportunity_service() -> OpportunityService:
     return OpportunityService()
 
 
+@lru_cache
 def get_opportunity_universe_service() -> OpportunityUniverseService:
     """Return the live funding-universe discovery and ranking service."""
 
@@ -1766,7 +1767,7 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         if preview.preview_hash != normalized_preview_hash:
@@ -1893,7 +1894,7 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         saved_entry = execution_store.append(journal_entry)
@@ -3147,9 +3148,7 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/opportunities/funding-universe", response_model=FundingUniverseScan)
     async def funding_universe(
-        service: Annotated[
-            OpportunityUniverseService, Depends(get_opportunity_universe_service)
-        ],
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
         venues: list[str] | None = None,
         ranking: str = "quality_adjusted_roundtrip_pnl",
         target_notional: float = 5_000.0,
@@ -3181,9 +3180,7 @@ def create_app() -> FastAPI:
         response_model=FundingUniversePortfolioPlan,
     )
     async def funding_universe_portfolio(
-        service: Annotated[
-            OpportunityUniverseService, Depends(get_opportunity_universe_service)
-        ],
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
         venues: list[str] | None = None,
         ranking: str = "quality_adjusted_roundtrip_pnl",
         target_notional: float = 5_000.0,

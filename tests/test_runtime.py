@@ -234,9 +234,22 @@ def test_opportunity_universe_service_ranks_by_deployable_round_trip_pnl() -> No
         )
 
         ranked_symbols = [item.opportunity.canonical_symbol for item in scan.opportunities]
+        ranked_pairs = [
+            (item.opportunity.long_venue, item.opportunity.short_venue)
+            for item in scan.opportunities
+        ]
         assert scan.overlap_count == 2
         assert len(scan.opportunities) >= 1
         assert ranked_symbols[0] == "STRK-USD-PERP"
+        assert ranked_pairs[0] == ("paradex", "extended")
+        assert (
+            sum(
+                1
+                for item in scan.opportunities
+                if item.opportunity.canonical_symbol == "STRK-USD-PERP"
+            )
+                == 1
+        )
         assert scan.opportunities[0].estimated_one_day_pnl_after_round_trip is not None
         assert (scan.opportunities[0].deployable_notional or 0.0) > 1_000
 
@@ -245,8 +258,8 @@ def test_opportunity_universe_service_ranks_by_deployable_round_trip_pnl() -> No
 
 def test_opportunity_universe_service_filters_thin_markets_for_quality_scan() -> None:
     symbol_lists = {
-        "extended": ["MON-USD", "LIT-USD"],
-        "paradex": ["MON-USD-PERP", "LIT-USD-PERP"],
+        "extended": ["MON-USD", "ZEN-USD", "LIT-USD"],
+        "paradex": ["MON-USD-PERP", "ZEN-USD-PERP", "LIT-USD-PERP"],
     }
     snapshots = {
         ("extended", "MON-USD"): _snapshot(
@@ -258,7 +271,7 @@ def test_opportunity_universe_service_filters_thin_markets_for_quality_scan() ->
             0.0201,
             3_000,
             daily_volume=600,
-            open_interest=4_000,
+            open_interest=25_000,
         ),
         ("paradex", "MON-USD-PERP"): _snapshot(
             "paradex",
@@ -269,6 +282,28 @@ def test_opportunity_universe_service_filters_thin_markets_for_quality_scan() ->
             0.0201,
             2_500,
             daily_volume=700,
+            open_interest=26_000,
+        ),
+        ("extended", "ZEN-USD"): _snapshot(
+            "extended",
+            "ZEN-USD",
+            0.000013,
+            0.12,
+            10_000,
+            0.121,
+            3_000,
+            daily_volume=20_000,
+            open_interest=4_000,
+        ),
+        ("paradex", "ZEN-USD-PERP"): _snapshot(
+            "paradex",
+            "ZEN-USD-PERP",
+            -0.0011,
+            0.12,
+            5_000,
+            0.121,
+            2_500,
+            daily_volume=25_000,
             open_interest=4_500,
         ),
         ("extended", "LIT-USD"): _snapshot(
@@ -400,6 +435,95 @@ def test_build_portfolio_plan_allocates_ranked_opportunities_without_duplicates(
         scan,
         target_notional=3_000,
         max_positions=3,
+        min_selected_notional=100,
+    )
+
+    assert plan.allocated_notional == 3_000
+    assert plan.unused_notional == 0
+    assert len(plan.entries) == 2
+    assert plan.entries[0].opportunity.opportunity.canonical_symbol == "ARB-USD-PERP"
+    assert plan.entries[0].selected_notional == 1_000
+    assert plan.entries[1].opportunity.opportunity.canonical_symbol == "STRK-USD-PERP"
+    assert plan.entries[1].selected_notional == 2_000
+
+
+def test_build_portfolio_plan_binding_position_cap_skips_duplicates() -> None:
+    opportunity_high = FundingUniverseOpportunity(
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="ARB-USD-PERP",
+            long_venue="paradex",
+            short_venue="extended",
+            long_fee_profile="pro",
+            short_fee_profile="default",
+            gross_daily_edge=0.004,
+            entry_cost_rate=0.00045,
+            round_trip_cost_rate=0.0009,
+            one_day_net_edge_after_entry=0.00355,
+            one_day_net_edge_after_round_trip=0.0031,
+            break_even_days_entry=0.2,
+            break_even_days_round_trip=0.3,
+            capacity=CapacityEstimate(max_entry_notional=1_000, limiting_venue="paradex"),
+        ),
+        deployable_notional=1_000,
+        estimated_one_day_pnl_after_entry=3.55,
+        estimated_one_day_pnl_after_round_trip=3.1,
+        quality_score=2.0,
+    )
+    opportunity_duplicate_symbol = FundingUniverseOpportunity(
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="ARB-USD-PERP",
+            long_venue="hyperliquid",
+            short_venue="extended",
+            long_fee_profile="tier0",
+            short_fee_profile="default",
+            gross_daily_edge=0.003,
+            entry_cost_rate=0.0007,
+            round_trip_cost_rate=0.0014,
+            one_day_net_edge_after_entry=0.0023,
+            one_day_net_edge_after_round_trip=0.0016,
+            break_even_days_entry=0.4,
+            break_even_days_round_trip=0.6,
+            capacity=CapacityEstimate(max_entry_notional=700, limiting_venue="hyperliquid"),
+        ),
+        deployable_notional=700,
+        estimated_one_day_pnl_after_entry=1.61,
+        estimated_one_day_pnl_after_round_trip=1.12,
+        quality_score=1.0,
+    )
+    opportunity_second = FundingUniverseOpportunity(
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="STRK-USD-PERP",
+            long_venue="hyperliquid",
+            short_venue="extended",
+            long_fee_profile="tier0",
+            short_fee_profile="default",
+            gross_daily_edge=0.0014,
+            entry_cost_rate=0.0007,
+            round_trip_cost_rate=0.0014,
+            one_day_net_edge_after_entry=0.0007,
+            one_day_net_edge_after_round_trip=0.0,
+            break_even_days_entry=0.5,
+            break_even_days_round_trip=1.0,
+            capacity=CapacityEstimate(max_entry_notional=2_500, limiting_venue="extended"),
+        ),
+        deployable_notional=2_500,
+        estimated_one_day_pnl_after_entry=1.75,
+        estimated_one_day_pnl_after_round_trip=0.0,
+        quality_score=0.5,
+    )
+    scan = FundingUniverseScan(
+        venues=["extended", "paradex", "hyperliquid"],
+        ranking="quality_adjusted_roundtrip_pnl",
+        target_notional=5_000,
+        overlap_count=2,
+        overlaps=[],
+        opportunities=[opportunity_high, opportunity_duplicate_symbol, opportunity_second],
+    )
+
+    plan = build_portfolio_plan(
+        scan,
+        target_notional=3_000,
+        max_positions=2,
         min_selected_notional=100,
     )
 
@@ -6407,11 +6531,9 @@ def test_paradex_cleanup_preview_service_uses_live_position_direction_over_execu
 
     asyncio.run(run())
 
-
 def test_row_represents_open_position_checks_all_numeric_quantity_fields() -> None:
     assert _row_represents_open_position({"size": "0", "qty": "1"}) is True
     assert _row_represents_open_position({"size": "0", "qty": "0"}) is False
-
 
 def test_hyperliquid_cleanup_preview_service_builds_reduce_only_close(
     monkeypatch: pytest.MonkeyPatch,

@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 from carryme_models.market import MarketStats, TopOfBook
 
-from carryme_connectors.base import BaseHttpConnector, ConnectorError, parse_float
+from carryme_connectors.base import (
+    BaseHttpConnector,
+    ConnectorError,
+    normalize_market_symbols,
+    parse_float,
+)
+
+_logger = logging.getLogger(__name__)
 
 
 class HyperliquidPublicConnector(BaseHttpConnector):
@@ -40,11 +48,15 @@ class HyperliquidPublicConnector(BaseHttpConnector):
             raise ConnectorError("Hyperliquid universe payload must be a list")
         symbols: list[str] = []
         for row in rows:
-            if isinstance(row, dict):
-                name = row.get("name")
-                if isinstance(name, str):
-                    symbols.append(name)
-        return symbols
+            if not isinstance(row, dict):
+                _logger.warning("Hyperliquid universe row was not an object: %r", row)
+                raise ConnectorError("Hyperliquid universe rows must be objects")
+            name = row.get("name")
+            if not isinstance(name, str):
+                _logger.warning("Hyperliquid universe row missing name string: %r", row)
+                raise ConnectorError("Hyperliquid universe row missing name string")
+            symbols.append(name)
+        return normalize_market_symbols(symbols)
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         payload = await self._request_json("POST", "/info", json_body={"type": "metaAndAssetCtxs"})

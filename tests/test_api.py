@@ -200,7 +200,7 @@ def test_funding_universe_endpoint_uses_service_dependency() -> None:
                 venues=["extended", "paradex", "hyperliquid"],
                 ranking="quality_adjusted_roundtrip_pnl",
                 target_notional=5000.0,
-                overlap_count=2,
+                overlap_count=1,
                 overlaps=[
                     FundingUniverseOverlap(
                         canonical_symbol="LIT-USD-PERP",
@@ -267,23 +267,23 @@ def test_funding_universe_endpoint_uses_service_dependency() -> None:
             )
 
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
-    client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-universe",
-        params=[
-            ("venues", "extended"),
-            ("venues", "paradex"),
-            ("venues", "hyperliquid"),
-            ("target_notional", "5000"),
-        ],
-    )
-
-    app.dependency_overrides.clear()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("venues", "hyperliquid"),
+                ("target_notional", "5000"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["overlap_count"] == 2
+    assert payload["overlap_count"] == 1
     assert payload["opportunities"][0]["opportunity"]["canonical_symbol"] == "LIT-USD-PERP"
 
 
@@ -327,20 +327,20 @@ def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
             )
 
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
-    client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-universe/portfolio",
-        params=[
-            ("venues", "extended"),
-            ("venues", "paradex"),
-            ("venues", "hyperliquid"),
-            ("target_notional", "5000"),
-            ("max_positions", "3"),
-        ],
-    )
-
-    app.dependency_overrides.clear()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/portfolio",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("venues", "hyperliquid"),
+                ("target_notional", "5000"),
+                ("max_positions", "3"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     payload = response.json()

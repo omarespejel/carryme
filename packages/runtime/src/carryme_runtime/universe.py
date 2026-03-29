@@ -31,6 +31,7 @@ from carryme_scoring import score_funding_pair
 from carryme_runtime.opportunities import (
     VENUE_REGISTRY,
     SnapshotFetcher,
+    UpstreamDataError,
     fetch_live_snapshot,
 )
 
@@ -56,15 +57,17 @@ DEFAULT_FEE_PROFILES: dict[str, str] = {
 }
 
 
+def _default_universe_fee_profiles() -> dict[str, str]:
+    return {venue: DEFAULT_FEE_PROFILES.get(venue, "default") for venue in VENUE_REGISTRY}
+
+
 @dataclass
 class OpportunityUniverseService:
     """Discover overlapping markets and rank the live funding universe."""
 
     list_symbols: VenueSymbolLister = field(default_factory=lambda: list_live_symbols)
     fetch_snapshot: SnapshotFetcher = field(default_factory=lambda: fetch_live_snapshot)
-    default_fee_profiles: dict[str, str] = field(
-        default_factory=lambda: dict(DEFAULT_FEE_PROFILES)
-    )
+    default_fee_profiles: dict[str, str] = field(default_factory=_default_universe_fee_profiles)
 
     async def scan(
         self,
@@ -129,12 +132,9 @@ class OpportunityUniverseService:
         )
 
     async def discover_overlaps(self, venues: list[str]) -> list[FundingUniverseOverlap]:
-        normalized_venues = _normalize_venues(venues)
-        symbol_lists = await asyncio.gather(
-            *(self.list_symbols(venue) for venue in normalized_venues)
-        )
+        symbol_lists = await asyncio.gather(*(self.list_symbols(venue) for venue in venues))
         by_canonical_symbol: dict[str, dict[str, str]] = {}
-        for venue, symbols in zip(normalized_venues, symbol_lists, strict=True):
+        for venue, symbols in zip(venues, symbol_lists, strict=True):
             for symbol in symbols:
                 try:
                     identity = normalize_symbol(venue, symbol)
@@ -167,7 +167,7 @@ class OpportunityUniverseService:
         for key, task in tasks.items():
             try:
                 snapshots[key] = await task
-            except (ValueError, httpx.HTTPError):
+            except (ValueError, UpstreamDataError, httpx.HTTPError):
                 continue
         return snapshots
 
