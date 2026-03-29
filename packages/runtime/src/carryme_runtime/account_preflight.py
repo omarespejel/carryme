@@ -393,14 +393,11 @@ async def _fetch_extended_optional_rows(
     try:
         return await fetcher()
     except ConnectorError as exc:
-        if "status 404" not in str(exc):
-            raise
-        return {
-            "data": [],
-            "notes": [f"Extended {resource_label} endpoint returned 404; treated as empty"],
-        }
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 404:
+        cause = exc.__cause__
+        if not (
+            isinstance(cause, httpx.HTTPStatusError)
+            and cause.response.status_code == 404
+        ):
             raise
         return {
             "data": [],
