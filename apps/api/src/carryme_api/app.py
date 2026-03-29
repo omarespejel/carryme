@@ -374,6 +374,10 @@ def get_paired_live_execution_coordinator(
         ExtendedLiveExecutionService,
         Depends(get_extended_live_execution_service),
     ],
+    hyperliquid_service: Annotated[
+        HyperliquidLiveExecutionService,
+        Depends(get_hyperliquid_live_execution_service),
+    ],
     paradex_service: Annotated[
         ParadexLiveExecutionService,
         Depends(get_paradex_live_execution_service),
@@ -384,6 +388,7 @@ def get_paired_live_execution_coordinator(
     return PairedLiveExecutionCoordinator(
         services={
             "extended": extended_service,
+            "hyperliquid": hyperliquid_service,
             "paradex": paradex_service,
         }
     )

@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 import pytest
@@ -3484,6 +3484,149 @@ def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails()
         assert entry.status == "partial"
         assert [leg.status for leg in entry.legs] == ["submitted", "rejected"]
         assert entry.legs[1].response_payload == {"error": "paradex reject", "venue": "paradex"}
+
+    asyncio.run(run())
+
+
+def test_paired_live_execution_coordinator_supports_hyperliquid_leg() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=13,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_hyperliquid",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00042,
+            break_even_days_entry=0.63,
+            capacity_limit_notional=126.83,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="hyperliquid",
+                symbol="ARB",
+                fee_profile="tier0",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    confirmation = PreviewConfirmationEntry(
+        entry_id=10,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=13,
+        label="arb_extended_hyperliquid",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=13,
+            label="arb_extended_hyperliquid",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    quantity=123.0,
+                    quantity_text="123",
+                    reference_price=0.0890,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0889,
+                    worst_price_text="0.0889",
+                    endpoint_path_hint="/api/v1/user/order",
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD"},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="hyperliquid",
+                    symbol="ARB",
+                    fee_profile="tier0",
+                    side="buy",
+                    target_notional=11.0,
+                    quantity=119.3,
+                    quantity_text="119.3",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09229,
+                    worst_price_text="0.09229",
+                    endpoint_path_hint="/exchange",
+                    auth_scheme="account address + API wallet private key",
+                    payload={"coin": "ARB"},
+                    notes=[],
+                ),
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    class StubService:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            symbol = next(
+                leg.symbol for leg in confirmation.preview.legs if leg.venue == self.venue
+            )
+            fee_profile = "default" if self.venue == "extended" else "tier0"
+            side: Literal["buy", "sell"] = (
+                "sell" if self.venue == "extended" else "buy"
+            )
+            return ExecutionJournalEntry(
+                executed_at=executed_at or datetime.now(UTC),
+                adapter=f"{self.venue}_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue=self.venue,
+                        symbol=symbol,
+                        fee_profile=fee_profile,
+                        side=side,
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference=f"{self.venue}-1",
+                    )
+                ],
+            )
+
+    async def run() -> None:
+        service = PairedLiveExecutionCoordinator(
+            services={
+                "extended": StubService("extended"),
+                "hyperliquid": StubService("hyperliquid"),
+            }
+        )
+        entry = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            first_venue="extended",
+        )
+        assert entry.status == "submitted"
+        assert entry.adapter == "paired_live:extended_then_hyperliquid"
+        assert [leg.venue for leg in entry.legs] == ["extended", "hyperliquid"]
 
     asyncio.run(run())
 
