@@ -51,7 +51,6 @@ from carryme_runtime import (
     HyperliquidLiveExecutionService,
     HyperliquidOrderStateObserver,
     InvalidTradeCandidateError,
-    LiveExecutionConfigMap,
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
@@ -439,34 +438,6 @@ def get_order_preview_service() -> OrderPreviewService:
 
     return OrderPreviewService()
 
-
-def _build_live_execution_configs(settings: ApiSettings) -> LiveExecutionConfigMap:
-    """Build the current venue credential map from API settings."""
-
-    return {
-        "extended": {
-            "enabled": settings.extended_live_enabled,
-            "credentials": {
-                "api_key": settings.extended_api_key,
-                "stark_private_key": settings.extended_stark_private_key,
-            },
-        },
-        "paradex": {
-            "enabled": settings.paradex_live_enabled,
-            "credentials": {
-                "account_address": settings.paradex_account_address,
-                "private_key": settings.paradex_private_key,
-            },
-        },
-        "hyperliquid": {
-            "enabled": settings.hyperliquid_live_enabled,
-            "credentials": {
-                "account_address": settings.hyperliquid_account_address,
-                "vault_address": settings.hyperliquid_vault_address,
-                "api_wallet_private_key": settings.hyperliquid_api_wallet_private_key,
-            },
-        },
-    }
 def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightConfigMap:
     """Build the authenticated-read account probe config map from API settings."""
 
