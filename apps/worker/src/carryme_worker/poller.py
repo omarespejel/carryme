@@ -13,6 +13,7 @@ from typing import Literal, Protocol, cast
 
 import httpx
 from carryme_models import (
+    ApprovedCanaryAlertEvent,
     ApprovedCanarySnapshot,
     CandidateAlertEvent,
     ExecutionAlertEvent,
@@ -45,6 +46,7 @@ from carryme_runtime import (
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
+    ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
     CandidateAlertStore,
     ExecutionAlertStore,
@@ -107,6 +109,12 @@ class CandidateAlertSink(Protocol):
     """Append-only sink for emitted candidate alert events."""
 
     def append(self, event: CandidateAlertEvent) -> bool: ...
+
+
+class ApprovedCanaryAlertSink(Protocol):
+    """Append-only sink for emitted approved-canary alert events."""
+
+    def append(self, event: ApprovedCanaryAlertEvent) -> None: ...
 
 
 class ExecutionAlertSink(Protocol):
@@ -176,6 +184,7 @@ class ApprovedCanaryScanSummary:
     scanned_candidates: int
     approved_candidates: int
     saved_snapshots: int
+    alert_events: int
     database_path: str
     snapshots: list[ApprovedCanarySnapshot] = field(default_factory=list, repr=False)
 
@@ -190,6 +199,7 @@ class ApprovedCanaryScanLoopSummary:
     scanned_candidates: int
     approved_candidates: int
     saved_snapshots: int
+    alert_events: int
     database_path: str
 
 
@@ -403,12 +413,14 @@ async def scan_approved_canary_once(
     scanner: OpportunityUniverseService | None = None,
     approval_service: RouteApprovalService | None = None,
     store: ApprovedCanaryStore | None = None,
+    alert_sink: ApprovedCanaryAlertSink | None = None,
     now: datetime | None = None,
 ) -> ApprovedCanaryScanSummary:
     """Scan the live universe for canaries that are currently operator-approved."""
 
     timestamp = now or datetime.now(UTC)
     snapshot_store = store or ApprovedCanaryStore(settings.database_path)
+    approved_canary_alert_sink = alert_sink or ApprovedCanaryAlertStore(settings.database_path)
     route_approval_service = approval_service or RouteApprovalService(
         store=RouteApprovalStore(settings.database_path)
     )
@@ -442,6 +454,14 @@ async def scan_approved_canary_once(
         limit=settings.approved_canary_scan_limit,
     )
     approved_candidates = route_approval_service.filter_approved_canary_candidates(candidates)
+    approved_labels = {
+        approval.label
+        for approval in route_approval_service.list_recent(limit=1_000, approved=True)
+    }
+    previous_snapshots = {
+        label: snapshot_store.latest(label=label)
+        for label in approved_labels
+    }
     snapshots: list[ApprovedCanarySnapshot] = []
     for candidate in approved_candidates:
         approval = route_approval_service.get_for_candidate(candidate)
@@ -459,10 +479,20 @@ async def scan_approved_canary_once(
             )
         )
 
+    alert_events = _emit_approved_canary_alerts(
+        approved_labels=approved_labels,
+        previous_snapshots=previous_snapshots,
+        current_snapshots=snapshots,
+        max_snapshot_age_seconds=settings.approved_canary_alert_max_snapshot_age_seconds,
+        emitted_at=timestamp,
+        sink=approved_canary_alert_sink,
+    )
+
     return ApprovedCanaryScanSummary(
         scanned_candidates=len(candidates),
         approved_candidates=len(approved_candidates),
         saved_snapshots=len(snapshots),
+        alert_events=alert_events,
         database_path=settings.database_path,
         snapshots=snapshots,
     )
@@ -572,6 +602,7 @@ async def run_supervised_approved_canary_scan_loop(
     scanner: OpportunityUniverseService | None = None,
     approval_service: RouteApprovalService | None = None,
     store: ApprovedCanaryStore | None = None,
+    alert_sink: ApprovedCanaryAlertSink | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     logger: logging.Logger | None = None,
     stop_event: asyncio.Event | None = None,
@@ -583,6 +614,7 @@ async def run_supervised_approved_canary_scan_loop(
         raise ValueError("max_iterations must be at least 1")
 
     snapshot_store = store or ApprovedCanaryStore(settings.database_path)
+    approved_canary_alert_sink = alert_sink or ApprovedCanaryAlertStore(settings.database_path)
     loop_logger = logger or logging.getLogger("carryme.worker")
     supervised_stop_event = stop_event or asyncio.Event()
 
@@ -592,6 +624,7 @@ async def run_supervised_approved_canary_scan_loop(
     scanned_candidates = 0
     approved_candidates = 0
     saved_snapshots = 0
+    alert_events = 0
     consecutive_failures = 0
 
     while not supervised_stop_event.is_set():
@@ -603,21 +636,24 @@ async def run_supervised_approved_canary_scan_loop(
                 scanner=scanner,
                 approval_service=approval_service,
                 store=snapshot_store,
+                alert_sink=approved_canary_alert_sink,
             )
             successful_cycles += 1
             consecutive_failures = 0
             scanned_candidates += summary.scanned_candidates
             approved_candidates += summary.approved_candidates
             saved_snapshots += summary.saved_snapshots
+            alert_events += summary.alert_events
             loop_logger.info(
                 (
                     "completed supervised approved canary scan cycle %s with %s candidates, "
-                    "%s approved candidates, and %s saved snapshots"
+                    "%s approved candidates, %s saved snapshots, and %s alerts"
                 ),
                 attempts,
                 summary.scanned_candidates,
                 summary.approved_candidates,
                 summary.saved_snapshots,
+                summary.alert_events,
             )
             if max_iterations is not None and attempts >= max_iterations:
                 break
@@ -657,8 +693,91 @@ async def run_supervised_approved_canary_scan_loop(
         scanned_candidates=scanned_candidates,
         approved_candidates=approved_candidates,
         saved_snapshots=saved_snapshots,
+        alert_events=alert_events,
         database_path=settings.database_path,
     )
+
+
+def _emit_approved_canary_alerts(
+    *,
+    approved_labels: set[str],
+    previous_snapshots: dict[str, ApprovedCanarySnapshot | None],
+    current_snapshots: list[ApprovedCanarySnapshot],
+    max_snapshot_age_seconds: int,
+    emitted_at: datetime,
+    sink: ApprovedCanaryAlertSink,
+) -> int:
+    """Emit transition alerts for approved-canary availability changes."""
+
+    current_by_label = {snapshot.label: snapshot for snapshot in current_snapshots}
+    alert_events = 0
+    for label in sorted(approved_labels):
+        previous_snapshot = previous_snapshots.get(label)
+        current_snapshot = current_by_label.get(label)
+
+        if current_snapshot is not None:
+            if previous_snapshot is None:
+                sink.append(
+                    ApprovedCanaryAlertEvent(
+                        emitted_at=emitted_at,
+                        alert_type="approved_canary_available",
+                        max_snapshot_age_seconds=max_snapshot_age_seconds,
+                        current_snapshot=current_snapshot,
+                        previous_snapshot=None,
+                    )
+                )
+                alert_events += 1
+                continue
+
+            if _snapshot_payload_changed(previous_snapshot, current_snapshot):
+                sink.append(
+                    ApprovedCanaryAlertEvent(
+                        emitted_at=emitted_at,
+                        alert_type="approved_canary_changed",
+                        max_snapshot_age_seconds=max_snapshot_age_seconds,
+                        current_snapshot=current_snapshot,
+                        previous_snapshot=previous_snapshot,
+                    )
+                )
+                alert_events += 1
+            continue
+
+        if previous_snapshot is None:
+            continue
+
+        snapshot_age_seconds = (emitted_at - previous_snapshot.captured_at).total_seconds()
+        if snapshot_age_seconds <= max_snapshot_age_seconds:
+            continue
+
+        sink.append(
+            ApprovedCanaryAlertEvent(
+                emitted_at=emitted_at,
+                alert_type="approved_canary_stale",
+                max_snapshot_age_seconds=max_snapshot_age_seconds,
+                current_snapshot=None,
+                previous_snapshot=previous_snapshot,
+            )
+        )
+        alert_events += 1
+
+    return alert_events
+
+
+def _snapshot_payload_changed(
+    previous_snapshot: ApprovedCanarySnapshot,
+    current_snapshot: ApprovedCanarySnapshot,
+) -> bool:
+    """Return whether the meaningful approved-canary payload changed."""
+
+    previous_payload = previous_snapshot.model_dump(
+        mode="python",
+        exclude={"snapshot_id", "captured_at"},
+    )
+    current_payload = current_snapshot.model_dump(
+        mode="python",
+        exclude={"snapshot_id", "captured_at"},
+    )
+    return previous_payload != current_payload
 
 
 def summarize_candidates(

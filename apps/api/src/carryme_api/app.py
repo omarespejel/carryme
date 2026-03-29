@@ -15,6 +15,7 @@ import httpx
 from carryme_models import (
     SUPPORTED_UNIVERSE_VENUES,
     AppDescriptor,
+    ApprovedCanaryAlertEvent,
     ApprovedCanarySnapshot,
     CanaryLifecycleResult,
     CandidateAlertEvent,
@@ -102,6 +103,7 @@ from carryme_runtime import (
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
+    ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
     BalanceSnapshotStore,
     CandidateAlertStore,
@@ -317,6 +319,14 @@ def get_approved_canary_store(
     """Return the shared approved-canary snapshot store."""
 
     return ApprovedCanaryStore(settings.database_path)
+
+
+def get_approved_canary_alert_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ApprovedCanaryAlertStore:
+    """Return the shared approved-canary alert store."""
+
+    return ApprovedCanaryAlertStore(settings.database_path)
 
 
 def get_route_stability_service(
@@ -2267,6 +2277,22 @@ def create_app() -> FastAPI:
         if snapshot is None:
             raise HTTPException(status_code=404, detail="No approved canary snapshot found")
         return snapshot
+
+    @app.get(
+        "/v1/alerts/approved-canaries",
+        response_model=list[ApprovedCanaryAlertEvent],
+    )
+    def approved_canary_alerts(
+        store: Annotated[
+            ApprovedCanaryAlertStore,
+            Depends(get_approved_canary_alert_store),
+        ],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[ApprovedCanaryAlertEvent]:
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return store.list_recent(limit=limit, label=label)
 
     @app.put(
         "/v1/opportunities/route-approvals/{label}",

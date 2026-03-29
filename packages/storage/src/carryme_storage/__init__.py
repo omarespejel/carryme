@@ -2,6 +2,7 @@
 
 from carryme_storage.alerts import CandidateAlertStore
 from carryme_storage.approved_canaries import ApprovedCanaryStore
+from carryme_storage.approved_canary_alerts import ApprovedCanaryAlertStore
 from carryme_storage.balance_snapshots import BalanceSnapshotStore
 from carryme_storage.cleanup_preview_confirmations import CleanupPreviewConfirmationStore
 from carryme_storage.execution_alerts import ExecutionAlertStore
@@ -15,6 +16,7 @@ from carryme_storage.route_approvals import RouteApprovalStore
 from carryme_storage.watchlist import WatchlistStore, load_watchlist, save_watchlist
 
 __all__ = [
+    "ApprovedCanaryAlertStore",
     "ApprovedCanaryStore",
     "CandidateAlertStore",
     "BalanceSnapshotStore",

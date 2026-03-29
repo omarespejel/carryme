@@ -8,6 +8,7 @@ from typing import Any, cast
 import httpx
 import pytest
 from carryme_models import (
+    ApprovedCanarySnapshot,
     CandidateAlertEvent,
     CapacityEstimate,
     ExecutionAlertEvent,
@@ -32,6 +33,7 @@ from carryme_models import (
 )
 from carryme_runtime import AccountPreflightService, ExecutionOrderStateService
 from carryme_storage import (
+    ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
@@ -316,6 +318,7 @@ def test_worker_approved_canary_scan_payload() -> None:
             scanned_candidates=4,
             approved_candidates=2,
             saved_snapshots=2,
+            alert_events=1,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -324,6 +327,7 @@ def test_worker_approved_canary_scan_payload() -> None:
         "scanned_candidates": 4,
         "approved_candidates": 2,
         "saved_snapshots": 2,
+        "alert_events": 1,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -337,6 +341,7 @@ def test_worker_approved_canary_scan_loop_payload() -> None:
             scanned_candidates=9,
             approved_candidates=4,
             saved_snapshots=4,
+            alert_events=2,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -348,6 +353,7 @@ def test_worker_approved_canary_scan_loop_payload() -> None:
         "scanned_candidates": 9,
         "approved_candidates": 4,
         "saved_snapshots": 4,
+        "alert_events": 2,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -944,25 +950,125 @@ def test_scan_approved_canary_once_saves_operator_approved_snapshots(tmp_path: P
         )
     )
     snapshot_store = ApprovedCanaryStore(settings.database_path)
+    alert_store = ApprovedCanaryAlertStore(settings.database_path)
 
     summary = asyncio.run(
         scan_approved_canary_once(
             settings,
             scanner=cast(Any, StubUniverseScanner()),
             store=snapshot_store,
+            alert_sink=alert_store,
             now=datetime(2026, 3, 29, 20, 5, tzinfo=UTC),
         )
     )
 
     snapshots = snapshot_store.list_recent(limit=10)
+    alerts = alert_store.list_recent(limit=10, label="arb_extended_paradex")
 
     assert summary.scanned_candidates == 1
     assert summary.approved_candidates == 1
     assert summary.saved_snapshots == 1
+    assert summary.alert_events == 1
     assert len(snapshots) == 1
     assert snapshots[0].label == "arb_extended_paradex"
     assert snapshots[0].candidate.suggested_canary_notional == 11.0
     assert snapshots[0].approval.max_live_notional == 11.0
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "approved_canary_available"
+
+
+def test_scan_approved_canary_once_emits_stale_alert_for_missing_route(tmp_path: Path) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        approved_canary_alert_max_snapshot_age_seconds=300,
+    )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+    snapshot_store.append(
+        ApprovedCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            approval=approval_store.list_recent(limit=1, label="arb_extended_paradex")[0],
+        )
+    )
+
+    class EmptyUniverseScanner:
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            return []
+
+    alert_store = ApprovedCanaryAlertStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, EmptyUniverseScanner()),
+            store=snapshot_store,
+            alert_sink=alert_store,
+            now=datetime(2026, 3, 29, 20, 6, tzinfo=UTC),
+        )
+    )
+
+    alerts = alert_store.list_recent(limit=10, label="arb_extended_paradex")
+
+    assert summary.scanned_candidates == 0
+    assert summary.approved_candidates == 0
+    assert summary.saved_snapshots == 0
+    assert summary.alert_events == 1
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "approved_canary_stale"
 
 
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
@@ -982,18 +1088,21 @@ def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
         scanner: object | None = None,
         approval_service: object | None = None,
         store: object | None = None,
+        alert_sink: object | None = None,
         now: datetime | None = None,
     ) -> ApprovedCanaryScanSummary:
         assert settings_arg is settings
         _ = scanner
         _ = approval_service
         _ = store
+        _ = alert_sink
         assert now is None
         calls.append(1)
         return ApprovedCanaryScanSummary(
             scanned_candidates=2,
             approved_candidates=1,
             saved_snapshots=1,
+            alert_events=1,
             database_path=settings.database_path,
         )
 
@@ -1010,6 +1119,7 @@ def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
             run_supervised_approved_canary_scan_loop(
                 settings,
                 store=ApprovedCanaryStore(settings.database_path),
+                alert_sink=ApprovedCanaryAlertStore(settings.database_path),
                 sleep=fake_sleep,
                 max_iterations=2,
             )
@@ -1021,6 +1131,7 @@ def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
     assert summary.scanned_candidates == 4
     assert summary.approved_candidates == 2
     assert summary.saved_snapshots == 2
+    assert summary.alert_events == 2
     assert calls == [1, 1]
     assert sleeps == [3.0]
 

@@ -8,6 +8,7 @@ import carryme_models as carryme_models_module
 import pytest
 from carryme_api.app import (
     app,
+    get_approved_canary_alert_store,
     get_approved_canary_store,
     get_balance_accounting_service,
     get_execution_accounting_service,
@@ -20,6 +21,7 @@ from carryme_api.app import (
 )
 from carryme_api.config import ApiSettings
 from carryme_models import (
+    ApprovedCanaryAlertEvent,
     ApprovedCanarySnapshot,
     CandidateAlertEvent,
     CapacityEstimate,
@@ -61,6 +63,7 @@ from carryme_models import (
     VenueOrderPreview,
 )
 from carryme_storage import (
+    ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
     BalanceSnapshotStore,
     CandidateAlertStore,
@@ -811,6 +814,87 @@ def test_latest_approved_canary_snapshot_endpoint_returns_latest(tmp_path: Path)
     payload = response.json()
     assert payload["label"] == "arb_extended_paradex"
     assert payload["approval"]["max_live_notional"] == 11.0
+
+
+def test_approved_canary_alerts_endpoint_lists_recent(tmp_path: Path) -> None:
+    store = ApprovedCanaryAlertStore(tmp_path / "history.sqlite3")
+    current_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=2,
+        captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    store.append(
+        ApprovedCanaryAlertEvent(
+            emitted_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
+            alert_type="approved_canary_available",
+            max_snapshot_age_seconds=300,
+            current_snapshot=current_snapshot,
+            previous_snapshot=None,
+        )
+    )
+
+    app.dependency_overrides[get_approved_canary_alert_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/alerts/approved-canaries",
+        params={"label": "arb_extended_paradex", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["alert_type"] == "approved_canary_available"
+    assert payload[0]["current_snapshot"]["label"] == "arb_extended_paradex"
 
 
 def test_capture_balance_snapshots_for_paper_trade(tmp_path: Path) -> None:

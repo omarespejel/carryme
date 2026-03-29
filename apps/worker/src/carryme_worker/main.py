@@ -117,6 +117,7 @@ def build_approved_canary_scan_payload(
         "scanned_candidates": summary.scanned_candidates,
         "approved_candidates": summary.approved_candidates,
         "saved_snapshots": summary.saved_snapshots,
+        "alert_events": summary.alert_events,
         "database_path": summary.database_path,
     }
 
@@ -133,6 +134,7 @@ def build_approved_canary_scan_loop_payload(
         "scanned_candidates": summary.scanned_candidates,
         "approved_candidates": summary.approved_candidates,
         "saved_snapshots": summary.saved_snapshots,
+        "alert_events": summary.alert_events,
         "database_path": summary.database_path,
     }
 
