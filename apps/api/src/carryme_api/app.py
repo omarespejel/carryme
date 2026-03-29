@@ -689,7 +689,6 @@ async def _observe_pair_status_for_execution(
             )
         except TimeoutError:
             continue
-        reconciliation = reconcile_execution(execution, account_preflight)
         last_status = build_execution_pair_status(execution, order_state, reconciliation)
         if last_status.derived_state in {
             "hedged",
@@ -1343,7 +1342,7 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get(
@@ -2170,15 +2169,35 @@ def create_app() -> FastAPI:
                     preview_hash=cleanup_confirmation.preview_hash,
                 )
                 if existing_entry is not None:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=existing_entry.model_dump(mode="json"),
+                    return GuardedPairExecutionResult(
+                        paper_trade_id=paper_trade_id,
+                        preview_hash=normalized_preview_hash,
+                        primary_execution=primary_execution,
+                        cleanup_execution=existing_entry,
+                        pair_status=pair_status.model_copy(
+                            update={
+                                "notes": [
+                                    *pair_status.notes,
+                                    "Existing cleanup execution reused for this confirmation",
+                                ]
+                            }
+                        ),
                     )
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "A live submission is already reserved for this confirmed cleanup "
-                        "preview; manual reconciliation is required before retrying"
+                return GuardedPairExecutionResult(
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=normalized_preview_hash,
+                    primary_execution=primary_execution,
+                    cleanup_execution=None,
+                    pair_status=pair_status.model_copy(
+                        update={
+                            "notes": [
+                                *pair_status.notes,
+                                (
+                                    "Cleanup live submission was already reserved; "
+                                    "manual reconciliation is required before retrying"
+                                ),
+                            ]
+                        }
                     ),
                 )
             try:
@@ -2188,7 +2207,7 @@ def create_app() -> FastAPI:
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except (ConnectorError, httpx.HTTPError) as exc:
+            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             cleanup_execution = execution_store.append(cleanup_execution)
             if cleanup_execution.entry_id is None:
