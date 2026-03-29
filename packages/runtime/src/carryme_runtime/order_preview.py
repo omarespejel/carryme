@@ -291,15 +291,15 @@ def _extract_order_constraints(
     venue: str,
     snapshot: NormalizedMarketSnapshot,
 ) -> OrderConstraints:
-    raw = snapshot.market.raw
+    raw = snapshot.market.raw if isinstance(snapshot.market.raw, dict) else {}
     mark_price = Decimal(str(snapshot.market.mark_price)) if snapshot.market.mark_price else None
     if venue == "paradex":
-        max_order_size = _raw_decimal(raw, "max_order_size")
+        max_order_size = _dict_decimal(raw, "max_order_size")
         return OrderConstraints(
-            quantity_increment=_raw_decimal(raw, "order_size_increment"),
-            minimum_order_size=_raw_decimal(raw, "order_size_increment"),
-            minimum_notional=_raw_decimal(raw, "min_notional"),
-            price_increment=_raw_decimal(raw, "price_tick_size"),
+            quantity_increment=_dict_decimal(raw, "order_size_increment"),
+            minimum_order_size=_dict_decimal(raw, "order_size_increment"),
+            minimum_notional=_dict_decimal(raw, "min_notional"),
+            price_increment=_dict_decimal(raw, "price_tick_size"),
             max_order_value=max_order_size * mark_price
             if max_order_size is not None and mark_price is not None
             else None,
@@ -319,13 +319,6 @@ def _extract_order_constraints(
             max_order_value=_dict_decimal(trading_config, "maxLimitOrderValue"),
         )
     return OrderConstraints()
-
-
-def _raw_decimal(raw: dict[str, object], key: str) -> Decimal | None:
-    value = raw.get(key)
-    if value is None:
-        return None
-    return Decimal(str(value))
 
 
 def _dict_decimal(raw: dict[str, object], key: str) -> Decimal | None:
