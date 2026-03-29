@@ -23,6 +23,7 @@ from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
     ConnectorError,
     ExecutionAdapter,
+    InvalidTradeCandidateError,
     MockExecutionAdapter,
     OpportunityService,
     UpstreamDataError,
@@ -228,6 +229,7 @@ def _build_trade_intent_candidates(
 
     limit = _validated_history_limit("limit", limit)
     sample = max(limit, _validated_history_limit("sample", sample))
+    candidate_sample = min(MAX_HISTORY_LIMIT, max(sample, limit * 4))
     capacity_fraction = _validated_fraction("capacity_fraction", capacity_fraction)
     max_target_notional = _validated_positive_threshold(
         "max_target_notional",
@@ -246,10 +248,10 @@ def _build_trade_intent_candidates(
             "max_break_even_days_entry",
             max_break_even_days_entry,
         )
-    records = store.list_recent(limit=sample, label=label)
+    records = store.list_recent(limit=candidate_sample, label=label)
     selected = _select_trade_intent_records(
         records,
-        limit=limit,
+        limit=candidate_sample,
         min_one_day_net_edge_after_entry=min_one_day_net_edge_after_entry,
         min_capacity_notional=min_capacity_notional,
         max_break_even_days_entry=max_break_even_days_entry,
@@ -267,8 +269,10 @@ def _build_trade_intent_candidates(
                     max_break_even_days_entry=max_break_even_days_entry,
                 )
             )
-        except ValueError:
+        except InvalidTradeCandidateError:
             continue
+        if len(intents) == limit:
+            break
     return intents
 
 
