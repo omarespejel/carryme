@@ -1,5 +1,6 @@
 """FastAPI application factory for carryme."""
 
+import os
 from typing import Annotated
 
 import httpx
@@ -11,7 +12,7 @@ from carryme_models import (
     TradingFeeProfile,
 )
 from carryme_normalizers import list_fee_profiles
-from carryme_runtime import ConnectorError, OpportunityService
+from carryme_runtime import ConnectorError, OpportunityService, UpstreamDataError
 from carryme_storage import OpportunityHistoryStore
 from fastapi import Depends, FastAPI, HTTPException
 
@@ -19,7 +20,17 @@ from carryme_api.config import ApiSettings, get_api_settings
 
 APP_NAME = "carryme-api"
 APP_VERSION = "0.1.0"
-APP_ENVIRONMENT = "development"
+DEFAULT_APP_ENVIRONMENT = "development"
+APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
+
+
+def get_app_environment() -> str:
+    """Return the runtime environment exposed by the API health endpoints."""
+
+    return (
+        os.getenv(APP_ENVIRONMENT_VARIABLE, DEFAULT_APP_ENVIRONMENT).strip()
+        or DEFAULT_APP_ENVIRONMENT
+    )
 
 
 def get_opportunity_service() -> OpportunityService:
@@ -47,7 +58,7 @@ def create_app() -> FastAPI:
             service=AppDescriptor(
                 name=APP_NAME,
                 version=APP_VERSION,
-                environment=APP_ENVIRONMENT,
+                environment=get_app_environment(),
             )
         )
 
@@ -92,10 +103,10 @@ def create_app() -> FastAPI:
                 right_symbol=right_symbol,
                 right_fee_profile=right_fee_profile,
             )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
 

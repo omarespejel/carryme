@@ -30,6 +30,24 @@ def _snapshot(
     return normalize_market_snapshot(venue, market)
 
 
+def _snapshot_without_book(
+    venue: str,
+    symbol: str,
+    funding_rate: float,
+    mark_price: float,
+) -> NormalizedMarketSnapshot:
+    market = MarketStats(
+        venue=venue,
+        symbol=symbol,
+        mark_price=mark_price,
+        funding_rate=funding_rate,
+        open_interest=1_000_000,
+        daily_volume=500_000,
+        top_of_book=None,
+    )
+    return normalize_market_snapshot(venue, market)
+
+
 def test_score_funding_pair_picks_the_higher_funding_short() -> None:
     extended = _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
     hyperliquid = _snapshot("hyperliquid", "STRK", -0.00005, 0.0344, 90_000, 0.0345, 75_000)
@@ -43,7 +61,13 @@ def test_score_funding_pair_picks_the_higher_funding_short() -> None:
 
     assert opportunity.short_venue == "extended"
     assert opportunity.long_venue == "hyperliquid"
-    assert opportunity.gross_daily_edge == pytest.approx(0.0048 - (-0.0012))
+    assert extended.funding.daily_rate is not None
+    assert hyperliquid.funding.daily_rate is not None
+    assert opportunity.gross_daily_edge == pytest.approx(
+        extended.funding.daily_rate - hyperliquid.funding.daily_rate
+    )
+    assert opportunity.short_daily_volume == pytest.approx(500_000)
+    assert opportunity.long_open_interest == pytest.approx(1_000_000)
 
 
 def test_score_funding_pair_computes_costs_and_break_even() -> None:
@@ -121,10 +145,53 @@ def test_score_funding_pair_rejects_fee_profile_venue_mismatch() -> None:
         )
 
 
-def test_score_funding_pair_returns_none_capacity_when_book_data_missing() -> None:
+def test_score_funding_pair_rejects_right_fee_profile_venue_mismatch() -> None:
     extended = _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
     hyperliquid = _snapshot("hyperliquid", "STRK", -0.00005, 0.0344, 90_000, 0.0345, 75_000)
-    hyperliquid.market.top_of_book = None
+
+    with pytest.raises(ValueError, match="Right fee profile must match the right venue"):
+        score_funding_pair(
+            extended,
+            hyperliquid,
+            get_fee_profile("extended", "default"),
+            get_fee_profile("extended", "default"),
+        )
+
+
+def test_score_funding_pair_zero_gross_edge_has_no_break_even() -> None:
+    extended = _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
+    hyperliquid = _snapshot("hyperliquid", "STRK", 0.0002, 0.0344, 90_000, 0.0345, 75_000)
+
+    opportunity = score_funding_pair(
+        extended,
+        hyperliquid,
+        get_fee_profile("extended", "default"),
+        get_fee_profile("hyperliquid", "tier0"),
+    )
+
+    assert opportunity.gross_daily_edge == pytest.approx(0.0)
+    assert opportunity.break_even_days_entry is None
+    assert opportunity.break_even_days_round_trip is None
+
+
+def test_score_funding_pair_negative_net_edge_after_fees() -> None:
+    extended = _snapshot("extended", "STRK-USD", 0.00001, 0.0345, 100_000, 0.0346, 80_000)
+    hyperliquid = _snapshot("hyperliquid", "STRK", -0.000005, 0.0344, 90_000, 0.0345, 75_000)
+
+    opportunity = score_funding_pair(
+        extended,
+        hyperliquid,
+        get_fee_profile("extended", "default"),
+        get_fee_profile("hyperliquid", "tier0"),
+    )
+
+    assert opportunity.one_day_net_edge_after_entry < 0
+    assert opportunity.one_day_net_edge_after_round_trip < 0
+
+
+def test_score_funding_pair_returns_none_capacity_when_book_data_missing() -> None:
+    extended = _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
+    hyperliquid = _snapshot_without_book("hyperliquid", "STRK", -0.00005, 0.03445)
 
     opportunity = score_funding_pair(
         extended,
@@ -156,6 +223,26 @@ def test_rank_opportunities_sorts_by_round_trip_edge_then_capacity() -> None:
     assert ranked[1] == worse
 
 
+def test_rank_opportunities_demotes_wide_spreads_when_edges_match() -> None:
+    narrow = score_funding_pair(
+        _snapshot("extended", "STRK-USD", 0.0002, 0.03449, 100_000, 0.03451, 80_000),
+        _snapshot("hyperliquid", "STRK", -0.00005, 0.03448, 90_000, 0.03450, 50_000),
+        get_fee_profile("extended", "default"),
+        get_fee_profile("hyperliquid", "tier0"),
+    )
+    wide = score_funding_pair(
+        _snapshot("extended", "STRK-USD", 0.0002, 0.0340, 100_000, 0.0350, 80_000),
+        _snapshot("hyperliquid", "STRK", -0.00005, 0.0340, 90_000, 0.0350, 50_000),
+        get_fee_profile("extended", "default"),
+        get_fee_profile("hyperliquid", "tier0"),
+    )
+
+    ranked = rank_opportunities([wide, narrow])
+
+    assert ranked[0] == narrow
+    assert ranked[1] == wide
+
+
 def test_rank_opportunities_treats_zero_capacity_as_better_than_missing_capacity() -> None:
     zero_capacity = score_funding_pair(
         _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 0.0, 0.0346, 80_000),
@@ -165,11 +252,10 @@ def test_rank_opportunities_treats_zero_capacity_as_better_than_missing_capacity
     )
     missing_capacity = score_funding_pair(
         _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000),
-        _snapshot("hyperliquid", "STRK", -0.00005, 0.0344, 90_000, 0.0345, 50_000),
+        _snapshot_without_book("hyperliquid", "STRK", -0.00005, 0.03445),
         get_fee_profile("extended", "default"),
         get_fee_profile("hyperliquid", "tier0"),
     )
-    missing_capacity.capacity = None
 
     ranked = rank_opportunities([missing_capacity, zero_capacity])
 

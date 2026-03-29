@@ -14,7 +14,12 @@ from carryme_connectors import (
     PublicVenueConnector,
 )
 from carryme_models import FundingArbOpportunity, NormalizedMarketSnapshot
-from carryme_normalizers import get_fee_profile, normalize_market_snapshot
+from carryme_normalizers import (
+    NormalizationError,
+    get_fee_profile,
+    normalize_market_snapshot,
+    normalize_symbol,
+)
 from carryme_scoring import score_funding_pair
 
 
@@ -31,6 +36,10 @@ CONNECTOR_BASE_URLS: dict[str, str] = {
 }
 
 
+class UpstreamDataError(ValueError):
+    """Raised when a venue returns malformed or inconsistent market data."""
+
+
 async def fetch_live_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
     """Fetch a live market snapshot and normalize it into canonical form."""
 
@@ -38,14 +47,29 @@ async def fetch_live_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapsh
     base_url = CONNECTOR_BASE_URLS.get(key)
     if base_url is None:
         raise ValueError(f"Unsupported venue: {venue}")
+    expected_identity = normalize_symbol(key, symbol)
 
     async with httpx.AsyncClient(base_url=base_url, timeout=15.0) as client:
         connector = _build_connector(key, client)
-        stats = await connector.fetch_market_stats(symbol)
-        book = await connector.fetch_top_of_book(symbol)
+        stats, book = await asyncio.gather(
+            connector.fetch_market_stats(symbol),
+            connector.fetch_top_of_book(symbol),
+        )
 
     market = stats.model_copy(update={"top_of_book": book})
-    return normalize_market_snapshot(key, market)
+    try:
+        normalized = normalize_market_snapshot(key, market)
+    except NormalizationError as exc:
+        raise UpstreamDataError(
+            f"Upstream market data could not be normalized for {key}:{symbol}: {exc}"
+        ) from exc
+    if normalized.identity.canonical_symbol != expected_identity.canonical_symbol:
+        raise UpstreamDataError(
+            f"Upstream market data symbol mismatch for {key}:{symbol}: "
+            "expected "
+            f"{expected_identity.canonical_symbol}, got {normalized.identity.canonical_symbol}"
+        )
+    return normalized
 
 
 @dataclass
@@ -66,6 +90,10 @@ class OpportunityService:
     ) -> FundingArbOpportunity:
         left_fee = get_fee_profile(left_venue, left_fee_profile)
         right_fee = get_fee_profile(right_venue, right_fee_profile)
+        left_identity = normalize_symbol(left_venue, left_symbol)
+        right_identity = normalize_symbol(right_venue, right_symbol)
+        if left_identity.canonical_symbol != right_identity.canonical_symbol:
+            raise ValueError("Funding pairs must share the same canonical symbol")
         left, right = await asyncio.gather(
             self.fetch_snapshot(left_venue, left_symbol),
             self.fetch_snapshot(right_venue, right_symbol),
@@ -86,3 +114,6 @@ def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnec
     if venue == "paradex":
         return ParadexPublicConnector(client)
     raise ValueError(f"Unsupported venue: {venue}")
+
+
+__all__ = ["OpportunityService", "UpstreamDataError", "fetch_live_snapshot"]
