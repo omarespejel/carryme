@@ -563,9 +563,7 @@ class HyperliquidAccountProbe:
                 "totalRawUsd",
                 context="hyperliquid account collateral",
             )
-            total_collateral = (
-                margin_collateral if margin_collateral is not None else withdrawable
-            )
+            total_collateral = margin_collateral if margin_collateral is not None else withdrawable
             return VenueAccountPreflight(
                 venue=self.venue,
                 enabled=enabled,
@@ -713,11 +711,7 @@ def _extract_balance_assets(value: dict[str, Any] | list[Any]) -> list[str]:
 
 
 def _extract_position_symbols(value: dict[str, Any] | list[Any]) -> list[str]:
-    rows = [
-        row
-        for row in _unwrap_rows(value)
-        if _row_represents_open_position(row)
-    ]
+    rows = [row for row in _unwrap_rows(value) if _row_represents_open_position(row)]
     return _extract_row_strings(rows, "symbol", "market", "instrument", "ticker")
 
 
@@ -744,6 +738,7 @@ def _row_represents_open_position(row: dict[str, Any]) -> bool:
     if isinstance(status, str) and status.strip().upper() == "CLOSED":
         return False
 
+    saw_numeric = False
     for key in ("size", "position_size", "qty", "quantity", "szi"):
         if key not in row:
             continue
@@ -753,9 +748,11 @@ def _row_represents_open_position(row: dict[str, Any]) -> bool:
             parsed = None
         if parsed is None:
             continue
-        return parsed != 0
+        saw_numeric = True
+        if parsed != 0:
+            return True
 
-    return True
+    return not saw_numeric
 
 
 def _pick_string(data: dict[str, Any], *keys: str) -> str | None:

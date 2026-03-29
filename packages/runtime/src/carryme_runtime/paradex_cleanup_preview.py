@@ -237,11 +237,12 @@ def _determine_cleanup_side(
     position: dict[str, Any],
     fallback_side: Literal["buy", "sell"],
 ) -> Literal["buy", "sell"]:
-    signed_size = _required_decimal(position, "size", "position_size", "qty", "quantity")
-    if signed_size > 0:
-        return "sell"
-    if signed_size < 0:
-        return "buy"
+    signed_size = _optional_decimal(position, "size", "position_size", "qty", "quantity")
+    if signed_size is not None:
+        if signed_size > 0:
+            return "sell"
+        if signed_size < 0:
+            return "buy"
 
     side_value = _string_value(position, "side")
     if side_value is not None:
@@ -251,7 +252,19 @@ def _determine_cleanup_side(
         if normalized_side in {"SELL", "SHORT"}:
             return "buy"
 
-    return "sell" if fallback_side == "buy" else "buy"
+    raise ValueError("Paradex position direction is ambiguous (missing/zero size and unknown side)")
+
+
+def _optional_decimal(payload: dict[str, Any], *keys: str) -> Decimal | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return Decimal(str(value))
+        except Exception:
+            continue
+    return None
 
 
 def _select_open_paradex_leg(
@@ -264,8 +277,7 @@ def _select_open_paradex_leg(
     candidates = [
         leg
         for leg in entry.legs
-        if leg.venue == "paradex"
-        and leg.symbol in position_symbols_by_venue.get("paradex", set())
+        if leg.venue == "paradex" and leg.symbol in position_symbols_by_venue.get("paradex", set())
     ]
     if len(candidates) != 1:
         raise ValueError("Cleanup preview requires exactly one open Paradex leg")

@@ -106,12 +106,13 @@ class ParadexLiveExecutionService:
             raise ValueError("Paper trade entry_id is required before live cleanup execution")
         if confirmation.entry_id is None:
             raise ValueError("Cleanup confirmation entry_id is required before live execution")
+        leg = self._select_paradex_cleanup_leg(confirmation)
 
         return await self._submit_adaptive_confirmed_preview(
             paper_trade=paper_trade,
             preview_hash=confirmation.preview_hash,
             confirmation_entry_id=confirmation.entry_id,
-            leg=confirmation.preview.leg,
+            leg=leg,
             executed_at=executed_at,
             adapter_name="paradex_cleanup_live",
         )
@@ -338,6 +339,17 @@ class ParadexLiveExecutionService:
                 "Expected exactly one Paradex leg in the confirmed preview before live submission"
             )
         return paradex_legs[0]
+
+    @staticmethod
+    def _select_paradex_cleanup_leg(
+        confirmation: CleanupPreviewConfirmationEntry,
+    ) -> VenueOrderPreview:
+        leg = confirmation.preview.leg
+        if leg.venue != "paradex":
+            raise ValueError("Cleanup confirmation must target Paradex venue")
+        if leg.reduce_only is not True:
+            raise ValueError("Cleanup confirmation must be reduce-only before live execution")
+        return leg
 
 
 def _response_payload(response: httpx.Response) -> dict[str, Any]:

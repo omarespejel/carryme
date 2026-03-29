@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from carryme_models.preview import (
     ExecutionCleanupPreview,
@@ -45,3 +45,9 @@ class PairClosePreviewConfirmationEntry(BaseModel):
     preview_hash: str = Field(min_length=1)
     preview: ExecutionPairClosePreview
     note: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_preview_hash_consistency(self) -> "PairClosePreviewConfirmationEntry":
+        if self.preview_hash != self.preview.preview_hash:
+            raise ValueError("Pair-close confirmation preview_hash must match preview.preview_hash")
+        return self

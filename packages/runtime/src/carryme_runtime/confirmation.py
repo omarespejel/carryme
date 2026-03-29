@@ -8,7 +8,11 @@ from carryme_models import (
 
 
 def _require_confirmation[
-    ConfirmationEntryT: (PreviewConfirmationEntry, CleanupPreviewConfirmationEntry)
+    ConfirmationEntryT: (
+        PreviewConfirmationEntry,
+        CleanupPreviewConfirmationEntry,
+        PairClosePreviewConfirmationEntry,
+    )
 ](
     *,
     paper_trade_id: int,
@@ -69,13 +73,9 @@ def require_confirmed_pair_close_preview(
 ) -> PairClosePreviewConfirmationEntry:
     """Return the matching pair-close confirmation entry or raise when none exists."""
 
-    for confirmation in confirmations:
-        if (
-            confirmation.paper_trade_id == paper_trade_id
-            and confirmation.preview_hash == preview_hash
-        ):
-            return confirmation
-    raise ValueError(
-        f"No pair-close preview confirmation matched paper_trade_id={paper_trade_id} "
-        f"and preview_hash={preview_hash}"
+    return _require_confirmation(
+        paper_trade_id=paper_trade_id,
+        preview_hash=preview_hash,
+        confirmations=confirmations,
+        label="pair-close preview confirmation",
     )

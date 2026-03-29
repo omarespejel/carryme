@@ -15,9 +15,8 @@ from carryme_models import (
     ExecutionLegResult,
     PairClosePreviewConfirmationEntry,
     PaperTradeEntry,
+    VenueOrderPreview,
 )
-
-from carryme_runtime.paired_live_execution import PairedLiveExecutionCoordinator
 
 
 class VenuePairCloseLiveExecutionService(Protocol):
@@ -50,19 +49,21 @@ class PairCloseLiveExecutionCoordinator:
             raise ValueError("Paper trade entry_id is required before pair close execution")
         if confirmation.entry_id is None:
             raise ValueError("Pair-close confirmation entry_id is required before live execution")
+        if confirmation.paper_trade_id != paper_trade.entry_id:
+            raise ValueError("Pair-close confirmation does not belong to this paper trade")
+        if confirmation.preview.paper_trade_id != paper_trade.entry_id:
+            raise ValueError("Pair-close preview does not belong to this paper trade")
 
         preview_venues = [leg.venue.strip().lower() for leg in confirmation.preview.legs]
-        if len(preview_venues) != 2:
-            raise ValueError("Pair close execution requires exactly two preview legs")
-        normalized_first = PairedLiveExecutionCoordinator._resolve_first_venue(
-            requested_first_venue=first_venue,
-            preview_venues=preview_venues,
-        )
-        if normalized_first not in preview_venues:
+        if len(preview_venues) != 2 or len(set(preview_venues)) != 2:
             raise ValueError(
-                f"Requested first venue {first_venue!r} is not present in the close preview"
+                "Pair close execution requires exactly two preview legs on distinct venues"
             )
-        second_venue = next(venue for venue in preview_venues if venue != normalized_first)
+        normalized_first = preview_venues[0]
+        normalized_requested_first = first_venue.strip().lower()
+        if normalized_requested_first not in {"", "auto", normalized_first}:
+            raise ValueError("Pair-close execution must preserve the confirmed venue order")
+        second_venue = preview_venues[1]
         timestamp = executed_at or datetime.now(UTC)
 
         legs: list[ExecutionLegResult] = []
@@ -127,7 +128,7 @@ class PairCloseLiveExecutionCoordinator:
                 executed_at=executed_at,
             )
         except (ValueError, ConnectorError, httpx.HTTPError) as exc:
-            leg = next(item for item in confirmation.preview.legs if item.venue == venue)
+            leg = _select_preview_leg(confirmation, venue)
             return ExecutionJournalEntry(
                 executed_at=executed_at,
                 adapter=f"{venue}_cleanup_live",
@@ -157,7 +158,11 @@ def _build_cleanup_confirmation(
     confirmation: PairClosePreviewConfirmationEntry,
     venue: str,
 ) -> CleanupPreviewConfirmationEntry:
-    leg = next(item for item in confirmation.preview.legs if item.venue == venue)
+    leg = _select_preview_leg(confirmation, venue)
+    if leg.reduce_only is not True:
+        raise ValueError(
+            f"Pair-close leg for venue {venue!r} must be reduce-only before live execution"
+        )
     preview_hash = f"{confirmation.preview_hash}:{venue}"
     cleanup_preview = ExecutionCleanupPreview(
         execution_entry_id=confirmation.preview.execution_entry_id,
@@ -177,3 +182,14 @@ def _build_cleanup_confirmation(
         preview=cleanup_preview,
         note=confirmation.note,
     )
+
+
+def _select_preview_leg(
+    confirmation: PairClosePreviewConfirmationEntry,
+    venue: str,
+) -> VenueOrderPreview:
+    normalized_venue = venue.strip().lower()
+    for leg in confirmation.preview.legs:
+        if leg.venue.strip().lower() == normalized_venue:
+            return leg
+    raise ValueError(f"Pair-close preview did not contain venue {venue!r}")
