@@ -52,9 +52,15 @@ from carryme_runtime import (
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
+    reconcile_execution,
     require_confirmed_preview,
 )
-from carryme_runtime.account_preflight import ExtendedAccountProbe, ParadexAccountProbe
+from carryme_runtime.account_preflight import (
+    ExtendedAccountProbe,
+    ParadexAccountProbe,
+    _extract_balance_assets,
+    _extract_position_symbols,
+)
 
 
 def _snapshot(
@@ -3656,6 +3662,126 @@ def test_paradex_account_probe_uses_subkey_jwt_when_bearer_is_missing(
         assert status.account_identifier == "0xabc"
 
     asyncio.run(run())
+
+
+def test_account_preflight_extracts_balance_assets_and_position_symbols() -> None:
+    balances = {
+        "results": [
+            {"token": "USDC", "size": "15.0"},
+            {"asset": "ETH", "size": "0.1"},
+            {"currency": "USDC", "size": "3.0"},
+        ]
+    }
+    positions = {
+        "positions": [
+            {"market": "ARB-USD-PERP", "size": "100"},
+            {"symbol": "STRK-USD", "size": "25"},
+            {"ticker": "ARB-USD-PERP", "size": "5"},
+        ]
+    }
+
+    assert _extract_balance_assets(balances) == ["USDC", "ETH"]
+    assert _extract_position_symbols(positions) == ["ARB-USD-PERP", "STRK-USD"]
+
+
+def test_reconcile_execution_marks_partial_and_missing_leg_symbols() -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=21,
+        executed_at=datetime(2026, 3, 29, 16, 0, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="partial",
+        paper_trade_id=11,
+        preview_hash="preview-hash",
+        confirmation_entry_id=7,
+        paper_trade=PaperTradeEntry(
+            entry_id=11,
+            created_at=datetime(2026, 3, 29, 15, 55, tzinfo=UTC),
+            note="operator approved",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 15, 50, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0012,
+                break_even_days_entry=0.4,
+                capacity_limit_notional=1000.0,
+                target_notional=11.0,
+                capacity_fraction=0.01,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+                status="rejected",
+                simulated=False,
+            ),
+        ],
+    )
+    account_preflight = PaperTradeAccountPreflight(
+        paper_trade_id=11,
+        label="arb_extended_paradex",
+        ready=True,
+        venues=[
+            VenueAccountPreflight(
+                venue="extended",
+                enabled=True,
+                authenticated=True,
+                ready=True,
+                credential_mode="api_key",
+                position_symbols=["ARB-USD"],
+            ),
+            VenueAccountPreflight(
+                venue="paradex",
+                enabled=True,
+                authenticated=True,
+                ready=True,
+                credential_mode="subkey_jwt",
+                balance_assets=["USDC"],
+                position_symbols=[],
+            ),
+        ],
+    )
+
+    reconciliation = reconcile_execution(entry, account_preflight)
+
+    assert reconciliation.execution_entry_id == 21
+    assert reconciliation.status == "partial"
+    assert reconciliation.recommended_action == "complete_or_unwind_missing_leg"
+    assert reconciliation.matched_all_leg_symbols is False
+    extended = next(item for item in reconciliation.venues if item.venue == "extended")
+    paradex = next(item for item in reconciliation.venues if item.venue == "paradex")
+    assert extended.matched_leg_symbols == ["ARB-USD"]
+    assert extended.unmatched_leg_symbols == []
+    assert paradex.matched_leg_symbols == []
+    assert paradex.unmatched_leg_symbols == ["ARB-USD-PERP"]
 
 
 def test_account_preflight_service_blocks_unsupported_trade_venue() -> None:

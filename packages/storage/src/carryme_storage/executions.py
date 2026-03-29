@@ -249,3 +249,53 @@ class ExecutionJournalStore:
             )
             for stored_id, entry_json in rows
         ]
+
+    def get(self, entry_id: int) -> ExecutionJournalEntry | None:
+        """Return one execution journal entry by id."""
+
+        self.initialize()
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT id, entry_json
+                FROM execution_journal_entries
+                WHERE id = ?
+                """,
+                (entry_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        stored_id, entry_json = row
+        return ExecutionJournalEntry.model_validate(
+            {
+                **json.loads(entry_json),
+                "entry_id": stored_id,
+            }
+        )
+
+    def latest_for_paper_trade(self, paper_trade_id: int) -> ExecutionJournalEntry | None:
+        """Return the newest execution journal entry for one paper trade."""
+
+        self.initialize()
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT id, entry_json
+                FROM execution_journal_entries
+                WHERE paper_trade_id = ?
+                ORDER BY executed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (paper_trade_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        stored_id, entry_json = row
+        return ExecutionJournalEntry.model_validate(
+            {
+                **json.loads(entry_json),
+                "entry_id": stored_id,
+            }
+        )

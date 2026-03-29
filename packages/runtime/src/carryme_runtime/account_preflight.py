@@ -257,6 +257,8 @@ class ExtendedAccountProbe:
                 ),
                 balance_count=balance_count,
                 position_count=_count_rows(positions, context="Extended positions"),
+                balance_assets=_extract_balance_assets(balances),
+                position_symbols=_extract_position_symbols(positions),
                 notes=[
                     (
                         "Extended account preflight completed using authenticated private GETs. "
@@ -374,9 +376,7 @@ class ParadexAccountProbe:
                 "id",
             )
             if account_identifier is None:
-                raise UpstreamDataError(
-                    "Paradex account payload is missing an account identifier"
-                )
+                raise UpstreamDataError("Paradex account payload is missing an account identifier")
             if account_identifier.casefold() != cast(str, account_address).casefold():
                 raise UpstreamDataError(
                     "Paradex account payload did not match the configured account address"
@@ -404,6 +404,8 @@ class ParadexAccountProbe:
                 ),
                 balance_count=_count_rows(balances, context="Paradex balances"),
                 position_count=_count_rows(positions, context="Paradex positions"),
+                balance_assets=_extract_balance_assets(balances),
+                position_symbols=_extract_position_symbols(positions),
                 notes=[
                     (
                         "Paradex account preflight completed using authenticated private GETs "
@@ -419,9 +421,7 @@ class ParadexAccountProbe:
                 ready=False,
                 credential_mode=credential_mode,
                 blocking_reasons=[f"Paradex authenticated read returned malformed payload: {exc}"],
-                notes=[
-                    "Paradex authenticated read succeeded but returned malformed account data."
-                ],
+                notes=["Paradex authenticated read succeeded but returned malformed account data."],
             )
 
 
@@ -434,10 +434,7 @@ async def _fetch_extended_optional_rows(
         return await fetcher()
     except ConnectorError as exc:
         cause = exc.__cause__
-        if not (
-            isinstance(cause, httpx.HTTPStatusError)
-            and cause.response.status_code == 404
-        ):
+        if not (isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code == 404):
             raise
         return {
             "data": [],
@@ -451,8 +448,7 @@ def _blocking_reasons(enabled: bool, missing_env_vars: list[str], venue: str) ->
         reasons.append(f"Venue {venue} account preflight is not enabled")
     if missing_env_vars:
         reasons.append(
-            f"Venue {venue} is missing required account credentials: "
-            + ", ".join(missing_env_vars)
+            f"Venue {venue} is missing required account credentials: " + ", ".join(missing_env_vars)
         )
     return reasons
 
@@ -519,6 +515,43 @@ def _count_rows(value: dict[str, Any] | list[Any], *, context: str) -> int:
     raise UpstreamDataError(f"{context} payload did not contain a row list")
 
 
+def _unwrap_rows(value: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        for key in ("data", "results", "result", "rows", "positions", "balances"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return [item for item in nested if isinstance(item, dict)]
+    return []
+
+
+def _extract_balance_assets(value: dict[str, Any] | list[Any]) -> list[str]:
+    return _extract_row_strings(value, "asset", "token", "currency", "symbol")
+
+
+def _extract_position_symbols(value: dict[str, Any] | list[Any]) -> list[str]:
+    return _extract_row_strings(value, "symbol", "market", "instrument", "ticker")
+
+
+def _extract_row_strings(value: dict[str, Any] | list[Any], *keys: str) -> list[str]:
+    rows = _unwrap_rows(value)
+    results: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in keys:
+            cell = row.get(key)
+            if not isinstance(cell, str):
+                continue
+            normalized = cell.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            results.append(normalized)
+            break
+    return results
+
+
 def _pick_string(data: dict[str, Any], *keys: str) -> str | None:
     for key in keys:
         value = data.get(key)
@@ -537,9 +570,7 @@ def _pick_float(data: dict[str, Any], *keys: str, context: str) -> float | None:
         try:
             value = parse_float(raw_value)
         except ConnectorError as exc:
-            raise UpstreamDataError(
-                f"{context} payload field {key!r} must be numeric"
-            ) from exc
+            raise UpstreamDataError(f"{context} payload field {key!r} must be numeric") from exc
         if value is not None:
             return value
     return None
