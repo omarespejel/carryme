@@ -32,6 +32,8 @@ uv run mypy $(find src apps packages tests -name '*.py' -type f)
 ```bash
 uv run carryme-api
 uv run carryme-worker
+uv run carryme-worker --supervise
+uv run carryme-worker --observe-executions-supervise
 ```
 
 Useful worker modes:
@@ -40,4 +42,8 @@ Useful worker modes:
 uv run carryme-worker --once
 uv run carryme-worker --iterations 3
 uv run carryme-worker --supervise
+uv run carryme-worker --supervise --iterations 3
+uv run carryme-worker --observe-executions-once
+uv run carryme-worker --observe-executions-supervise
+uv run carryme-worker --observe-executions-supervise --iterations 3
 ```
