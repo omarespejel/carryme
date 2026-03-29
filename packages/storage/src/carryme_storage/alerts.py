@@ -23,20 +23,24 @@ def _normalize_label(label: str | None) -> str | None:
 def _normalize_event_payload(event: CandidateAlertEvent) -> dict[str, object]:
     """Normalize persisted event payloads before storage."""
 
-    payload = event.model_dump(mode="json")
-    record = dict(payload["record"])
-    pair = dict(record["pair"])
-    pair["label"] = _normalize_label(pair.get("label"))
+    raw_payload = cast(dict[str, object], event.model_dump(mode="json"))
+    payload = cast(dict[str, object], json.loads(json.dumps(raw_payload)))
+    record = cast(dict[str, object], payload["record"])
+    pair = cast(dict[str, object], record["pair"])
+    pair["label"] = _normalize_label(cast(str | None, pair.get("label")))
     record["pair"] = pair
     payload["record"] = record
+    payload["raw_payload"] = raw_payload
     return payload
 
 
 def _alert_identity_key(event: CandidateAlertEvent) -> str:
     """Build a deterministic dedupe key for candidate alerts."""
 
+    payload = _normalize_event_payload(event)
+    payload.pop("raw_payload", None)
     return json.dumps(
-        _normalize_event_payload(event),
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -70,7 +74,8 @@ class CandidateAlertStore:
                         canonical_symbol TEXT NOT NULL,
                         alert_type TEXT NOT NULL,
                         alert_key TEXT,
-                        event_json TEXT NOT NULL
+                        event_json TEXT NOT NULL,
+                        raw_event_json TEXT
                     )
                     """
                 )
@@ -84,11 +89,22 @@ class CandidateAlertStore:
                     connection.execute(
                         "ALTER TABLE candidate_alert_events ADD COLUMN alert_key TEXT"
                     )
+                if "raw_event_json" not in columns:
+                    connection.execute(
+                        "ALTER TABLE candidate_alert_events ADD COLUMN raw_event_json TEXT"
+                    )
                 connection.execute(
                     """
                     UPDATE candidate_alert_events
                     SET alert_key = printf('legacy:%s', id)
                     WHERE alert_key IS NULL
+                    """
+                )
+                connection.execute(
+                    """
+                    UPDATE candidate_alert_events
+                    SET raw_event_json = event_json
+                    WHERE raw_event_json IS NULL
                     """
                 )
                 connection.execute(
@@ -116,6 +132,7 @@ class CandidateAlertStore:
 
         self.initialize()
         normalized_payload = _normalize_event_payload(event)
+        raw_payload = cast(dict[str, object], normalized_payload.pop("raw_payload"))
         record_payload = cast(dict[str, object], normalized_payload["record"])
         pair_payload = cast(dict[str, object], record_payload["pair"])
         normalized_label = cast(str | None, pair_payload["label"])
@@ -129,8 +146,9 @@ class CandidateAlertStore:
                     canonical_symbol,
                     alert_type,
                     alert_key,
-                    event_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    event_json,
+                    raw_event_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.emitted_at.isoformat(),
@@ -139,6 +157,7 @@ class CandidateAlertStore:
                     event.alert_type,
                     alert_key,
                     json.dumps(normalized_payload, sort_keys=True),
+                    json.dumps(raw_payload, sort_keys=True),
                 ),
             )
         return cursor.rowcount > 0

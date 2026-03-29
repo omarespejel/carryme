@@ -10,7 +10,6 @@ from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
     FundingArbOpportunity,
-    FundingPairSpec,
     OpportunityRecord,
     ServiceHealth,
     TradingFeeProfile,
@@ -151,15 +150,18 @@ def create_app() -> FastAPI:
     def watchlist(
         store: Annotated[WatchlistStore, Depends(get_watchlist_store)],
     ) -> WatchlistDocument:
-        return WatchlistDocument(pairs=store.load())
+        try:
+            pairs = store.load()
+        except FileNotFoundError:
+            pairs = []
+        return WatchlistDocument(pairs=pairs)
 
     @app.put("/v1/watchlist", response_model=WatchlistDocument)
     def replace_watchlist(
         document: Annotated[WatchlistDocument, Body(...)],
         store: Annotated[WatchlistStore, Depends(get_watchlist_store)],
     ) -> WatchlistDocument:
-        pairs = [FundingPairSpec.model_validate(item) for item in document.pairs]
-        return WatchlistDocument(pairs=store.replace(pairs))
+        return WatchlistDocument(pairs=store.replace(document.pairs))
 
     @app.get("/v1/history/funding-pairs", response_model=list[OpportunityRecord])
     def history(

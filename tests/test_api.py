@@ -215,6 +215,17 @@ def test_watchlist_endpoint_reads_saved_pairs(tmp_path: Path) -> None:
     }
 
 
+def test_watchlist_endpoint_returns_empty_when_file_is_missing(tmp_path: Path) -> None:
+    store = WatchlistStore(tmp_path / "missing-watchlist.json")
+
+    client = TestClient(app)
+    with _dependency_override(get_watchlist_store, lambda: store):
+        response = client.get("/v1/watchlist")
+
+    assert response.status_code == 200
+    assert response.json() == {"pairs": []}
+
+
 def test_watchlist_endpoint_replaces_pairs(tmp_path: Path) -> None:
     store = WatchlistStore(tmp_path / "watchlist.json")
 

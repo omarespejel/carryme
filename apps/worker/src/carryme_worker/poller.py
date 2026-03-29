@@ -329,10 +329,9 @@ async def run_supervised_polling_loop(
                     min_one_day_net_edge_after_entry=settings.min_candidate_entry_edge,
                     min_capacity_notional=settings.min_candidate_capacity_notional,
                 )
-                candidate_summary = summarize_candidates(
-                    summary.records,
-                    min_one_day_net_edge_after_entry=settings.min_candidate_entry_edge,
-                    min_capacity_notional=settings.min_candidate_capacity_notional,
+                candidate_summary = CandidateRecordSummary(
+                    total_records=len(summary.records),
+                    candidate_records=len(candidate_records),
                 )
                 if candidate_records:
                     try:

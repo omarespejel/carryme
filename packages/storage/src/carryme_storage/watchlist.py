@@ -50,7 +50,11 @@ def save_watchlist(path: str | Path, pairs: list[FundingPairSpec]) -> list[Fundi
         os.fsync(temporary_file.fileno())
         temporary_path = Path(temporary_file.name)
 
-    temporary_path.replace(target_path)
+    try:
+        temporary_path.replace(target_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
     return document.pairs
 
 

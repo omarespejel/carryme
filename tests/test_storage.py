@@ -16,6 +16,7 @@ from carryme_storage import (
     load_watchlist,
     save_watchlist,
 )
+from carryme_storage.watchlist import _parse_watchlist_payload
 
 
 def test_load_watchlist_from_pairs_object(tmp_path: Path) -> None:
@@ -42,6 +43,33 @@ def test_load_watchlist_from_pairs_object(tmp_path: Path) -> None:
 
     assert len(pairs) == 1
     assert pairs[0].label == "arb_extended_paradex"
+
+
+def test_parse_watchlist_payload_from_raw_array() -> None:
+    pairs = _parse_watchlist_payload(
+        [
+            {
+                "label": "arb_extended_paradex",
+                "left_venue": "extended",
+                "left_symbol": "ARB-USD",
+                "left_fee_profile": "default",
+                "right_venue": "paradex",
+                "right_symbol": "ARB-USD-PERP",
+                "right_fee_profile": "pro",
+            }
+        ]
+    )
+
+    assert len(pairs) == 1
+    assert pairs[0] == FundingPairSpec(
+        label="arb_extended_paradex",
+        left_venue="extended",
+        left_symbol="ARB-USD",
+        left_fee_profile="default",
+        right_venue="paradex",
+        right_symbol="ARB-USD-PERP",
+        right_fee_profile="pro",
+    )
 
 
 def test_load_watchlist_rejects_missing_pairs_key(tmp_path: Path) -> None:
