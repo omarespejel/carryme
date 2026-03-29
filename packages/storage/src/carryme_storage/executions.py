@@ -95,14 +95,15 @@ class ExecutionJournalStore:
         if limit < 1:
             raise ValueError("limit must be at least 1")
         self.initialize()
+        normalized_label = label.strip() if label is not None else None
         query = """
             SELECT id, entry_json
             FROM execution_journal_entries
         """
         params: tuple[object, ...]
-        if label:
+        if normalized_label:
             query += " WHERE label = ?"
-            params = (label, limit)
+            params = (normalized_label, limit)
         else:
             params = (limit,)
         query += " ORDER BY executed_at DESC, id DESC LIMIT ?"
