@@ -76,6 +76,27 @@ def test_fee_profiles_endpoint() -> None:
     assert {item["profile"] for item in payload} == {"retail", "pro", "pro_fastfills"}
 
 
+def test_paired_live_execution_coordinator_provider_includes_hyperliquid() -> None:
+    from carryme_api.app import get_paired_live_execution_coordinator
+    from carryme_runtime import (
+        ExtendedLiveExecutionService,
+        HyperliquidLiveExecutionService,
+        ParadexLiveExecutionService,
+    )
+
+    class StubService:
+        async def submit_confirmed_preview(self, **kwargs: object) -> None:
+            return None
+
+    coordinator = get_paired_live_execution_coordinator(
+        extended_service=cast(ExtendedLiveExecutionService, StubService()),
+        hyperliquid_service=cast(HyperliquidLiveExecutionService, StubService()),
+        paradex_service=cast(ParadexLiveExecutionService, StubService()),
+    )
+
+    assert set(coordinator.services) == {"extended", "hyperliquid", "paradex"}
+
+
 def test_funding_pair_endpoint_uses_service_dependency() -> None:
     class StubOpportunityService:
         async def score_pair(self, **_: str) -> FundingArbOpportunity:
