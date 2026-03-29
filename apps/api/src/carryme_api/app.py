@@ -15,8 +15,10 @@ from carryme_models import (
     FundingPairTradeIntent,
     OpportunityRecord,
     PaperTradeEntry,
+    PaperTradeExecutionPreflight,
     ServiceHealth,
     TradingFeeProfile,
+    VenueExecutionPreflight,
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
@@ -27,7 +29,10 @@ from carryme_runtime import (
     MockExecutionAdapter,
     OpportunityService,
     UpstreamDataError,
+    build_live_execution_configs,
+    build_paper_trade_execution_preflight,
     build_trade_intent,
+    build_venue_execution_preflights,
 )
 from carryme_storage import (
     CandidateAlertStore,
@@ -523,6 +528,32 @@ def create_app() -> FastAPI:
             return store.list_recent(limit=limit, label=label)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/executions/preflight/venues", response_model=list[VenueExecutionPreflight])
+    def execution_preflight_venues(
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+    ) -> list[VenueExecutionPreflight]:
+        return build_venue_execution_preflights(build_live_execution_configs(settings))
+
+    @app.get(
+        "/v1/executions/preflight/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeExecutionPreflight,
+    )
+    def execution_preflight_for_paper_trade(
+        paper_trade_id: int,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+    ) -> PaperTradeExecutionPreflight:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        return build_paper_trade_execution_preflight(
+            paper_trade,
+            build_live_execution_configs(settings),
+        )
 
     @app.post(
         "/v1/executions/mock/from-paper-trade/{paper_trade_id}",

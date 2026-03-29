@@ -9,6 +9,7 @@ import httpx
 import pytest
 from carryme_api.app import (
     app,
+    get_api_settings,
     get_candidate_alert_store,
     get_execution_adapter,
     get_execution_journal_store,
@@ -17,6 +18,7 @@ from carryme_api.app import (
     get_paper_trade_store,
     get_watchlist_store,
 )
+from carryme_api.config import ApiSettings
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
@@ -1627,6 +1629,117 @@ def test_executions_endpoint_rejects_limit_above_history_cap(tmp_path: Path) -> 
 
     assert response.status_code == 400
     assert response.json()["detail"] == "limit must be at most 1000"
+
+
+def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None:
+    client = TestClient(app)
+    with _dependency_override(
+        get_api_settings,
+        lambda: ApiSettings(
+            extended_live_enabled=True,
+            extended_api_key=None,
+            extended_stark_private_key=None,
+            paradex_live_enabled=True,
+            paradex_private_key="paradex-secret",
+            hyperliquid_live_enabled=False,
+            hyperliquid_account_address=None,
+            hyperliquid_api_wallet_private_key=None,
+        ),
+    ):
+        response = client.get("/v1/executions/preflight/venues")
+
+    assert response.status_code == 200
+    payload = {item["venue"]: item for item in response.json()}
+    assert payload["extended"]["ready"] is False
+    assert "CARRYME_API_EXTENDED_API_KEY" in payload["extended"]["missing_env_vars"]
+    assert "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY" in payload["extended"]["missing_env_vars"]
+    assert payload["paradex"]["ready"] is True
+
+
+def test_live_execution_preflight_for_saved_paper_trade(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    client = TestClient(app)
+    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
+        get_api_settings,
+        lambda: ApiSettings(
+            extended_live_enabled=True,
+            extended_api_key="extended-key",
+            extended_stark_private_key="extended-stark",
+            paradex_live_enabled=False,
+            paradex_private_key=None,
+            hyperliquid_live_enabled=False,
+            hyperliquid_account_address=None,
+            hyperliquid_api_wallet_private_key=None,
+        ),
+    ):
+        response = client.get(
+            f"/v1/executions/preflight/from-paper-trade/{paper_trade.entry_id}"
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["ready"] is False
+    assert {item["venue"] for item in payload["venues"]} == {"extended", "paradex"}
+    assert "Venue paradex live execution is not enabled" in payload["blocking_reasons"]
+    extended_status = next(item for item in payload["venues"] if item["venue"] == "extended")
+    assert extended_status["ready"] is True
+
+
+def test_live_execution_preflight_returns_404_for_missing_paper_trade(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    client = TestClient(app)
+    with _dependency_override(get_paper_trade_store, lambda: paper_store), _dependency_override(
+        get_api_settings,
+        lambda: ApiSettings(
+            extended_live_enabled=True,
+            extended_api_key="extended-key",
+            extended_stark_private_key="extended-stark",
+            paradex_live_enabled=True,
+            paradex_private_key="paradex-secret",
+            hyperliquid_live_enabled=False,
+            hyperliquid_account_address=None,
+            hyperliquid_api_wallet_private_key=None,
+        ),
+    ):
+        response = client.get("/v1/executions/preflight/from-paper-trade/999999")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Paper trade 999999 was not found"
 
 
 def test_funding_pair_endpoint_uses_service_dependency() -> None:

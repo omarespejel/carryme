@@ -17,11 +17,17 @@ from carryme_models.normalization import (
     TradingFeeProfile,
 )
 from carryme_models.opportunity import CapacityEstimate, FundingArbOpportunity
+from carryme_models.preflight import (
+    CredentialRequirementStatus,
+    PaperTradeExecutionPreflight,
+    VenueExecutionPreflight,
+)
 
 __all__ = [
     "AppDescriptor",
     "CapacityEstimate",
     "CandidateAlertEvent",
+    "CredentialRequirementStatus",
     "ExecutionJournalEntry",
     "ExecutionLegResult",
     "FundingPairSpec",
@@ -33,9 +39,11 @@ __all__ = [
     "NormalizedMarketSnapshot",
     "OpportunityRecord",
     "PaperTradeEntry",
+    "PaperTradeExecutionPreflight",
     "ServiceHealth",
     "TopOfBook",
     "TradeLegIntent",
     "TradingFeeProfile",
+    "VenueExecutionPreflight",
     "WatchlistDocument",
 ]
