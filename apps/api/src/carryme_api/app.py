@@ -1483,7 +1483,10 @@ def create_app() -> FastAPI:
             confirmation_entry_id=confirmation.entry_id,
             preview_hash=confirmation.preview_hash,
         ):
-            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=confirmation.entry_id,
+                preview_hash=confirmation.preview_hash,
+            )
             if existing_entry is not None:
                 raise HTTPException(
                     status_code=409,
@@ -1515,6 +1518,7 @@ def create_app() -> FastAPI:
             )
         execution_store.mark_live_submission_completed(
             confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
             execution_entry_id=saved_entry.entry_id,
         )
         return saved_entry
@@ -1581,7 +1585,10 @@ def create_app() -> FastAPI:
             confirmation_entry_id=confirmation.entry_id,
             preview_hash=confirmation.preview_hash,
         ):
-            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=confirmation.entry_id,
+                preview_hash=confirmation.preview_hash,
+            )
             if existing_entry is not None:
                 raise HTTPException(
                     status_code=409,
@@ -1613,6 +1620,7 @@ def create_app() -> FastAPI:
             )
         execution_store.mark_live_submission_completed(
             confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
             execution_entry_id=saved_entry.entry_id,
         )
         return saved_entry
@@ -1696,7 +1704,10 @@ def create_app() -> FastAPI:
             confirmation_entry_id=confirmation.entry_id,
             preview_hash=confirmation.preview_hash,
         ):
-            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=confirmation.entry_id,
+                preview_hash=confirmation.preview_hash,
+            )
             if existing_entry is not None:
                 raise HTTPException(status_code=409, detail=existing_entry.model_dump(mode="json"))
             raise HTTPException(
@@ -1723,6 +1734,7 @@ def create_app() -> FastAPI:
             )
         execution_store.mark_live_submission_completed(
             confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
             execution_entry_id=saved_entry.entry_id,
         )
         return saved_entry
@@ -1806,7 +1818,10 @@ def create_app() -> FastAPI:
             confirmation_entry_id=confirmation.entry_id,
             preview_hash=confirmation.preview_hash,
         ):
-            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=confirmation.entry_id,
+                preview_hash=confirmation.preview_hash,
+            )
             if existing_entry is not None:
                 raise HTTPException(status_code=409, detail=existing_entry.model_dump(mode="json"))
             raise HTTPException(
@@ -1833,6 +1848,7 @@ def create_app() -> FastAPI:
             )
         execution_store.mark_live_submission_completed(
             confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
             execution_entry_id=saved_entry.entry_id,
         )
         return saved_entry
@@ -1903,7 +1919,10 @@ def create_app() -> FastAPI:
             confirmation_entry_id=confirmation.entry_id,
             preview_hash=confirmation.preview_hash,
         ):
-            existing_entry = execution_store.find_by_confirmation_entry_id(confirmation.entry_id)
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=confirmation.entry_id,
+                preview_hash=confirmation.preview_hash,
+            )
             if existing_entry is not None:
                 raise HTTPException(
                     status_code=409,
@@ -1934,6 +1953,7 @@ def create_app() -> FastAPI:
             )
         execution_store.mark_live_submission_completed(
             confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
             execution_entry_id=saved_entry.entry_id,
         )
         return saved_entry
@@ -1988,33 +2008,57 @@ def create_app() -> FastAPI:
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
 
-        readiness = await _build_readiness_for_paper_trade(
-            paper_trade=paper_trade,
-            preview_hash=preview_hash,
-            settings=settings,
-            confirmation_store=confirmation_store,
-            account_preflight_service=account_preflight_service,
-        )
+        try:
+            readiness = await _build_readiness_for_paper_trade(
+                paper_trade=paper_trade,
+                preview_hash=preview_hash,
+                settings=settings,
+                confirmation_store=confirmation_store,
+                account_preflight_service=account_preflight_service,
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not readiness.ready:
             raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
 
-        confirmations = confirmation_store.list_recent(
-            limit=50,
+        confirmation = confirmation_store.find_latest_by_preview_hash(
             paper_trade_id=paper_trade_id,
+            preview_hash=preview_hash,
         )
-        try:
-            confirmation = next(
-                item
-                for item in confirmations
-                if item.paper_trade_id == paper_trade_id and item.preview_hash == preview_hash
-            )
-        except StopIteration as exc:
+        if confirmation is None:
             raise HTTPException(
                 status_code=409,
                 detail=(
                     "No preview confirmation matched the requested paper trade and preview hash"
                 ),
-            ) from exc
+            )
+        if confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Preview confirmation entry_id is required before live submission",
+            )
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=confirmation.entry_id,
+                preview_hash=confirmation.preview_hash,
+            )
+            if existing_entry is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=existing_entry.model_dump(mode="json"),
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "A live submission is already reserved for this confirmed preview; "
+                    "manual reconciliation is required before retrying"
+                ),
+            )
 
         try:
             primary_execution = await service.submit_confirmed_preview(
@@ -2024,8 +2068,20 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         primary_execution = execution_store.append(primary_execution)
+        if primary_execution.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        execution_store.mark_live_submission_completed(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+            execution_entry_id=primary_execution.entry_id,
+        )
         try:
             pair_status = await _observe_pair_status_for_execution(
                 paper_trade=paper_trade,
@@ -2038,6 +2094,8 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         cleanup_execution: ExecutionJournalEntry | None = None
         if auto_cleanup and pair_status.recommended_action == "close_open_leg":
@@ -2048,23 +2106,61 @@ def create_app() -> FastAPI:
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-            await _ensure_cleanup_live_ready(
-                venue=cleanup_preview.leg.venue,
-                settings=settings,
-                account_service=account_preflight_service,
-            )
-
-            cleanup_confirmation = cleanup_confirmation_store.append(
-                CleanupPreviewConfirmationEntry(
-                    confirmed_at=datetime.now(UTC),
-                    paper_trade_id=paper_trade_id,
-                    label=paper_trade.intent.label,
-                    preview_hash=cleanup_preview.preview_hash,
-                    preview=cleanup_preview,
-                    note="guarded pair auto-cleanup",
+            try:
+                await _ensure_cleanup_live_ready(
+                    venue=cleanup_preview.leg.venue,
+                    settings=settings,
+                    account_service=account_preflight_service,
                 )
+            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+            cleanup_confirmation = cleanup_confirmation_store.find_latest_by_preview_hash(
+                paper_trade_id=paper_trade_id,
+                preview_hash=cleanup_preview.preview_hash,
             )
+            if cleanup_confirmation is None:
+                cleanup_confirmation = cleanup_confirmation_store.append(
+                    CleanupPreviewConfirmationEntry(
+                        confirmed_at=datetime.now(UTC),
+                        paper_trade_id=paper_trade_id,
+                        label=paper_trade.intent.label,
+                        preview_hash=cleanup_preview.preview_hash,
+                        preview=cleanup_preview,
+                        note="guarded pair auto-cleanup",
+                    )
+                )
+            if cleanup_confirmation.entry_id is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Cleanup preview confirmation entry_id is required before "
+                        "live submission"
+                    ),
+                )
+            if not execution_store.reserve_live_submission(
+                confirmation_entry_id=cleanup_confirmation.entry_id,
+                preview_hash=cleanup_confirmation.preview_hash,
+            ):
+                existing_entry = execution_store.find_by_confirmation(
+                    confirmation_entry_id=cleanup_confirmation.entry_id,
+                    preview_hash=cleanup_confirmation.preview_hash,
+                )
+                if existing_entry is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=existing_entry.model_dump(mode="json"),
+                    )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "A live submission is already reserved for this confirmed cleanup "
+                        "preview; manual reconciliation is required before retrying"
+                    ),
+                )
             try:
                 cleanup_execution = await cleanup_live_router.submit_confirmed_cleanup_preview(
                     paper_trade=paper_trade,
@@ -2075,15 +2171,30 @@ def create_app() -> FastAPI:
             except (ConnectorError, httpx.HTTPError) as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             cleanup_execution = execution_store.append(cleanup_execution)
-            pair_status = await _observe_pair_status_for_execution(
-                paper_trade=paper_trade,
-                execution=primary_execution,
-                settings=settings,
-                account_service=account_preflight_service,
-                order_state_service=order_state_service,
-                poll_attempts=poll_attempts,
-                poll_interval_seconds=poll_interval_seconds,
+            if cleanup_execution.entry_id is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Execution journal append did not return an id",
+                )
+            execution_store.mark_live_submission_completed(
+                confirmation_entry_id=cleanup_confirmation.entry_id,
+                preview_hash=cleanup_confirmation.preview_hash,
+                execution_entry_id=cleanup_execution.entry_id,
             )
+            try:
+                pair_status = await _observe_pair_status_for_execution(
+                    paper_trade=paper_trade,
+                    execution=primary_execution,
+                    settings=settings,
+                    account_service=account_preflight_service,
+                    order_state_service=order_state_service,
+                    poll_attempts=poll_attempts,
+                    poll_interval_seconds=poll_interval_seconds,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         return GuardedPairExecutionResult(
             paper_trade_id=paper_trade_id,
