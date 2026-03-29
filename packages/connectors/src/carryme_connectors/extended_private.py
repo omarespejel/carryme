@@ -36,6 +36,12 @@ class ExtendedPrivateConnector(BaseHttpConnector):
             raise ConnectorError("Extended fees payload must be an object or list")
         return payload
 
+    async def fetch_orders(self) -> dict[str, Any] | list[Any]:
+        payload = await self._request_json("GET", "/api/v1/user/orders")
+        if not isinstance(payload, dict | list):
+            raise ConnectorError("Extended orders payload must be an object or list")
+        return payload
+
     async def fetch_positions(self) -> dict[str, Any] | list[Any]:
         payload = await self._request_json("GET", "/api/v1/user/positions")
         if not isinstance(payload, dict | list):

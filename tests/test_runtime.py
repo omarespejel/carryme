@@ -43,6 +43,7 @@ from carryme_runtime import (
     OrderPreviewService,
     PairedLiveExecutionCoordinator,
     ParadexLiveExecutionService,
+    ParadexOrderStateObserver,
     VenueAccountProbe,
     build_live_submission_readiness,
     build_paper_trade_execution_preflight,
@@ -592,8 +593,8 @@ def test_order_preview_service_builds_per_venue_templates() -> None:
         assert extended.http_method == "POST"
         assert extended.payload["symbol"] == "ARB-USD"
         assert extended.payload["side"] == "SELL"
-        assert extended.payload["size"] == "10881.00000000"
-        assert extended.payload["price"] == "0.09180000"
+        assert extended.payload["size"] == "10881"
+        assert extended.payload["price"] == "0.0918"
 
     asyncio.run(run())
 
@@ -929,6 +930,11 @@ def test_build_signed_extended_order_payload_uses_settlement_schema() -> None:
         market_payload={
             "data": {
                 "name": "ARB-USD",
+                "assetPrecision": 0,
+                "tradingConfig": {
+                    "minOrderSizeChange": "1",
+                    "minPriceChange": "0.0001",
+                },
                 "l2Config": {
                     "collateralId": "0x1",
                     "syntheticId": "0x4152422d3100000000000000000000",
@@ -957,8 +963,8 @@ def test_build_signed_extended_order_payload_uses_settlement_schema() -> None:
     assert payload["market"] == "ARB-USD"
     assert payload["side"] == "SELL"
     assert payload["type"] == "LIMIT"
-    assert payload["qty"] == "10881.00000000"
-    assert payload["price"] == "0.09180000"
+    assert payload["qty"] == "10881"
+    assert payload["price"] == "0.0918"
     assert payload["fee"] == "0.00025"
     assert payload["timeInForce"] == "IOC"
     assert payload["nonce"] == "1473459052"
@@ -1237,14 +1243,14 @@ def test_extended_live_execution_service_submits_confirmed_preview(
                     target_notional=1000.0,
                     effective_notional=999.9639,
                     quantity=10881.0,
-                    quantity_text="10881.00000000",
+                    quantity_text="10881",
                     quantity_increment=1.0,
                     minimum_order_size=10.0,
                     minimum_notional=0.918,
                     reference_price=0.0919,
                     reference_price_source="best_bid",
                     worst_acceptable_price=0.0918,
-                    worst_price_text="0.09180000",
+                    worst_price_text="0.0918",
                     price_increment=0.0001,
                     max_order_value=1_250_000.0,
                     order_type="limit",
@@ -1260,8 +1266,8 @@ def test_extended_live_execution_service_submits_confirmed_preview(
                         "symbol": "ARB-USD",
                         "side": "SELL",
                         "type": "LIMIT",
-                        "size": "10881.00000000",
-                        "price": "0.09180000",
+                        "size": "10881",
+                        "price": "0.0918",
                         "time_in_force": "IOC",
                         "client_order_id": "carryme-pt8-extended-sell",
                         "reduce_only": False,
@@ -1382,11 +1388,11 @@ def test_paired_live_execution_coordinator_submits_both_legs() -> None:
                     side="sell",
                     target_notional=1000.0,
                     quantity=10881.0,
-                    quantity_text="10881.00000000",
+                    quantity_text="10881",
                     reference_price=0.0919,
                     reference_price_source="best_bid",
                     worst_acceptable_price=0.0918,
-                    worst_price_text="0.09180000",
+                    worst_price_text="0.0918",
                     endpoint_path_hint="/api/v1/user/order",
                     auth_scheme="api key + Stark signing key",
                     payload={"symbol": "ARB-USD"},
@@ -1522,11 +1528,11 @@ def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails()
                     side="sell",
                     target_notional=1000.0,
                     quantity=10881.0,
-                    quantity_text="10881.00000000",
+                    quantity_text="10881",
                     reference_price=0.0919,
                     reference_price_source="best_bid",
                     worst_acceptable_price=0.0918,
-                    worst_price_text="0.09180000",
+                    worst_price_text="0.0918",
                     endpoint_path_hint="/api/v1/user/order",
                     auth_scheme="api key + Stark signing key",
                     payload={"symbol": "ARB-USD"},
@@ -1905,3 +1911,139 @@ def test_reconcile_execution_marks_partial_and_missing_leg_symbols() -> None:
     assert extended.unmatched_leg_symbols == []
     assert paradex.matched_leg_symbols == []
     assert paradex.unmatched_leg_symbols == ["ARB-USD-PERP"]
+
+
+def test_paradex_order_state_observer_marks_closed_ioc_as_unfilled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubTokenProvider:
+        async def issue_jwt_token(
+            self,
+            *,
+            account_address: str,
+            private_key: str,
+            client: httpx.AsyncClient | None = None,
+            now: int | None = None,
+        ) -> str:
+            assert account_address == "0xabc"
+            assert private_key == "0x123"
+            return "jwt-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/orders/order-1"
+        assert request.headers["Authorization"] == "Bearer jwt-token"
+        return httpx.Response(
+            200,
+            json={
+                "id": "order-1",
+                "client_id": "carryme-pt1-paradex-buy",
+                "market": "ARB-USD-PERP",
+                "status": "CLOSED",
+                "cancel_reason": "REMAINING_IOC_CANCEL",
+                "avg_fill_price": "",
+                "remaining_size": "122.7",
+                "size": "122.7",
+            },
+        )
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        observer = ParadexOrderStateObserver(
+            account_address="0xabc",
+            private_key="0x123",
+            token_provider=StubTokenProvider(),
+        )
+        state = await observer.observe(
+            {
+                "venue": "paradex",
+                "external_reference": "order-1",
+                "request_payload": {"client_id": "carryme-pt1-paradex-buy"},
+            }
+        )
+        assert state.supported is True
+        assert state.derived_state == "unfilled"
+        assert state.order_status == "CLOSED"
+        assert state.cancel_reason == "REMAINING_IOC_CANCEL"
+
+    asyncio.run(run())
+
+
+def test_paradex_order_state_observer_falls_back_to_history_for_closed_ioc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubTokenProvider:
+        async def issue_jwt_token(
+            self,
+            *,
+            account_address: str,
+            private_key: str,
+            client: httpx.AsyncClient | None = None,
+            now: int | None = None,
+        ) -> str:
+            assert account_address == "0xabc"
+            assert private_key == "0x123"
+            return "jwt-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer jwt-token"
+        if request.url.path == "/v1/orders/order-1":
+            return httpx.Response(
+                400,
+                json={"error": "ORDER_ID_NOT_FOUND", "message": "could not find order id"},
+            )
+        assert request.url.path == "/v1/orders-history"
+        assert request.url.params["market"] == "ARB-USD-PERP"
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": "order-1",
+                        "client_id": "carryme-pt1-paradex-buy",
+                        "market": "ARB-USD-PERP",
+                        "status": "CLOSED",
+                        "cancel_reason": "REMAINING_IOC_CANCEL",
+                        "avg_fill_price": "",
+                        "remaining_size": "122.7",
+                        "size": "122.7",
+                    }
+                ]
+            },
+        )
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        observer = ParadexOrderStateObserver(
+            account_address="0xabc",
+            private_key="0x123",
+            token_provider=StubTokenProvider(),
+        )
+        state = await observer.observe(
+            {
+                "venue": "paradex",
+                "external_reference": "order-1",
+                "request_payload": {
+                    "client_id": "carryme-pt1-paradex-buy",
+                    "market": "ARB-USD-PERP",
+                },
+            }
+        )
+        assert state.supported is True
+        assert state.derived_state == "unfilled"
+        assert state.notes == [
+            "Paradex direct order lookup missed the order; fell back to orders-history."
+        ]
+
+    asyncio.run(run())

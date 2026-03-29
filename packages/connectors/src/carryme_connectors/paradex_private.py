@@ -29,6 +29,26 @@ class ParadexPrivateConnector(BaseHttpConnector):
             raise ConnectorError("Paradex balances payload must be an object or list")
         return payload
 
+    async def fetch_order(self, order_id: str) -> dict[str, Any]:
+        payload = await self._request_json("GET", f"/v1/orders/{order_id}")
+        if not isinstance(payload, dict):
+            raise ConnectorError("Paradex order payload must be an object")
+        return payload
+
+    async def fetch_order_history(
+        self,
+        *,
+        market: str | None = None,
+        page_size: int = 50,
+    ) -> dict[str, Any] | list[Any]:
+        params: dict[str, Any] = {"page_size": page_size}
+        if market:
+            params["market"] = market
+        payload = await self._request_json("GET", "/v1/orders-history", params=params)
+        if not isinstance(payload, dict | list):
+            raise ConnectorError("Paradex order-history payload must be an object or list")
+        return payload
+
     async def fetch_positions(self) -> dict[str, Any] | list[Any]:
         payload = await self._request_json("GET", "/v1/positions")
         if not isinstance(payload, dict | list):

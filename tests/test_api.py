@@ -7,7 +7,9 @@ from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
     ExecutionJournalEntry,
+    ExecutionLegOrderState,
     ExecutionLegResult,
+    ExecutionOrderState,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -1059,6 +1061,105 @@ def test_execution_reconciliation_endpoint_reports_latest_execution_state(tmp_pa
     assert by_venue["paradex"]["unmatched_leg_symbols"] == ["ARB-USD-PERP"]
 
 
+def test_execution_order_state_endpoint_reports_latest_leg_state(tmp_path: Path) -> None:
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="paradex_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=9,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="order-1",
+                    request_payload={"client_id": "carryme-pt1-paradex-buy"},
+                )
+            ],
+        )
+    )
+
+    from carryme_api.app import (
+        get_execution_journal_store,
+        get_execution_order_state_service,
+    )
+
+    class StubExecutionOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            assert entry.paper_trade_id == 7
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="paradex",
+                        supported=True,
+                        external_reference="order-1",
+                        client_id="carryme-pt1-paradex-buy",
+                        derived_state="unfilled",
+                        order_status="CLOSED",
+                        cancel_reason="REMAINING_IOC_CANCEL",
+                        remaining_size="122.7",
+                        size="122.7",
+                    )
+                ],
+            )
+
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_execution_order_state_service] = (
+        lambda: StubExecutionOrderStateService()
+    )
+    client = TestClient(app)
+    response = client.get("/v1/executions/order-state/latest/from-paper-trade/7")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == 7
+    assert payload["legs"][0]["derived_state"] == "unfilled"
+    assert payload["legs"][0]["cancel_reason"] == "REMAINING_IOC_CANCEL"
+
+
 def test_live_execution_preflight_venues_endpoint_reports_missing_envs() -> None:
     from carryme_api.app import get_api_settings
 
@@ -2082,14 +2183,14 @@ def test_extended_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pa
                         target_notional=1000.0,
                         effective_notional=999.96,
                         quantity=10881.0,
-                        quantity_text="10881.00000000",
+                        quantity_text="10881",
                         quantity_increment=1.0,
                         minimum_order_size=10.0,
                         minimum_notional=0.918,
                         reference_price=0.0919,
                         reference_price_source="best_bid",
                         worst_acceptable_price=0.0918,
-                        worst_price_text="0.09180000",
+                        worst_price_text="0.0918",
                         price_increment=0.0001,
                         max_order_value=1_250_000.0,
                         order_type="limit",
@@ -2105,8 +2206,8 @@ def test_extended_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pa
                             "symbol": "ARB-USD",
                             "side": "SELL",
                             "type": "LIMIT",
-                            "size": "10881.00000000",
-                            "price": "0.09180000",
+                            "size": "10881",
+                            "price": "0.0918",
                             "time_in_force": "IOC",
                             "client_order_id": "carryme-pt8-extended-sell",
                             "reduce_only": False,
@@ -2271,14 +2372,14 @@ def test_paired_live_execution_endpoint_submits_both_legs(tmp_path: Path) -> Non
                         target_notional=1000.0,
                         effective_notional=999.96,
                         quantity=10881.0,
-                        quantity_text="10881.00000000",
+                        quantity_text="10881",
                         quantity_increment=1.0,
                         minimum_order_size=10.0,
                         minimum_notional=0.918,
                         reference_price=0.0919,
                         reference_price_source="best_bid",
                         worst_acceptable_price=0.0918,
-                        worst_price_text="0.09180000",
+                        worst_price_text="0.0918",
                         price_increment=0.0001,
                         max_order_value=1_250_000.0,
                         endpoint_path_hint="/api/v1/user/order",
