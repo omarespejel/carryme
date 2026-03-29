@@ -4083,6 +4083,70 @@ def test_hyperliquid_order_state_observer_classifies_filled_order(
     )
 
     async def run() -> None:
+        observer = HyperliquidOrderStateObserver(
+            account_address="0xhyper",
+            websocket_timeout_seconds=0,
+        )
+        state = await observer.observe(
+            {
+                "venue": "hyperliquid",
+                "external_reference": "777",
+                "request_payload": {},
+            }
+        )
+        assert state.supported is True
+        assert state.derived_state == "filled"
+        assert state.order_status == "filled"
+        assert state.avg_fill_price == "0.0923"
+        assert state.observation_source == "rest_poll"
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_order_state_observer_prefers_websocket_order_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubWebsocketManager:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def subscribe(self, subscription: dict[str, str], callback: Any) -> int:
+            if subscription["type"] == "orderUpdates":
+                callback(
+                    {
+                        "channel": "orderUpdates",
+                        "data": [
+                            {
+                                "oid": 777,
+                                "status": "filled",
+                                "order": {
+                                    "cloid": "0xabc",
+                                    "origSz": "119.3",
+                                    "sz": "0",
+                                    "avgPx": "0.0923",
+                                },
+                            }
+                        ],
+                    }
+                )
+            return 1
+
+        def unsubscribe(self, subscription: dict[str, str], subscription_id: int) -> bool:
+            return True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_websocket_manager",
+        lambda: StubWebsocketManager(),
+    )
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_info",
+        lambda: pytest.fail("REST fallback should not be used when websocket returns a match"),
+    )
+
+    async def run() -> None:
         observer = HyperliquidOrderStateObserver(account_address="0xhyper")
         state = await observer.observe(
             {
@@ -4095,6 +4159,69 @@ def test_hyperliquid_order_state_observer_classifies_filled_order(
         assert state.derived_state == "filled"
         assert state.order_status == "filled"
         assert state.avg_fill_price == "0.0923"
+        assert state.client_id == "0xabc"
+        assert state.observation_source == "websocket_order_updates"
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_order_state_observer_falls_back_when_websocket_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubWebsocketManager:
+        def subscribe(self, subscription: dict[str, str], callback: Any) -> int:
+            return 1
+
+        def unsubscribe(self, subscription: dict[str, str], subscription_id: int) -> bool:
+            return True
+
+        def stop(self) -> None:
+            return None
+
+    class StubInfo:
+        def query_order_by_oid(self, address: str, oid: int) -> dict[str, object]:
+            assert address == "0xhyper"
+            assert oid == 777
+            return {
+                "status": "open",
+                "order": {
+                    "coin": "ARB",
+                    "origSz": "119.3",
+                    "sz": "119.3",
+                    "avgPx": None,
+                },
+            }
+
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_websocket_manager",
+        lambda: StubWebsocketManager(),
+    )
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_info",
+        lambda: StubInfo(),
+    )
+
+    async def run() -> None:
+        observer = HyperliquidOrderStateObserver(
+            account_address="0xhyper",
+            websocket_timeout_seconds=0.01,
+        )
+        state = await observer.observe(
+            {
+                "venue": "hyperliquid",
+                "external_reference": "777",
+                "request_payload": {},
+            }
+        )
+        assert state.supported is True
+        assert state.derived_state == "open"
+        assert state.observation_source == "rest_poll"
+        assert state.notes == [
+            (
+                "Hyperliquid websocket did not yield a terminal update before timeout; "
+                "fell back to REST."
+            )
+        ]
 
     asyncio.run(run())
 
@@ -4125,6 +4252,7 @@ def test_hyperliquid_order_state_observer_prefers_vault_address_when_configured(
         observer = HyperliquidOrderStateObserver(
             account_address="0xhyper",
             vault_address="0xvault",
+            websocket_timeout_seconds=0,
         )
         state = await observer.observe(
             {
@@ -4137,6 +4265,70 @@ def test_hyperliquid_order_state_observer_prefers_vault_address_when_configured(
         assert state.derived_state == "filled"
         assert state.order_status == "filled"
         assert state.avg_fill_price == "0.0923"
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_order_state_observer_prefers_vault_address_for_websocket_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubWebsocketManager:
+        def subscribe(self, subscription: dict[str, str], callback: Any) -> int:
+            assert subscription["user"] == "0xvault"
+            if subscription["type"] == "orderUpdates":
+                callback(
+                    {
+                        "channel": "orderUpdates",
+                        "data": [
+                            {
+                                "oid": 777,
+                                "status": "filled",
+                                "order": {
+                                    "cloid": "0xvault-order",
+                                    "origSz": "119.3",
+                                    "sz": "0",
+                                    "avgPx": "0.0923",
+                                },
+                            }
+                        ],
+                    }
+                )
+            return 1
+
+        def unsubscribe(self, subscription: dict[str, str], subscription_id: int) -> bool:
+            assert subscription["user"] == "0xvault"
+            return True
+
+        def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_websocket_manager",
+        lambda: StubWebsocketManager(),
+    )
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_info",
+        lambda: pytest.fail("REST fallback should not be used when websocket returns a match"),
+    )
+
+    async def run() -> None:
+        observer = HyperliquidOrderStateObserver(
+            account_address="0xhyper",
+            vault_address="0xvault",
+        )
+        state = await observer.observe(
+            {
+                "venue": "hyperliquid",
+                "external_reference": "777",
+                "request_payload": {},
+            }
+        )
+        assert state.supported is True
+        assert state.derived_state == "filled"
+        assert state.order_status == "filled"
+        assert state.avg_fill_price == "0.0923"
+        assert state.client_id == "0xvault-order"
+        assert state.observation_source == "websocket_order_updates"
 
     asyncio.run(run())
 

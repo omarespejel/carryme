@@ -10,6 +10,7 @@ from hyperliquid.exchange import Exchange  # type: ignore[import-untyped]
 from hyperliquid.info import Info  # type: ignore[import-untyped]
 from hyperliquid.utils.constants import MAINNET_API_URL  # type: ignore[import-untyped]
 from hyperliquid.utils.signing import float_to_wire  # type: ignore[import-untyped]
+from hyperliquid.websocket_manager import WebsocketManager  # type: ignore[import-untyped]
 
 HYPERLIQUID_API_BASE_URL = MAINNET_API_URL
 
@@ -53,6 +54,17 @@ def build_hyperliquid_info(
     """
 
     return Info(base_url=base_url, skip_ws=True, timeout=timeout)
+
+
+def build_hyperliquid_websocket_manager(
+    *,
+    base_url: str = HYPERLIQUID_API_BASE_URL,
+) -> Any:
+    """Return an official Hyperliquid websocket manager with its thread started."""
+
+    manager = WebsocketManager(base_url)
+    manager.start()
+    return manager
 
 
 def format_hyperliquid_size(value: Decimal, *, sz_decimals: int) -> tuple[Decimal, str]:

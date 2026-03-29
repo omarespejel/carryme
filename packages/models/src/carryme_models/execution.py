@@ -77,6 +77,7 @@ class ExecutionLegOrderState(BaseModel):
 
     venue: str = Field(min_length=1)
     supported: bool
+    observation_source: str | None = None
     external_reference: str | None = None
     client_id: str | None = None
     derived_state: Literal["open", "filled", "partial_fill", "unfilled", "unknown", "unsupported"]
