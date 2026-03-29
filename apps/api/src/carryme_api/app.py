@@ -37,6 +37,7 @@ from carryme_runtime import (
     MockExecutionAdapter,
     OpportunityService,
     OrderPreviewService,
+    ParadexLiveExecutionService,
     build_live_submission_readiness,
     build_paper_trade_execution_preflight,
     build_trade_intent,
@@ -127,6 +128,18 @@ def get_execution_adapter() -> ExecutionAdapter:
     return MockExecutionAdapter()
 
 
+def get_paradex_live_execution_service(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ParadexLiveExecutionService:
+    """Return the live Paradex execution service for manual submissions."""
+
+    return ParadexLiveExecutionService(
+        account_address=settings.paradex_account_address or "",
+        private_key=settings.paradex_private_key or "",
+        recv_window_ms=settings.paradex_recv_window_ms,
+    )
+
+
 @lru_cache
 def get_account_preflight_service() -> AccountPreflightService:
     """Return the authenticated account-state preflight service."""
@@ -187,6 +200,36 @@ def _build_account_preflight_configs(settings: ApiSettings) -> AccountPreflightC
             },
         },
     }
+
+
+async def _build_readiness_for_paper_trade(
+    *,
+    paper_trade: PaperTradeEntry,
+    preview_hash: str,
+    settings: ApiSettings,
+    confirmation_store: PreviewConfirmationStore,
+    account_preflight_service: AccountPreflightService,
+) -> LiveSubmissionReadiness:
+    execution_preflight = build_paper_trade_execution_preflight(
+        paper_trade,
+        _build_live_execution_configs(settings),
+    )
+    account_preflight = await account_preflight_service.probe_paper_trade(
+        paper_trade,
+        _build_account_preflight_configs(settings),
+    )
+    confirmations = confirmation_store.list_recent(
+        limit=50,
+        paper_trade_id=paper_trade.entry_id,
+    )
+    return build_live_submission_readiness(
+        paper_trade_id=paper_trade.entry_id or 0,
+        label=paper_trade.intent.label,
+        preview_hash=preview_hash,
+        confirmations=confirmations,
+        execution_preflight=execution_preflight,
+        account_preflight=account_preflight,
+    )
 
 
 def _select_trade_intent_records(
@@ -542,25 +585,12 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
-        execution_preflight = build_paper_trade_execution_preflight(
-            paper_trade,
-            _build_live_execution_configs(settings),
-        )
-        account_preflight = await service.probe_paper_trade(
-            paper_trade,
-            _build_account_preflight_configs(settings),
-        )
-        confirmations = confirmation_store.list_recent(
-            limit=50,
-            paper_trade_id=paper_trade_id,
-        )
-        return build_live_submission_readiness(
-            paper_trade_id=paper_trade_id,
-            label=paper_trade.intent.label,
+        return await _build_readiness_for_paper_trade(
+            paper_trade=paper_trade,
             preview_hash=preview_hash,
-            confirmations=confirmations,
-            execution_preflight=execution_preflight,
-            account_preflight=account_preflight,
+            settings=settings,
+            confirmation_store=confirmation_store,
+            account_preflight_service=service,
         )
 
     @app.get(
@@ -666,6 +696,76 @@ def create_app() -> FastAPI:
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
         journal_entry = adapter.submit(paper_trade)
+        return execution_store.append(journal_entry)
+
+    @app.post(
+        "/v1/executions/live/paradex/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionJournalEntry,
+    )
+    async def execute_saved_paper_trade_on_paradex(
+        paper_trade_id: int,
+        preview_hash: str,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        account_preflight_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        service: Annotated[
+            ParadexLiveExecutionService,
+            Depends(get_paradex_live_execution_service),
+        ],
+    ) -> ExecutionJournalEntry:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+
+        readiness = await _build_readiness_for_paper_trade(
+            paper_trade=paper_trade,
+            preview_hash=preview_hash,
+            settings=settings,
+            confirmation_store=confirmation_store,
+            account_preflight_service=account_preflight_service,
+        )
+        if not readiness.ready:
+            raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
+
+        confirmations = confirmation_store.list_recent(
+            limit=50,
+            paper_trade_id=paper_trade_id,
+        )
+        try:
+            confirmation = next(
+                item
+                for item in confirmations
+                if item.paper_trade_id == paper_trade_id and item.preview_hash == preview_hash
+            )
+        except StopIteration as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No preview confirmation matched the requested paper trade and preview hash"
+                ),
+            ) from exc
+
+        try:
+            journal_entry = await service.submit_confirmed_preview(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
         return execution_store.append(journal_entry)
 
     @app.get("/dashboard", response_class=HTMLResponse)

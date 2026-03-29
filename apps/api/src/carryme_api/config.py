@@ -18,6 +18,7 @@ class ApiSettings(BaseSettings):
     paradex_account_address: str | None = None
     paradex_private_key: str | None = None
     paradex_bearer_token: str | None = None
+    paradex_recv_window_ms: int = 300000
     hyperliquid_live_enabled: bool = False
     hyperliquid_account_address: str | None = None
     hyperliquid_api_wallet_private_key: str | None = None

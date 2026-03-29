@@ -8,6 +8,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -20,9 +21,11 @@ from carryme_connectors.base import ConnectorError
 PARADEX_API_BASE_URL = "https://api.prod.paradex.trade"
 PARADEX_SYSTEM_CONFIG_PATH = "/v1/system/config"
 PARADEX_AUTH_PATH = "/v1/auth"
+PARADEX_ORDER_PATH = "/v1/orders"
 PARADEX_AUTH_TOKEN_LIFETIME_SECONDS = 24 * 60 * 60
 STARK_FIELD_MASK = (1 << 250) - 1
 STARK_CURVE_ORDER = 0x800000000000010FFFFFFFFFFFFFFFFB781126DCAE7B2321E66A241ADC64D2F
+PARADEX_DEFAULT_RECV_WINDOW_MS = 300_000
 
 _AUTH_TYPES: dict[str, list[dict[str, str]]] = {
     "StarkNetDomain": [
@@ -36,6 +39,22 @@ _AUTH_TYPES: dict[str, list[dict[str, str]]] = {
         {"name": "body", "type": "felt"},
         {"name": "timestamp", "type": "felt"},
         {"name": "expiration", "type": "felt"},
+    ],
+}
+
+_ORDER_TYPES: dict[str, list[dict[str, str]]] = {
+    "StarkNetDomain": [
+        {"name": "name", "type": "felt"},
+        {"name": "chainId", "type": "felt"},
+        {"name": "version", "type": "felt"},
+    ],
+    "Order": [
+        {"name": "timestamp", "type": "felt"},
+        {"name": "market", "type": "felt"},
+        {"name": "side", "type": "felt"},
+        {"name": "orderType", "type": "felt"},
+        {"name": "size", "type": "felt"},
+        {"name": "price", "type": "felt"},
     ],
 }
 
@@ -189,11 +208,138 @@ def build_paradex_auth_headers(
     }
 
 
+def build_signed_paradex_order_payload(
+    *,
+    account_address: str,
+    private_key: str,
+    starknet_chain_id: str,
+    order_payload: Mapping[str, Any],
+    signature_timestamp_ms: int | None = None,
+    recv_window_ms: int = PARADEX_DEFAULT_RECV_WINDOW_MS,
+) -> dict[str, Any]:
+    """Build a signed Paradex order payload from an unsigned preview payload."""
+
+    market = _require_string(order_payload, "market")
+    side = _normalize_order_side(_require_string(order_payload, "side"))
+    order_type = _normalize_order_type(_require_string(order_payload, "type"))
+    size = _require_decimal(order_payload, "size")
+    price = _require_decimal(order_payload, "price") if order_type != "MARKET" else Decimal("0")
+    instruction = _require_string(order_payload, "instruction")
+    client_id = _require_string(order_payload, "client_id")
+    reduce_only = bool(order_payload.get("reduce_only"))
+    signature_timestamp = (
+        int(time.time() * 1000) if signature_timestamp_ms is None else signature_timestamp_ms
+    )
+    signature = build_paradex_order_signature(
+        account_address=account_address,
+        private_key=private_key,
+        starknet_chain_id=starknet_chain_id,
+        market=market,
+        side=side,
+        order_type=order_type,
+        size=size,
+        price=price,
+        signature_timestamp_ms=signature_timestamp,
+    )
+
+    signed_payload: dict[str, Any] = {
+        "market": market,
+        "side": side,
+        "type": order_type,
+        "size": _format_order_decimal(size),
+        "price": _format_order_decimal(price),
+        "instruction": instruction,
+        "client_id": client_id,
+        "signature": signature,
+        "signature_timestamp": signature_timestamp,
+        "recv_window": recv_window_ms,
+    }
+    if reduce_only:
+        signed_payload["flags"] = ["REDUCE_ONLY"]
+    return signed_payload
+
+
+def build_paradex_order_signature(
+    *,
+    account_address: str,
+    private_key: str,
+    starknet_chain_id: str,
+    market: str,
+    side: str,
+    order_type: str,
+    size: Decimal,
+    price: Decimal,
+    signature_timestamp_ms: int,
+) -> str:
+    """Return the Paradex typed-data order signature for one order payload."""
+
+    account_address_int = _parse_hex_value(account_address, "Paradex account address")
+    private_key_int = _parse_hex_value(private_key, "Paradex private key")
+    chain_id_int = int.from_bytes(starknet_chain_id.encode("utf-8"), "big")
+    typed_data = _build_auth_typed_data(
+        account_address=account_address_int,
+        domain={
+            "name": "Paradex",
+            "chainId": hex(chain_id_int),
+            "version": "1",
+        },
+        primary_type="Order",
+        message={
+            "timestamp": str(signature_timestamp_ms),
+            "market": market,
+            "side": "1" if side == "BUY" else "2",
+            "orderType": order_type,
+            "size": str(_to_chain_decimal(size)),
+            "price": "0" if order_type == "MARKET" else str(_to_chain_decimal(price)),
+        },
+        types=_ORDER_TYPES,
+    )
+    k = _generate_k_rfc6979(typed_data.message_hash, private_key_int)
+    signature = sign(private_key=private_key_int, msg_hash=typed_data.message_hash, seed=k)
+    return f'["{signature[0]}","{signature[1]}"]'
+
+
 def _parse_hex_value(value: str, label: str) -> int:
     try:
         return int(value, 16)
     except ValueError as exc:  # pragma: no cover - defensive only
         raise ConnectorError(f"{label} must be a hex string") from exc
+
+
+def _require_string(payload: Mapping[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ConnectorError(f"Paradex order payload missing required string field: {key}")
+    return value
+
+
+def _require_decimal(payload: Mapping[str, Any], key: str) -> Decimal:
+    value = payload.get(key)
+    if value is None:
+        raise ConnectorError(f"Paradex order payload missing required decimal field: {key}")
+    return Decimal(str(value))
+
+
+def _normalize_order_side(value: str) -> str:
+    normalized = value.strip().upper()
+    if normalized not in {"BUY", "SELL"}:
+        raise ConnectorError(f"Unsupported Paradex order side: {value}")
+    return normalized
+
+
+def _normalize_order_type(value: str) -> str:
+    normalized = value.strip().upper()
+    if normalized not in {"LIMIT", "MARKET"}:
+        raise ConnectorError(f"Unsupported Paradex order type: {value}")
+    return normalized
+
+
+def _to_chain_decimal(value: Decimal) -> int:
+    return int(value.scaleb(8))
+
+
+def _format_order_decimal(value: Decimal) -> str:
+    return format(value, "f")
 
 
 @dataclass(frozen=True)
