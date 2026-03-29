@@ -5151,6 +5151,125 @@ def test_build_execution_pair_status_marks_reduce_only_cleanup_as_closed() -> No
     assert any("no live positions remain" in note.lower() for note in status.notes)
 
 
+def test_build_execution_pair_status_does_not_mark_non_reduce_only_as_closed() -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=23,
+        executed_at=datetime(2026, 3, 29, 19, 5, tzinfo=UTC),
+        adapter="paired_live:paradex_then_extended",
+        mode="live",
+        status="submitted",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        confirmation_entry_id=5,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 3, 29, 12, 50, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 40, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=991.7,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-live",
+                request_payload={"reduce_only": False},
+            ),
+            ExecutionLegResult(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="ext-live",
+                request_payload={},
+            ),
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=23,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        legs=[
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="pdx-live",
+                derived_state="filled",
+                order_status="CLOSED",
+            ),
+            ExecutionLegOrderState(
+                venue="extended",
+                supported=True,
+                external_reference="ext-live",
+                derived_state="unknown",
+            ),
+        ],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=23,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                matched_leg_symbols=[],
+                unmatched_leg_symbols=["ARB-USD-PERP"],
+            ),
+            ExecutionVenueReconciliation(
+                venue="extended",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                matched_leg_symbols=[],
+                unmatched_leg_symbols=["ARB-USD"],
+            ),
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "review_required"
+    assert status.recommended_action == "manual_review_required"
+    assert any("reported a fill" in note.lower() for note in status.notes)
+
+
 def test_extended_cleanup_preview_service_builds_reduce_only_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

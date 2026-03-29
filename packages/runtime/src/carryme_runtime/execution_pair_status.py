@@ -119,9 +119,8 @@ def _position_presence_by_leg(
 
 
 def _is_cleanup_execution(entry: ExecutionJournalEntry) -> bool:
-    adapter = entry.adapter.lower()
-    if "cleanup" in adapter:
-        return True
+    if not entry.legs:
+        return False
     for leg in entry.legs:
         payload = leg.request_payload if isinstance(leg.request_payload, dict) else None
         if payload is None:
@@ -131,4 +130,4 @@ def _is_cleanup_execution(entry: ExecutionJournalEntry) -> bool:
             reduce_only = payload.get("reduceOnly")
         if reduce_only is not True:
             return False
-    return bool(entry.legs)
+    return True
