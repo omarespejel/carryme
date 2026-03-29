@@ -44,6 +44,7 @@ from carryme_worker.poller import (
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
+    _build_order_state_observers,
     install_signal_handlers,
     observe_live_executions_once,
     poll_watchlist_once,
@@ -1013,6 +1014,204 @@ def test_observe_live_executions_once_skips_failed_observations(tmp_path: Path) 
     assert summary.saved_observations == 1
     assert len(results) == 1
     assert results[0].paper_trade_id == 8
+
+
+def test_observe_live_executions_once_pages_until_it_finds_live_entries(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_observation_limit=1,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
+            adapter="paired_mock:extended_then_paradex",
+            mode="mock",
+            status="submitted",
+            paper_trade_id=9,
+            preview_hash="paper-preview",
+            confirmation_entry_id=10,
+            paper_trade=PaperTradeEntry(
+                entry_id=9,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="paper trade",
+                intent=FundingPairTradeIntent(
+                    label="paper_pair",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=True,
+                    external_reference="mock-order-1",
+                )
+            ],
+        )
+    )
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=9,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order-1",
+                )
+            ],
+        )
+    )
+
+    class StubAccountService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            config_map: object,
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id == 7
+            _ = config_map
+            return PaperTradeAccountPreflight(
+                paper_trade_id=7,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=[],
+                    )
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            assert entry.paper_trade_id == 7
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="extended",
+                        supported=True,
+                        observation_source="rest_poll",
+                        external_reference="ext-order-1",
+                        derived_state="unfilled",
+                        order_status="CLOSED",
+                    )
+                ],
+                notes=[],
+            )
+
+    summary = asyncio.run(
+        observe_live_executions_once(
+            settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            account_service=cast(AccountPreflightService, StubAccountService()),
+            order_state_service=cast(ExecutionOrderStateService, StubOrderStateService()),
+            now=datetime(2026, 3, 29, 13, 8, tzinfo=UTC),
+        )
+    )
+
+    assert summary.scanned_executions == 1
+    assert summary.observed_executions == 1
+    assert summary.saved_observations == 1
+    assert observation_store.latest_for_paper_trade(7) is not None
+
+
+def test_build_order_state_observers_respects_live_enabled_flags(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        extended_live_enabled=False,
+        extended_api_key="extended-key",
+        paradex_live_enabled=False,
+        paradex_account_address="0xabc",
+        paradex_private_key="paradex-private",
+        hyperliquid_live_enabled=False,
+        hyperliquid_account_address="0xdef",
+        hyperliquid_api_wallet_private_key="hyperliquid-private",
+    )
+
+    assert _build_order_state_observers(settings) == {}
 
 
 def test_worker_main_rejects_mutually_exclusive_modes(

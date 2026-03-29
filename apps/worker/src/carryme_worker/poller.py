@@ -14,6 +14,7 @@ from typing import Protocol
 import httpx
 from carryme_models import (
     CandidateAlertEvent,
+    ExecutionJournalEntry,
     ExecutionObservationEntry,
     FundingArbOpportunity,
     OpportunityRecord,
@@ -207,17 +208,15 @@ async def observe_live_executions_once(
         observers=_build_order_state_observers(settings)
     )
     timestamp = now or datetime.now(UTC)
+    recent_live_executions = _list_recent_live_executions(
+        journal_store,
+        limit=settings.execution_observation_limit,
+    )
 
     scanned_executions = 0
     observed_executions = 0
     saved_observations = 0
-    seen_paper_trade_ids: set[int] = set()
-    for execution in journal_store.list_recent(limit=settings.execution_observation_limit):
-        if execution.mode != "live" or execution.status not in {"submitted", "partial"}:
-            continue
-        if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
-            continue
-        seen_paper_trade_ids.add(execution.paper_trade_id)
+    for execution in recent_live_executions:
         scanned_executions += 1
 
         try:
@@ -527,9 +526,9 @@ def _build_order_state_observers(
     settings: WorkerSettings,
 ) -> dict[str, ExecutionLegOrderObserver]:
     observers: dict[str, ExecutionLegOrderObserver] = {}
-    if settings.extended_api_key:
+    if settings.extended_live_enabled and settings.extended_api_key:
         observers["extended"] = ExtendedOrderStateObserver(api_key=settings.extended_api_key)
-    if settings.paradex_account_address and (
+    if settings.paradex_live_enabled and settings.paradex_account_address and (
         settings.paradex_private_key or settings.paradex_bearer_token
     ):
         observers["paradex"] = ParadexOrderStateObserver(
@@ -537,12 +536,50 @@ def _build_order_state_observers(
             private_key=settings.paradex_private_key,
             bearer_token=settings.paradex_bearer_token,
         )
-    if settings.hyperliquid_account_address and settings.hyperliquid_api_wallet_private_key:
+    if (
+        settings.hyperliquid_live_enabled
+        and settings.hyperliquid_account_address
+        and settings.hyperliquid_api_wallet_private_key
+    ):
         observers["hyperliquid"] = HyperliquidOrderStateObserver(
             account_address=settings.hyperliquid_account_address,
             vault_address=settings.hyperliquid_vault_address,
         )
     return observers
+
+
+def _list_recent_live_executions(
+    journal_store: ExecutionJournalStore,
+    *,
+    limit: int,
+) -> list[ExecutionJournalEntry]:
+    """Return recent unique live executions after filtering irrelevant journal rows."""
+
+    page_size = max(limit, 20)
+    offset = 0
+    seen_paper_trade_ids: set[int] = set()
+    selected: list[ExecutionJournalEntry] = []
+
+    while len(selected) < limit:
+        batch = journal_store.list_recent(limit=page_size, offset=offset)
+        if not batch:
+            break
+        offset += len(batch)
+
+        for execution in batch:
+            if execution.mode != "live" or execution.status not in {"submitted", "partial"}:
+                continue
+            if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
+                continue
+            seen_paper_trade_ids.add(execution.paper_trade_id)
+            selected.append(execution)
+            if len(selected) >= limit:
+                break
+
+        if len(batch) < page_size:
+            break
+
+    return selected
 
 
 def install_signal_handlers(

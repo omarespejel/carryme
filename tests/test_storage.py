@@ -1831,15 +1831,33 @@ def test_execution_observation_store_appends_and_lists_recent(tmp_path: Path) ->
             execution_entry_id=13,
             paper_trade_id=7,
             preview_hash="preview-hash-newer",
-            order_state=entry.order_state,
+            order_state=pair_status.order_state.model_copy(
+                update={
+                    "execution_entry_id": 13,
+                    "paper_trade_id": 7,
+                    "preview_hash": "preview-hash-newer",
+                }
+            ),
             pair_status=ExecutionPairStatus(
                 execution_entry_id=13,
                 paper_trade_id=7,
                 preview_hash="preview-hash-newer",
                 derived_state="review_required",
                 recommended_action="wait_for_fill",
-                order_state=pair_status.order_state,
-                reconciliation=pair_status.reconciliation,
+                order_state=pair_status.order_state.model_copy(
+                    update={
+                        "execution_entry_id": 13,
+                        "paper_trade_id": 7,
+                        "preview_hash": "preview-hash-newer",
+                    }
+                ),
+                reconciliation=pair_status.reconciliation.model_copy(
+                    update={
+                        "execution_entry_id": 13,
+                        "paper_trade_id": 7,
+                        "preview_hash": "preview-hash-newer",
+                    }
+                ),
                 notes=[],
             ),
         )
@@ -1856,3 +1874,52 @@ def test_execution_observation_store_appends_and_lists_recent(tmp_path: Path) ->
     assert results[0].pair_status.derived_state == "review_required"
     assert latest is not None
     assert latest.entry_id == newer.entry_id
+
+
+def test_execution_observation_store_rejects_naive_timestamps(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="observed_at must be timezone-aware"):
+        store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 3, 29, 13, 5),
+                context="worker_execution_monitor",
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=12,
+                    paper_trade_id=7,
+                    preview_hash="preview-hash",
+                    legs=[],
+                    notes=[],
+                ),
+            )
+        )
+
+
+def test_execution_observation_store_normalizes_timestamps_to_utc(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    saved = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 15, 5, tzinfo=timezone(timedelta(hours=2))),
+            context="worker_execution_monitor",
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            order_state=ExecutionOrderState(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+
+    latest = store.latest_for_paper_trade(7)
+
+    assert saved.observed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)
+    assert latest is not None
+    assert latest.observed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)

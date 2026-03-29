@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC
 from pathlib import Path
 
 from carryme_models import ExecutionObservationEntry
@@ -56,6 +57,11 @@ class ExecutionObservationStore:
         """Append an observation entry and return it with its assigned id."""
 
         self.initialize()
+        if entry.observed_at.tzinfo is None or entry.observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware")
+        normalized_entry = entry.model_copy(
+            update={"observed_at": entry.observed_at.astimezone(UTC)}
+        )
         with sqlite3.connect(self.database_path) as connection:
             cursor = connection.execute(
                 """
@@ -69,17 +75,17 @@ class ExecutionObservationStore:
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    entry.observed_at.isoformat(),
-                    entry.context,
-                    entry.execution_entry_id,
-                    entry.paper_trade_id,
-                    entry.preview_hash,
-                    entry.model_dump_json(),
+                    normalized_entry.observed_at.isoformat(),
+                    normalized_entry.context,
+                    normalized_entry.execution_entry_id,
+                    normalized_entry.paper_trade_id,
+                    normalized_entry.preview_hash,
+                    normalized_entry.model_dump_json(),
                 ),
             )
         return ExecutionObservationEntry.model_validate(
             {
-                **entry.model_dump(mode="json"),
+                **normalized_entry.model_dump(mode="json"),
                 "entry_id": cursor.lastrowid,
             }
         )

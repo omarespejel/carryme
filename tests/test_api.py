@@ -4528,6 +4528,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
     cleanup_confirmation_store = CleanupPreviewConfirmationStore(tmp_path / "history.sqlite3")
     execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    observation_store = ExecutionObservationStore(tmp_path / "history.sqlite3")
     paper_trade = paper_store.append(
         PaperTradeEntry(
             created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
@@ -4825,6 +4826,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
         get_cleanup_preview_confirmation_store,
         get_cleanup_preview_service,
         get_execution_journal_store,
+        get_execution_observation_store,
         get_execution_order_state_service,
         get_paired_live_execution_coordinator,
         get_paper_trade_store,
@@ -4851,6 +4853,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     app.dependency_overrides[get_cleanup_live_execution_router] = (
         lambda: StubCleanupLiveExecutionRouter()
     )
+    app.dependency_overrides[get_execution_observation_store] = lambda: observation_store
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -4895,6 +4898,10 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     assert saved_executions[0].preview_hash == "cleanup-hash"
     assert saved_executions[0].confirmation_entry_id == cleanup_confirmations[0].entry_id
     assert saved_executions[1].preview_hash == "preview-hash"
+    latest_observation = observation_store.latest_for_paper_trade(paper_trade.entry_id or 0)
+    assert latest_observation is not None
+    assert latest_observation.execution_entry_id == saved_executions[0].entry_id
+    assert latest_observation.preview_hash == "cleanup-hash"
 
 
 def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirmation(

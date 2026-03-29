@@ -2502,7 +2502,7 @@ def create_app() -> FastAPI:
             try:
                 pair_status = await _observe_pair_status_for_execution(
                     paper_trade=paper_trade,
-                    execution=primary_execution,
+                    execution=cleanup_execution,
                     settings=settings,
                     account_service=account_preflight_service,
                     order_state_service=order_state_service,
