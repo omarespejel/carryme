@@ -15,6 +15,7 @@ from carryme_connectors import (
     build_signed_paradex_order_payload,
 )
 from carryme_models import (
+    CleanupPreviewConfirmationEntry,
     ExecutionJournalEntry,
     ExecutionLegResult,
     PaperTradeEntry,
@@ -65,7 +66,48 @@ class ParadexLiveExecutionService:
         if confirmation.entry_id is None:
             raise ValueError("Preview confirmation entry_id is required before live execution")
 
-        leg = self._select_paradex_leg(confirmation)
+        return await self._submit_venue_order(
+            paper_trade=paper_trade,
+            preview_hash=confirmation.preview_hash,
+            confirmation_entry_id=confirmation.entry_id,
+            adapter_name="paradex_live",
+            leg=self._select_paradex_leg(confirmation),
+            executed_at=executed_at,
+        )
+
+    async def submit_confirmed_cleanup_preview(
+        self,
+        *,
+        paper_trade: PaperTradeEntry,
+        confirmation: CleanupPreviewConfirmationEntry,
+        executed_at: datetime | None = None,
+    ) -> ExecutionJournalEntry:
+        """Submit one confirmed Paradex cleanup preview to the live venue."""
+
+        if paper_trade.entry_id is None:
+            raise ValueError("Paper trade entry_id is required before live cleanup execution")
+        if confirmation.entry_id is None:
+            raise ValueError("Cleanup confirmation entry_id is required before live execution")
+
+        return await self._submit_venue_order(
+            paper_trade=paper_trade,
+            preview_hash=confirmation.preview_hash,
+            confirmation_entry_id=confirmation.entry_id,
+            adapter_name="paradex_cleanup_live",
+            leg=confirmation.preview.leg,
+            executed_at=executed_at,
+        )
+
+    async def _submit_venue_order(
+        self,
+        *,
+        paper_trade: PaperTradeEntry,
+        preview_hash: str,
+        confirmation_entry_id: int,
+        adapter_name: str,
+        leg: VenueOrderPreview,
+        executed_at: datetime | None = None,
+    ) -> ExecutionJournalEntry:
         timestamp = executed_at or datetime.now(UTC)
         request_timeout = httpx.Timeout(15.0, connect=5.0)
 
@@ -99,12 +141,12 @@ class ParadexLiveExecutionService:
                 }
                 return ExecutionJournalEntry(
                     executed_at=timestamp,
-                    adapter="paradex_live",
+                    adapter=adapter_name,
                     mode="live",
                     status="rejected",
                     paper_trade_id=paper_trade.entry_id,
-                    preview_hash=confirmation.preview_hash,
-                    confirmation_entry_id=confirmation.entry_id,
+                    preview_hash=preview_hash,
+                    confirmation_entry_id=confirmation_entry_id,
                     paper_trade=paper_trade,
                     legs=[
                         ExecutionLegResult(
@@ -135,12 +177,12 @@ class ParadexLiveExecutionService:
 
         return ExecutionJournalEntry(
             executed_at=timestamp,
-            adapter="paradex_live",
+            adapter=adapter_name,
             mode="live",
             status=leg_status,
             paper_trade_id=paper_trade.entry_id,
-            preview_hash=confirmation.preview_hash,
-            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=preview_hash,
+            confirmation_entry_id=confirmation_entry_id,
             paper_trade=paper_trade,
             legs=[
                 ExecutionLegResult(
