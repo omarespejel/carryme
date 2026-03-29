@@ -33,6 +33,12 @@ def build_live_submission_readiness(
         )
         confirmation_entry_id = confirmation.entry_id
         confirmed_preview = True
+        blocking_reasons.extend(
+            _build_zero_collateral_blockers(
+                confirmation=confirmation,
+                account_preflight=account_preflight,
+            )
+        )
     except ValueError as exc:
         blocking_reasons.append(str(exc))
 
@@ -55,3 +61,42 @@ def build_live_submission_readiness(
         account_preflight=account_preflight,
         blocking_reasons=deduped_reasons,
     )
+
+
+def _build_zero_collateral_blockers(
+    *,
+    confirmation: PreviewConfirmationEntry,
+    account_preflight: PaperTradeAccountPreflight,
+) -> list[str]:
+    preview_legs = {leg.venue: leg for leg in confirmation.preview.legs}
+    blockers: list[str] = []
+    for venue_status in account_preflight.venues:
+        preview_leg = preview_legs.get(venue_status.venue)
+        if preview_leg is None:
+            continue
+        usable_collateral = _usable_collateral(venue_status)
+        if usable_collateral is None:
+            continue
+        if usable_collateral > 0:
+            continue
+        blockers.append(
+            f"Venue {venue_status.venue} has no usable collateral for the confirmed "
+            f"{preview_leg.target_notional:.2f} notional preview"
+        )
+    return blockers
+
+
+def _usable_collateral(venue_status: object) -> float | None:
+    available_to_trade = getattr(venue_status, "available_to_trade", None)
+    if isinstance(available_to_trade, int | float):
+        return float(available_to_trade)
+
+    free_collateral = getattr(venue_status, "free_collateral", None)
+    if isinstance(free_collateral, int | float):
+        return float(free_collateral)
+
+    total_collateral = getattr(venue_status, "total_collateral", None)
+    if isinstance(total_collateral, int | float):
+        return float(total_collateral)
+
+    return None
