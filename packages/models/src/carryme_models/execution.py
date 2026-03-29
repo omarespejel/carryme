@@ -22,6 +22,7 @@ class ExecutionLegResult(BaseModel):
     request_payload: dict[str, Any] | None = None
     response_payload: dict[str, Any] | None = None
     signature_timestamp: int | None = None
+    raw_payload: Any | None = None
 
 
 class ExecutionJournalEntry(BaseModel):
@@ -31,6 +32,7 @@ class ExecutionJournalEntry(BaseModel):
     executed_at: datetime
     adapter: str = Field(min_length=1)
     mode: Literal["mock", "live"]
+    submission_id: str | None = None
     status: Literal["accepted", "rejected", "submitted"]
     paper_trade_id: int | None = None
     preview_hash: str | None = None

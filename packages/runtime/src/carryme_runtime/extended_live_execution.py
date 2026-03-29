@@ -12,6 +12,7 @@ import httpx
 from carryme_connectors import (
     EXTENDED_API_BASE_URL,
     EXTENDED_ORDER_PATH,
+    ConnectorError,
     ExtendedPrivateConnector,
     build_signed_extended_order_payload,
 )
@@ -67,7 +68,7 @@ class ExtendedLiveExecutionService:
                 api_key=self.api_key,
                 stark_private_key=self.stark_private_key,
                 account_payload=account,
-                market_payload=snapshot.market.raw,
+                market_payload=_require_market_payload(snapshot.market.raw, symbol=leg.symbol),
                 order_payload=leg.payload,
                 taker_fee_rate=_pick_taker_fee_rate(fees) or fee_rate,
             )
@@ -167,3 +168,9 @@ def _pick_taker_fee_rate(payload: dict[str, Any] | list[Any]) -> Decimal | None:
             continue
         return Decimal(str(value))
     return None
+
+
+def _require_market_payload(payload: dict[str, Any] | list[Any], *, symbol: str) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    raise ConnectorError(f"Extended market payload for {symbol} must be an object")

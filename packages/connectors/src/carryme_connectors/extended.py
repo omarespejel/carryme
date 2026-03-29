@@ -15,20 +15,38 @@ class ExtendedPublicConnector(BaseHttpConnector):
 
     venue = "extended"
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        super().__init__(client)
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        max_attempts: int = 3,
+        base_backoff_seconds: float = 0.1,
+    ) -> None:
+        super().__init__(
+            client,
+            max_attempts=max_attempts,
+            base_backoff_seconds=base_backoff_seconds,
+        )
 
     async def fetch_market_stats(self, symbol: str) -> MarketStats:
         payload = await self._request_json("GET", "/api/v1/info/markets", params={"market": symbol})
         if not isinstance(payload, dict):
-            raise ConnectorError("Extended market metadata payload must be an object")
-        rows = payload.get("data", [])
-        if not isinstance(rows, list):
-            raise ConnectorError("Extended market metadata missing data list")
-        data = _find_market(rows, symbol)
-        market_stats = data.get("marketStats", {})
-        if not isinstance(market_stats, dict):
-            raise ConnectorError("Extended market metadata missing marketStats object")
+            raise ConnectorError("Extended market stats payload must be an object")
+
+        data = payload.get("data")
+        raw: dict[str, Any]
+        market_stats: dict[str, Any]
+        if isinstance(data, list):
+            raw = _find_market(data, symbol)
+            market_stats = raw.get("marketStats", {})
+            if not isinstance(market_stats, dict):
+                raise ConnectorError("Extended market metadata missing marketStats object")
+        elif isinstance(data, dict):
+            raw = payload
+            market_stats = data
+        else:
+            raise ConnectorError("Extended market stats missing data object")
+
         return MarketStats(
             venue=self.venue,
             symbol=symbol,
@@ -36,14 +54,14 @@ class ExtendedPublicConnector(BaseHttpConnector):
             funding_rate=parse_float(market_stats.get("fundingRate")),
             open_interest=parse_float(market_stats.get("openInterest")),
             daily_volume=parse_float(market_stats.get("dailyVolume")),
-            raw=data,
+            raw=raw,
         )
 
     async def fetch_top_of_book(self, symbol: str) -> TopOfBook:
         payload = await self._request_json("GET", f"/api/v1/info/markets/{symbol}/orderbook")
         if not isinstance(payload, dict):
             raise ConnectorError("Extended orderbook payload must be an object")
-        data = payload.get("data", {})
+        data = payload.get("data")
         if not isinstance(data, dict):
             raise ConnectorError("Extended orderbook missing data object")
         best_bid = _first_level(data.get("bid"))
@@ -54,8 +72,6 @@ class ExtendedPublicConnector(BaseHttpConnector):
             best_ask_price=parse_float(best_ask.get("price")) if best_ask else None,
             best_ask_size=parse_float(best_ask.get("qty")) if best_ask else None,
         )
-
-
 def _first_level(value: Any) -> dict[str, Any] | None:
     if isinstance(value, list) and value:
         item = value[0]
