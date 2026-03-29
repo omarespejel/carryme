@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -28,6 +29,8 @@ from carryme_runtime.order_preview import (
     _snap_quantity,
     _to_float,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 class ParadexJwtTokenIssuer(Protocol):
@@ -113,15 +116,26 @@ class ParadexCleanupPreviewService:
         ) as client:
             payload = await ParadexPrivateConnector(client).fetch_positions()
 
-        rows = _unwrap_rows(payload)
+        rows, container_key = _unwrap_rows(payload)
         for row in rows:
-            candidates = {
-                _string_value(row, "market"),
-                _string_value(row, "symbol"),
-                _string_value(row, "ticker"),
-            }
-            if symbol in candidates:
-                return row
+            match_key = _matching_symbol_key(row, symbol)
+            if match_key is None:
+                continue
+            if container_key not in (None, "results"):
+                _logger.warning(
+                    "Paradex positions used fallback container key key=%s symbol=%s row_keys=%s",
+                    container_key,
+                    symbol,
+                    sorted(row.keys()),
+                )
+            if match_key != "market":
+                _logger.warning(
+                    "Paradex positions used fallback symbol key key=%s symbol=%s row_keys=%s",
+                    match_key,
+                    symbol,
+                    sorted(row.keys()),
+                )
+            return row
         raise ValueError(f"No open Paradex position matched {symbol}")
 
     async def _build_cleanup_leg(
@@ -254,15 +268,26 @@ def _cleanup_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _unwrap_rows(payload: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
+def _unwrap_rows(payload: dict[str, Any] | list[Any]) -> tuple[list[dict[str, Any]], str | None]:
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        return [item for item in payload if isinstance(item, dict)], None
     if isinstance(payload, dict):
-        for key in ("data", "rows", "results", "positions"):
+        for key in ("results", "positions", "data", "rows"):
             nested = payload.get(key)
             if isinstance(nested, list):
-                return [item for item in nested if isinstance(item, dict)]
-    return []
+                return [item for item in nested if isinstance(item, dict)], key
+        _logger.warning(
+            "Paradex positions payload missing expected top-level containers keys=%s",
+            sorted(payload.keys()),
+        )
+    return [], None
+
+
+def _matching_symbol_key(payload: dict[str, Any], symbol: str) -> str | None:
+    for key in ("market", "symbol", "ticker"):
+        if _string_value(payload, key) == symbol:
+            return key
+    return None
 
 
 def _string_value(payload: dict[str, Any], key: str) -> str | None:

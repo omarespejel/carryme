@@ -141,7 +141,7 @@ class ParadexLiveExecutionService:
                 }
                 return ExecutionJournalEntry(
                     executed_at=timestamp,
-                    adapter="paradex_live",
+                    adapter=adapter_name,
                     mode="live",
                     status="rejected",
                     paper_trade_id=paper_trade.entry_id,
