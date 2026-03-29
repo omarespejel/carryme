@@ -6,7 +6,7 @@ from typing import Annotated
 import httpx
 from carryme_models import AppDescriptor, FundingArbOpportunity, ServiceHealth, TradingFeeProfile
 from carryme_normalizers import list_fee_profiles
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 
 from carryme_api.opportunities import ConnectorError, OpportunityService, UpstreamDataError
 
@@ -65,10 +65,11 @@ def create_app() -> FastAPI:
         right_venue: str,
         right_symbol: str,
         right_fee_profile: str,
+        response: Response,
         service: Annotated[OpportunityService, Depends(get_opportunity_service)],
     ) -> FundingArbOpportunity:
         try:
-            return await service.score_pair(
+            opportunity = await service.score_pair(
                 left_venue=left_venue,
                 left_symbol=left_symbol,
                 left_fee_profile=left_fee_profile,
@@ -76,6 +77,8 @@ def create_app() -> FastAPI:
                 right_symbol=right_symbol,
                 right_fee_profile=right_fee_profile,
             )
+            response.headers["Cache-Control"] = "no-store"
+            return opportunity
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
