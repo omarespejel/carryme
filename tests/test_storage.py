@@ -563,6 +563,64 @@ def test_execution_journal_store_normalizes_executed_at_to_utc(tmp_path: Path) -
     assert saved.executed_at == datetime(2026, 3, 29, 13, 5, tzinfo=UTC)
 
 
+def test_execution_journal_store_rejects_naive_executed_at(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="executed_at must be timezone-aware"):
+        store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 5),
+                adapter="mock",
+                mode="mock",
+                submission_id="submission-naive",
+                status="accepted",
+                paper_trade_id=7,
+                paper_trade=PaperTradeEntry(
+                    entry_id=7,
+                    created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                    note="operator accepted candidate",
+                    intent=FundingPairTradeIntent(
+                        label="arb_extended_paradex",
+                        canonical_symbol="ARB-USD-PERP",
+                        source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                        one_day_net_edge_after_entry=0.00055,
+                        break_even_days_entry=0.45,
+                        capacity_limit_notional=4500.0,
+                        target_notional=1000.0,
+                        capacity_fraction=0.25,
+                        max_target_notional=1000.0,
+                        long_leg=TradeLegIntent(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                            fee_profile="pro",
+                            side="buy",
+                            target_notional=1000.0,
+                        ),
+                        short_leg=TradeLegIntent(
+                            venue="extended",
+                            symbol="ARB-USD",
+                            fee_profile="default",
+                            side="sell",
+                            target_notional=1000.0,
+                        ),
+                    ),
+                ),
+                legs=[
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                        status="accepted",
+                        simulated=True,
+                        external_reference="mock:7:buy",
+                    )
+                ],
+            )
+        )
+
+
 def test_execution_journal_store_orders_ties_deterministically(tmp_path: Path) -> None:
     store = ExecutionJournalStore(tmp_path / "history.sqlite3")
     for paper_trade_id in [1, 2]:
