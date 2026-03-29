@@ -13,6 +13,7 @@ from carryme_models import (
     ExecutionJournalEntry,
     FundingArbOpportunity,
     FundingPairTradeIntent,
+    LiveSubmissionReadiness,
     OpportunityRecord,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
@@ -37,6 +38,7 @@ from carryme_runtime import (
     OrderPreviewService,
     UpstreamDataError,
     build_live_execution_configs,
+    build_live_submission_readiness,
     build_paper_trade_execution_preflight,
     build_trade_intent,
     build_venue_execution_preflights,
@@ -659,6 +661,56 @@ def create_app() -> FastAPI:
             )
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/executions/readiness/from-paper-trade/{paper_trade_id}",
+        response_model=LiveSubmissionReadiness,
+    )
+    async def execution_readiness_for_paper_trade(
+        paper_trade_id: int,
+        preview_hash: str,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        service: Annotated[AccountPreflightService, Depends(get_account_preflight_service)],
+        response: Response,
+    ) -> LiveSubmissionReadiness:
+        response.headers["Cache-Control"] = "no-store"
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
+        execution_preflight = build_paper_trade_execution_preflight(
+            paper_trade,
+            build_live_execution_configs(settings),
+        )
+        try:
+            account_preflight = await service.probe_paper_trade(
+                paper_trade,
+                _build_account_preflight_configs(settings),
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        confirmation = confirmation_store.find_latest_by_preview_hash(
+            paper_trade_id=paper_trade_id,
+            preview_hash=normalized_preview_hash,
+        )
+        return build_live_submission_readiness(
+            paper_trade_id=paper_trade_id,
+            label=paper_trade.intent.label,
+            preview_hash=normalized_preview_hash,
+            confirmations=[] if confirmation is None else [confirmation],
+            execution_preflight=execution_preflight,
+            account_preflight=account_preflight,
+        )
 
     @app.get(
         "/v1/executions/preview/from-paper-trade/{paper_trade_id}",

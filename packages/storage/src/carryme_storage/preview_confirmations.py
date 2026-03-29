@@ -51,6 +51,18 @@ class PreviewConfirmationStore:
                 ON preview_confirmation_entries(paper_trade_id)
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_preview_confirmation_trade_hash_confirmed_desc
+                ON preview_confirmation_entries(
+                    paper_trade_id,
+                    preview_hash,
+                    confirmed_at DESC,
+                    id DESC
+                )
+                """
+            )
 
     def append(self, entry: PreviewConfirmationEntry) -> PreviewConfirmationEntry:
         """Append a preview confirmation entry and return it with its assigned id."""
@@ -149,3 +161,37 @@ class PreviewConfirmationStore:
             )
             for stored_id, entry_json in rows
         ]
+
+    def find_latest_by_preview_hash(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+    ) -> PreviewConfirmationEntry | None:
+        """Return the latest stored confirmation for one trade/hash pair."""
+
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        self.initialize()
+        query = """
+            SELECT id, entry_json
+            FROM preview_confirmation_entries
+            WHERE paper_trade_id = ? AND preview_hash = ?
+            ORDER BY confirmed_at DESC, id DESC
+            LIMIT 1
+        """
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                query,
+                (paper_trade_id, normalized_preview_hash),
+            ).fetchone()
+        if row is None:
+            return None
+        stored_id, entry_json = row
+        return PreviewConfirmationEntry.model_validate(
+            {
+                **json.loads(entry_json),
+                "entry_id": stored_id,
+            }
+        )
