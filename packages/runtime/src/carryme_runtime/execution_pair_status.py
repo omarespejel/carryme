@@ -11,7 +11,14 @@ from carryme_models import (
     ExecutionReconciliation,
 )
 
-DerivedPairState = Literal["hedged", "pending", "unfilled", "cleanup_needed", "review_required"]
+DerivedPairState = Literal[
+    "hedged",
+    "pending",
+    "unfilled",
+    "closed",
+    "cleanup_needed",
+    "review_required",
+]
 
 
 def build_execution_pair_status(
@@ -62,6 +69,10 @@ def build_execution_pair_status(
         else:
             recommended_action = "complete_or_unwind_missing_leg"
             notes.append("Only part of the intended hedge is present in live position state.")
+    elif _is_cleanup_execution(entry) and any_filled and not any_position:
+        derived_state = "closed"
+        recommended_action = "no_action"
+        notes.append("Reduce-only cleanup execution filled and no live positions remain.")
     elif any_filled:
         derived_state = "review_required"
         recommended_action = "manual_review_required"
@@ -105,3 +116,19 @@ def _position_presence_by_leg(
             leg.symbol in venue_state.position_symbols if venue_state is not None else False
         )
     return position_presence
+
+
+def _is_cleanup_execution(entry: ExecutionJournalEntry) -> bool:
+    adapter = entry.adapter.lower()
+    if "cleanup" in adapter:
+        return True
+    for leg in entry.legs:
+        payload = leg.request_payload if isinstance(leg.request_payload, dict) else None
+        if payload is None:
+            return False
+        reduce_only = payload.get("reduce_only")
+        if reduce_only is None:
+            reduce_only = payload.get("reduceOnly")
+        if reduce_only is not True:
+            return False
+    return bool(entry.legs)
