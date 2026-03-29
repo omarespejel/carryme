@@ -1175,6 +1175,18 @@ def test_preview_confirmation_store_returns_none_for_missing_hash(tmp_path: Path
     )
 
 
+def test_preview_confirmation_store_rejects_whitespace_only_hash_lookup(
+    tmp_path: Path,
+) -> None:
+    store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match="preview_hash must be non-empty"):
+        store.find_latest_by_preview_hash(
+            paper_trade_id=7,
+            preview_hash="  ",
+        )
+
+
 def test_preview_confirmation_store_normalizes_labels_and_hashes(tmp_path: Path) -> None:
     store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
     store.append(

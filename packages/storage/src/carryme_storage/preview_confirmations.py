@@ -51,6 +51,18 @@ class PreviewConfirmationStore:
                 ON preview_confirmation_entries(paper_trade_id)
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                idx_preview_confirmation_trade_hash_confirmed_desc
+                ON preview_confirmation_entries(
+                    paper_trade_id,
+                    preview_hash,
+                    confirmed_at DESC,
+                    id DESC
+                )
+                """
+            )
 
     def append(self, entry: PreviewConfirmationEntry) -> PreviewConfirmationEntry:
         """Append a preview confirmation entry and return it with its assigned id."""
