@@ -3070,14 +3070,165 @@ def test_cleanup_live_execution_router_dispatches_to_preview_venue() -> None:
                 ],
             )
 
+    class StubOtherService:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            self.called = True
+            raise AssertionError("Cleanup router dispatched to the wrong venue")
+
     async def run() -> None:
-        router = CleanupLiveExecutionRouter(services={"paradex": StubParadexService()})
+        other_service = StubOtherService()
+        router = CleanupLiveExecutionRouter(
+            services={
+                "other": other_service,
+                "paradex": StubParadexService(),
+            }
+        )
         entry = await router.submit_confirmed_cleanup_preview(
             paper_trade=paper_trade,
             confirmation=confirmation,
         )
         assert entry.adapter == "paradex_cleanup_live"
         assert entry.legs[0].venue == "paradex"
+        assert other_service.called is False
+
+    asyncio.run(run())
+
+
+def test_cleanup_live_execution_router_rejects_mismatched_trade_or_non_reduce_only() -> None:
+    class StubParadexService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            raise AssertionError(
+                "Router should reject invalid cleanup confirmation before dispatch"
+            )
+
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    router = CleanupLiveExecutionRouter(services={"paradex": StubParadexService()})
+
+    mismatched_confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=9,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0890,
+                worst_price_text="0.08900000",
+                reduce_only=True,
+                endpoint_path_hint="/v1/orders",
+                auth_scheme="main account address + subkey private key",
+                payload={"market": "ARB-USD-PERP", "reduce_only": True},
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    non_reduce_only_confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=12,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash-2",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash-2",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0890,
+                worst_price_text="0.08900000",
+                reduce_only=False,
+                endpoint_path_hint="/v1/orders",
+                auth_scheme="main account address + subkey private key",
+                payload={"market": "ARB-USD-PERP", "reduce_only": False},
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    async def run() -> None:
+        with pytest.raises(ValueError, match="does not belong"):
+            await router.submit_confirmed_cleanup_preview(
+                paper_trade=paper_trade,
+                confirmation=mismatched_confirmation,
+            )
+        with pytest.raises(ValueError, match="must be reduce-only"):
+            await router.submit_confirmed_cleanup_preview(
+                paper_trade=paper_trade,
+                confirmation=non_reduce_only_confirmation,
+            )
 
     asyncio.run(run())
 

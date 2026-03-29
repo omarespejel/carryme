@@ -34,6 +34,15 @@ class CleanupLiveExecutionRouter:
         confirmation: CleanupPreviewConfirmationEntry,
         executed_at: datetime | None = None,
     ) -> ExecutionJournalEntry:
+        paper_trade_id = paper_trade.entry_id
+        if paper_trade_id is None:
+            raise ValueError("Cleanup live execution requires a persisted paper trade")
+        if confirmation.paper_trade_id != paper_trade_id:
+            raise ValueError("Cleanup confirmation does not belong to the supplied paper trade")
+        if confirmation.preview.paper_trade_id != paper_trade_id:
+            raise ValueError("Cleanup preview does not belong to the supplied paper trade")
+        if confirmation.preview.leg.reduce_only is not True:
+            raise ValueError("Cleanup confirmation must be reduce-only before live execution")
         venue = confirmation.preview.leg.venue
         service = self.services.get(venue)
         if service is None:

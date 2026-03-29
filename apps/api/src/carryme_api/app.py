@@ -93,6 +93,7 @@ APP_VERSION = "0.1.0"
 DEFAULT_APP_ENVIRONMENT = "development"
 APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
 MAX_HISTORY_LIMIT = 1000
+PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
 
 
 class ConfirmPreviewRequest(BaseModel):
@@ -673,12 +674,22 @@ async def _observe_pair_status_for_execution(
     for attempt in range(poll_attempts):
         if attempt > 0 and poll_interval_seconds > 0:
             await asyncio.sleep(poll_interval_seconds)
-        account_preflight = await account_service.probe_paper_trade(
-            paper_trade,
-            _build_account_preflight_configs(settings),
-        )
+        try:
+            account_preflight = await asyncio.wait_for(
+                account_service.probe_paper_trade(
+                    paper_trade,
+                    _build_account_preflight_configs(settings),
+                ),
+                timeout=PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS,
+            )
+            reconciliation = reconcile_execution(execution, account_preflight)
+            order_state = await asyncio.wait_for(
+                order_state_service.observe_execution(execution),
+                timeout=PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            continue
         reconciliation = reconcile_execution(execution, account_preflight)
-        order_state = await order_state_service.observe_execution(execution)
         last_status = build_execution_pair_status(execution, order_state, reconciliation)
         if last_status.derived_state in {
             "hedged",
@@ -688,7 +699,8 @@ async def _observe_pair_status_for_execution(
         }:
             return last_status
 
-    assert last_status is not None  # poll_attempts is validated positive
+    if last_status is None:
+        raise UpstreamDataError("Timed out polling execution status from venue services")
     return last_status
 
 
@@ -2007,11 +2019,14 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"Paper trade {paper_trade_id} was not found",
             )
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
 
         try:
             readiness = await _build_readiness_for_paper_trade(
                 paper_trade=paper_trade,
-                preview_hash=preview_hash,
+                preview_hash=normalized_preview_hash,
                 settings=settings,
                 confirmation_store=confirmation_store,
                 account_preflight_service=account_preflight_service,
@@ -2025,7 +2040,7 @@ def create_app() -> FastAPI:
 
         confirmation = confirmation_store.find_latest_by_preview_hash(
             paper_trade_id=paper_trade_id,
-            preview_hash=preview_hash,
+            preview_hash=normalized_preview_hash,
         )
         if confirmation is None:
             raise HTTPException(
@@ -2198,7 +2213,7 @@ def create_app() -> FastAPI:
 
         return GuardedPairExecutionResult(
             paper_trade_id=paper_trade_id,
-            preview_hash=preview_hash,
+            preview_hash=normalized_preview_hash,
             primary_execution=primary_execution,
             cleanup_execution=cleanup_execution,
             pair_status=pair_status,

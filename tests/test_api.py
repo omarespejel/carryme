@@ -1,6 +1,10 @@
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
+import carryme_api.app as app_module
+import pytest
 from carryme_api.app import app, get_history_store, get_opportunity_service
 from carryme_api.config import ApiSettings
 from carryme_models import (
@@ -3952,8 +3956,22 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     assert payload["cleanup_execution"]["adapter"] == "extended_cleanup_live"
     assert payload["pair_status"]["derived_state"] == "unfilled"
     assert payload["pair_status"]["recommended_action"] == "no_action"
-    assert len(cleanup_confirmation_store.list_recent(limit=10)) == 1
-    assert len(execution_store.list_recent(limit=10)) == 2
+    cleanup_confirmations = cleanup_confirmation_store.list_recent(limit=10)
+    assert len(cleanup_confirmations) == 1
+    assert cleanup_confirmations[0].preview_hash == "cleanup-hash"
+    assert cleanup_confirmations[0].note == "guarded pair auto-cleanup"
+    assert cleanup_confirmations[0].preview.leg.venue == "extended"
+    saved_executions = sorted(
+        execution_store.list_recent(limit=10),
+        key=lambda entry: entry.adapter,
+    )
+    assert [entry.adapter for entry in saved_executions] == [
+        "extended_cleanup_live",
+        "paired_live:extended_then_paradex",
+    ]
+    assert saved_executions[0].preview_hash == "cleanup-hash"
+    assert saved_executions[0].confirmation_entry_id == cleanup_confirmations[0].entry_id
+    assert saved_executions[1].preview_hash == "preview-hash"
 
 
 def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirmation(
@@ -4543,3 +4561,148 @@ def test_guarded_paired_live_execution_endpoint_rejects_duplicate_retry(
     assert first.status_code == 200
     assert second.status_code == 409
     assert second.json()["detail"]["adapter"] == "paired_live:extended_then_paradex"
+
+
+def test_observe_pair_status_retries_after_probe_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app_module, "PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS", 0.01)
+
+    paper_trade = PaperTradeEntry(
+        entry_id=7,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="operator accepted candidate",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    execution = ExecutionJournalEntry(
+        entry_id=1,
+        executed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        confirmation_entry_id=3,
+        paper_trade=paper_trade,
+        legs=[
+            ExecutionLegResult(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="extended-1",
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="paradex-1",
+            ),
+        ],
+    )
+
+    class SlowAccountPreflightService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(0.05)
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=[],
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                        position_symbols=[],
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubExecutionOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="extended",
+                        supported=True,
+                        external_reference="extended-1",
+                        derived_state="filled",
+                    ),
+                    ExecutionLegOrderState(
+                        venue="paradex",
+                        supported=True,
+                        external_reference="paradex-1",
+                        derived_state="filled",
+                    ),
+                ],
+            )
+
+    async def run() -> None:
+        account_service = SlowAccountPreflightService()
+        status = await app_module._observe_pair_status_for_execution(
+            paper_trade=paper_trade,
+            execution=execution,
+            settings=ApiSettings(),
+            account_service=cast(Any, account_service),
+            order_state_service=cast(Any, StubExecutionOrderStateService()),
+            poll_attempts=2,
+            poll_interval_seconds=0,
+        )
+        assert status.paper_trade_id == 7
+        assert account_service.calls == 2
+
+    asyncio.run(run())
