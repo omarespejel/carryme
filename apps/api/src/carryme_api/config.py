@@ -27,6 +27,7 @@ class ApiSettings(BaseSettings):
     paradex_recv_window_ms: int = 300000
     hyperliquid_live_enabled: bool = False
     hyperliquid_account_address: str | None = None
+    hyperliquid_vault_address: str | None = None
     hyperliquid_api_wallet_private_key: str | None = None
 
     model_config = SettingsConfigDict(

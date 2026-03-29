@@ -4134,9 +4134,20 @@ def test_hyperliquid_live_execution_service_submits_confirmed_preview(
                 },
             }
 
+    def stub_exchange_builder(
+        *,
+        private_key: str,
+        account_address: str,
+        vault_address: str | None = None,
+    ) -> StubExchange:
+        assert private_key == "0xwallet"
+        assert account_address == "0xhyper"
+        assert vault_address == "0xvault"
+        return StubExchange()
+
     monkeypatch.setattr(
         "carryme_runtime.hyperliquid_live_execution.build_hyperliquid_exchange",
-        lambda *, private_key, account_address: StubExchange(),
+        stub_exchange_builder,
     )
 
     paper_trade = PaperTradeEntry(
@@ -4225,6 +4236,7 @@ def test_hyperliquid_live_execution_service_submits_confirmed_preview(
     async def run() -> None:
         service = HyperliquidLiveExecutionService(
             account_address="0xhyper",
+            vault_address="0xvault",
             api_wallet_private_key="0xwallet",
         )
         entry = await service.submit_confirmed_preview(
