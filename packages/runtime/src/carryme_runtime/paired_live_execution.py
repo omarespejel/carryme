@@ -48,13 +48,15 @@ class PairedLiveExecutionCoordinator:
             raise ValueError("Preview confirmation entry_id is required before live execution")
 
         normalized_first = first_venue.strip().lower()
-        preview_venues = [leg.venue for leg in confirmation.preview.legs]
+        preview_venues = [leg.venue.strip().lower() for leg in confirmation.preview.legs]
+        if not all(preview_venues):
+            raise ValueError("Paired execution requires non-empty preview leg venues")
         if normalized_first not in preview_venues:
             raise ValueError(
                 f"Requested first venue {first_venue!r} is not present in the confirmed preview"
             )
-        if len(preview_venues) != 2:
-            raise ValueError("Paired execution requires exactly two preview legs")
+        if len(preview_venues) != 2 or len(set(preview_venues)) != 2:
+            raise ValueError("Paired execution requires exactly two distinct preview legs")
 
         second_venue = next(venue for venue in preview_venues if venue != normalized_first)
         timestamp = executed_at or datetime.now(UTC)
@@ -121,7 +123,9 @@ class PairedLiveExecutionCoordinator:
                 executed_at=executed_at,
             )
         except (ValueError, ConnectorError, httpx.HTTPError) as exc:
-            leg = next(item for item in confirmation.preview.legs if item.venue == venue)
+            leg = next(
+                item for item in confirmation.preview.legs if item.venue.strip().lower() == venue
+            )
             return ExecutionJournalEntry(
                 executed_at=executed_at,
                 adapter=f"{venue}_live",
