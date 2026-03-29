@@ -1271,6 +1271,54 @@ async def _select_approved_canary_candidate(
     return selected, approval
 
 
+def _select_latest_approved_canary_snapshot(
+    *,
+    store: ApprovedCanaryStore,
+    approval_service: RouteApprovalService,
+    label: str | None,
+    max_snapshot_age_seconds: int,
+    now: datetime | None = None,
+) -> tuple[ApprovedCanarySnapshot, FundingUniverseCanaryCandidate, RouteApprovalEntry]:
+    snapshot = store.latest(label=label)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="No approved canary snapshot found")
+    current_time = now or datetime.now(UTC)
+    snapshot_age_seconds = max(
+        0.0,
+        (current_time - snapshot.captured_at).total_seconds(),
+    )
+    if snapshot_age_seconds > max_snapshot_age_seconds:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approved canary snapshot is stale "
+                f"({snapshot_age_seconds:.1f}s > {max_snapshot_age_seconds}s)"
+            ),
+        )
+    approval = approval_service.get_for_candidate(snapshot.candidate)
+    if approval is None or not approval.approved:
+        raise HTTPException(
+            status_code=409,
+            detail="Latest approved canary snapshot is no longer approved for live execution",
+        )
+    capped_notional = min(
+        snapshot.candidate.suggested_canary_notional,
+        approval.max_live_notional,
+    )
+    if capped_notional <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot no longer permits a positive live notional",
+        )
+    return (
+        snapshot,
+        snapshot.candidate.model_copy(
+            update={"suggested_canary_notional": capped_notional}
+        ),
+        approval,
+    )
+
+
 def _append_paper_trade_from_canary_candidate(
     *,
     candidate: FundingUniverseCanaryCandidate,
@@ -1303,6 +1351,175 @@ def _append_paper_trade_from_canary_candidate(
         note=note,
     )
     return paper_store.append(entry)
+
+
+async def _run_guarded_canary_lifecycle(
+    *,
+    candidate: FundingUniverseCanaryCandidate,
+    approval: RouteApprovalEntry,
+    desired_notional: float | None,
+    note: str | None,
+    lifecycle_note: str | None,
+    paper_store: PaperTradeStore,
+    confirmation_store: PreviewConfirmationStore,
+    pair_close_confirmation_store: PairClosePreviewConfirmationStore,
+    cleanup_confirmation_store: CleanupPreviewConfirmationStore,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    settings: ApiSettings,
+    account_preflight_service: AccountPreflightService,
+    balance_service: BalanceAccountingService,
+    order_preview_service: OrderPreviewService,
+    order_state_service: ExecutionOrderStateService,
+    cleanup_preview_service: CleanupPreviewRouter,
+    pair_close_preview_service: PairClosePreviewService,
+    cleanup_live_router: CleanupLiveExecutionRouter,
+    paired_service: PairedLiveExecutionCoordinator,
+    pair_close_live_service: PairCloseLiveExecutionCoordinator,
+    approval_service: RouteApprovalService,
+    slippage_tolerance_bps: int,
+    open_first_venue: str,
+    close_first_venue: str,
+    poll_attempts: int,
+    poll_interval_seconds: float,
+    auto_cleanup: bool,
+    close_position: bool,
+) -> CanaryLifecycleResult:
+    paper_trade = _append_paper_trade_from_canary_candidate(
+        candidate=candidate,
+        paper_store=paper_store,
+        desired_notional=desired_notional,
+        note=note or "guarded canary lifecycle",
+    )
+    _require_live_route_approval(
+        paper_trade=paper_trade,
+        approval_service=approval_service,
+    )
+
+    pre_open_snapshots = await _capture_authenticated_balance_snapshots_for_paper_trade(
+        paper_trade=paper_trade,
+        stage="pre_open",
+        note="guarded canary lifecycle pre-open",
+        settings=settings,
+        account_service=account_preflight_service,
+        balance_service=balance_service,
+    )
+    open_confirmation = await _append_preview_confirmation_for_paper_trade(
+        paper_trade=paper_trade,
+        confirmation_store=confirmation_store,
+        service=order_preview_service,
+        slippage_tolerance_bps=slippage_tolerance_bps,
+        note="guarded canary lifecycle auto-confirm open preview",
+    )
+    readiness = await _build_readiness_for_paper_trade(
+        paper_trade=paper_trade,
+        preview_hash=open_confirmation.preview_hash,
+        settings=settings,
+        confirmation_store=confirmation_store,
+        account_preflight_service=account_preflight_service,
+    )
+    if not readiness.ready:
+        raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
+    open_execution = await _execute_guarded_pair_from_confirmation(
+        paper_trade=paper_trade,
+        confirmation=open_confirmation,
+        settings=settings,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        cleanup_confirmation_store=cleanup_confirmation_store,
+        account_preflight_service=account_preflight_service,
+        order_state_service=order_state_service,
+        cleanup_preview_service=cleanup_preview_service,
+        cleanup_live_router=cleanup_live_router,
+        service=paired_service,
+        first_venue=open_first_venue,
+        poll_attempts=poll_attempts,
+        poll_interval_seconds=poll_interval_seconds,
+        auto_cleanup=auto_cleanup,
+    )
+    post_open_snapshots = await _capture_authenticated_balance_snapshots_for_paper_trade(
+        paper_trade=paper_trade,
+        stage="post_open",
+        note="guarded canary lifecycle post-open",
+        settings=settings,
+        account_service=account_preflight_service,
+        balance_service=balance_service,
+    )
+
+    close_confirmation: PairClosePreviewConfirmationEntry | None = None
+    close_execution: GuardedPairExecutionResult | None = None
+    post_close_snapshots: list[VenueBalanceSnapshot] = []
+    notes: list[str] = []
+    if lifecycle_note:
+        notes.append(lifecycle_note)
+    final_pair_status = open_execution.pair_status
+
+    if close_position and open_execution.pair_status.derived_state == "hedged":
+        _paper_trade, _execution, _pair_status, pair_close_preview = (
+            await _build_pair_close_context_for_paper_trade(
+                paper_trade_id=paper_trade.entry_id or 0,
+                settings=settings,
+                paper_store=paper_store,
+                execution_store=execution_store,
+                account_service=account_preflight_service,
+                order_state_service=order_state_service,
+                pair_close_service=pair_close_preview_service,
+            )
+        )
+        close_confirmation = _append_pair_close_confirmation_for_preview(
+            paper_trade=paper_trade,
+            confirmation_store=pair_close_confirmation_store,
+            preview=pair_close_preview,
+            note="guarded canary lifecycle auto-confirm close preview",
+        )
+        close_execution = await _execute_guarded_pair_close_from_confirmation(
+            paper_trade=paper_trade,
+            confirmation=close_confirmation,
+            settings=settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            account_preflight_service=account_preflight_service,
+            order_state_service=order_state_service,
+            cleanup_preview_service=cleanup_preview_service,
+            cleanup_live_router=cleanup_live_router,
+            service=pair_close_live_service,
+            first_venue=close_first_venue,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            auto_cleanup=auto_cleanup,
+        )
+        post_close_snapshots = await _capture_authenticated_balance_snapshots_for_paper_trade(
+            paper_trade=paper_trade,
+            stage="post_close",
+            note="guarded canary lifecycle post-close",
+            settings=settings,
+            account_service=account_preflight_service,
+            balance_service=balance_service,
+        )
+        final_pair_status = close_execution.pair_status
+    elif close_position:
+        notes.append(
+            "Close step was skipped because the open step did not end in a hedged state."
+        )
+    else:
+        notes.append("Close step was disabled for this canary cycle.")
+
+    return CanaryLifecycleResult(
+        candidate=candidate,
+        approval=approval,
+        paper_trade=paper_trade,
+        open_confirmation=open_confirmation,
+        open_execution=open_execution,
+        close_confirmation=close_confirmation,
+        close_execution=close_execution,
+        pre_open_snapshots=pre_open_snapshots,
+        post_open_snapshots=post_open_snapshots,
+        post_close_snapshots=post_close_snapshots,
+        balance_delta=balance_service.summarize_paper_trade(paper_trade.entry_id or 0),
+        final_pair_status=final_pair_status,
+        notes=notes,
+    )
 
 
 async def _capture_authenticated_balance_snapshots_for_paper_trade(
@@ -4455,140 +4672,154 @@ def create_app() -> FastAPI:
             exclude_tags=exclude_tags,
             limit=limit,
         )
-        paper_trade = _append_paper_trade_from_canary_candidate(
+        return await _run_guarded_canary_lifecycle(
             candidate=selected,
-            paper_store=paper_store,
+            approval=approval,
             desired_notional=desired_notional,
-            note=note or "guarded canary lifecycle",
-        )
-        _require_live_route_approval(
-            paper_trade=paper_trade,
-            approval_service=approval_service,
-        )
-
-        pre_open_snapshots = await _capture_authenticated_balance_snapshots_for_paper_trade(
-            paper_trade=paper_trade,
-            stage="pre_open",
-            note="guarded canary lifecycle pre-open",
-            settings=settings,
-            account_service=account_preflight_service,
-            balance_service=balance_service,
-        )
-        open_confirmation = await _append_preview_confirmation_for_paper_trade(
-            paper_trade=paper_trade,
+            note=note,
+            lifecycle_note=None,
+            paper_store=paper_store,
             confirmation_store=confirmation_store,
-            service=order_preview_service,
-            slippage_tolerance_bps=slippage_tolerance_bps,
-            note="guarded canary lifecycle auto-confirm open preview",
-        )
-        readiness = await _build_readiness_for_paper_trade(
-            paper_trade=paper_trade,
-            preview_hash=open_confirmation.preview_hash,
-            settings=settings,
-            confirmation_store=confirmation_store,
-            account_preflight_service=account_preflight_service,
-        )
-        if not readiness.ready:
-            raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
-        open_execution = await _execute_guarded_pair_from_confirmation(
-            paper_trade=paper_trade,
-            confirmation=open_confirmation,
-            settings=settings,
+            pair_close_confirmation_store=pair_close_confirmation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
             execution_store=execution_store,
             observation_store=observation_store,
-            cleanup_confirmation_store=cleanup_confirmation_store,
+            settings=settings,
             account_preflight_service=account_preflight_service,
+            balance_service=balance_service,
+            order_preview_service=order_preview_service,
             order_state_service=order_state_service,
             cleanup_preview_service=cleanup_preview_service,
+            pair_close_preview_service=pair_close_preview_service,
             cleanup_live_router=cleanup_live_router,
-            service=paired_service,
-            first_venue=open_first_venue,
+            paired_service=paired_service,
+            pair_close_live_service=pair_close_live_service,
+            approval_service=approval_service,
+            slippage_tolerance_bps=slippage_tolerance_bps,
+            open_first_venue=open_first_venue,
+            close_first_venue=close_first_venue,
             poll_attempts=poll_attempts,
             poll_interval_seconds=poll_interval_seconds,
             auto_cleanup=auto_cleanup,
-        )
-        post_open_snapshots = await _capture_authenticated_balance_snapshots_for_paper_trade(
-            paper_trade=paper_trade,
-            stage="post_open",
-            note="guarded canary lifecycle post-open",
-            settings=settings,
-            account_service=account_preflight_service,
-            balance_service=balance_service,
+            close_position=close_position,
         )
 
-        close_confirmation: PairClosePreviewConfirmationEntry | None = None
-        close_execution: GuardedPairExecutionResult | None = None
-        post_close_snapshots: list[VenueBalanceSnapshot] = []
-        notes: list[str] = []
-        final_pair_status = open_execution.pair_status
-
-        if close_position and open_execution.pair_status.derived_state == "hedged":
-            _paper_trade, _execution, _pair_status, pair_close_preview = (
-                await _build_pair_close_context_for_paper_trade(
-                    paper_trade_id=paper_trade.entry_id or 0,
-                    settings=settings,
-                    paper_store=paper_store,
-                    execution_store=execution_store,
-                    account_service=account_preflight_service,
-                    order_state_service=order_state_service,
-                    pair_close_service=pair_close_preview_service,
-                )
-            )
-            close_confirmation = _append_pair_close_confirmation_for_preview(
-                paper_trade=paper_trade,
-                confirmation_store=pair_close_confirmation_store,
-                preview=pair_close_preview,
-                note="guarded canary lifecycle auto-confirm close preview",
-            )
-            close_execution = await _execute_guarded_pair_close_from_confirmation(
-                paper_trade=paper_trade,
-                confirmation=close_confirmation,
-                settings=settings,
-                execution_store=execution_store,
-                observation_store=observation_store,
-                cleanup_confirmation_store=cleanup_confirmation_store,
-                account_preflight_service=account_preflight_service,
-                order_state_service=order_state_service,
-                cleanup_preview_service=cleanup_preview_service,
-                cleanup_live_router=cleanup_live_router,
-                service=pair_close_live_service,
-                first_venue=close_first_venue,
-                poll_attempts=poll_attempts,
-                poll_interval_seconds=poll_interval_seconds,
-                auto_cleanup=auto_cleanup,
-            )
-            post_close_snapshots = (
-                await _capture_authenticated_balance_snapshots_for_paper_trade(
-                    paper_trade=paper_trade,
-                    stage="post_close",
-                    note="guarded canary lifecycle post-close",
-                    settings=settings,
-                    account_service=account_preflight_service,
-                    balance_service=balance_service,
-                )
-            )
-            final_pair_status = close_execution.pair_status
-        elif close_position:
-            notes.append(
-                "Close step was skipped because the open step did not end in a hedged state."
-            )
-        else:
-            notes.append("Close step was disabled for this canary cycle.")
-
-        return CanaryLifecycleResult(
+    @app.post(
+        "/v1/executions/live/canary-cycle/latest-approved",
+        response_model=CanaryLifecycleResult,
+    )
+    async def execute_guarded_canary_cycle_from_latest_approved(
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        store: Annotated[ApprovedCanaryStore, Depends(get_approved_canary_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        pair_close_confirmation_store: Annotated[
+            PairClosePreviewConfirmationStore,
+            Depends(get_pair_close_preview_confirmation_store),
+        ],
+        cleanup_confirmation_store: Annotated[
+            CleanupPreviewConfirmationStore,
+            Depends(get_cleanup_preview_confirmation_store),
+        ],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        observation_store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
+        account_preflight_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        balance_service: Annotated[
+            BalanceAccountingService,
+            Depends(get_balance_accounting_service),
+        ],
+        order_preview_service: Annotated[
+            OrderPreviewService,
+            Depends(get_order_preview_service),
+        ],
+        order_state_service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+        cleanup_preview_service: Annotated[
+            CleanupPreviewRouter,
+            Depends(get_cleanup_preview_service),
+        ],
+        pair_close_preview_service: Annotated[
+            PairClosePreviewService,
+            Depends(get_pair_close_preview_service),
+        ],
+        cleanup_live_router: Annotated[
+            CleanupLiveExecutionRouter,
+            Depends(get_cleanup_live_execution_router),
+        ],
+        paired_service: Annotated[
+            PairedLiveExecutionCoordinator,
+            Depends(get_paired_live_execution_coordinator),
+        ],
+        pair_close_live_service: Annotated[
+            PairCloseLiveExecutionCoordinator,
+            Depends(get_pair_close_live_execution_coordinator),
+        ],
+        label: str | None = None,
+        desired_notional: float | None = None,
+        note: str | None = None,
+        max_snapshot_age_seconds: int = 300,
+        slippage_tolerance_bps: int = 20,
+        open_first_venue: str = "auto",
+        close_first_venue: str = "auto",
+        poll_attempts: int = 5,
+        poll_interval_seconds: float = 2.0,
+        auto_cleanup: bool = True,
+        close_position: bool = True,
+    ) -> CanaryLifecycleResult:
+        snapshot, selected, approval = _select_latest_approved_canary_snapshot(
+            store=store,
+            approval_service=approval_service,
+            label=label,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+        )
+        return await _run_guarded_canary_lifecycle(
             candidate=selected,
             approval=approval,
-            paper_trade=paper_trade,
-            open_confirmation=open_confirmation,
-            open_execution=open_execution,
-            close_confirmation=close_confirmation,
-            close_execution=close_execution,
-            pre_open_snapshots=pre_open_snapshots,
-            post_open_snapshots=post_open_snapshots,
-            post_close_snapshots=post_close_snapshots,
-            balance_delta=balance_service.summarize_paper_trade(paper_trade.entry_id or 0),
-            final_pair_status=final_pair_status,
-            notes=notes,
+            desired_notional=desired_notional,
+            note=note,
+            lifecycle_note=(
+                "Launched from approved canary snapshot "
+                f"{snapshot.snapshot_id} captured at {snapshot.captured_at.isoformat()}."
+            ),
+            paper_store=paper_store,
+            confirmation_store=confirmation_store,
+            pair_close_confirmation_store=pair_close_confirmation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            settings=settings,
+            account_preflight_service=account_preflight_service,
+            balance_service=balance_service,
+            order_preview_service=order_preview_service,
+            order_state_service=order_state_service,
+            cleanup_preview_service=cleanup_preview_service,
+            pair_close_preview_service=pair_close_preview_service,
+            cleanup_live_router=cleanup_live_router,
+            paired_service=paired_service,
+            pair_close_live_service=pair_close_live_service,
+            approval_service=approval_service,
+            slippage_tolerance_bps=slippage_tolerance_bps,
+            open_first_venue=open_first_venue,
+            close_first_venue=close_first_venue,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            auto_cleanup=auto_cleanup,
+            close_position=close_position,
         )
 
     @app.get(
