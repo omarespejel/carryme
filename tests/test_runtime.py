@@ -33,6 +33,7 @@ from carryme_models import (
     FundingPairTradeIntent,
     FundingUniverseOpportunity,
     FundingUniverseScan,
+    FundingUniverseVenueMarket,
     LiveSubmissionReadiness,
     MarketStats,
     NormalizedMarketSnapshot,
@@ -112,6 +113,7 @@ def _snapshot(
     open_interest: float = 1_000_000,
     daily_volume: float = 500_000,
     raw: dict[str, object] | None = None,
+    top_of_book: TopOfBook | None = None,
 ) -> NormalizedMarketSnapshot:
     return normalize_market_snapshot(
         venue,
@@ -122,7 +124,8 @@ def _snapshot(
             funding_rate=funding_rate,
             open_interest=open_interest,
             daily_volume=daily_volume,
-            top_of_book=TopOfBook(
+            top_of_book=top_of_book
+            or TopOfBook(
                 best_bid_price=bid_price,
                 best_bid_size=bid_size,
                 best_ask_price=ask_price,
@@ -440,6 +443,72 @@ def test_funding_universe_scan_rejects_unknown_fee_profile_venues() -> None:
         )
 
 
+def test_opportunity_universe_service_models_paradex_fastfills_from_visible_book_share() -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD"],
+        "paradex": ["ARB-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.09,
+            20_000,
+            0.0901,
+            18_000,
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0006,
+            0.09,
+            18_000,
+            0.0901,
+            1_000,
+            top_of_book=TopOfBook(
+                best_bid_price=0.09,
+                best_bid_size=18_000,
+                best_ask_price=0.0901,
+                best_ask_size=1_000,
+                best_ask_api_price=0.0901,
+                best_ask_api_size=900,
+            ),
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            fee_profile_overrides={"paradex": "pro_fastfills"},
+            target_notional=50.0,
+            limit=10,
+        )
+
+        assert len(scan.opportunities) == 1
+        candidate = scan.opportunities[0]
+        assert candidate.opportunity.long_fee_profile == "pro_fastfills"
+        assert candidate.modeled_entry_cost_rate is not None
+        assert candidate.modeled_entry_cost_rate > candidate.opportunity.entry_cost_rate
+        assert candidate.paradex_fastfill_share == pytest.approx(0.1802, rel=1e-3)
+        assert candidate.paradex_fastfill_eligible_notional == pytest.approx(9.01)
+        assert candidate.estimated_one_day_pnl_after_round_trip is not None
+        naive_round_trip = 50.0 * candidate.opportunity.one_day_net_edge_after_round_trip
+        assert candidate.estimated_one_day_pnl_after_round_trip < naive_round_trip
+
+    asyncio.run(run())
+
+
 def test_funding_universe_scan_rejects_empty_fee_profile_names() -> None:
     with pytest.raises(
         ValidationError,
@@ -454,6 +523,142 @@ def test_funding_universe_scan_rejects_empty_fee_profile_names() -> None:
             overlaps=[],
             opportunities=[],
         )
+
+
+def test_opportunity_universe_service_filters_fastfill_routes_with_modeled_edge() -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD"],
+        "paradex": ["ARB-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.09,
+            20_000,
+            0.0901,
+            18_000,
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0006,
+            0.09,
+            18_000,
+            0.0901,
+            1_000,
+            top_of_book=TopOfBook(
+                best_bid_price=0.09,
+                best_bid_size=18_000,
+                best_ask_price=0.0901,
+                best_ask_size=1_000,
+                best_ask_api_price=0.0901,
+                best_ask_api_size=900,
+            ),
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+        )
+        baseline_scan = await service.scan(
+            venues=["extended", "paradex"],
+            fee_profile_overrides={"paradex": "pro_fastfills"},
+            target_notional=50.0,
+            limit=10,
+        )
+
+        assert len(baseline_scan.opportunities) == 1
+        candidate = baseline_scan.opportunities[0]
+        assert candidate.modeled_round_trip_cost_rate is not None
+        modeled_roundtrip_edge = (
+            candidate.opportunity.gross_daily_edge - candidate.modeled_round_trip_cost_rate
+        )
+        static_roundtrip_edge = candidate.opportunity.one_day_net_edge_after_round_trip
+        assert modeled_roundtrip_edge < static_roundtrip_edge
+
+        filtered_scan = await service.scan(
+            venues=["extended", "paradex"],
+            fee_profile_overrides={"paradex": "pro_fastfills"},
+            target_notional=50.0,
+            min_roundtrip_edge=(modeled_roundtrip_edge + static_roundtrip_edge) / 2,
+            limit=10,
+        )
+
+        assert filtered_scan.opportunities == []
+
+    asyncio.run(run())
+
+
+def test_opportunity_universe_service_excludes_away_from_top_interactive_liquidity() -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD"],
+        "paradex": ["ARB-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.09,
+            20_000,
+            0.0901,
+            18_000,
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0006,
+            0.09,
+            18_000,
+            0.0901,
+            1_000,
+            top_of_book=TopOfBook(
+                best_bid_price=0.09,
+                best_bid_size=18_000,
+                best_ask_price=0.0901,
+                best_ask_size=1_000,
+                best_ask_api_price=0.0901,
+                best_ask_api_size=900,
+                best_ask_interactive_price=0.0902,
+                best_ask_interactive_size=100,
+            ),
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            fee_profile_overrides={"paradex": "pro_fastfills"},
+            target_notional=50.0,
+            limit=10,
+        )
+
+        assert len(scan.opportunities) == 1
+        candidate = scan.opportunities[0]
+        assert candidate.paradex_fastfill_share == pytest.approx(0.0)
+        assert candidate.paradex_fastfill_eligible_notional == pytest.approx(0.0)
+
+    asyncio.run(run())
 
 
 def test_opportunity_universe_service_retries_retryable_snapshot_errors() -> None:
@@ -2015,6 +2220,69 @@ def test_passes_symbol_policy_accepts_single_string_inputs() -> None:
     assert passes_symbol_policy("ARB-USD-PERP", include_symbols="ARB-USD-PERP")
     assert not passes_symbol_policy("ARB-USD-PERP", exclude_symbols="ARB-USD-PERP")
     assert not passes_symbol_policy("TRUMP-USD-PERP", exclude_tags="political")
+
+
+def test_build_portfolio_plan_reprices_fastfill_route_for_selected_notional() -> None:
+    opportunity = FundingUniverseOpportunity(
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="ARB-USD-PERP",
+            long_venue="paradex",
+            short_venue="extended",
+            long_fee_profile="pro_fastfills",
+            short_fee_profile="default",
+            gross_daily_edge=0.004,
+            entry_cost_rate=0.00039,
+            round_trip_cost_rate=0.00078,
+            one_day_net_edge_after_entry=0.00361,
+            one_day_net_edge_after_round_trip=0.00322,
+            break_even_days_entry=0.2,
+            break_even_days_round_trip=0.3,
+            capacity=CapacityEstimate(
+                short_bid_notional=1_500.0,
+                long_ask_notional=900.0,
+                max_entry_notional=900.0,
+                limiting_venue="paradex",
+            ),
+        ),
+        venue_markets={
+            "extended": FundingUniverseVenueMarket(
+                venue="extended",
+                symbol="ARB-USD",
+                bid_notional=1_500.0,
+                ask_notional=1_400.0,
+            ),
+            "paradex": FundingUniverseVenueMarket(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                bid_notional=1_300.0,
+                ask_notional=900.0,
+                ask_notional_api=600.0,
+                ask_notional_interactive=300.0,
+            ),
+        },
+        deployable_notional=900.0,
+        modeled_entry_cost_rate=0.00043,
+        modeled_round_trip_cost_rate=0.00086,
+        estimated_one_day_pnl_after_entry=3.213,
+        estimated_one_day_pnl_after_round_trip=2.826,
+        paradex_fastfill_share=0.333333,
+        paradex_fastfill_eligible_notional=300.0,
+        quality_score=1.8,
+    )
+    scan = FundingUniverseScan(
+        venues=["extended", "paradex"],
+        ranking="quality_adjusted_roundtrip_pnl",
+        target_notional=900.0,
+        overlap_count=1,
+        overlaps=[],
+        opportunities=[opportunity],
+    )
+
+    plan = build_portfolio_plan(scan, target_notional=200.0, max_positions=1)
+
+    assert plan.estimated_one_day_pnl_after_round_trip == pytest.approx(0.644)
+    assert len(plan.entries) == 1
+    assert plan.entries[0].estimated_one_day_pnl_after_round_trip == pytest.approx(0.644)
 
 
 def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path) -> None:

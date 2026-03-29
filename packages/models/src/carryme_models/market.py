@@ -13,6 +13,14 @@ class TopOfBook(BaseModel):
     best_bid_size: float | None = None
     best_ask_price: float | None = None
     best_ask_size: float | None = None
+    best_bid_api_price: float | None = None
+    best_bid_api_size: float | None = None
+    best_ask_api_price: float | None = None
+    best_ask_api_size: float | None = None
+    best_bid_interactive_price: float | None = None
+    best_bid_interactive_size: float | None = None
+    best_ask_interactive_price: float | None = None
+    best_ask_interactive_size: float | None = None
 
 
 class MarketStats(BaseModel):

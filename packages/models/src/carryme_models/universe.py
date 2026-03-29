@@ -30,6 +30,10 @@ class FundingUniverseVenueMarket(BaseModel):
     daily_volume: float | None = Field(default=None, ge=0)
     bid_notional: float | None = Field(default=None, ge=0)
     ask_notional: float | None = Field(default=None, ge=0)
+    bid_notional_api: float | None = Field(default=None, ge=0)
+    ask_notional_api: float | None = Field(default=None, ge=0)
+    bid_notional_interactive: float | None = Field(default=None, ge=0)
+    ask_notional_interactive: float | None = Field(default=None, ge=0)
 
 
 class ExecutionQualitySummary(BaseModel):
@@ -90,8 +94,12 @@ class FundingUniverseOpportunity(BaseModel):
     min_open_interest: float | None = Field(default=None, ge=0)
     target_notional: float | None = Field(default=None, ge=0)
     deployable_notional: float | None = Field(default=None, ge=0)
+    modeled_entry_cost_rate: float | None = Field(default=None, ge=0)
+    modeled_round_trip_cost_rate: float | None = Field(default=None, ge=0)
     estimated_one_day_pnl_after_entry: float | None = None
     estimated_one_day_pnl_after_round_trip: float | None = None
+    paradex_fastfill_share: float | None = Field(default=None, ge=0, le=1)
+    paradex_fastfill_eligible_notional: float | None = Field(default=None, ge=0)
     quality_score: float | None = None
     execution_quality: ExecutionQualitySummary | None = None
     route_stability: RouteStabilitySummary | None = None

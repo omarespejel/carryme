@@ -197,10 +197,10 @@ def test_paradex_connector_parses_stats_and_top_of_book() -> None:
             200,
             json={
                 "market": "ARB-USD-PERP",
-                "bid": "0.0913",
-                "bid_size": "42584.8",
-                "ask": "0.0919",
-                "ask_size": "42473",
+                "bids": [["0.0913", "42584.8"]],
+                "asks": [["0.0919", "42473"]],
+                "best_bid_api": ["0.0913", "12000"],
+                "best_ask_api": ["0.0919", "8000"],
             },
         )
 
@@ -221,6 +221,10 @@ def test_paradex_connector_parses_stats_and_top_of_book() -> None:
         assert book.best_bid_size == pytest.approx(42584.8)
         assert book.best_ask_price == pytest.approx(0.0919)
         assert book.best_ask_size == pytest.approx(42473.0)
+        assert book.best_bid_api_price == pytest.approx(0.0913)
+        assert book.best_bid_api_size == pytest.approx(12000.0)
+        assert book.best_ask_api_price == pytest.approx(0.0919)
+        assert book.best_ask_api_size == pytest.approx(8000.0)
 
     asyncio.run(_run_with_client("https://api.prod.paradex.trade", handler, exercise))
 
@@ -324,6 +328,26 @@ def test_paradex_connector_lists_deterministic_symbols_and_rejects_malformed_row
     async def exercise(client: httpx.AsyncClient) -> None:
         connector = ParadexPublicConnector(client)
         assert await connector.list_market_symbols() == ["ARB-USD-PERP", "STRK-USD-PERP"]
+
+    asyncio.run(_run_with_client("https://api.prod.paradex.trade", handler, exercise))
+
+
+def test_paradex_connector_rejects_malformed_orderbook_shapes() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "bids": {"price": "0.0913", "size": "42584.8"},
+                "asks": [["0.0919", "42473"]],
+                "best_bid_api": ["0.0913", "12000"],
+                "best_ask_api": ["0.0919", "8000"],
+            },
+        )
+
+    async def exercise(client: httpx.AsyncClient) -> None:
+        connector = ParadexPublicConnector(client)
+        with pytest.raises(ConnectorError, match="Paradex orderbook bids must be a list"):
+            await connector.fetch_top_of_book("ARB-USD-PERP")
 
     asyncio.run(_run_with_client("https://api.prod.paradex.trade", handler, exercise))
 

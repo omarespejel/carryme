@@ -31,6 +31,7 @@ from carryme_models import (
     NormalizedMarketSnapshot,
     OpportunityRecord,
     RouteStabilitySummary,
+    TopOfBook,
 )
 from carryme_normalizers import get_fee_profile, normalize_symbol
 from carryme_scoring import score_funding_pair
@@ -290,6 +291,18 @@ class OpportunityUniverseService:
         raise RuntimeError("unreachable snapshot retry loop")
 
 
+@dataclass(frozen=True)
+class ModeledPairEconomics:
+    """Expected-value economics for a routed pair at a concrete notional."""
+
+    entry_cost_rate: float
+    round_trip_cost_rate: float
+    one_day_pnl_after_entry: float | None
+    one_day_pnl_after_round_trip: float | None
+    paradex_fastfill_share: float | None = None
+    paradex_fastfill_eligible_notional: float | None = None
+
+
 async def list_live_symbols(venue: str) -> list[str]:
     """List active perp symbols on a supported venue."""
 
@@ -350,16 +363,13 @@ def _build_universe_opportunity(
     min_daily_volume = _min_metric(list(venue_markets.values()), "daily_volume")
     min_open_interest = _min_metric(list(venue_markets.values()), "open_interest")
     deployable_notional = _deployable_notional(opportunity, target_notional)
-    pnl_after_entry = (
-        deployable_notional * opportunity.one_day_net_edge_after_entry
-        if deployable_notional is not None
-        else None
+    modeled = _model_pair_economics(
+        opportunity=opportunity,
+        venue_markets=venue_markets,
+        notional=deployable_notional,
     )
-    pnl_after_round_trip = (
-        deployable_notional * opportunity.one_day_net_edge_after_round_trip
-        if deployable_notional is not None
-        else None
-    )
+    pnl_after_entry = modeled.one_day_pnl_after_entry
+    pnl_after_round_trip = modeled.one_day_pnl_after_round_trip
     quality_score = _quality_score(
         estimated_one_day_pnl_after_round_trip=pnl_after_round_trip,
         deployable_notional=deployable_notional,
@@ -417,8 +427,12 @@ def _build_universe_opportunity(
         min_open_interest=min_open_interest,
         target_notional=target_notional,
         deployable_notional=deployable_notional,
+        modeled_entry_cost_rate=modeled.entry_cost_rate,
+        modeled_round_trip_cost_rate=modeled.round_trip_cost_rate,
         estimated_one_day_pnl_after_entry=pnl_after_entry,
         estimated_one_day_pnl_after_round_trip=pnl_after_round_trip,
+        paradex_fastfill_share=modeled.paradex_fastfill_share,
+        paradex_fastfill_eligible_notional=modeled.paradex_fastfill_eligible_notional,
         quality_score=quality_score,
         execution_quality=execution_quality,
         route_stability=route_stability,
@@ -432,13 +446,8 @@ def _build_universe_opportunity(
 
 def _venue_market(snapshot: NormalizedMarketSnapshot) -> FundingUniverseVenueMarket:
     book = snapshot.market.top_of_book
-    bid_notional = None
-    ask_notional = None
-    if book is not None:
-        if book.best_bid_price is not None and book.best_bid_size is not None:
-            bid_notional = book.best_bid_price * book.best_bid_size
-        if book.best_ask_price is not None and book.best_ask_size is not None:
-            ask_notional = book.best_ask_price * book.best_ask_size
+    bid_notional = _book_side_notional(book, "bid")
+    ask_notional = _book_side_notional(book, "ask")
     return FundingUniverseVenueMarket(
         venue=snapshot.identity.venue,
         symbol=snapshot.identity.venue_symbol,
@@ -448,6 +457,10 @@ def _venue_market(snapshot: NormalizedMarketSnapshot) -> FundingUniverseVenueMar
         daily_volume=snapshot.market.daily_volume,
         bid_notional=bid_notional,
         ask_notional=ask_notional,
+        bid_notional_api=_book_side_api_notional(book, "bid"),
+        ask_notional_api=_book_side_api_notional(book, "ask"),
+        bid_notional_interactive=_book_side_interactive_notional(book, "bid"),
+        ask_notional_interactive=_book_side_interactive_notional(book, "ask"),
     )
 
 
@@ -516,7 +529,7 @@ def _passes_filters(
         return False
     if (opportunity.min_open_interest or 0.0) < min_open_interest:
         return False
-    if opportunity.opportunity.one_day_net_edge_after_round_trip < min_roundtrip_edge:
+    if _modeled_net_edge_after_round_trip(opportunity) < min_roundtrip_edge:
         return False
     execution_quality_score = (
         opportunity.execution_quality.weighted_score
@@ -554,11 +567,200 @@ def _passes_filters(
     return route_sample_size >= min_route_samples
 
 
+def _model_pair_economics(
+    *,
+    opportunity: FundingArbOpportunity,
+    venue_markets: dict[str, FundingUniverseVenueMarket],
+    notional: float | None,
+) -> ModeledPairEconomics:
+    short_market = venue_markets.get(opportunity.short_venue)
+    long_market = venue_markets.get(opportunity.long_venue)
+    if short_market is None or long_market is None:
+        return ModeledPairEconomics(
+            entry_cost_rate=opportunity.entry_cost_rate,
+            round_trip_cost_rate=opportunity.round_trip_cost_rate,
+            one_day_pnl_after_entry=(
+                notional * opportunity.one_day_net_edge_after_entry
+                if notional is not None
+                else None
+            ),
+            one_day_pnl_after_round_trip=(
+                notional * opportunity.one_day_net_edge_after_round_trip
+                if notional is not None
+                else None
+            ),
+        )
+
+    short_fee_rate, short_fastfill_share, short_fastfill_eligible = _modeled_taker_fee_rate(
+        market=short_market,
+        fee_profile=opportunity.short_fee_profile,
+        side="bid",
+        notional=notional,
+    )
+    long_fee_rate, long_fastfill_share, long_fastfill_eligible = _modeled_taker_fee_rate(
+        market=long_market,
+        fee_profile=opportunity.long_fee_profile,
+        side="ask",
+        notional=notional,
+    )
+    entry_cost_rate = short_fee_rate + long_fee_rate
+    round_trip_cost_rate = entry_cost_rate * 2.0
+    one_day_pnl_after_entry = (
+        notional * (opportunity.gross_daily_edge - entry_cost_rate)
+        if notional is not None
+        else None
+    )
+    one_day_pnl_after_round_trip = (
+        notional * (opportunity.gross_daily_edge - round_trip_cost_rate)
+        if notional is not None
+        else None
+    )
+    paradex_fastfill_share = short_fastfill_share
+    paradex_fastfill_eligible = short_fastfill_eligible
+    if paradex_fastfill_share is None:
+        paradex_fastfill_share = long_fastfill_share
+        paradex_fastfill_eligible = long_fastfill_eligible
+    return ModeledPairEconomics(
+        entry_cost_rate=entry_cost_rate,
+        round_trip_cost_rate=round_trip_cost_rate,
+        one_day_pnl_after_entry=one_day_pnl_after_entry,
+        one_day_pnl_after_round_trip=one_day_pnl_after_round_trip,
+        paradex_fastfill_share=paradex_fastfill_share,
+        paradex_fastfill_eligible_notional=paradex_fastfill_eligible,
+    )
+
+
+def _modeled_taker_fee_rate(
+    *,
+    market: FundingUniverseVenueMarket,
+    fee_profile: str,
+    side: Literal["bid", "ask"],
+    notional: float | None,
+) -> tuple[float, float | None, float | None]:
+    selected_fee = get_fee_profile(market.venue, fee_profile).taker_fee_rate
+    if market.venue != "paradex" or fee_profile != "pro_fastfills":
+        return selected_fee, None, None
+    pro_fee = get_fee_profile("paradex", "pro").taker_fee_rate
+    fastfill_fee = get_fee_profile("paradex", "pro_fastfills").taker_fee_rate
+    if notional is None or notional <= 0:
+        return pro_fee, 0.0, 0.0
+    interactive_notional = _market_side_interactive_notional(market, side)
+    if interactive_notional is None or interactive_notional <= 0:
+        return pro_fee, 0.0, 0.0
+    eligible_notional = min(interactive_notional, notional)
+    eligible_share = min(eligible_notional / notional, 1.0)
+    effective_fee = pro_fee - ((pro_fee - fastfill_fee) * eligible_share)
+    return effective_fee, eligible_share, eligible_notional
+
+
+def _market_side_interactive_notional(
+    market: FundingUniverseVenueMarket,
+    side: Literal["bid", "ask"],
+) -> float | None:
+    if side == "bid":
+        return market.bid_notional_interactive
+    return market.ask_notional_interactive
+
+
+def _book_side_notional(book: object, side: Literal["bid", "ask"]) -> float | None:
+    if not isinstance(book, TopOfBook):
+        return None
+    if side == "bid":
+        return _notional_from_price_size(book.best_bid_price, book.best_bid_size)
+    return _notional_from_price_size(book.best_ask_price, book.best_ask_size)
+
+
+def _book_side_api_notional(book: object, side: Literal["bid", "ask"]) -> float | None:
+    if not isinstance(book, TopOfBook):
+        return None
+    if side == "bid":
+        return _notional_from_price_size(book.best_bid_api_price, book.best_bid_api_size)
+    return _notional_from_price_size(book.best_ask_api_price, book.best_ask_api_size)
+
+
+def _book_side_interactive_notional(book: object, side: Literal["bid", "ask"]) -> float | None:
+    if not isinstance(book, TopOfBook):
+        return None
+    total_price, total_size, api_price, api_size = _book_side_components(book, side)
+    explicit = _book_side_explicit_interactive_notional(book, side)
+    if explicit is not None:
+        interactive_price = (
+            book.best_bid_interactive_price if side == "bid" else book.best_ask_interactive_price
+        )
+        if total_price is None or interactive_price is None or interactive_price != total_price:
+            return 0.0
+        return explicit
+    if total_price is None or total_size is None:
+        return None
+    if api_price is None:
+        return None
+    if api_price != total_price:
+        return 0.0
+    if api_size is None:
+        return None
+    interactive_size = max(total_size - api_size, 0.0)
+    return total_price * interactive_size
+
+
+def _book_side_explicit_interactive_notional(
+    book: TopOfBook,
+    side: Literal["bid", "ask"],
+) -> float | None:
+    if side == "bid":
+        return _notional_from_price_size(
+            book.best_bid_interactive_price,
+            book.best_bid_interactive_size,
+        )
+    return _notional_from_price_size(
+        book.best_ask_interactive_price,
+        book.best_ask_interactive_size,
+    )
+
+
+def _book_side_components(
+    book: TopOfBook,
+    side: Literal["bid", "ask"],
+) -> tuple[float | None, float | None, float | None, float | None]:
+    if side == "bid":
+        return (
+            book.best_bid_price,
+            book.best_bid_size,
+            book.best_bid_api_price,
+            book.best_bid_api_size,
+        )
+    return (
+        book.best_ask_price,
+        book.best_ask_size,
+        book.best_ask_api_price,
+        book.best_ask_api_size,
+    )
+
+
+def _notional_from_price_size(price: float | None, size: float | None) -> float | None:
+    if price is None or size is None:
+        return None
+    return price * size
+
+
+def _modeled_net_edge_after_entry(opportunity: FundingUniverseOpportunity) -> float:
+    modeled_entry_cost_rate = opportunity.modeled_entry_cost_rate
+    if modeled_entry_cost_rate is None:
+        return opportunity.opportunity.one_day_net_edge_after_entry
+    return opportunity.opportunity.gross_daily_edge - modeled_entry_cost_rate
+
+
+def _modeled_net_edge_after_round_trip(opportunity: FundingUniverseOpportunity) -> float:
+    modeled_round_trip_cost_rate = opportunity.modeled_round_trip_cost_rate
+    if modeled_round_trip_cost_rate is None:
+        return opportunity.opportunity.one_day_net_edge_after_round_trip
+    return opportunity.opportunity.gross_daily_edge - modeled_round_trip_cost_rate
+
+
 def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRanking) -> float:
     if ranking == "roundtrip_edge":
-        return opportunity.opportunity.one_day_net_edge_after_round_trip
+        return _modeled_net_edge_after_round_trip(opportunity)
     if ranking == "entry_edge":
-        return opportunity.opportunity.one_day_net_edge_after_entry
+        return _modeled_net_edge_after_entry(opportunity)
     if ranking == "roundtrip_pnl":
         return opportunity.estimated_one_day_pnl_after_round_trip or float("-inf")
     if ranking == "entry_pnl":
@@ -652,21 +854,22 @@ def build_portfolio_plan(
         if selected_notional < min_selected_notional:
             continue
 
-        entry_edge = opportunity.opportunity.one_day_net_edge_after_entry
-        round_trip_edge = opportunity.opportunity.one_day_net_edge_after_round_trip
+        modeled = _model_pair_economics(
+            opportunity=opportunity.opportunity,
+            venue_markets=opportunity.venue_markets,
+            notional=selected_notional,
+        )
+        execution_weight = _execution_weight(opportunity)
         stability_weight = (
             opportunity.route_stability.stability_weight
             if opportunity.route_stability is not None
             else 1.0
         )
-        entry_pnl = selected_notional * entry_edge
-        round_trip_pnl = selected_notional * round_trip_edge
-        execution_weight = _execution_weight(opportunity)
-        execution_adjusted_round_trip_pnl = selected_notional * round_trip_edge * execution_weight
-        stability_adjusted_round_trip_pnl = selected_notional * round_trip_edge * stability_weight
-        route_adjusted_round_trip_pnl = (
-            selected_notional * round_trip_edge * execution_weight * stability_weight
-        )
+        entry_pnl = modeled.one_day_pnl_after_entry or 0.0
+        round_trip_pnl = modeled.one_day_pnl_after_round_trip or 0.0
+        execution_adjusted_round_trip_pnl = round_trip_pnl * execution_weight
+        stability_adjusted_round_trip_pnl = round_trip_pnl * stability_weight
+        route_adjusted_round_trip_pnl = round_trip_pnl * execution_weight * stability_weight
 
         entries.append(
             FundingUniversePortfolioEntry(
