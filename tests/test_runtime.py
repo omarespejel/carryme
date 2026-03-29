@@ -762,7 +762,10 @@ def test_order_preview_service_builds_per_venue_templates() -> None:
         assert paradex.quantity == pytest.approx(10845.9)
         assert paradex.effective_notional == pytest.approx(999.99198)
         assert paradex.quantity_increment == pytest.approx(0.1)
+        assert paradex.minimum_order_size is None
+        assert paradex.minimum_notional == pytest.approx(10.0)
         assert paradex.price_increment == pytest.approx(0.0001)
+        assert paradex.max_order_value == pytest.approx(1_104_000.0)
         assert paradex.time_in_force == "ioc"
         assert paradex.http_method == "POST"
         assert paradex.endpoint_path_hint == "/v1/orders"
@@ -777,7 +780,10 @@ def test_order_preview_service_builds_per_venue_templates() -> None:
         assert extended.quantity == pytest.approx(10881.0)
         assert extended.effective_notional == pytest.approx(999.9639)
         assert extended.quantity_increment == pytest.approx(1.0)
+        assert extended.minimum_order_size == pytest.approx(10.0)
+        assert extended.minimum_notional == pytest.approx(0.92)
         assert extended.price_increment == pytest.approx(0.0001)
+        assert extended.max_order_value == pytest.approx(1_250_000.0)
         assert extended.time_in_force == "ioc"
         assert extended.http_method == "POST"
         assert extended.payload["symbol"] == "ARB-USD"
@@ -800,22 +806,22 @@ def test_order_preview_service_rejects_preview_below_venue_minimum_notional() ->
             one_day_net_edge_after_entry=0.0008,
             break_even_days_entry=0.5,
             capacity_limit_notional=4500.0,
-            target_notional=5.0,
+            target_notional=10.001,
             capacity_fraction=0.25,
-            max_target_notional=5.0,
+            max_target_notional=10.001,
             long_leg=TradeLegIntent(
                 venue="paradex",
                 symbol="ARB-USD-PERP",
                 fee_profile="pro",
                 side="buy",
-                target_notional=5.0,
+                target_notional=10.001,
             ),
             short_leg=TradeLegIntent(
                 venue="extended",
                 symbol="ARB-USD",
                 fee_profile="default",
                 side="sell",
-                target_notional=5.0,
+                target_notional=10.001,
             ),
         ),
     )
@@ -859,7 +865,10 @@ def test_order_preview_service_rejects_preview_below_venue_minimum_notional() ->
         return snapshots[(venue, symbol)]
 
     async def run() -> None:
-        with pytest.raises(ValueError, match="minimum notional"):
+        with pytest.raises(
+            ValueError,
+            match=r"Venue paradex preview notional for ARB-USD-PERP fell below minimum notional",
+        ):
             await OrderPreviewService(fetch_snapshot=fetch_snapshot).preview_paper_trade(
                 paper_trade,
                 slippage_tolerance_bps=10,
