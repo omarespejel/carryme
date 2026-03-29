@@ -16,8 +16,14 @@ from carryme_normalizers import list_fee_profiles
 from carryme_runtime import ConnectorError, OpportunityService, UpstreamDataError
 from carryme_storage import OpportunityHistoryStore
 from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.responses import HTMLResponse
 
 from carryme_api.config import ApiSettings, get_api_settings
+from carryme_api.history_view import (
+    latest_records_by_label,
+    rank_history_records,
+    render_dashboard,
+)
 
 APP_NAME = "carryme-api"
 APP_VERSION = "0.1.0"
@@ -56,6 +62,19 @@ def get_history_store(
     return _history_store_for_path(settings.database_path)
 
 
+def _validated_history_limit(name: str, value: int) -> int:
+    """Validate bounded positive query parameters for history views."""
+
+    if value < 1:
+        raise HTTPException(status_code=400, detail=f"{name} must be at least 1")
+    if value > MAX_HISTORY_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be at most {MAX_HISTORY_LIMIT}",
+        )
+    return value
+
+
 def create_app() -> FastAPI:
     """Create the FastAPI application."""
 
@@ -88,15 +107,46 @@ def create_app() -> FastAPI:
         limit: int = 50,
         label: str | None = None,
     ) -> list[OpportunityRecord]:
-        if limit > MAX_HISTORY_LIMIT:
-            raise HTTPException(
-                status_code=400,
-                detail=f"limit must be at most {MAX_HISTORY_LIMIT}",
-            )
+        limit = _validated_history_limit("limit", limit)
         try:
             return store.list_recent(limit=limit, label=label)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/history/funding-pairs/latest", response_model=list[OpportunityRecord])
+    def latest_history(
+        store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        limit: int = 20,
+        sample: int = 200,
+        label: str | None = None,
+    ) -> list[OpportunityRecord]:
+        limit = _validated_history_limit("limit", limit)
+        sample = max(limit, _validated_history_limit("sample", sample))
+        records = store.list_recent(limit=sample, label=label)
+        return latest_records_by_label(records, limit=limit)
+
+    @app.get("/v1/history/funding-pairs/ranked", response_model=list[OpportunityRecord])
+    def ranked_history(
+        store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        limit: int = 20,
+        sample: int = 200,
+        label: str | None = None,
+    ) -> list[OpportunityRecord]:
+        limit = _validated_history_limit("limit", limit)
+        sample = max(limit, _validated_history_limit("sample", sample))
+        records = store.list_recent(limit=sample, label=label)
+        latest = latest_records_by_label(records, limit=sample)
+        return rank_history_records(latest, limit=limit)
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard(
+        store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        sample: int = 200,
+        label: str | None = None,
+    ) -> HTMLResponse:
+        sample = _validated_history_limit("sample", sample)
+        records = store.list_recent(limit=sample, label=label)
+        return HTMLResponse(render_dashboard(records))
 
     @app.get("/v1/opportunities/funding-pair", response_model=FundingArbOpportunity)
     async def funding_pair(

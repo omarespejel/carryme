@@ -3,11 +3,17 @@
 import argparse
 import asyncio
 import json
+import logging
 
 from carryme_models import AppDescriptor, ServiceHealth
 
 from carryme_worker.config import WorkerSettings
-from carryme_worker.poller import PollCycleSummary, poll_watchlist_once
+from carryme_worker.poller import (
+    PollCycleSummary,
+    PollLoopSummary,
+    poll_watchlist_once,
+    run_polling_loop,
+)
 
 APP_NAME = "carryme-worker"
 APP_VERSION = "0.1.0"
@@ -36,17 +42,44 @@ def build_cycle_payload(summary: PollCycleSummary) -> dict[str, int | str]:
     }
 
 
+def build_loop_payload(summary: PollLoopSummary) -> dict[str, int | str]:
+    """Build a deterministic summary payload for a worker loop."""
+
+    return {
+        "attempts": summary.attempts,
+        "successful_cycles": summary.successful_cycles,
+        "failures": summary.failures,
+        "saved_records": summary.saved_records,
+        "database_path": summary.database_path,
+    }
+
+
 def main() -> None:
     """Run one poll cycle or print worker health."""
 
     parser = argparse.ArgumentParser(prog="carryme-worker")
-    parser.add_argument("--once", action="store_true", help="Poll the configured watchlist once")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="Poll the configured watchlist once")
+    mode.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Run the worker loop for a fixed number of iterations",
+    )
     args = parser.parse_args()
 
+    if args.iterations is not None and args.iterations < 1:
+        parser.error("--iterations must be at least 1")
+
     settings = WorkerSettings()
+    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
     if args.once:
         summary = asyncio.run(poll_watchlist_once(settings))
         print(json.dumps(build_cycle_payload(summary), indent=2))
+        return
+    if args.iterations is not None:
+        loop_summary = asyncio.run(run_polling_loop(settings, iterations=args.iterations))
+        print(json.dumps(build_loop_payload(loop_summary), indent=2))
         return
 
     payload = build_health_payload(settings)

@@ -14,7 +14,8 @@ class WorkerSettings(BaseSettings):
 
     environment: str = "development"
     log_level: LogLevel = "INFO"
-    poll_interval_seconds: int = 30
+    poll_interval_seconds: int = Field(default=30, gt=0)
+    max_backoff_seconds: int = Field(default=300, gt=0)
     score_timeout_seconds: float = Field(default=30.0, gt=0)
     database_path: str = "data/carryme.sqlite3"
     watchlist_path: str = "config/watchlists/default.json"

@@ -7,8 +7,20 @@ import pytest
 from carryme_models import CapacityEstimate, FundingArbOpportunity
 from carryme_storage import OpportunityHistoryStore
 from carryme_worker.config import WorkerSettings
-from carryme_worker.main import build_cycle_payload, build_health_payload
-from carryme_worker.poller import PollCycleSummary, poll_watchlist_once
+from carryme_worker.main import (
+    build_cycle_payload,
+    build_health_payload,
+    build_loop_payload,
+)
+from carryme_worker.main import (
+    main as worker_main,
+)
+from carryme_worker.poller import (
+    PollCycleSummary,
+    PollLoopSummary,
+    poll_watchlist_once,
+    run_polling_loop,
+)
 from pydantic import ValidationError
 
 
@@ -16,6 +28,7 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CARRYME_WORKER_ENVIRONMENT", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_LOG_LEVEL", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_POLL_INTERVAL_SECONDS", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_MAX_BACKOFF_SECONDS", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_SCORE_TIMEOUT_SECONDS", raising=False)
 
 
@@ -26,6 +39,7 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.environment == "development"
     assert settings.log_level == "INFO"
     assert settings.poll_interval_seconds == 30
+    assert settings.max_backoff_seconds == 300
     assert settings.score_timeout_seconds == 30.0
     assert settings.database_path == "data/carryme.sqlite3"
     assert Path(settings.watchlist_path).is_file()
@@ -67,6 +81,26 @@ def test_worker_cycle_payload() -> None:
         "watched_pairs": 2,
         "saved_records": 2,
         "failed_records": 0,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_loop_payload() -> None:
+    payload = build_loop_payload(
+        PollLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            saved_records=2,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "saved_records": 2,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -378,3 +412,270 @@ def test_poll_watchlist_once_handles_empty_watchlist(tmp_path: Path) -> None:
     assert summary.saved_records == 0
     assert summary.failed_records == 0
     assert store.list_recent() == []
+
+
+def test_run_polling_loop_applies_backoff_and_saves_after_retry(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        """
+        {
+          "pairs": [
+            {
+              "label": "strk_extended_hyperliquid",
+              "left_venue": "extended",
+              "left_symbol": "STRK-USD",
+              "left_fee_profile": "default",
+              "right_venue": "hyperliquid",
+              "right_symbol": "STRK",
+              "right_fee_profile": "tier0"
+            }
+          ]
+        }
+        """
+    )
+
+    class FlakyScorer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary failure")
+            return FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            )
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        poll_interval_seconds=2,
+        max_backoff_seconds=10,
+    )
+    store = OpportunityHistoryStore(settings.database_path)
+
+    summary = asyncio.run(
+        run_polling_loop(
+            settings,
+            iterations=2,
+            scorer=FlakyScorer(),
+            store=store,
+            sleep=fake_sleep,
+        )
+    )
+
+    history = store.list_recent()
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 1
+    assert summary.failures == 1
+    assert summary.saved_records == 1
+    assert sleeps == [2.0]
+    assert len(history) == 1
+
+
+def test_run_polling_loop_resets_backoff_after_success(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        """
+        {
+          "pairs": [
+            {
+              "label": "strk_extended_hyperliquid",
+              "left_venue": "extended",
+              "left_symbol": "STRK-USD",
+              "left_fee_profile": "default",
+              "right_venue": "hyperliquid",
+              "right_symbol": "STRK",
+              "right_fee_profile": "tier0"
+            }
+          ]
+        }
+        """
+    )
+
+    class SequencedScorer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            self.calls += 1
+            if self.calls in {1, 3}:
+                raise RuntimeError("temporary failure")
+            return FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            )
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        poll_interval_seconds=2,
+        max_backoff_seconds=10,
+    )
+    store = OpportunityHistoryStore(settings.database_path)
+
+    summary = asyncio.run(
+        run_polling_loop(
+            settings,
+            iterations=4,
+            scorer=SequencedScorer(),
+            store=store,
+            sleep=fake_sleep,
+        )
+    )
+
+    assert summary.attempts == 4
+    assert summary.successful_cycles == 2
+    assert summary.failures == 2
+    assert summary.saved_records == 2
+    assert sleeps == [2.0, 2.0, 2.0]
+
+
+def test_run_polling_loop_clamps_backoff_to_maximum(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text(
+        """
+        {
+          "pairs": [
+            {
+              "label": "strk_extended_hyperliquid",
+              "left_venue": "extended",
+              "left_symbol": "STRK-USD",
+              "left_fee_profile": "default",
+              "right_venue": "hyperliquid",
+              "right_symbol": "STRK",
+              "right_fee_profile": "tier0"
+            }
+          ]
+        }
+        """
+    )
+
+    class MostlyFailingScorer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            self.calls += 1
+            if self.calls < 4:
+                raise RuntimeError("temporary failure")
+            return FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            )
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        poll_interval_seconds=2,
+        max_backoff_seconds=5,
+    )
+    store = OpportunityHistoryStore(settings.database_path)
+
+    summary = asyncio.run(
+        run_polling_loop(
+            settings,
+            iterations=4,
+            scorer=MostlyFailingScorer(),
+            store=store,
+            sleep=fake_sleep,
+        )
+    )
+
+    assert summary.attempts == 4
+    assert summary.successful_cycles == 1
+    assert summary.failures == 3
+    assert summary.saved_records == 1
+    assert sleeps == [2.0, 4.0, 5.0]
+
+
+def test_run_polling_loop_rejects_non_positive_iterations(tmp_path: Path) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    with pytest.raises(ValueError, match="iterations must be at least 1"):
+        asyncio.run(run_polling_loop(settings, iterations=0))
+
+
+def test_worker_main_rejects_mutually_exclusive_modes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--once", "--iterations", "2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        worker_main()
+
+    _, stderr = capsys.readouterr()
+    assert "not allowed with argument" in stderr
