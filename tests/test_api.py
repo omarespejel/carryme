@@ -2106,7 +2106,7 @@ def test_preview_confirmation_endpoint_persists_matching_preview(tmp_path: Path)
     ):
         response = client.post(
             f"/v1/executions/preview-confirmations/from-paper-trade/{paper_trade.entry_id}",
-            params={
+            json={
                 "preview_hash": " preview-hash ",
                 "slippage_tolerance_bps": 12,
                 "note": "operator confirmed",
@@ -2204,7 +2204,7 @@ def test_preview_confirmation_endpoint_rejects_hash_mismatch(tmp_path: Path) -> 
     ):
         response = client.post(
             f"/v1/executions/preview-confirmations/from-paper-trade/{paper_trade.entry_id}",
-            params={"preview_hash": "wrong-hash"},
+            json={"preview_hash": "wrong-hash"},
         )
 
     assert response.status_code == 409
@@ -2212,6 +2212,7 @@ def test_preview_confirmation_endpoint_rejects_hash_mismatch(tmp_path: Path) -> 
         response.json()["detail"]
         == "Preview hash did not match the current unsigned order preview"
     )
+    assert confirmation_store.list_recent(limit=10) == []
 
 
 def test_preview_confirmations_endpoint_lists_saved_entries(tmp_path: Path) -> None:

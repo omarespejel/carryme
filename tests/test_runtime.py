@@ -1045,7 +1045,6 @@ def test_require_confirmed_preview_returns_matching_entry() -> None:
     assert matched.entry_id == 3
     assert matched.preview.preview_hash == "preview-hash"
 
-
 def test_account_preflight_service_filters_to_trade_venues() -> None:
     class StubProbe:
         def __init__(self, result: VenueAccountPreflight) -> None:
@@ -1145,3 +1144,61 @@ def test_account_preflight_service_filters_to_trade_venues() -> None:
         assert any("paradex" in reason for reason in preflight.blocking_reasons)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("paper_trade_id", "preview_hash"),
+    [
+        (6, "preview-hash"),
+        (5, "wrong-hash"),
+    ],
+)
+def test_require_confirmed_preview_rejects_mismatches(
+    paper_trade_id: int,
+    preview_hash: str,
+) -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=3,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=5,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=5,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    quantity=10_845.0,
+                    quantity_text="10845.00000000",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.09231064,
+                    worst_price_text="0.09231064",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=["CARRYME_API_PARADEX_PRIVATE_KEY"],
+                    auth_scheme="subkey private key",
+                    payload={"market": "ARB-USD-PERP"},
+                    notes=[],
+                )
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    with pytest.raises(ValueError, match="No preview confirmation matched"):
+        require_confirmed_preview(
+            paper_trade_id=paper_trade_id,
+            preview_hash=preview_hash,
+            confirmations=[confirmation],
+        )
