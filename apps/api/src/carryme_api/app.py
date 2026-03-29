@@ -15,17 +15,22 @@ from carryme_models import (
     FundingPairTradeIntent,
     OpportunityRecord,
     PaperTradeEntry,
+    PaperTradeExecutionPreflight,
     ServiceHealth,
     TradingFeeProfile,
+    VenueExecutionPreflight,
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
 from carryme_runtime import (
     ConnectorError,
     ExecutionAdapter,
+    LiveExecutionConfigMap,
     MockExecutionAdapter,
     OpportunityService,
+    build_paper_trade_execution_preflight,
     build_trade_intent,
+    build_venue_execution_preflights,
 )
 from carryme_storage import (
     CandidateAlertStore,
@@ -101,6 +106,33 @@ def get_execution_adapter() -> ExecutionAdapter:
     """Return the default explicitly simulated execution adapter."""
 
     return MockExecutionAdapter()
+
+
+def _build_live_execution_configs(settings: ApiSettings) -> LiveExecutionConfigMap:
+    """Build the current venue credential map from API settings."""
+
+    return {
+        "extended": {
+            "enabled": settings.extended_live_enabled,
+            "credentials": {
+                "api_key": settings.extended_api_key,
+                "stark_private_key": settings.extended_stark_private_key,
+            },
+        },
+        "paradex": {
+            "enabled": settings.paradex_live_enabled,
+            "credentials": {
+                "private_key": settings.paradex_private_key,
+            },
+        },
+        "hyperliquid": {
+            "enabled": settings.hyperliquid_live_enabled,
+            "credentials": {
+                "account_address": settings.hyperliquid_account_address,
+                "api_wallet_private_key": settings.hyperliquid_api_wallet_private_key,
+            },
+        },
+    }
 
 
 def _select_trade_intent_records(
@@ -377,6 +409,32 @@ def create_app() -> FastAPI:
         label: str | None = None,
     ) -> list[ExecutionJournalEntry]:
         return store.list_recent(limit=limit, label=label)
+
+    @app.get("/v1/executions/preflight/venues", response_model=list[VenueExecutionPreflight])
+    def execution_preflight_venues(
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+    ) -> list[VenueExecutionPreflight]:
+        return build_venue_execution_preflights(_build_live_execution_configs(settings))
+
+    @app.get(
+        "/v1/executions/preflight/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeExecutionPreflight,
+    )
+    def execution_preflight_for_paper_trade(
+        paper_trade_id: int,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+    ) -> PaperTradeExecutionPreflight:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        return build_paper_trade_execution_preflight(
+            paper_trade,
+            _build_live_execution_configs(settings),
+        )
 
     @app.post(
         "/v1/executions/mock/from-paper-trade/{paper_trade_id}",
