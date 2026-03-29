@@ -88,13 +88,19 @@ def test_paired_live_execution_coordinator_provider_includes_hyperliquid() -> No
         async def submit_confirmed_preview(self, **kwargs: object) -> None:
             return None
 
+    extended_service = cast(ExtendedLiveExecutionService, StubService())
+    hyperliquid_service = cast(HyperliquidLiveExecutionService, StubService())
+    paradex_service = cast(ParadexLiveExecutionService, StubService())
     coordinator = get_paired_live_execution_coordinator(
-        extended_service=cast(ExtendedLiveExecutionService, StubService()),
-        hyperliquid_service=cast(HyperliquidLiveExecutionService, StubService()),
-        paradex_service=cast(ParadexLiveExecutionService, StubService()),
+        extended_service=extended_service,
+        hyperliquid_service=hyperliquid_service,
+        paradex_service=paradex_service,
     )
 
     assert set(coordinator.services) == {"extended", "hyperliquid", "paradex"}
+    assert coordinator.services["extended"] is extended_service
+    assert coordinator.services["hyperliquid"] is hyperliquid_service
+    assert coordinator.services["paradex"] is paradex_service
 
 
 def test_funding_pair_endpoint_uses_service_dependency() -> None:
