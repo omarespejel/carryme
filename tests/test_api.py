@@ -22,6 +22,7 @@ from carryme_api.config import ApiSettings
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
+    CleanupPreviewConfirmationEntry,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionLegOrderState,
@@ -53,6 +54,7 @@ from carryme_runtime import (
 from carryme_runtime.opportunities import SnapshotFetcher
 from carryme_storage import (
     CandidateAlertStore,
+    CleanupPreviewConfirmationStore,
     ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
@@ -2207,6 +2209,448 @@ def test_execution_cleanup_preview_endpoint_returns_reduce_only_preview(tmp_path
     assert payload["leg"]["reduce_only"] is True
     assert payload["leg"]["side"] == "buy"
     assert payload["leg"]["quantity_text"] == "123"
+
+
+def test_execution_cleanup_preview_confirmation_endpoint_persists_confirmation(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "paper.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 12, 50, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 45, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0012,
+                break_even_days_entry=0.35,
+                capacity_limit_notional=1000.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=paper_trade.entry_id,
+            preview_hash="preview-hash",
+            confirmation_entry_id=3,
+            paper_trade=paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order",
+                )
+            ],
+        )
+    )
+    cleanup_store = CleanupPreviewConfirmationStore(tmp_path / "history.sqlite3")
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_api_settings,
+        get_cleanup_preview_confirmation_store,
+        get_execution_journal_store,
+        get_execution_order_state_service,
+        get_extended_cleanup_preview_service,
+        get_paper_trade_store,
+    )
+
+    class StubExecutionOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="extended",
+                        supported=True,
+                        external_reference="ext-order",
+                        derived_state="unknown",
+                    )
+                ],
+            )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            entry: PaperTradeEntry,
+            configs: object,
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=entry.entry_id or 0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=["ARB-USD"],
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                        position_symbols=[],
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubExtendedCleanupPreviewService:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int = 10,
+            generated_at: datetime | None = None,
+        ) -> ExecutionCleanupPreview:
+            return ExecutionCleanupPreview(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                generated_at=datetime(2026, 3, 29, 13, 1, tzinfo=UTC),
+                preview_hash="cleanup-hash",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=123.0,
+                    quantity_text="123",
+                    reference_price=0.0895,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0896,
+                    worst_price_text="0.0896",
+                    reduce_only=True,
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[],
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings()
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_cleanup_preview_confirmation_store] = lambda: cleanup_store
+    app.dependency_overrides[get_execution_order_state_service] = (
+        lambda: StubExecutionOrderStateService()
+    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_extended_cleanup_preview_service] = (
+        lambda: StubExtendedCleanupPreviewService()
+    )
+    client = TestClient(app)
+    assert paper_trade.entry_id is not None
+    response = client.post(
+        f"/v1/executions/cleanup-preview-confirmations/latest/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "cleanup-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["preview_hash"] == "cleanup-hash"
+    assert payload["preview"]["reason"] == "close_open_leg"
+    stored_confirmations = cleanup_store.list_recent(limit=10, paper_trade_id=paper_trade.entry_id)
+    assert len(stored_confirmations) == 1
+    assert stored_confirmations[0].preview_hash == "cleanup-hash"
+    assert stored_confirmations[0].preview.reason == "close_open_leg"
+
+
+def test_execute_extended_cleanup_endpoint_submits_confirmed_cleanup_preview(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "paper.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 12, 50, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 45, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0012,
+                break_even_days_entry=0.35,
+                capacity_limit_notional=1000.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    latest_execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=paper_trade.entry_id,
+            preview_hash="preview-hash",
+            confirmation_entry_id=3,
+            paper_trade=paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order",
+                )
+            ],
+        )
+    )
+    cleanup_store = CleanupPreviewConfirmationStore(tmp_path / "history.sqlite3")
+    confirmation = cleanup_store.append(
+        CleanupPreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 2, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label="arb_extended_paradex",
+            preview_hash="cleanup-hash",
+            preview=ExecutionCleanupPreview(
+                execution_entry_id=latest_execution.entry_id,
+                paper_trade_id=paper_trade.entry_id,
+                generated_at=datetime(2026, 3, 29, 13, 1, tzinfo=UTC),
+                preview_hash="cleanup-hash",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=11.0,
+                    effective_notional=11.0,
+                    quantity=123.0,
+                    quantity_text="123",
+                    reference_price=0.0895,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0896,
+                    worst_price_text="0.0896",
+                    reduce_only=True,
+                    endpoint_path_hint="/api/v1/user/order",
+                    required_auth_env_vars=[],
+                    auth_scheme="api key + Stark signing key",
+                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    notes=[],
+                ),
+                notes=[],
+            ),
+            note="operator confirmed cleanup",
+        )
+    )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_api_settings,
+        get_cleanup_preview_confirmation_store,
+        get_execution_journal_store,
+        get_execution_order_state_service,
+        get_extended_cleanup_preview_service,
+        get_extended_live_execution_service,
+        get_paper_trade_store,
+    )
+
+    class StubExecutionOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="extended",
+                        supported=True,
+                        external_reference="ext-order",
+                        derived_state="unknown",
+                    )
+                ],
+            )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            entry: PaperTradeEntry,
+            configs: object,
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=entry.entry_id or 0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=["ARB-USD"],
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                        position_symbols=[],
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+        async def probe_venues(self, configs: object) -> list[VenueAccountPreflight]:
+            return [
+                VenueAccountPreflight(
+                    venue="extended",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_key",
+                ),
+                VenueAccountPreflight(
+                    venue="paradex",
+                    enabled=False,
+                    authenticated=False,
+                    ready=False,
+                    credential_mode="subkey_jwt",
+                ),
+            ]
+
+    class StubExtendedCleanupPreviewService:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int = 10,
+            generated_at: datetime | None = None,
+        ) -> ExecutionCleanupPreview:
+            return confirmation.preview
+
+    class StubExtendedLiveExecutionService:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            assert confirmation.entry_id is not None
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 13, 3, tzinfo=UTC),
+                adapter="extended_cleanup_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="buy",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="cleanup-order-1",
+                    )
+                ],
+            )
+
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="stark-key",
+    )
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_cleanup_preview_confirmation_store] = lambda: cleanup_store
+    app.dependency_overrides[get_execution_order_state_service] = (
+        lambda: StubExecutionOrderStateService()
+    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_extended_cleanup_preview_service] = (
+        lambda: StubExtendedCleanupPreviewService()
+    )
+    app.dependency_overrides[get_extended_live_execution_service] = (
+        lambda: StubExtendedLiveExecutionService()
+    )
+    client = TestClient(app)
+    assert paper_trade.entry_id is not None
+    response = client.post(
+        f"/v1/executions/live/extended/cleanup/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "cleanup-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["adapter"] == "extended_cleanup_live"
+    assert payload["confirmation_entry_id"] == confirmation.entry_id
+    assert payload["preview_hash"] == "cleanup-hash"
+    assert payload["legs"][0]["external_reference"] == "cleanup-order-1"
+    stored_entries = execution_store.list_recent(limit=10)
+    assert len(stored_entries) == 2
+    assert stored_entries[0].paper_trade_id == paper_trade.entry_id
+    assert stored_entries[0].preview_hash == "cleanup-hash"
+    assert stored_entries[0].confirmation_entry_id == confirmation.entry_id
 
 
 def test_executions_endpoint_rejects_invalid_limit(tmp_path: Path) -> None:

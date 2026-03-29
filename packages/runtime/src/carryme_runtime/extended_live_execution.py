@@ -18,6 +18,7 @@ from carryme_connectors import (
     build_signed_extended_order_payload,
 )
 from carryme_models import (
+    CleanupPreviewConfirmationEntry,
     ExecutionJournalEntry,
     ExecutionLegResult,
     PaperTradeEntry,
@@ -58,7 +59,62 @@ class ExtendedLiveExecutionService:
         if confirmation.entry_id is None:
             raise ValueError("Preview confirmation entry_id is required before live execution")
 
-        leg = self._select_extended_leg(confirmation)
+        return await self._submit_venue_order(
+            paper_trade=paper_trade,
+            preview_hash=confirmation.preview_hash,
+            confirmation_entry_id=confirmation.entry_id,
+            adapter_name="extended_live",
+            leg=self._select_extended_leg(confirmation),
+            executed_at=executed_at,
+        )
+
+    async def submit_confirmed_cleanup_preview(
+        self,
+        *,
+        paper_trade: PaperTradeEntry,
+        confirmation: CleanupPreviewConfirmationEntry,
+        executed_at: datetime | None = None,
+    ) -> ExecutionJournalEntry:
+        """Submit one confirmed Extended cleanup preview to the live venue."""
+
+        if paper_trade.entry_id is None:
+            raise ValueError("Paper trade entry_id is required before live cleanup execution")
+        if confirmation.entry_id is None:
+            raise ValueError("Cleanup confirmation entry_id is required before live execution")
+
+        cleanup_leg = self._select_extended_cleanup_leg(confirmation)
+        return await self._submit_venue_order(
+            paper_trade=paper_trade,
+            preview_hash=confirmation.preview_hash,
+            confirmation_entry_id=confirmation.entry_id,
+            adapter_name="extended_cleanup_live",
+            leg=cleanup_leg,
+            executed_at=executed_at,
+        )
+
+    @staticmethod
+    def _select_extended_cleanup_leg(
+        confirmation: CleanupPreviewConfirmationEntry,
+    ) -> VenueOrderPreview:
+        """Return the validated Extended cleanup leg for a confirmed cleanup preview."""
+
+        leg = confirmation.preview.leg
+        if leg.venue != "extended":
+            raise ValueError("Cleanup confirmation must target Extended venue")
+        if leg.reduce_only is not True:
+            raise ValueError("Cleanup confirmation must be reduce-only before live execution")
+        return leg
+
+    async def _submit_venue_order(
+        self,
+        *,
+        paper_trade: PaperTradeEntry,
+        preview_hash: str,
+        confirmation_entry_id: int,
+        adapter_name: str,
+        leg: VenueOrderPreview,
+        executed_at: datetime | None = None,
+    ) -> ExecutionJournalEntry:
         snapshot = await self.fetch_snapshot("extended", leg.symbol)
         fee_rate = await self._resolve_taker_fee_rate(leg.symbol, leg.fee_profile)
         timestamp = executed_at or datetime.now(UTC)
@@ -93,12 +149,12 @@ class ExtendedLiveExecutionService:
 
         return ExecutionJournalEntry(
             executed_at=timestamp,
-            adapter="extended_live",
+            adapter=adapter_name,
             mode="live",
             status=leg_status,
             paper_trade_id=paper_trade.entry_id,
-            preview_hash=confirmation.preview_hash,
-            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=preview_hash,
+            confirmation_entry_id=confirmation_entry_id,
             paper_trade=paper_trade,
             legs=[
                 ExecutionLegResult(
@@ -170,9 +226,7 @@ def _pick_external_reference(
 
 def _pick_taker_fee_rate(payload: dict[str, Any] | list[Any]) -> Decimal | None:
     if isinstance(payload, list):
-        _logger.warning(
-            "Extended fees payload returned a list; falling back to static fee profile"
-        )
+        _logger.warning("Extended fees payload returned a list; falling back to static fee profile")
         return None
     body = payload.get("data", payload)
     if not isinstance(body, dict):
