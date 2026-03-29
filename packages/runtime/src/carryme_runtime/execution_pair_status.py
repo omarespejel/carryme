@@ -128,6 +128,8 @@ def _is_cleanup_execution(entry: ExecutionJournalEntry) -> bool:
         reduce_only = payload.get("reduce_only")
         if reduce_only is None:
             reduce_only = payload.get("reduceOnly")
-        if reduce_only is not True:
+        flags = payload.get("flags")
+        has_reduce_only_flag = isinstance(flags, list) and "REDUCE_ONLY" in flags
+        if reduce_only is not True and not has_reduce_only_flag:
             return False
     return True
