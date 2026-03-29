@@ -4109,6 +4109,13 @@ def test_hyperliquid_order_state_observer_prefers_websocket_order_updates(
     class StubWebsocketManager:
         def __init__(self) -> None:
             self.stopped = False
+            self.unsubscribed = False
+
+        def __enter__(self) -> "StubWebsocketManager":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            self.stop()
 
         def subscribe(self, subscription: dict[str, str], callback: Any) -> int:
             if subscription["type"] == "orderUpdates":
@@ -4132,14 +4139,16 @@ def test_hyperliquid_order_state_observer_prefers_websocket_order_updates(
             return 1
 
         def unsubscribe(self, subscription: dict[str, str], subscription_id: int) -> bool:
+            self.unsubscribed = True
             return True
 
         def stop(self) -> None:
             self.stopped = True
 
+    stub_manager = StubWebsocketManager()
     monkeypatch.setattr(
         "carryme_runtime.execution_order_state.build_hyperliquid_websocket_manager",
-        lambda: StubWebsocketManager(),
+        lambda: stub_manager,
     )
     monkeypatch.setattr(
         "carryme_runtime.execution_order_state.build_hyperliquid_info",
@@ -4161,6 +4170,8 @@ def test_hyperliquid_order_state_observer_prefers_websocket_order_updates(
         assert state.avg_fill_price == "0.0923"
         assert state.client_id == "0xabc"
         assert state.observation_source == "websocket_order_updates"
+        assert stub_manager.unsubscribed is True
+        assert stub_manager.stopped is True
 
     asyncio.run(run())
 
@@ -4169,14 +4180,25 @@ def test_hyperliquid_order_state_observer_falls_back_when_websocket_times_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StubWebsocketManager:
+        def __init__(self) -> None:
+            self.stopped = False
+            self.unsubscribed = False
+
+        def __enter__(self) -> "StubWebsocketManager":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            self.stop()
+
         def subscribe(self, subscription: dict[str, str], callback: Any) -> int:
             return 1
 
         def unsubscribe(self, subscription: dict[str, str], subscription_id: int) -> bool:
+            self.unsubscribed = True
             return True
 
         def stop(self) -> None:
-            return None
+            self.stopped = True
 
     class StubInfo:
         def query_order_by_oid(self, address: str, oid: int) -> dict[str, object]:
@@ -4192,9 +4214,10 @@ def test_hyperliquid_order_state_observer_falls_back_when_websocket_times_out(
                 },
             }
 
+    stub_manager = StubWebsocketManager()
     monkeypatch.setattr(
         "carryme_runtime.execution_order_state.build_hyperliquid_websocket_manager",
-        lambda: StubWebsocketManager(),
+        lambda: stub_manager,
     )
     monkeypatch.setattr(
         "carryme_runtime.execution_order_state.build_hyperliquid_info",
@@ -4222,6 +4245,8 @@ def test_hyperliquid_order_state_observer_falls_back_when_websocket_times_out(
                 "fell back to REST."
             )
         ]
+        assert stub_manager.unsubscribed is True
+        assert stub_manager.stopped is True
 
     asyncio.run(run())
 
@@ -4273,6 +4298,16 @@ def test_hyperliquid_order_state_observer_prefers_vault_address_for_websocket_up
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class StubWebsocketManager:
+        def __init__(self) -> None:
+            self.stopped = False
+            self.unsubscribed = False
+
+        def __enter__(self) -> "StubWebsocketManager":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            self.stop()
+
         def subscribe(self, subscription: dict[str, str], callback: Any) -> int:
             assert subscription["user"] == "0xvault"
             if subscription["type"] == "orderUpdates":
@@ -4297,14 +4332,16 @@ def test_hyperliquid_order_state_observer_prefers_vault_address_for_websocket_up
 
         def unsubscribe(self, subscription: dict[str, str], subscription_id: int) -> bool:
             assert subscription["user"] == "0xvault"
+            self.unsubscribed = True
             return True
 
         def stop(self) -> None:
-            return None
+            self.stopped = True
 
+    stub_manager = StubWebsocketManager()
     monkeypatch.setattr(
         "carryme_runtime.execution_order_state.build_hyperliquid_websocket_manager",
-        lambda: StubWebsocketManager(),
+        lambda: stub_manager,
     )
     monkeypatch.setattr(
         "carryme_runtime.execution_order_state.build_hyperliquid_info",
@@ -4329,6 +4366,100 @@ def test_hyperliquid_order_state_observer_prefers_vault_address_for_websocket_up
         assert state.avg_fill_price == "0.0923"
         assert state.client_id == "0xvault-order"
         assert state.observation_source == "websocket_order_updates"
+        assert stub_manager.unsubscribed is True
+        assert stub_manager.stopped is True
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_order_state_observer_handles_userfills_edge_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubWebsocketManager:
+        def __init__(self) -> None:
+            self.stopped = False
+            self.unsubscribed = False
+
+        def __enter__(self) -> "StubWebsocketManager":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            self.stop()
+
+        def subscribe(self, subscription: dict[str, str], callback: Any) -> int:
+            if subscription["type"] == "userFills":
+                callback(
+                    {
+                        "channel": "userFills",
+                        "data": {
+                            "isSnapshot": False,
+                            "fills": [
+                                {
+                                    "oid": 777,
+                                    "px": "0.0923",
+                                    "sz": "10.0",
+                                }
+                            ],
+                        },
+                    }
+                )
+            return 1
+
+        def unsubscribe(self, subscription: dict[str, str], subscription_id: int) -> bool:
+            self.unsubscribed = True
+            return True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class StubInfo:
+        def query_order_by_oid(self, address: str, oid: int) -> dict[str, object]:
+            assert address == "0xhyper"
+            assert oid == 777
+            return {
+                "status": "open",
+                "order": {
+                    "coin": "ARB",
+                    "origSz": "119.3",
+                    "sz": "109.3",
+                    "avgPx": "0.0923",
+                },
+            }
+
+    stub_manager = StubWebsocketManager()
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_websocket_manager",
+        lambda: stub_manager,
+    )
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_info",
+        lambda: StubInfo(),
+    )
+
+    async def run() -> None:
+        observer = HyperliquidOrderStateObserver(
+            account_address="0xhyper",
+            websocket_timeout_seconds=0.01,
+        )
+        state = await observer.observe(
+            {
+                "venue": "hyperliquid",
+                "external_reference": "777",
+                "request_payload": {},
+            }
+        )
+        assert state.supported is True
+        assert state.derived_state == "partial_fill"
+        assert state.order_status == "open"
+        assert state.observation_source == "rest_poll"
+        assert state.notes == [
+            (
+                "Observed via Hyperliquid websocket userFills; fill events may be partial, "
+                "so REST fallback confirms terminal order state."
+            )
+        ]
+        assert stub_manager.unsubscribed is True
+        assert stub_manager.stopped is True
 
     asyncio.run(run())
 

@@ -14,6 +14,7 @@ from carryme_models.execution import (
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
     GuardedPairExecutionResult,
+    ObservationSource,
 )
 from carryme_models.health import AppDescriptor, ServiceHealth
 from carryme_models.history import (
@@ -56,6 +57,7 @@ __all__ = [
     "ExecutionPairStatus",
     "ExecutionReconciliation",
     "ExecutionVenueReconciliation",
+    "ObservationSource",
     "FundingPairSpec",
     "FundingRateNormalization",
     "FundingArbOpportunity",

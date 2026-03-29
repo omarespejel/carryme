@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -17,7 +16,12 @@ from carryme_connectors import (
     build_hyperliquid_info,
     build_hyperliquid_websocket_manager,
 )
-from carryme_models import ExecutionJournalEntry, ExecutionLegOrderState, ExecutionOrderState
+from carryme_models import (
+    ExecutionJournalEntry,
+    ExecutionLegOrderState,
+    ExecutionOrderState,
+    ObservationSource,
+)
 
 
 class ExecutionLegOrderObserver(Protocol):
@@ -269,6 +273,16 @@ class HyperliquidOrderStateObserver:
                 fallback_notes.extend(stream_state.notes)
             if stream_state is not None and stream_state.derived_state != "unknown":
                 return stream_state
+            if stream_state is not None and stream_state.derived_state == "unknown":
+                fallback_notes.extend(
+                    stream_state.notes
+                    or [
+                        (
+                            "Hyperliquid websocket produced an unknown "
+                            "order-state payload; fell back to REST."
+                        )
+                    ]
+                )
             if not fallback_notes:
                 fallback_notes.append(
                     "Hyperliquid websocket did not yield a terminal update before timeout; "
@@ -462,9 +476,9 @@ def _await_hyperliquid_order_state_from_stream(
     oid: int,
     timeout_seconds: float,
 ) -> ExecutionLegOrderState | None:
-    manager = build_hyperliquid_websocket_manager()
     event = threading.Event()
     result_holder: dict[str, ExecutionLegOrderState | None] = {"state": None}
+    user_fill_notes: list[str] = []
     lock = threading.Lock()
     subscriptions: list[tuple[dict[str, str], int]] = []
 
@@ -495,55 +509,50 @@ def _await_hyperliquid_order_state_from_stream(
             fill_oid = fill.get("oid")
             if not isinstance(fill_oid, int) or fill_oid != oid:
                 continue
-            capture(
-                ExecutionLegOrderState(
+            note = (
+                "Observed via Hyperliquid websocket userFills"
+                + (" snapshot; " if is_snapshot else "; ")
+                + "fill events may be partial, so REST fallback confirms terminal order state."
+            )
+            with lock:
+                if note not in user_fill_notes:
+                    user_fill_notes.append(note)
+            return
+
+    with build_hyperliquid_websocket_manager() as manager:
+        try:
+            order_subscription: dict[str, str] = {"type": "orderUpdates", "user": account_address}
+            fills_subscription: dict[str, str] = {"type": "userFills", "user": account_address}
+            subscriptions.append(
+                (
+                    order_subscription,
+                    manager.subscribe(order_subscription, on_order_updates),
+                )
+            )
+            subscriptions.append(
+                (
+                    fills_subscription,
+                    manager.subscribe(fills_subscription, on_user_fills),
+                )
+            )
+            if event.wait(timeout_seconds):
+                return result_holder["state"]
+            if user_fill_notes:
+                return ExecutionLegOrderState(
                     venue="hyperliquid",
                     supported=True,
                     observation_source="websocket_user_fills",
                     external_reference=str(oid),
-                    derived_state="filled",
-                    order_status="filled",
-                    avg_fill_price=_string_value(fill, "px"),
-                    remaining_size="0",
-                    size=_string_value(fill, "sz"),
-                    notes=[
-                        (
-                            "Observed via Hyperliquid websocket userFills"
-                            + (" snapshot." if is_snapshot else ".")
-                        )
-                    ],
-                    raw_response=message,
+                    derived_state="unknown",
+                    notes=user_fill_notes,
                 )
-            )
-            return
-
-    try:
-        order_subscription: dict[str, str] = {"type": "orderUpdates", "user": account_address}
-        fills_subscription: dict[str, str] = {"type": "userFills", "user": account_address}
-        subscriptions.append(
-            (
-                order_subscription,
-                manager.subscribe(order_subscription, on_order_updates),
-            )
-        )
-        subscriptions.append(
-            (
-                fills_subscription,
-                manager.subscribe(fills_subscription, on_user_fills),
-            )
-        )
-        if not event.wait(timeout_seconds):
             return None
-        return result_holder["state"]
-    finally:
-        for subscription, subscription_id in subscriptions:
-            try:
-                manager.unsubscribe(subscription, subscription_id)
-            except Exception:
-                continue
-
-        with suppress(Exception):
-            manager.stop()
+        finally:
+            for subscription, subscription_id in subscriptions:
+                try:
+                    manager.unsubscribe(subscription, subscription_id)
+                except Exception:
+                    continue
 
 
 def _extract_hyperliquid_order_update(
@@ -583,7 +592,7 @@ def _build_hyperliquid_order_state(
     *,
     external_reference: str,
     payload: dict[str, Any],
-    observation_source: str,
+    observation_source: ObservationSource,
     notes: list[str] | None = None,
 ) -> ExecutionLegOrderState:
     order = payload.get("order")
