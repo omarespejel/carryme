@@ -5,6 +5,8 @@ from carryme_api.app import app, get_history_store, get_opportunity_service
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
+    ExecutionJournalEntry,
+    ExecutionLegResult,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -14,6 +16,7 @@ from carryme_models import (
 )
 from carryme_storage import (
     CandidateAlertStore,
+    ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     WatchlistStore,
@@ -744,6 +747,7 @@ def test_create_paper_trade_from_intent_persists_entry(tmp_path: Path) -> None:
     payload = response.json()
     assert payload["intent"]["label"] == "arb_extended_paradex"
     assert payload["note"] == "operator accepted candidate"
+    assert payload["entry_id"] is not None
     assert len(paper_store.list_recent(limit=10)) == 1
 
 
@@ -792,3 +796,130 @@ def test_paper_trades_endpoint_lists_saved_entries(tmp_path: Path) -> None:
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["intent"]["label"] == "arb_extended_paradex"
+
+
+def test_mock_execution_endpoint_submits_saved_paper_trade(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        )
+    )
+
+    from carryme_api.app import get_execution_journal_store, get_paper_trade_store
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    client = TestClient(app)
+    response = client.post(f"/v1/executions/mock/from-paper-trade/{paper_trade.entry_id}")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["adapter"] == "mock"
+    assert len(execution_store.list_recent(limit=10)) == 1
+
+
+def test_executions_endpoint_lists_saved_entries(tmp_path: Path) -> None:
+    execution_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="mock",
+            mode="mock",
+            status="accepted",
+            paper_trade_id=7,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                    status="accepted",
+                    simulated=True,
+                    external_reference="mock:7:buy",
+                ),
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                    status="accepted",
+                    simulated=True,
+                    external_reference="mock:7:sell",
+                ),
+            ],
+        )
+    )
+
+    from carryme_api.app import get_execution_journal_store
+
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    client = TestClient(app)
+    response = client.get("/v1/executions")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["paper_trade_id"] == 7

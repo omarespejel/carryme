@@ -4,6 +4,8 @@ from pathlib import Path
 from carryme_models import (
     CandidateAlertEvent,
     CapacityEstimate,
+    ExecutionJournalEntry,
+    ExecutionLegResult,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -13,6 +15,7 @@ from carryme_models import (
 )
 from carryme_storage import (
     CandidateAlertStore,
+    ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     WatchlistStore,
@@ -225,9 +228,84 @@ def test_paper_trade_store_appends_and_lists_recent(tmp_path: Path) -> None:
         ),
     )
 
-    store.append(entry)
+    saved = store.append(entry)
     results = store.list_recent(limit=10)
 
+    assert saved.entry_id is not None
     assert len(results) == 1
+    assert results[0].entry_id == saved.entry_id
     assert results[0].intent.label == "arb_extended_paradex"
     assert results[0].note == "operator accepted candidate"
+    assert store.get(saved.entry_id) is not None
+
+
+def test_execution_journal_store_appends_and_lists_recent(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    entry = ExecutionJournalEntry(
+        executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+        adapter="mock",
+        mode="mock",
+        status="accepted",
+        paper_trade_id=7,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=1000.0,
+                capacity_fraction=0.25,
+                max_target_notional=1000.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=1000.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+                status="accepted",
+                simulated=True,
+                external_reference="mock:7:buy",
+            ),
+            ExecutionLegResult(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+                status="accepted",
+                simulated=True,
+                external_reference="mock:7:sell",
+            ),
+        ],
+    )
+
+    saved = store.append(entry)
+    results = store.list_recent(limit=10)
+
+    assert saved.entry_id is not None
+    assert len(results) == 1
+    assert results[0].entry_id == saved.entry_id
+    assert results[0].paper_trade_id == 7
+    assert results[0].legs[0].external_reference == "mock:7:buy"

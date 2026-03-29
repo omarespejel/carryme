@@ -44,12 +44,12 @@ class PaperTradeStore:
                 """
             )
 
-    def append(self, entry: PaperTradeEntry) -> None:
-        """Append a paper trade entry."""
+    def append(self, entry: PaperTradeEntry) -> PaperTradeEntry:
+        """Append a paper trade entry and return it with its assigned id."""
 
         self.initialize()
         with sqlite3.connect(self.database_path) as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO paper_trade_entries (
                     created_at,
@@ -65,6 +65,37 @@ class PaperTradeStore:
                     entry.model_dump_json(),
                 ),
             )
+        return PaperTradeEntry.model_validate(
+            {
+                **entry.model_dump(mode="json"),
+                "entry_id": cursor.lastrowid,
+            }
+        )
+
+    def get(self, entry_id: int) -> PaperTradeEntry | None:
+        """Return one paper trade entry by id."""
+
+        self.initialize()
+        with sqlite3.connect(self.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT id, entry_json
+                FROM paper_trade_entries
+                WHERE id = ?
+                """,
+                (entry_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        stored_id, entry_json = row
+        return PaperTradeEntry.model_validate(
+            {
+                **json.loads(entry_json),
+                "entry_id": stored_id,
+            }
+        )
 
     def list_recent(
         self,
@@ -76,7 +107,7 @@ class PaperTradeStore:
 
         self.initialize()
         query = """
-            SELECT entry_json
+            SELECT id, entry_json
             FROM paper_trade_entries
         """
         params: tuple[object, ...]
@@ -90,4 +121,12 @@ class PaperTradeStore:
         with sqlite3.connect(self.database_path) as connection:
             rows = connection.execute(query, params).fetchall()
 
-        return [PaperTradeEntry.model_validate(json.loads(entry_json)) for (entry_json,) in rows]
+        return [
+            PaperTradeEntry.model_validate(
+                {
+                    **json.loads(entry_json),
+                    "entry_id": stored_id,
+                }
+            )
+            for stored_id, entry_json in rows
+        ]

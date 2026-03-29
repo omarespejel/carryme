@@ -4,15 +4,17 @@ from datetime import UTC, datetime
 import pytest
 from carryme_models import (
     CapacityEstimate,
+    ExecutionJournalEntry,
     FundingArbOpportunity,
     FundingPairSpec,
     MarketStats,
     NormalizedMarketSnapshot,
     OpportunityRecord,
+    PaperTradeEntry,
     TopOfBook,
 )
 from carryme_normalizers import normalize_market_snapshot
-from carryme_runtime import OpportunityService, build_trade_intent
+from carryme_runtime import MockExecutionAdapter, OpportunityService, build_trade_intent
 
 
 def _snapshot(
@@ -164,3 +166,64 @@ def test_build_trade_intent_rejects_edge_below_threshold() -> None:
             min_one_day_net_edge_after_entry=0.0,
             min_capacity_notional=500.0,
         )
+
+
+def test_mock_execution_adapter_builds_accepted_execution_entry() -> None:
+    intent = build_trade_intent(
+        OpportunityRecord(
+            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            pair=FundingPairSpec(
+                label="strk_extended_hyperliquid",
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK",
+                right_fee_profile="tier0",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="STRK-USD-PERP",
+                long_venue="hyperliquid",
+                short_venue="extended",
+                long_fee_profile="tier0",
+                short_fee_profile="default",
+                gross_daily_edge=0.0005,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0002,
+                one_day_net_edge_after_round_trip=-0.0001,
+                break_even_days_entry=0.6,
+                break_even_days_round_trip=1.2,
+                capacity=CapacityEstimate(
+                    short_bid_notional=4000.0,
+                    long_ask_notional=3000.0,
+                    max_entry_notional=3000.0,
+                    limiting_venue="hyperliquid",
+                ),
+            ),
+        ),
+        capacity_fraction=0.5,
+        max_target_notional=1000.0,
+        min_one_day_net_edge_after_entry=0.0,
+        min_capacity_notional=500.0,
+    )
+    paper_trade = PaperTradeEntry(
+        entry_id=11,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="operator accepted candidate",
+        intent=intent,
+    )
+
+    entry = MockExecutionAdapter().submit(
+        paper_trade,
+        executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+    )
+
+    assert isinstance(entry, ExecutionJournalEntry)
+    assert entry.adapter == "mock"
+    assert entry.mode == "mock"
+    assert entry.status == "accepted"
+    assert entry.paper_trade_id == 11
+    assert len(entry.legs) == 2
+    assert entry.legs[0].status == "accepted"
+    assert entry.legs[0].simulated is True

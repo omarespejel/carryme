@@ -35,6 +35,7 @@ class FundingPairTradeIntent(BaseModel):
 class PaperTradeEntry(BaseModel):
     """An append-only paper trade journal entry."""
 
+    entry_id: int | None = None
     created_at: datetime
     intent: FundingPairTradeIntent
     note: str | None = None

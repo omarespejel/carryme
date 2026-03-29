@@ -9,6 +9,7 @@ import httpx
 from carryme_models import (
     AppDescriptor,
     CandidateAlertEvent,
+    ExecutionJournalEntry,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
@@ -19,9 +20,16 @@ from carryme_models import (
     WatchlistDocument,
 )
 from carryme_normalizers import list_fee_profiles
-from carryme_runtime import ConnectorError, OpportunityService, build_trade_intent
+from carryme_runtime import (
+    ConnectorError,
+    ExecutionAdapter,
+    MockExecutionAdapter,
+    OpportunityService,
+    build_trade_intent,
+)
 from carryme_storage import (
     CandidateAlertStore,
+    ExecutionJournalStore,
     OpportunityHistoryStore,
     PaperTradeStore,
     WatchlistStore,
@@ -79,6 +87,20 @@ def get_paper_trade_store(
     """Return the shared paper trade journal store."""
 
     return PaperTradeStore(settings.database_path)
+
+
+def get_execution_journal_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> ExecutionJournalStore:
+    """Return the shared execution journal store."""
+
+    return ExecutionJournalStore(settings.database_path)
+
+
+def get_execution_adapter() -> ExecutionAdapter:
+    """Return the default explicitly simulated execution adapter."""
+
+    return MockExecutionAdapter()
 
 
 def _select_trade_intent_records(
@@ -346,8 +368,34 @@ def create_app() -> FastAPI:
             intent=intents[0],
             note=note,
         )
-        paper_store.append(entry)
-        return entry
+        return paper_store.append(entry)
+
+    @app.get("/v1/executions", response_model=list[ExecutionJournalEntry])
+    def executions(
+        store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[ExecutionJournalEntry]:
+        return store.list_recent(limit=limit, label=label)
+
+    @app.post(
+        "/v1/executions/mock/from-paper-trade/{paper_trade_id}",
+        response_model=ExecutionJournalEntry,
+    )
+    def execute_saved_paper_trade(
+        paper_trade_id: int,
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        adapter: Annotated[ExecutionAdapter, Depends(get_execution_adapter)],
+    ) -> ExecutionJournalEntry:
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        journal_entry = adapter.submit(paper_trade)
+        return execution_store.append(journal_entry)
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard(
