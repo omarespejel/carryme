@@ -74,6 +74,7 @@ class OrderConstraints:
     minimum_order_size: Decimal | None = None
     minimum_notional: Decimal | None = None
     price_increment: Decimal | None = None
+    maximum_order_size: Decimal | None = None
     max_order_value: Decimal | None = None
 
 
@@ -176,6 +177,7 @@ def _build_leg_preview(
         )
 
     reference = Decimal(str(reference_price))
+    mark_price = _require_mark_price(snapshot.market.mark_price, venue=venue_key)
     constraints = _extract_order_constraints(venue_key, snapshot)
     raw_quantity = Decimal(str(target_notional)) / reference
     quantity = _snap_quantity(raw_quantity, constraints.quantity_increment)
@@ -193,13 +195,23 @@ def _build_leg_preview(
         side=side,
     )
     effective_notional = quantity * reference
+    mark_notional = quantity * mark_price
     limit_order_value = quantity * worst_price
     if (
         constraints.minimum_notional is not None
-        and effective_notional < constraints.minimum_notional
+        and mark_notional < constraints.minimum_notional
     ):
         raise ValueError(f"Venue {venue} preview notional for {symbol} fell below minimum notional")
-    if constraints.max_order_value is not None and limit_order_value > constraints.max_order_value:
+    if (
+        constraints.maximum_order_size is not None
+        and quantity > constraints.maximum_order_size
+    ):
+        raise ValueError(f"Venue {venue} preview quantity for {symbol} exceeded maximum order size")
+    if (
+        constraints.max_order_value is not None
+        and constraints.maximum_order_size is None
+        and limit_order_value > constraints.max_order_value
+    ):
         raise ValueError(
             f"Venue {venue} preview order value for {symbol} exceeded maximum limit order value"
         )
@@ -325,6 +337,7 @@ def _extract_order_constraints(
             minimum_order_size=None,
             minimum_notional=minimum_notional,
             price_increment=price_increment,
+            maximum_order_size=max_order_size,
             max_order_value=max_order_size * mark_price,
         )
     if venue == "extended":
@@ -396,6 +409,8 @@ def _require_decimal(raw: dict[str, object], key: str, *, label: str) -> Decimal
         raise ValueError(f"{label} field {key!r} must be numeric") from exc
     if value is None:
         raise ValueError(f"{label} missing {key!r}")
+    if value <= 0:
+        raise ValueError(f"{label} field {key!r} must be positive")
     return value
 
 

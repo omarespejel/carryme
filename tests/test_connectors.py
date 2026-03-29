@@ -27,6 +27,7 @@ def test_extended_connector_parses_stats_and_top_of_book() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"
         if request.url.path == "/api/v1/info/markets":
+            assert request.url.params["market"] == "STRK-USD"
             return httpx.Response(
                 200,
                 json={
