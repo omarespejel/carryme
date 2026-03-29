@@ -404,6 +404,12 @@ def _reprice_leg_within_confirmed_cap(
         book_price = top_of_book.best_ask_price
         if book_price is None or book_price <= 0:
             raise ValueError(f"Paradex is missing a usable best_ask for {leg.symbol}")
+        if top_of_book.best_ask_size is None or top_of_book.best_ask_size <= 0:
+            _logger.warning(
+                "Paradex retry repricing saw thin ask liquidity for %s: best_ask_size=%s",
+                leg.symbol,
+                top_of_book.best_ask_size,
+            )
         candidate = Decimal(str(book_price)) * (
             Decimal("1") + (Decimal(book_slippage_bps) / Decimal(10_000))
         )
@@ -413,6 +419,12 @@ def _reprice_leg_within_confirmed_cap(
         book_price = top_of_book.best_bid_price
         if book_price is None or book_price <= 0:
             raise ValueError(f"Paradex is missing a usable best_bid for {leg.symbol}")
+        if top_of_book.best_bid_size is None or top_of_book.best_bid_size <= 0:
+            _logger.warning(
+                "Paradex retry repricing saw thin bid liquidity for %s: best_bid_size=%s",
+                leg.symbol,
+                top_of_book.best_bid_size,
+            )
         candidate = Decimal(str(book_price)) * (
             Decimal("1") - (Decimal(book_slippage_bps) / Decimal(10_000))
         )
