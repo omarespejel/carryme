@@ -25,6 +25,7 @@ from carryme_models import (
     ExecutionOrderState,
     ExecutionPairClosePreview,
     ExecutionPairStatus,
+    ExecutionQualitySummary,
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
     FundingArbOpportunity,
@@ -890,6 +891,24 @@ def test_execution_quality_service_lists_ranked_summaries(tmp_path: Path) -> Non
     )
     append_summary_sample(
         paper_trade_id=5,
+        canonical_symbol="STRK-USD-PERP",
+        short_venue="hyperliquid",
+        short_symbol="STRK",
+        long_venue="paradex",
+        long_symbol="STRK-USD-PERP",
+        outcome="closed",
+    )
+    append_summary_sample(
+        paper_trade_id=6,
+        canonical_symbol="STRK-USD-PERP",
+        short_venue="paradex",
+        short_symbol="STRK-USD-PERP",
+        long_venue="hyperliquid",
+        long_symbol="STRK",
+        outcome="closed",
+    )
+    append_summary_sample(
+        paper_trade_id=7,
         canonical_symbol="STRK-USD-PERP",
         short_venue="hyperliquid",
         short_symbol="STRK",
