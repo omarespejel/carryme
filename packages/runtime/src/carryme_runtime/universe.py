@@ -29,7 +29,7 @@ from carryme_normalizers import get_fee_profile, normalize_symbol
 from carryme_scoring import score_funding_pair
 
 from carryme_runtime.opportunities import (
-    CONNECTOR_BASE_URLS,
+    VENUE_REGISTRY,
     SnapshotFetcher,
     fetch_live_snapshot,
 )
@@ -176,9 +176,10 @@ async def list_live_symbols(venue: str) -> list[str]:
     """List active perp symbols on a supported venue."""
 
     key = venue.strip().lower()
-    base_url = CONNECTOR_BASE_URLS.get(key)
-    if base_url is None:
+    venue_config = VENUE_REGISTRY.get(key)
+    if venue_config is None:
         raise ValueError(f"Unsupported venue: {venue}")
+    base_url, _connector_factory = venue_config
 
     async with httpx.AsyncClient(base_url=base_url, timeout=20.0) as client:
         connector = _build_connector(key, client)
@@ -346,7 +347,7 @@ def _normalize_venues(venues: list[str]) -> list[str]:
     normalized = sorted({venue.strip().lower() for venue in venues if venue.strip()})
     if len(normalized) < 2:
         raise ValueError("At least two venues are required for funding universe scans")
-    unsupported = [venue for venue in normalized if venue not in CONNECTOR_BASE_URLS]
+    unsupported = [venue for venue in normalized if venue not in VENUE_REGISTRY]
     if unsupported:
         joined = ", ".join(sorted(unsupported))
         raise ValueError(f"Unsupported venue(s): {joined}")
