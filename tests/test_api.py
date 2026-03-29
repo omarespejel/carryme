@@ -3,7 +3,13 @@ from typing import cast
 
 import pytest
 from carryme_api.app import app, get_opportunity_service
-from carryme_api.opportunities import ConnectorError, OpportunityService, SnapshotFetcher
+from carryme_api.opportunities import (
+    ConnectorError,
+    OpportunityService,
+    SnapshotFetcher,
+    UpstreamDataError,
+    fetch_live_snapshot,
+)
 from carryme_models import (
     CapacityEstimate,
     FundingArbOpportunity,
@@ -183,6 +189,32 @@ def test_funding_pair_endpoint_maps_connector_errors_to_bad_gateway() -> None:
     assert response.json()["detail"] == "upstream venue timeout"
 
 
+def test_funding_pair_endpoint_maps_upstream_data_errors_to_bad_gateway() -> None:
+    class FailingOpportunityService:
+        async def score_pair(self, **_: str) -> FundingArbOpportunity:
+            raise UpstreamDataError("malformed upstream payload")
+
+    app.dependency_overrides[get_opportunity_service] = lambda: FailingOpportunityService()
+    client = TestClient(app)
+
+    response = client.get(
+        "/v1/opportunities/funding-pair",
+        params={
+            "left_venue": "extended",
+            "left_symbol": "STRK-USD",
+            "left_fee_profile": "default",
+            "right_venue": "hyperliquid",
+            "right_symbol": "STRK",
+            "right_fee_profile": "tier0",
+        },
+    )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "malformed upstream payload"
+
+
 def test_opportunity_service_validates_fee_profiles_before_network_calls() -> None:
     class CountingFetcher:
         def __init__(self) -> None:
@@ -203,6 +235,60 @@ def test_opportunity_service_validates_fee_profiles_before_network_calls() -> No
                 left_fee_profile="missing",
                 right_venue="hyperliquid",
                 right_symbol="STRK",
+                right_fee_profile="tier0",
+            )
+        )
+
+    assert fetcher.calls == 0
+
+
+def test_opportunity_service_rejects_invalid_symbols_before_network_calls() -> None:
+    class CountingFetcher:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, _venue: str, _symbol: str) -> NormalizedMarketSnapshot:
+            self.calls += 1
+            return _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
+
+    fetcher = CountingFetcher()
+    service = OpportunityService(fetch_snapshot=cast(SnapshotFetcher, fetcher))
+
+    with pytest.raises(ValueError, match="Invalid Hyperliquid perp symbol"):
+        asyncio.run(
+            service.score_pair(
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="STRK-USD",
+                right_fee_profile="tier0",
+            )
+        )
+
+    assert fetcher.calls == 0
+
+
+def test_opportunity_service_rejects_mismatched_pairs_before_network_calls() -> None:
+    class CountingFetcher:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def __call__(self, _venue: str, _symbol: str) -> NormalizedMarketSnapshot:
+            self.calls += 1
+            return _snapshot("extended", "STRK-USD", 0.0002, 0.0345, 100_000, 0.0346, 80_000)
+
+    fetcher = CountingFetcher()
+    service = OpportunityService(fetch_snapshot=cast(SnapshotFetcher, fetcher))
+
+    with pytest.raises(ValueError, match="Funding pairs must share the same canonical symbol"):
+        asyncio.run(
+            service.score_pair(
+                left_venue="extended",
+                left_symbol="STRK-USD",
+                left_fee_profile="default",
+                right_venue="hyperliquid",
+                right_symbol="ETH",
                 right_fee_profile="tier0",
             )
         )
@@ -241,3 +327,34 @@ def test_opportunity_service_fetches_snapshots_concurrently() -> None:
 
     assert fetcher.started == ["extended", "hyperliquid"]
     assert opportunity.canonical_symbol == "STRK-USD-PERP"
+
+
+def test_fetch_live_snapshot_rejects_upstream_symbol_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeConnector:
+        async def fetch_market_stats(self, _symbol: str) -> MarketStats:
+            return MarketStats(
+                venue="extended",
+                symbol="ETH-USD",
+                mark_price=1800.0,
+                funding_rate=0.0002,
+                open_interest=1_000_000,
+                daily_volume=500_000,
+            )
+
+        async def fetch_top_of_book(self, _symbol: str) -> TopOfBook:
+            return TopOfBook(
+                best_bid_price=1799.0,
+                best_bid_size=20.0,
+                best_ask_price=1801.0,
+                best_ask_size=18.0,
+            )
+
+    monkeypatch.setattr(
+        "carryme_api.opportunities._build_connector",
+        lambda _venue, _client: FakeConnector(),
+    )
+
+    with pytest.raises(UpstreamDataError, match="symbol mismatch"):
+        asyncio.run(fetch_live_snapshot("extended", "STRK-USD"))

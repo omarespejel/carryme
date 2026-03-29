@@ -7,7 +7,7 @@ from carryme_models import AppDescriptor, FundingArbOpportunity, ServiceHealth, 
 from carryme_normalizers import list_fee_profiles
 from fastapi import Depends, FastAPI, HTTPException
 
-from carryme_api.opportunities import ConnectorError, OpportunityService
+from carryme_api.opportunities import ConnectorError, OpportunityService, UpstreamDataError
 
 APP_NAME = "carryme-api"
 APP_VERSION = "0.1.0"
@@ -65,10 +65,10 @@ def create_app() -> FastAPI:
                 right_symbol=right_symbol,
                 right_fee_profile=right_fee_profile,
             )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
 
