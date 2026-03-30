@@ -36,6 +36,7 @@ uv run carryme-worker
 uv run carryme-worker --supervise
 uv run carryme-worker --observe-executions-supervise
 uv run carryme-worker --ready
+uv run carryme-render-validate --skip-db-ping
 ```
 
 Useful worker modes:
@@ -56,3 +57,4 @@ The production target is Render with managed Postgres and split background worke
 
 1. Blueprint: [render.yaml](render.yaml)
 2. Deployment guide: [docs/deploy/render.md](docs/deploy/render.md)
+3. Render env template: [.env.render.example](.env.render.example)

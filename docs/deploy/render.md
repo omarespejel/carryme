@@ -55,6 +55,8 @@ uv run alembic upgrade head
 
 Do not commit these. Configure them in Render secrets or an environment group and attach them to the services that need them.
 
+The exact starting template is committed in [`.env.render.example`](../../.env.render.example).
+
 ### Extended
 
 1. `CARRYME_API_EXTENDED_LIVE_ENABLED=true`
@@ -105,6 +107,16 @@ uv sync --all-packages --group dev
 uv run alembic upgrade head
 uv run carryme-api
 uv run carryme-worker --ready
+uv run carryme-render-validate --skip-db-ping
+```
+
+To validate a real hosted-style database target before deploy:
+
+```bash
+export DATABASE_URL=postgresql+psycopg://...
+export CARRYME_API_ENVIRONMENT=production
+export CARRYME_WORKER_ENVIRONMENT=production
+uv run carryme-render-validate
 ```
 
 ## Production Rollout Order
@@ -115,3 +127,19 @@ uv run carryme-worker --ready
 4. verify `carryme-api /ready`
 5. verify `uv run carryme-worker --ready` locally against the same Postgres URL if needed
 6. keep live notional tiny until hosted canary cycles prove stable
+
+## Render Console Checklist
+
+1. create the Render project
+2. provision the managed Postgres instance first
+3. apply [render.yaml](../../render.yaml)
+4. create one shared environment group from [`.env.render.example`](../../.env.render.example)
+5. attach that group to:
+   - `carryme-api`
+   - `carryme-approved-canary-scan`
+   - `carryme-launch-ready-cache`
+   - `carryme-stable-launch`
+   - `carryme-system-state`
+   - `carryme-execution-monitor`
+6. leave live venue flags `false` until `/ready` and worker readiness are green
+7. only then enable live venue flags and paste trading secrets

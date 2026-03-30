@@ -1,4 +1,5 @@
 .PHONY: sync lint format typecheck test check db-upgrade run-api run-worker worker-ready
+.PHONY: sync lint format typecheck test check db-upgrade run-api run-worker worker-ready render-validate
 
 sync:
 	uv sync --all-packages --group dev
@@ -28,3 +29,6 @@ run-worker:
 
 worker-ready:
 	uv run carryme-worker --ready
+
+render-validate:
+	uv run carryme-render-validate
