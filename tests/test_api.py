@@ -151,10 +151,11 @@ def test_versioned_readiness_endpoint_returns_503_when_database_ping_fails(
         database_path="postgresql+psycopg://user:secret@db.example.com/carryme"
     )
 
-    def fail_ping(self: object) -> None:
+    def fail_ping(self: object, timeout_seconds: float) -> None:
+        assert timeout_seconds > 0
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr(app_module.Database, "ping", fail_ping)
+    monkeypatch.setattr(app_module.Database, "ping_with_timeout", fail_ping)
     client = TestClient(app)
 
     response = client.get("/v1/ready")

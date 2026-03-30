@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Connection, Engine, Result, Row, make_url
+
+DEFAULT_DATABASE_PING_TIMEOUT_SECONDS = 5.0
 
 
 def normalize_database_url(database: str | Path) -> str:
@@ -76,6 +79,40 @@ def _prepare_sql(
             f"({placeholder_index} placeholders, {len(params)} parameters)"
         )
     return "".join(pieces), bind_params
+
+
+def _run_with_timeout(
+    operation: Callable[[], None],
+    *,
+    timeout_seconds: float,
+) -> None:
+    """Run one blocking operation with a bounded timeout."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+
+    operation_error: Exception | None = None
+    completed = threading.Event()
+
+    def _run() -> None:
+        nonlocal operation_error
+        try:
+            operation()
+        except Exception as error:  # pragma: no cover - simple propagation path
+            operation_error = error
+        finally:
+            completed.set()
+
+    thread = threading.Thread(
+        target=_run,
+        name="carryme-db-ping",
+        daemon=True,
+    )
+    thread.start()
+    if not completed.wait(timeout_seconds):
+        raise TimeoutError(f"Database ping timed out after {timeout_seconds:.1f}s")
+    if operation_error is not None:
+        raise operation_error
 
 
 class DatabaseConnection:
@@ -197,3 +234,11 @@ class Database:
 
         with self.begin() as connection:
             connection.ping()
+
+    def ping_with_timeout(
+        self,
+        timeout_seconds: float = DEFAULT_DATABASE_PING_TIMEOUT_SECONDS,
+    ) -> None:
+        """Run a bounded readiness query against the target database."""
+
+        _run_with_timeout(self.ping, timeout_seconds=timeout_seconds)

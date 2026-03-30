@@ -131,7 +131,7 @@ from carryme_storage import (
     SystemStateAlertStore,
     WatchlistStore,
 )
-from carryme_storage.db import Database
+from carryme_storage.db import DEFAULT_DATABASE_PING_TIMEOUT_SECONDS, Database
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -2470,7 +2470,9 @@ def create_app() -> FastAPI:
     def _database_readiness_payload(settings: ApiSettings) -> ServiceReadiness:
         ready = True
         try:
-            Database(settings.database_path).ping()
+            Database(settings.database_path).ping_with_timeout(
+                DEFAULT_DATABASE_PING_TIMEOUT_SECONDS
+            )
         except Exception:
             ready = False
         return ServiceReadiness(
