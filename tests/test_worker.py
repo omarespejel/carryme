@@ -61,8 +61,7 @@ from carryme_storage import (
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
 )
-from carryme_storage.db import DatabaseConnection
-from carryme_storage.db import redact_database_url
+from carryme_storage.db import DatabaseConnection, redact_database_url
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
     build_approved_canary_scan_loop_payload,
