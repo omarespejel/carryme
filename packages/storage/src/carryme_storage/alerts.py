@@ -1,14 +1,15 @@
-"""SQLite-backed candidate alert storage."""
+"""Database-backed candidate alert storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from threading import Lock
 from typing import cast
 
 from carryme_models import CandidateAlertEvent
+
+from carryme_storage.db import Database
 
 
 def _normalize_label(label: str | None) -> str | None:
@@ -50,7 +51,10 @@ class CandidateAlertStore:
     """Persist and query emitted candidate alert events."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
         self._initialized = False
         self._initialize_lock = Lock()
 
@@ -63,8 +67,7 @@ class CandidateAlertStore:
         with self._initialize_lock:
             if self._initialized:
                 return
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(self.database_path) as connection:
+            with self.database.begin() as connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS candidate_alert_events (
@@ -79,12 +82,7 @@ class CandidateAlertStore:
                     )
                     """
                 )
-                columns = {
-                    row[1]
-                    for row in connection.execute(
-                        "PRAGMA table_info(candidate_alert_events)"
-                    ).fetchall()
-                }
+                columns = connection.table_columns("candidate_alert_events")
                 if "alert_key" not in columns:
                     connection.execute(
                         "ALTER TABLE candidate_alert_events ADD COLUMN alert_key TEXT"
@@ -96,7 +94,7 @@ class CandidateAlertStore:
                 connection.execute(
                     """
                     UPDATE candidate_alert_events
-                    SET alert_key = printf('legacy:%s', id)
+                    SET alert_key = 'legacy:' || CAST(id AS TEXT)
                     WHERE alert_key IS NULL
                     """
                 )
@@ -137,10 +135,10 @@ class CandidateAlertStore:
         pair_payload = cast(dict[str, object], record_payload["pair"])
         normalized_label = cast(str | None, pair_payload["label"])
         alert_key = _alert_identity_key(normalized_payload)
-        with sqlite3.connect(self.database_path) as connection:
-            cursor = connection.execute(
+        with self.database.begin() as connection:
+            result = connection.execute(
                 """
-                INSERT OR IGNORE INTO candidate_alert_events (
+                INSERT INTO candidate_alert_events (
                     emitted_at,
                     label,
                     canonical_symbol,
@@ -149,6 +147,7 @@ class CandidateAlertStore:
                     event_json,
                     raw_event_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(alert_key) DO NOTHING
                 """,
                 (
                     event.emitted_at.isoformat(),
@@ -160,7 +159,8 @@ class CandidateAlertStore:
                     json.dumps(raw_payload, sort_keys=True),
                 ),
             )
-        return cursor.rowcount > 0
+        rowcount = getattr(result, "rowcount", None)
+        return isinstance(rowcount, int) and rowcount > 0
 
     def list_recent(
         self,
@@ -186,7 +186,7 @@ class CandidateAlertStore:
             params = (limit,)
         query += " ORDER BY emitted_at DESC, id DESC LIMIT ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [

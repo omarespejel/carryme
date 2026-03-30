@@ -18,3 +18,18 @@ class ServiceHealth(BaseModel):
 
     service: AppDescriptor
     status: Literal["ok"] = "ok"
+
+
+class DatabaseReadiness(BaseModel):
+    """Database readiness state for a service."""
+
+    target: str = Field(min_length=1)
+    ready: bool = True
+
+
+class ServiceReadiness(BaseModel):
+    """Readiness payload returned by services."""
+
+    service: AppDescriptor
+    status: Literal["ready", "degraded"]
+    database: DatabaseReadiness

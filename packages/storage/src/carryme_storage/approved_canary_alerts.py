@@ -1,25 +1,28 @@
-"""SQLite-backed approved canary alert storage."""
+"""Database-backed approved canary alert storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 from carryme_models import ApprovedCanaryAlertEvent
+
+from carryme_storage.db import Database
 
 
 class ApprovedCanaryAlertStore:
     """Persist and query approved-canary alert events."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the approved-canary alert table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS approved_canary_alert_events (
@@ -48,7 +51,7 @@ class ApprovedCanaryAlertStore:
         """Append one approved-canary alert event."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 INSERT INTO approved_canary_alert_events (
@@ -101,7 +104,7 @@ class ApprovedCanaryAlertStore:
             params = (limit,)
         query += " ORDER BY emitted_at DESC, rowid DESC LIMIT ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [

@@ -20,6 +20,7 @@ from carryme_models import (
     CanaryLifecycleResult,
     CandidateAlertEvent,
     CleanupPreviewConfirmationEntry,
+    DatabaseReadiness,
     ExecutionAlertEvent,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
@@ -53,6 +54,7 @@ from carryme_models import (
     RouteApprovalUpsert,
     RouteStabilitySummary,
     ServiceHealth,
+    ServiceReadiness,
     StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
     TradingFeeProfile,
@@ -129,6 +131,7 @@ from carryme_storage import (
     SystemStateAlertStore,
     WatchlistStore,
 )
+from carryme_storage.db import Database
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -2463,6 +2466,42 @@ def create_app() -> FastAPI:
     @app.get("/v1/health", response_model=ServiceHealth)
     def versioned_health() -> ServiceHealth:
         return health()
+
+    def _database_readiness_payload(settings: ApiSettings) -> ServiceReadiness:
+        ready = True
+        try:
+            Database(settings.database_path).ping()
+        except Exception:
+            ready = False
+        return ServiceReadiness(
+            service=AppDescriptor(
+                name=APP_NAME,
+                version=APP_VERSION,
+                environment=settings.environment,
+            ),
+            status="ready" if ready else "degraded",
+            database=DatabaseReadiness(
+                target=settings.database_target,
+                ready=ready,
+            ),
+        )
+
+    @app.get("/ready", response_model=ServiceReadiness)
+    def readiness(
+        response: Response,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+    ) -> ServiceReadiness:
+        payload = _database_readiness_payload(settings)
+        if payload.status != "ready":
+            response.status_code = 503
+        return payload
+
+    @app.get("/v1/ready", response_model=ServiceReadiness)
+    def versioned_readiness(
+        response: Response,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+    ) -> ServiceReadiness:
+        return readiness(response, settings)
 
     @app.get("/v1/reference/fees/{venue}", response_model=list[TradingFeeProfile])
     def fee_profiles(venue: str) -> list[TradingFeeProfile]:

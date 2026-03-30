@@ -14,6 +14,7 @@ from carryme_storage.pair_close_preview_confirmations import PairClosePreviewCon
 from carryme_storage.paper_trades import PaperTradeStore
 from carryme_storage.preview_confirmations import PreviewConfirmationStore
 from carryme_storage.route_approvals import RouteApprovalStore
+from carryme_storage.schema import SCHEMA_TABLES, initialize_database_schema
 from carryme_storage.stable_canary_launches import StableCanaryLaunchStore
 from carryme_storage.stable_launch_ready_alerts import StableLaunchReadyAlertStore
 from carryme_storage.system_state_alerts import SystemStateAlertStore
@@ -38,6 +39,8 @@ __all__ = [
     "StableCanaryLaunchStore",
     "SystemStateAlertStore",
     "WatchlistStore",
+    "SCHEMA_TABLES",
+    "initialize_database_schema",
     "load_watchlist",
     "save_watchlist",
 ]

@@ -8,6 +8,7 @@ import carryme_models as carryme_models_module
 import pytest
 from carryme_api.app import (
     app,
+    get_api_settings,
     get_approved_canary_alert_store,
     get_approved_canary_store,
     get_balance_accounting_service,
@@ -115,6 +116,63 @@ def test_versioned_health_endpoint() -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_readiness_endpoint(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "ready.sqlite3")
+    )
+    client = TestClient(app)
+
+    response = client.get("/ready")
+
+    app.dependency_overrides.clear()
+    assert response.status_code == 200
+    assert response.json() == {
+        "service": {
+            "name": "carryme-api",
+            "version": "0.1.0",
+            "environment": "development",
+        },
+        "status": "ready",
+        "database": {
+            "target": str(tmp_path / "ready.sqlite3"),
+            "ready": True,
+        },
+    }
+
+
+def test_versioned_readiness_endpoint_returns_503_when_database_ping_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carryme_api import app as app_module
+
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path="postgresql+psycopg://user:secret@db.example.com/carryme"
+    )
+
+    def fail_ping(self: object) -> None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(app_module.Database, "ping", fail_ping)
+    client = TestClient(app)
+
+    response = client.get("/v1/ready")
+
+    app.dependency_overrides.clear()
+    assert response.status_code == 503
+    assert response.json() == {
+        "service": {
+            "name": "carryme-api",
+            "version": "0.1.0",
+            "environment": "development",
+        },
+        "status": "degraded",
+        "database": {
+            "target": "postgresql+psycopg://***@db.example.com/carryme",
+            "ready": False,
+        },
+    }
 
 
 def test_fee_profiles_endpoint() -> None:

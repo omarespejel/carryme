@@ -1,25 +1,28 @@
-"""SQLite-backed stable launch-ready alert storage."""
+"""Database-backed stable launch-ready alert storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 from carryme_models import StableLaunchReadyAlertEvent
+
+from carryme_storage.db import Database
 
 
 class StableLaunchReadyAlertStore:
     """Persist and query stable launch-ready alert events."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the stable launch-ready alert table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS stable_launch_ready_alert_events (
@@ -48,7 +51,7 @@ class StableLaunchReadyAlertStore:
         """Append one stable launch-ready alert event."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 INSERT INTO stable_launch_ready_alert_events (
@@ -101,7 +104,7 @@ class StableLaunchReadyAlertStore:
             params = (limit,)
         query += " ORDER BY emitted_at DESC, rowid DESC LIMIT ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [

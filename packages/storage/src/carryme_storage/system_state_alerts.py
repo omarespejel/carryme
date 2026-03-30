@@ -1,25 +1,28 @@
-"""SQLite-backed system-state alert storage."""
+"""Database-backed system-state alert storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 from carryme_models import SystemStateAlertEvent
+
+from carryme_storage.db import Database
 
 
 class SystemStateAlertStore:
     """Persist and query emitted system-state alert events."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the system-state alert table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS system_state_alert_events (
@@ -48,7 +51,7 @@ class SystemStateAlertStore:
         """Append one system-state alert event."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 INSERT INTO system_state_alert_events (
@@ -93,7 +96,7 @@ class SystemStateAlertStore:
             params = (limit,)
         query += " ORDER BY emitted_at DESC, rowid DESC LIMIT ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [

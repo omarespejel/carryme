@@ -1,25 +1,28 @@
-"""SQLite-backed launch-ready canary snapshot storage."""
+"""Database-backed launch-ready canary snapshot storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 from carryme_models import LaunchReadyCanarySnapshot
+
+from carryme_storage.db import Database
 
 
 class LaunchReadyCanaryStore:
     """Persist and query launch-ready canary snapshots."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the launch-ready canary table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS launch_ready_canary_snapshots (
@@ -48,8 +51,8 @@ class LaunchReadyCanaryStore:
         """Append one launch-ready canary snapshot."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
-            cursor = connection.execute(
+        with self.database.begin() as connection:
+            row_id = connection.insert_returning_id(
                 """
                 INSERT INTO launch_ready_canary_snapshots (
                     captured_at,
@@ -65,7 +68,6 @@ class LaunchReadyCanaryStore:
                     snapshot.model_dump_json(),
                 ),
             )
-            row_id = cursor.lastrowid
 
         return LaunchReadyCanarySnapshot.model_validate(
             {
@@ -95,7 +97,7 @@ class LaunchReadyCanaryStore:
             params = (limit,)
         query += " ORDER BY captured_at DESC, id DESC LIMIT ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [

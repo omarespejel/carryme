@@ -1,25 +1,28 @@
-"""SQLite-backed route approval storage."""
+"""Database-backed route approval storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 from carryme_models import RouteApprovalEntry
+
+from carryme_storage.db import Database
 
 
 class RouteApprovalStore:
     """Persist and query operator route approvals."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the route approval table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS route_approval_entries (
@@ -62,7 +65,7 @@ class RouteApprovalStore:
         """Insert or replace one route approval entry."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 INSERT INTO route_approval_entries (
@@ -136,7 +139,7 @@ class RouteApprovalStore:
         query += " ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
 
         return [RouteApprovalEntry.model_validate(json.loads(entry_json)) for (entry_json,) in rows]
@@ -154,7 +157,7 @@ class RouteApprovalStore:
         """Return the stored approval for one exact route, if present."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             row = connection.execute(
                 """
                 SELECT entry_json

@@ -22,6 +22,7 @@ The current workspace is intentionally narrow:
 
 ```bash
 uv sync --all-packages --group dev
+uv run alembic upgrade head
 uv run pytest
 uv run ruff check .
 uv run mypy $(find src apps packages tests -name '*.py' -type f)
@@ -34,6 +35,7 @@ uv run carryme-api
 uv run carryme-worker
 uv run carryme-worker --supervise
 uv run carryme-worker --observe-executions-supervise
+uv run carryme-worker --ready
 ```
 
 Useful worker modes:
@@ -47,3 +49,10 @@ uv run carryme-worker --observe-executions-once
 uv run carryme-worker --observe-executions-supervise
 uv run carryme-worker --observe-executions-supervise --iterations 3
 ```
+
+## Hosted deployment
+
+The production target is Render with managed Postgres and split background workers.
+
+1. Blueprint: [render.yaml](render.yaml)
+2. Deployment guide: [docs/deploy/render.md](docs/deploy/render.md)

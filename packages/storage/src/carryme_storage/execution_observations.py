@@ -1,9 +1,8 @@
-"""SQLite-backed execution observation storage."""
+"""Database-backed execution observation storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import UTC
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from carryme_models import (
     ExecutionPairStatus,
 )
 
+from carryme_storage.db import Database, DatabaseConnection
 from carryme_storage.execution_alerts import ExecutionAlertStore
 
 
@@ -28,13 +28,15 @@ class ExecutionObservationStore:
     """Persist and query append-only execution observation snapshots."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the observation table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS execution_observation_entries (
@@ -71,7 +73,7 @@ class ExecutionObservationStore:
         """Append an observation entry and return it with its assigned id."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             return self._append_on_connection(connection, entry)
 
     def append_with_alert(
@@ -86,11 +88,10 @@ class ExecutionObservationStore:
 
         self.initialize()
         alert_store.initialize()
-        if alert_store.database_path != self.database_path:
+        if alert_store.database.url != self.database.url:
             raise ValueError("observation and alert stores must share the same database")
 
-        with sqlite3.connect(self.database_path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with self.database.begin() as connection:
             alert_saved = False
             if alert_event is not None:
                 alert_saved = alert_store._append_if_changed_on_connection(
@@ -105,7 +106,7 @@ class ExecutionObservationStore:
         """Return the newest observation entry for one paper trade."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             row = connection.execute(
                 """
                 SELECT id, entry_json
@@ -153,7 +154,7 @@ class ExecutionObservationStore:
             query += " LIMIT ?"
             params = (*params, limit)
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [
@@ -168,13 +169,13 @@ class ExecutionObservationStore:
 
     def _append_on_connection(
         self,
-        connection: sqlite3.Connection,
+        connection: DatabaseConnection,
         entry: ExecutionObservationEntry,
     ) -> ExecutionObservationEntry:
         """Append an observation entry using an existing transaction."""
 
         normalized_entry = _normalize_observation(entry)
-        cursor = connection.execute(
+        row_id = connection.insert_returning_id(
             """
             INSERT INTO execution_observation_entries (
                 observed_at,
@@ -197,6 +198,6 @@ class ExecutionObservationStore:
         return ExecutionObservationEntry.model_validate(
             {
                 **normalized_entry.model_dump(mode="json"),
-                "entry_id": cursor.lastrowid,
+                "entry_id": row_id,
             }
         )

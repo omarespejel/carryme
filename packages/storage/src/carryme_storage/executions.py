@@ -1,21 +1,25 @@
-"""SQLite-backed execution journal storage."""
+"""Database-backed execution journal storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import UTC
 from pathlib import Path
 from threading import Lock
 
 from carryme_models import ExecutionJournalEntry
 
+from carryme_storage.db import Database
+
 
 class ExecutionJournalStore:
     """Persist and query append-only execution journal entries."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
         self._initialized = False
         self._initialize_lock = Lock()
 
@@ -28,8 +32,7 @@ class ExecutionJournalStore:
         with self._initialize_lock:
             if self._initialized:
                 return
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(self.database_path) as connection:
+            with self.database.begin() as connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS execution_journal_entries (
@@ -45,12 +48,7 @@ class ExecutionJournalStore:
                     )
                     """
                 )
-                columns = {
-                    row[1]
-                    for row in connection.execute(
-                        "PRAGMA table_info(execution_journal_entries)"
-                    ).fetchall()
-                }
+                columns = connection.table_columns("execution_journal_entries")
                 if "confirmation_entry_id" not in columns:
                     connection.execute(
                         """
@@ -117,14 +115,7 @@ class ExecutionJournalStore:
                     )
                     """
                 )
-                reservation_columns = connection.execute(
-                    "PRAGMA table_info(live_submission_reservations)"
-                ).fetchall()
-                reservation_pk = [
-                    row[1]
-                    for row in sorted(reservation_columns, key=lambda row: row[5])
-                    if row[5] > 0
-                ]
+                reservation_pk = connection.primary_key_columns("live_submission_reservations")
                 if reservation_pk != ["confirmation_entry_id", "preview_hash"]:
                     connection.execute(
                         """
@@ -138,13 +129,14 @@ class ExecutionJournalStore:
                     )
                     connection.execute(
                         """
-                        INSERT OR IGNORE INTO live_submission_reservations_v2 (
+                        INSERT INTO live_submission_reservations_v2 (
                             confirmation_entry_id,
                             preview_hash,
                             execution_entry_id
                         )
                         SELECT confirmation_entry_id, preview_hash, execution_entry_id
                         FROM live_submission_reservations
+                        ON CONFLICT(confirmation_entry_id, preview_hash) DO NOTHING
                         """
                     )
                     connection.execute("DROP TABLE live_submission_reservations")
@@ -177,9 +169,7 @@ class ExecutionJournalStore:
         ) or None
         normalized_paper_trade = entry.paper_trade.model_copy(
             update={
-                "intent": entry.paper_trade.intent.model_copy(
-                    update={"label": normalized_label}
-                )
+                "intent": entry.paper_trade.intent.model_copy(update={"label": normalized_label})
             }
         )
         normalized_entry = entry.model_copy(
@@ -189,8 +179,8 @@ class ExecutionJournalStore:
                 "paper_trade": normalized_paper_trade,
             }
         )
-        with sqlite3.connect(self.database_path) as connection:
-            cursor = connection.execute(
+        with self.database.begin() as connection:
+            row_id = connection.insert_returning_id(
                 """
                 INSERT INTO execution_journal_entries (
                     executed_at,
@@ -217,7 +207,7 @@ class ExecutionJournalStore:
         return ExecutionJournalEntry.model_validate(
             {
                 **normalized_entry.model_dump(mode="json"),
-                "entry_id": cursor.lastrowid,
+                "entry_id": row_id,
             }
         )
 
@@ -230,18 +220,19 @@ class ExecutionJournalStore:
         normalized_preview_hash = preview_hash.strip()
         if not normalized_preview_hash:
             raise ValueError("preview_hash must be non-empty")
-        with sqlite3.connect(self.database_path) as connection:
-            before_changes = connection.total_changes
-            connection.execute(
+        with self.database.begin() as connection:
+            result = connection.execute(
                 """
-                INSERT OR IGNORE INTO live_submission_reservations (
+                INSERT INTO live_submission_reservations (
                     confirmation_entry_id,
                     preview_hash
                 ) VALUES (?, ?)
+                ON CONFLICT(confirmation_entry_id, preview_hash) DO NOTHING
                 """,
                 (confirmation_entry_id, normalized_preview_hash),
             )
-            return connection.total_changes > before_changes
+        rowcount = getattr(result, "rowcount", None)
+        return isinstance(rowcount, int) and rowcount > 0
 
     def mark_live_submission_completed(
         self,
@@ -260,7 +251,7 @@ class ExecutionJournalStore:
             raise ValueError("preview_hash must be non-empty")
         if execution_entry_id < 1:
             raise ValueError("execution_entry_id must be positive")
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 UPDATE live_submission_reservations
@@ -284,7 +275,7 @@ class ExecutionJournalStore:
         if not normalized_preview_hash:
             raise ValueError("preview_hash must be non-empty")
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             row = connection.execute(
                 """
                 SELECT id, entry_json
@@ -314,7 +305,7 @@ class ExecutionJournalStore:
         if confirmation_entry_id < 1:
             raise ValueError("confirmation_entry_id must be positive")
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             row = connection.execute(
                 """
                 SELECT id, entry_json
@@ -362,7 +353,7 @@ class ExecutionJournalStore:
             params = (limit, offset)
         query += " ORDER BY executed_at DESC, id DESC LIMIT ? OFFSET ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [
@@ -379,7 +370,7 @@ class ExecutionJournalStore:
         """Return one execution journal entry by id."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             row = connection.execute(
                 """
                 SELECT id, entry_json
@@ -403,7 +394,7 @@ class ExecutionJournalStore:
         """Return the newest execution journal entry for one paper trade."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             row = connection.execute(
                 """
                 SELECT id, entry_json
@@ -434,7 +425,7 @@ class ExecutionJournalStore:
         """Return recent execution journal entries for one paper trade."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(
                 """
                 SELECT id, entry_json

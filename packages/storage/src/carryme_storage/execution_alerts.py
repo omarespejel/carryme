@@ -1,15 +1,16 @@
-"""SQLite-backed execution alert storage."""
+"""Database-backed execution alert storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import cast
 
 from carryme_models import ExecutionAlertEvent, ExecutionPairStatus
+
+from carryme_storage.db import Database, DatabaseConnection
 
 ALERTING_EXECUTION_STATES = {"cleanup_needed", "review_required"}
 
@@ -55,7 +56,10 @@ class ExecutionAlertStore:
     """Persist and query emitted execution alert events."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
         self._initialized = False
         self._initialize_lock = Lock()
 
@@ -68,8 +72,7 @@ class ExecutionAlertStore:
         with self._initialize_lock:
             if self._initialized:
                 return
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(self.database_path) as connection:
+            with self.database.begin() as connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS execution_alert_events (
@@ -83,12 +86,7 @@ class ExecutionAlertStore:
                     )
                     """
                 )
-                columns = {
-                    row[1]
-                    for row in connection.execute(
-                        "PRAGMA table_info(execution_alert_events)"
-                    ).fetchall()
-                }
+                columns = connection.table_columns("execution_alert_events")
                 if "alert_key" not in columns:
                     connection.execute(
                         "ALTER TABLE execution_alert_events ADD COLUMN alert_key TEXT"
@@ -96,7 +94,7 @@ class ExecutionAlertStore:
                 connection.execute(
                     """
                     UPDATE execution_alert_events
-                    SET alert_key = printf('legacy:%s', id)
+                    SET alert_key = 'legacy:' || CAST(id AS TEXT)
                     WHERE alert_key IS NULL
                     """
                 )
@@ -140,8 +138,7 @@ class ExecutionAlertStore:
         """Append one execution alert event when it represents a new alert transition."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with self.database.begin() as connection:
             return self._append_if_changed_on_connection(
                 connection,
                 event,
@@ -150,7 +147,7 @@ class ExecutionAlertStore:
 
     def _append_if_changed_on_connection(
         self,
-        connection: sqlite3.Connection,
+        connection: DatabaseConnection,
         event: ExecutionAlertEvent,
         *,
         previous_pair_status: ExecutionPairStatus | None = None,
@@ -172,9 +169,9 @@ class ExecutionAlertStore:
             exact_retry = same_preview and latest.emitted_at == normalized_event.emitted_at
             if continued_same_state or exact_retry:
                 return False
-        cursor = connection.execute(
+        result = connection.execute(
             """
-            INSERT OR IGNORE INTO execution_alert_events (
+            INSERT INTO execution_alert_events (
                 emitted_at,
                 paper_trade_id,
                 preview_hash,
@@ -182,6 +179,7 @@ class ExecutionAlertStore:
                 alert_key,
                 event_json
             ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(alert_key) DO NOTHING
             """,
             (
                 normalized_event.emitted_at.isoformat(),
@@ -192,18 +190,15 @@ class ExecutionAlertStore:
                 json.dumps(normalized_payload, sort_keys=True),
             ),
         )
-        return cursor.rowcount > 0
+        rowcount = getattr(result, "rowcount", None)
+        return isinstance(rowcount, int) and rowcount > 0
 
     def latest_for_paper_trade(self, paper_trade_id: int) -> ExecutionAlertEvent | None:
         """Return the newest execution alert for one paper trade."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
-            row = self._latest_row_for_paper_trade(connection, paper_trade_id)
-
-        if row is None:
-            return None
-        return ExecutionAlertEvent.model_validate(json.loads(row[0]))
+        with self.database.begin() as connection:
+            return self._latest_for_paper_trade(connection, paper_trade_id)
 
     def list_recent(
         self,
@@ -228,7 +223,7 @@ class ExecutionAlertStore:
             params = (limit,)
         query += " ORDER BY emitted_at DESC, id DESC LIMIT ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [
@@ -238,7 +233,7 @@ class ExecutionAlertStore:
 
     def _latest_for_paper_trade(
         self,
-        connection: sqlite3.Connection,
+        connection: DatabaseConnection,
         paper_trade_id: int,
     ) -> ExecutionAlertEvent | None:
         row = self._latest_row_for_paper_trade(connection, paper_trade_id)
@@ -248,10 +243,10 @@ class ExecutionAlertStore:
 
     def _latest_row_for_paper_trade(
         self,
-        connection: sqlite3.Connection,
+        connection: DatabaseConnection,
         paper_trade_id: int,
     ) -> tuple[str] | None:
-        row = connection.execute(
+        row = connection.fetchone(
             """
             SELECT event_json
             FROM execution_alert_events
@@ -260,5 +255,7 @@ class ExecutionAlertStore:
             LIMIT 1
             """,
             (paper_trade_id,),
-        ).fetchone()
-        return cast(tuple[str] | None, row)
+        )
+        if row is None:
+            return None
+        return (str(row[0]),)

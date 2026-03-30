@@ -5,7 +5,8 @@ import asyncio
 import json
 import logging
 
-from carryme_models import AppDescriptor, ServiceHealth
+from carryme_models import AppDescriptor, DatabaseReadiness, ServiceHealth, ServiceReadiness
+from carryme_storage.db import Database
 
 from carryme_worker.config import WorkerSettings
 from carryme_worker.poller import (
@@ -59,6 +60,29 @@ def build_health_payload(settings: WorkerSettings) -> ServiceHealth:
             version=APP_VERSION,
             environment=settings.environment,
         )
+    )
+
+
+def build_readiness_payload(settings: WorkerSettings) -> ServiceReadiness:
+    """Build a deterministic worker readiness payload."""
+
+    ready = True
+    try:
+        Database(settings.database_path).ping()
+    except Exception:
+        ready = False
+
+    return ServiceReadiness(
+        service=AppDescriptor(
+            name=APP_NAME,
+            version=APP_VERSION,
+            environment=settings.environment,
+        ),
+        status="ready" if ready else "degraded",
+        database=DatabaseReadiness(
+            target=settings.database_target,
+            ready=ready,
+        ),
     )
 
 
@@ -411,6 +435,11 @@ def main() -> None:
         default=None,
         help="Run loop modes for a fixed number of iterations",
     )
+    parser.add_argument(
+        "--ready",
+        action="store_true",
+        help="Check worker readiness against the configured database",
+    )
     mode.add_argument(
         "--supervise",
         action="store_true",
@@ -433,6 +462,7 @@ def main() -> None:
         args.observe_executions_supervise,
         args.observe_system_state_once,
         args.observe_system_state_supervise,
+        args.ready,
         args.supervise,
     )
     if sum(bool(flag) for flag in mode_flags) > 1:
@@ -453,6 +483,9 @@ def main() -> None:
 
     settings = WorkerSettings()
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+    if args.ready:
+        print(build_readiness_payload(settings).model_dump_json(indent=2))
+        return
     if args.once:
         summary = asyncio.run(poll_watchlist_once(settings))
         print(json.dumps(build_cycle_payload(summary), indent=2))
