@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import httpx
 from carryme_api.app import (
@@ -804,7 +804,10 @@ async def scan_approved_canary_once(
     if alert_notifier is not None:
         for event in alerts:
             try:
-                await alert_notifier.notify(event)
+                await _wait_for_notification(
+                    alert_notifier.notify(event),
+                    timeout=settings.approved_canary_alert_webhook_timeout_seconds,
+                )
                 sent_notifications += 1
             except Exception:
                 loop_logger.exception(
@@ -948,7 +951,10 @@ async def cache_launch_ready_canaries_once(
     if alert_notifier is not None:
         for event in alerts:
             try:
-                await alert_notifier.notify(event)
+                await _wait_for_notification(
+                    alert_notifier.notify(event),
+                    timeout=settings.stable_launch_ready_alert_webhook_timeout_seconds,
+                )
                 sent_notifications += 1
             except Exception:
                 loop_logger.exception(
@@ -1791,7 +1797,10 @@ async def observe_system_state_once(
     if alert_notifier is not None:
         for event in alerts:
             try:
-                await alert_notifier.notify(event)
+                await _wait_for_notification(
+                    alert_notifier.notify(event),
+                    timeout=settings.system_state_alert_webhook_timeout_seconds,
+                )
                 sent_notifications += 1
             except Exception:
                 loop_logger.exception(
@@ -2697,10 +2706,21 @@ async def _notify_execution_alert(
 ) -> int:
     if isinstance(alert_notifier, CompositeExecutionAlertNotifier):
         return await alert_notifier.notify(alert_event)
-    return await asyncio.wait_for(
-        alert_notifier.notify(alert_event),
-        timeout=settings.execution_alert_webhook_timeout_seconds,
+    return cast(
+        int,
+        await _wait_for_notification(
+            alert_notifier.notify(alert_event),
+            timeout=settings.execution_alert_webhook_timeout_seconds,
+        ),
     )
+
+
+async def _wait_for_notification(
+    awaitable: Awaitable[Any],
+    *,
+    timeout: float,
+) -> Any:
+    return await asyncio.wait_for(awaitable, timeout=timeout)
 
 
 def _list_recent_live_executions(

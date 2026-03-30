@@ -3058,6 +3058,44 @@ def test_run_supervised_production_supervisor_loop_builds_and_reuses_stage_notif
     approved_notifier = object()
     stable_notifier = object()
     execution_notifier = object()
+    builder_calls = {
+        "system": 0,
+        "approved": 0,
+        "stable": 0,
+        "execution": 0,
+    }
+    cycle_calls = 0
+
+    async def fake_sleep(seconds: float) -> None:
+        _ = seconds
+
+    def build_system_notifier(settings_arg: WorkerSettings, *, logger: object | None = None) -> object:
+        assert settings_arg is settings
+        _ = logger
+        builder_calls["system"] += 1
+        return system_notifier
+
+    def build_approved_notifier(
+        settings_arg: WorkerSettings, *, logger: object | None = None
+    ) -> object:
+        assert settings_arg is settings
+        _ = logger
+        builder_calls["approved"] += 1
+        return approved_notifier
+
+    def build_stable_notifier(settings_arg: WorkerSettings, *, logger: object | None = None) -> object:
+        assert settings_arg is settings
+        _ = logger
+        builder_calls["stable"] += 1
+        return stable_notifier
+
+    def build_execution_notifier(
+        settings_arg: WorkerSettings, *, logger: object | None = None
+    ) -> object:
+        assert settings_arg is settings
+        _ = logger
+        builder_calls["execution"] += 1
+        return execution_notifier
 
     async def fake_run_production_supervisor_cycle_once(
         settings_arg: WorkerSettings,
@@ -3069,6 +3107,7 @@ def test_run_supervised_production_supervisor_loop_builds_and_reuses_stage_notif
         now: datetime | None = None,
         logger: object | None = None,
     ) -> ProductionSupervisorCycleSummary:
+        nonlocal cycle_calls
         assert settings_arg is settings
         assert system_state_alert_notifier is system_notifier
         assert approved_canary_alert_notifier is approved_notifier
@@ -3076,6 +3115,7 @@ def test_run_supervised_production_supervisor_loop_builds_and_reuses_stage_notif
         assert execution_alert_notifier is execution_notifier
         assert now is None
         _ = logger
+        cycle_calls += 1
         return ProductionSupervisorCycleSummary(
             checked_venues=1,
             degraded_venues=0,
@@ -3098,19 +3138,19 @@ def test_run_supervised_production_supervisor_loop_builds_and_reuses_stage_notif
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
             "carryme_worker.notifications.build_system_state_alert_notifier",
-            lambda settings_arg, *, logger=None: system_notifier,
+            build_system_notifier,
         )
         monkeypatch.setattr(
             "carryme_worker.notifications.build_approved_canary_alert_notifier",
-            lambda settings_arg, *, logger=None: approved_notifier,
+            build_approved_notifier,
         )
         monkeypatch.setattr(
             "carryme_worker.notifications.build_stable_launch_ready_alert_notifier",
-            lambda settings_arg, *, logger=None: stable_notifier,
+            build_stable_notifier,
         )
         monkeypatch.setattr(
             "carryme_worker.notifications.build_execution_alert_notifier",
-            lambda settings_arg, *, logger=None: execution_notifier,
+            build_execution_notifier,
         )
         monkeypatch.setattr(
             "carryme_worker.poller.run_production_supervisor_cycle_once",
@@ -3119,15 +3159,23 @@ def test_run_supervised_production_supervisor_loop_builds_and_reuses_stage_notif
         summary = asyncio.run(
             run_supervised_production_supervisor_loop(
                 settings,
-                max_iterations=1,
+                sleep=fake_sleep,
+                max_iterations=2,
             )
         )
 
-    assert summary.attempts == 1
-    assert summary.successful_cycles == 1
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
     assert summary.failures == 0
-    assert summary.skipped == 1
-    assert summary.sent_notifications == 4
+    assert summary.skipped == 2
+    assert summary.sent_notifications == 8
+    assert cycle_calls == 2
+    assert builder_calls == {
+        "system": 1,
+        "approved": 1,
+        "stable": 1,
+        "execution": 1,
+    }
 
 
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
@@ -3260,6 +3308,54 @@ def test_observe_system_state_once_emits_and_notifies_alerts(tmp_path: Path) -> 
     assert len(alerts) == 1
     assert alerts[0].alert_type == "venue_degraded"
     assert notified == ["venue_degraded"]
+
+
+def test_observe_system_state_once_times_out_stuck_notifier(tmp_path: Path) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        system_state_alert_webhook_timeout_seconds=0.01,
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            assert "paradex" in configs
+            return [
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=False,
+                    status="maintenance",
+                    blocking_reasons=["Paradex system state is maintenance"],
+                )
+            ]
+
+    class HangingNotifier:
+        async def notify(self, event: SystemStateAlertEvent) -> None:
+            _ = event
+            await asyncio.Event().wait()
+
+    summary = asyncio.run(
+        observe_system_state_once(
+            settings,
+            service=cast(SystemStateService, StubSystemStateService()),
+            alert_sink=SystemStateAlertStore(settings.database_path),
+            alert_notifier=HangingNotifier(),
+            now=datetime(2026, 3, 29, 20, 7, tzinfo=UTC),
+        )
+    )
+
+    alerts = SystemStateAlertStore(settings.database_path).list_recent(limit=10, venue="paradex")
+
+    assert summary.checked_venues == 1
+    assert summary.degraded_venues == 1
+    assert summary.saved_alerts == 1
+    assert summary.sent_notifications == 0
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "venue_degraded"
 
 
 def test_run_supervised_system_state_observation_loop_honors_max_iterations(
