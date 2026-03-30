@@ -4275,6 +4275,25 @@ def test_build_paradex_auth_headers_returns_official_header_shape() -> None:
     assert all(isinstance(item, str) and item.isdigit() for item in signature)
 
 
+def test_build_paradex_auth_headers_are_deterministic() -> None:
+    first = build_paradex_auth_headers(
+        account_address="0x123",
+        private_key="0x456",
+        starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+        issued_at=1_700_000_000,
+        expires_at=1_700_086_400,
+    )
+    second = build_paradex_auth_headers(
+        account_address="0x123",
+        private_key="0x456",
+        starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+        issued_at=1_700_000_000,
+        expires_at=1_700_086_400,
+    )
+
+    assert first == second
+
+
 def test_paradex_jwt_token_provider_fetches_config_and_authenticates() -> None:
     requests: list[tuple[str, str, dict[str, str]]] = []
     auth_path = build_paradex_auth_request_path(private_key="0x456")

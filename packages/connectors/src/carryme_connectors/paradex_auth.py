@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import functools
-import hashlib
-import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -13,8 +11,7 @@ from typing import Any
 
 import httpx
 from Crypto.Hash import keccak
-from ecdsa.rfc6979 import generate_k  # type: ignore[import-untyped]
-from starknet_crypto_py import get_public_key, pedersen_hash, sign
+from fast_stark_crypto import get_public_key, pedersen_hash, sign
 
 from carryme_connectors.base import ConnectorError
 
@@ -24,7 +21,6 @@ PARADEX_AUTH_PATH = "/v1/auth"
 PARADEX_ORDER_PATH = "/v1/orders"
 PARADEX_AUTH_TOKEN_LIFETIME_SECONDS = 24 * 60 * 60
 STARK_FIELD_MASK = (1 << 250) - 1
-STARK_CURVE_ORDER = 0x800000000000010FFFFFFFFFFFFFFFFB781126DCAE7B2321E66A241ADC64D2F
 PARADEX_DEFAULT_RECV_WINDOW_MS = 300_000
 
 _AUTH_TYPES: dict[str, list[dict[str, str]]] = {
@@ -204,8 +200,7 @@ def build_paradex_auth_headers(
         },
         types=_AUTH_TYPES,
     )
-    k = _generate_k_rfc6979(typed_data.message_hash, private_key_int)
-    signature = sign(private_key=private_key_int, msg_hash=typed_data.message_hash, seed=k)
+    signature = sign(private_key=private_key_int, msg_hash=typed_data.message_hash)
     flattened_signature = f'["{signature[0]}","{signature[1]}"]'
     return {
         "PARADEX-STARKNET-ACCOUNT": account_address,
@@ -312,8 +307,7 @@ def build_paradex_order_signature(
         },
         types=_ORDER_TYPES,
     )
-    k = _generate_k_rfc6979(typed_data.message_hash, private_key_int)
-    signature = sign(private_key=private_key_int, msg_hash=typed_data.message_hash, seed=k)
+    signature = sign(private_key=private_key_int, msg_hash=typed_data.message_hash)
     return f'["{signature[0]}","{signature[1]}"]'
 
 
@@ -508,18 +502,3 @@ def _is_pointer(value: str) -> bool:
 
 def _strip_pointer(value: str) -> str:
     return value[:-1] if _is_pointer(value) else value
-
-
-def _generate_k_rfc6979(msg_hash: int, private_key: int) -> int:
-    """Replicate StarkWare's RFC6979 nonce derivation used by official clients."""
-
-    if 1 <= msg_hash.bit_length() % 8 <= 4 and msg_hash.bit_length() >= 248:
-        msg_hash *= 16
-    return int(
-        generate_k(
-            STARK_CURVE_ORDER,
-            private_key,
-            hashlib.sha256,
-            msg_hash.to_bytes(math.ceil(msg_hash.bit_length() / 8), "big"),
-        )
-    )
