@@ -50,6 +50,8 @@ from carryme_runtime.preflight import (
 from carryme_runtime.readiness import build_live_submission_readiness
 from carryme_runtime.universe import (
     OpportunityUniverseService,
+    build_opportunity_record_from_universe_opportunity,
+    build_pair_spec_from_universe_opportunity,
     build_portfolio_plan,
     list_live_symbols,
 )
@@ -96,6 +98,8 @@ __all__ = [
     "OpportunityService",
     "UpstreamDataError",
     "OpportunityUniverseService",
+    "build_opportunity_record_from_universe_opportunity",
+    "build_pair_spec_from_universe_opportunity",
     "fetch_live_snapshot",
     "filter_candidate_records",
     "list_live_symbols",

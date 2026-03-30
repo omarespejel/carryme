@@ -19,6 +19,7 @@ from carryme_models import (
     ExecutionObservationEntry,
     ExecutionPairStatus,
     FundingArbOpportunity,
+    FundingUniverseScan,
     OpportunityRecord,
 )
 from carryme_runtime import (
@@ -26,12 +27,15 @@ from carryme_runtime import (
     AccountPreflightService,
     ConnectorError,
     ExecutionOrderStateService,
+    ExecutionQualityService,
     ExtendedOrderStateObserver,
     HyperliquidOrderStateObserver,
     OpportunityService,
+    OpportunityUniverseService,
     ParadexOrderStateObserver,
     build_account_preflight_configs,
     build_execution_pair_status,
+    build_opportunity_record_from_universe_opportunity,
     filter_candidate_records,
     reconcile_execution,
 )
@@ -65,6 +69,28 @@ class PairScorer(Protocol):
         right_symbol: str,
         right_fee_profile: str,
     ) -> FundingArbOpportunity: ...
+
+
+class UniverseScanner(Protocol):
+    """Interface for scanning the live funding universe."""
+
+    async def scan(
+        self,
+        *,
+        venues: list[str],
+        ranking: str,
+        target_notional: float,
+        min_capacity_notional: float,
+        min_daily_volume: float,
+        min_open_interest: float,
+        min_roundtrip_edge: float,
+        min_execution_quality_score: float,
+        min_execution_samples: int,
+        include_symbols: list[str] | None,
+        exclude_symbols: list[str] | None,
+        exclude_tags: list[str] | None,
+        limit: int,
+    ) -> FundingUniverseScan: ...
 
 
 class CandidateAlertSink(Protocol):
@@ -105,6 +131,18 @@ class PollLoopSummary:
     saved_records: int
     database_path: str
     alert_events: int = 0
+
+
+@dataclass
+class UniverseScanSummary:
+    """Summary emitted after one funding-universe scan."""
+
+    overlap_count: int
+    scanned_opportunities: int
+    saved_records: int
+    alert_events: int
+    database_path: str
+    records: list[OpportunityRecord] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -197,6 +235,86 @@ async def poll_watchlist_once(
         failed_records=failed_records,
         database_path=settings.database_path,
         records=records,
+    )
+
+
+async def scan_funding_universe_once(
+    settings: WorkerSettings,
+    *,
+    scanner: UniverseScanner | None = None,
+    store: OpportunityHistoryStore | None = None,
+    alert_sink: CandidateAlertSink | None = None,
+    now: datetime | None = None,
+) -> UniverseScanSummary:
+    """Scan the live funding universe once and persist ranked opportunities."""
+
+    history_store = store or OpportunityHistoryStore(settings.database_path)
+    candidate_alert_sink = alert_sink or CandidateAlertStore(settings.database_path)
+    timestamp = now or datetime.now(UTC)
+    runtime = scanner or OpportunityUniverseService(
+        execution_quality_service=ExecutionQualityService(
+            journal_store=ExecutionJournalStore(settings.database_path),
+            observation_store=ExecutionObservationStore(settings.database_path),
+        )
+    )
+
+    async with asyncio.timeout(settings.universe_scan_timeout_seconds):
+        scan = await runtime.scan(
+            venues=list(settings.universe_scan_venues),
+            ranking=settings.universe_scan_ranking,
+            target_notional=settings.universe_scan_target_notional,
+            min_capacity_notional=settings.universe_scan_min_capacity_notional,
+            min_daily_volume=settings.universe_scan_min_daily_volume,
+            min_open_interest=settings.universe_scan_min_open_interest,
+            min_roundtrip_edge=settings.universe_scan_min_roundtrip_edge,
+            min_execution_quality_score=settings.universe_scan_min_execution_quality_score,
+            min_execution_samples=settings.universe_scan_min_execution_samples,
+            include_symbols=list(settings.universe_scan_include_symbols) or None,
+            exclude_symbols=list(settings.universe_scan_exclude_symbols) or None,
+            exclude_tags=list(settings.universe_scan_exclude_tags) or None,
+            limit=settings.universe_scan_limit,
+        )
+
+    records = [
+        build_opportunity_record_from_universe_opportunity(
+            recorded_at=timestamp,
+            opportunity=opportunity,
+        )
+        for opportunity in scan.opportunities
+    ]
+    persisted_records: list[OpportunityRecord] = []
+    for record in records:
+        try:
+            history_store.append(record)
+        except sqlite3.Error:
+            logger.warning(
+                "Failed to persist universe record for %s",
+                record.pair.label,
+                exc_info=True,
+            )
+            continue
+        persisted_records.append(record)
+
+    candidate_records = filter_candidate_records(
+        persisted_records,
+        min_one_day_net_edge_after_entry=settings.min_candidate_entry_edge,
+        min_capacity_notional=settings.min_candidate_capacity_notional,
+    )
+    alert_events = emit_candidate_alerts(
+        candidate_records,
+        sink=candidate_alert_sink,
+        emitted_at=timestamp,
+        min_one_day_net_edge_after_entry=settings.min_candidate_entry_edge,
+        min_capacity_notional=settings.min_candidate_capacity_notional,
+    )
+
+    return UniverseScanSummary(
+        overlap_count=scan.overlap_count,
+        scanned_opportunities=len(scan.opportunities),
+        saved_records=len(persisted_records),
+        alert_events=alert_events,
+        database_path=settings.database_path,
+        records=persisted_records,
     )
 
 

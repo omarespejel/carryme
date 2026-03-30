@@ -6,6 +6,7 @@ import asyncio
 import itertools
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal, Protocol
 
 import httpx
@@ -18,6 +19,7 @@ from carryme_connectors import (
 from carryme_models import (
     ExecutionQualitySummary,
     FundingArbOpportunity,
+    FundingPairSpec,
     FundingUniverseOpportunity,
     FundingUniverseOverlap,
     FundingUniversePortfolioEntry,
@@ -25,6 +27,7 @@ from carryme_models import (
     FundingUniverseScan,
     FundingUniverseVenueMarket,
     NormalizedMarketSnapshot,
+    OpportunityRecord,
 )
 from carryme_normalizers import get_fee_profile, normalize_symbol
 from carryme_scoring import score_funding_pair
@@ -537,3 +540,41 @@ def _execution_weight(opportunity: FundingUniverseOpportunity) -> float:
     ):
         return adjusted_pnl / raw_pnl
     return 1.0
+
+
+def build_pair_spec_from_universe_opportunity(
+    opportunity: FundingUniverseOpportunity,
+) -> FundingPairSpec:
+    """Convert a universe opportunity into a reusable pair spec."""
+
+    scored = opportunity.opportunity
+    if scored.short_venue not in opportunity.venue_markets:
+        raise ValueError(f"Missing venue_markets entry for short_venue: {scored.short_venue}")
+    if scored.long_venue not in opportunity.venue_markets:
+        raise ValueError(f"Missing venue_markets entry for long_venue: {scored.long_venue}")
+    short_market = opportunity.venue_markets[scored.short_venue]
+    long_market = opportunity.venue_markets[scored.long_venue]
+    base_asset = scored.canonical_symbol.split("-", 1)[0].lower()
+    return FundingPairSpec(
+        label=f"{base_asset}_{scored.short_venue}_{scored.long_venue}",
+        left_venue=scored.short_venue,
+        left_symbol=short_market.symbol,
+        left_fee_profile=scored.short_fee_profile,
+        right_venue=scored.long_venue,
+        right_symbol=long_market.symbol,
+        right_fee_profile=scored.long_fee_profile,
+    )
+
+
+def build_opportunity_record_from_universe_opportunity(
+    *,
+    recorded_at: datetime,
+    opportunity: FundingUniverseOpportunity,
+) -> OpportunityRecord:
+    """Convert a universe opportunity into a persisted opportunity record."""
+
+    return OpportunityRecord(
+        recorded_at=recorded_at,
+        pair=build_pair_spec_from_universe_opportunity(opportunity),
+        opportunity=opportunity.opportunity,
+    )
