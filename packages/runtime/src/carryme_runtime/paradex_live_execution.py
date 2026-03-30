@@ -425,7 +425,10 @@ def _clone_paradex_token_provider(
     token_usage: str,
 ) -> ParadexLiveTokenProvider:
     if not isinstance(default_provider, ParadexJwtTokenProvider):
-        return default_provider
+        raise ValueError(
+            "Interactive Paradex auth requires ParadexJwtTokenProvider; "
+            f"got {type(default_provider).__name__} for token_usage={token_usage!r}"
+        )
     return ParadexJwtTokenProvider(
         base_url=default_provider._base_url,
         system_config_path=default_provider._system_config_path,
