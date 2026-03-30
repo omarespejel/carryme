@@ -99,9 +99,10 @@ Set these once in a shared Render environment group:
 4. `CARRYME_API_EXTENDED_LIVE_ENABLED=false`
 5. `CARRYME_API_PARADEX_LIVE_ENABLED=false`
 6. `CARRYME_API_HYPERLIQUID_LIVE_ENABLED=false`
-7. optional webhook URLs
+7. no alert webhook URLs in this shared group
 
 Do not put `DATABASE_URL` in the group. Render injects that per service from the managed Postgres instance.
+Do not put webhook URLs in the shared group either. Alert endpoints are service-owned secrets and should only be attached to the workers listed in the per-service matrix below, or delivered through a centralized secret store with equivalent service-level scoping.
 
 ### Per-Service Matrix
 
@@ -110,10 +111,10 @@ Do not put `DATABASE_URL` in the group. Render injects that per service from the
 | `carryme-api` | yes | yes | all venue secrets if you want operator-triggered live actions from the API | no |
 | `carryme-universe-scan` | yes | no | no | no |
 | `carryme-approved-canary-scan` | yes | yes | no | no |
-| `carryme-launch-ready-cache` | yes | yes | no | `CARRYME_WORKER_STABLE_LAUNCH_READY_ALERT_WEBHOOK_URL` |
+| `carryme-launch-ready-cache` | yes | yes | no | `CARRYME_WORKER_STABLE_LAUNCH_READY_ALERT_WEBHOOK_URL` (service-level secret only) |
 | `carryme-stable-launch` | yes | yes | yes, for the venues you intend to launch live on | no |
-| `carryme-system-state` | yes | no | no | `CARRYME_WORKER_SYSTEM_STATE_ALERT_WEBHOOK_URL` |
-| `carryme-execution-monitor` | yes | yes | yes, for the venues you intend to reconcile live on | `CARRYME_WORKER_EXECUTION_ALERT_WEBHOOK_URL` |
+| `carryme-system-state` | yes | no | no | `CARRYME_WORKER_SYSTEM_STATE_ALERT_WEBHOOK_URL` (service-level secret only) |
+| `carryme-execution-monitor` | yes | yes | yes, for the venues you intend to reconcile live on | `CARRYME_WORKER_EXECUTION_ALERT_WEBHOOK_URL` (service-level secret only) |
 
 ### Venue Secret Ownership
 
