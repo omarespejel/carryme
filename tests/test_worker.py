@@ -4768,6 +4768,36 @@ def test_worker_main_rejects_universe_scan_mode_with_iterations(
     assert "only supported with the looped worker modes" in stderr
 
 
+def test_worker_main_rejects_cache_launch_ready_canary_once_with_iterations(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--cache-launch-ready-canary-once", "--iterations", "2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        worker_main()
+
+    _, stderr = capsys.readouterr()
+    assert "only supported with the looped worker modes" in stderr
+
+
+def test_worker_main_rejects_production_supervisor_once_with_iterations(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--run-production-supervisor-once", "--iterations", "2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        worker_main()
+
+    _, stderr = capsys.readouterr()
+    assert "only supported with the looped worker modes" in stderr
+
+
 def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text('{"pairs": []}')

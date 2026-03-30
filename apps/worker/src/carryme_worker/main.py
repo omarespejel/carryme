@@ -441,9 +441,11 @@ def main() -> None:
         args.once
         or args.scan_universe_once
         or args.scan_approved_canary_once
+        or args.cache_launch_ready_canary_once
         or args.launch_latest_stable_canary_once
         or args.observe_executions_once
         or args.observe_system_state_once
+        or args.run_production_supervisor_once
     ):
         parser.error("--iterations is only supported with the looped worker modes")
 
