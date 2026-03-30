@@ -119,6 +119,32 @@ def test_render_validation_accepts_paradex_bearer_token_alone(tmp_path: Path) ->
     assert worker_summary["valid"] is True
 
 
+def test_render_validation_flags_paradex_missing_auth_fields(tmp_path: Path) -> None:
+    report = build_render_validation_report(
+        {
+            "DATABASE_URL": f"sqlite:///{tmp_path / 'render.sqlite3'}",
+            "CARRYME_API_ENVIRONMENT": "production",
+            "CARRYME_WORKER_ENVIRONMENT": "production",
+            "CARRYME_API_PARADEX_LIVE_ENABLED": "true",
+            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS": "0xabc",
+        }
+    )
+    live_venues = cast(dict[str, dict[str, Any]], report["live_venues"])
+    api_summary = cast(dict[str, Any], report["api"])
+    worker_summary = cast(dict[str, Any], report["worker"])
+
+    assert report["status"] == "degraded"
+    assert live_venues["paradex"] == {
+        "enabled": True,
+        "missing_env": [
+            "CARRYME_API_PARADEX_PRIVATE_KEY|CARRYME_API_PARADEX_BEARER_TOKEN",
+        ],
+    }
+    assert api_summary["valid"] is True
+    assert worker_summary["valid"] is False
+    assert "paradex_private_key|paradex_bearer_token" in str(worker_summary["error"])
+
+
 def test_render_validation_flags_missing_hyperliquid_credentials(tmp_path: Path) -> None:
     report = build_render_validation_report(
         {

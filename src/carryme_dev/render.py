@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
+import threading
 from collections.abc import Mapping
 from unittest.mock import patch
 
@@ -35,6 +37,8 @@ LIVE_VENUE_ENV_VARS: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
 }
 
+DEFAULT_DATABASE_PING_TIMEOUT_SECONDS = 5.0
+
 
 def _is_truthy(value: str | None) -> bool:
     """Return whether an environment value should be treated as enabled."""
@@ -61,10 +65,37 @@ def _paradex_missing_env(resolved_env: Mapping[str, str]) -> list[str]:
     return missing
 
 
+def _ping_database_with_timeout(database_url: str, timeout_seconds: float) -> None:
+    """Ping the configured database with a bounded timeout on supported platforms."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("database_ping_timeout_seconds must be positive")
+
+    if hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread():
+        def _handle_timeout(signum: int, frame: object) -> None:
+            _ = signum, frame
+            raise TimeoutError(
+                f"Database ping timed out after {timeout_seconds:.1f}s"
+            )
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, _handle_timeout)
+        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+        try:
+            Database(database_url).ping()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+        return
+
+    Database(database_url).ping()
+
+
 def build_render_validation_report(
     env: Mapping[str, str] | None = None,
     *,
     ping_database: bool = True,
+    database_ping_timeout_seconds: float = DEFAULT_DATABASE_PING_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     """Validate the current environment for Render-style deployment."""
 
@@ -130,7 +161,10 @@ def build_render_validation_report(
             database_error = "DATABASE_URL is not set."
         else:
             try:
-                Database(resolved_env["DATABASE_URL"]).ping()
+                _ping_database_with_timeout(
+                    resolved_env["DATABASE_URL"],
+                    database_ping_timeout_seconds,
+                )
                 database_ready = True
             except Exception as error:  # pragma: no cover
                 database_error = str(error)
