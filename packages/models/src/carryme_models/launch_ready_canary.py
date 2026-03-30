@@ -17,3 +17,13 @@ class LaunchReadyCanarySnapshot(BaseModel):
     max_snapshot_age_seconds: int
     approved_snapshot: ApprovedCanarySnapshot
     system_state: PaperTradeSystemState
+
+
+class LaunchReadyCanaryStability(BaseModel):
+    """Stability summary for the latest launch-ready snapshot chain."""
+
+    snapshot: LaunchReadyCanarySnapshot
+    consecutive_snapshots: int
+    stable_seconds: float
+    min_snapshot_count: int
+    min_stable_seconds: float
