@@ -71,7 +71,8 @@ def test_render_validation_flags_missing_live_credentials(tmp_path: Path) -> Non
         ],
     }
     assert api_summary["valid"] is True
-    assert worker_summary["valid"] is True
+    assert worker_summary["valid"] is False
+    assert "extended_api_key" in str(worker_summary["error"])
 
 
 def test_render_validation_warns_on_non_production_env(tmp_path: Path) -> None:
