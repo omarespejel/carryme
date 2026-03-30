@@ -172,6 +172,8 @@ def test_render_validation_flags_missing_hyperliquid_credentials(tmp_path: Path)
 
 
 def test_render_validation_honors_empty_explicit_env() -> None:
+    """Verify build_render_validation_report respects env={} over populated os.environ."""
+
     with patch.dict(
         "os.environ",
         {

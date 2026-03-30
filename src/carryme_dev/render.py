@@ -7,8 +7,8 @@ import json
 import os
 import signal
 import threading
-from collections.abc import Mapping
-from unittest.mock import patch
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 
 from carryme_api.config import ApiSettings
 from carryme_storage.db import Database, redact_database_url
@@ -65,8 +65,22 @@ def _paradex_missing_env(resolved_env: Mapping[str, str]) -> list[str]:
     return missing
 
 
+@contextmanager
+def _override_environ(env: Mapping[str, str]) -> Iterator[None]:
+    """Temporarily replace process environment variables with an explicit mapping."""
+
+    original_env = os.environ.copy()
+    os.environ.clear()
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
+
+
 def _ping_database_with_timeout(database_url: str, timeout_seconds: float) -> None:
-    """Ping the configured database with a bounded timeout on supported platforms."""
+    """Ping the configured database with a bounded timeout on every platform."""
 
     if timeout_seconds <= 0:
         raise ValueError("database_ping_timeout_seconds must be positive")
@@ -88,7 +102,28 @@ def _ping_database_with_timeout(database_url: str, timeout_seconds: float) -> No
             signal.signal(signal.SIGALRM, previous_handler)
         return
 
-    Database(database_url).ping()
+    ping_error: Exception | None = None
+    done = threading.Event()
+
+    def _ping_in_background() -> None:
+        nonlocal ping_error
+        try:
+            Database(database_url).ping()
+        except Exception as error:  # pragma: no cover
+            ping_error = error
+        finally:
+            done.set()
+
+    thread = threading.Thread(
+        target=_ping_in_background,
+        name="carryme-render-db-ping",
+        daemon=True,
+    )
+    thread.start()
+    if not done.wait(timeout_seconds):
+        raise TimeoutError(f"Database ping timed out after {timeout_seconds:.1f}s")
+    if ping_error is not None:
+        raise ping_error
 
 
 def build_render_validation_report(
@@ -108,7 +143,7 @@ def build_render_validation_report(
     api_settings: ApiSettings | None = None
     worker_settings: WorkerSettings | None = None
 
-    with patch.dict(os.environ, resolved_env, clear=True):
+    with _override_environ(resolved_env):
         try:
             api_settings = ApiSettings()
         except Exception as error:  # pragma: no cover
