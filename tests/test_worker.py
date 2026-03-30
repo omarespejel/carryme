@@ -73,6 +73,8 @@ from carryme_worker.main import (
     build_launch_ready_canary_cache_loop_payload,
     build_launch_ready_canary_cache_payload,
     build_loop_payload,
+    build_production_supervisor_cycle_payload,
+    build_production_supervisor_loop_payload,
     build_stable_canary_launch_loop_payload,
     build_stable_canary_launch_payload,
     build_system_state_observation_loop_payload,
@@ -93,6 +95,8 @@ from carryme_worker.poller import (
     LaunchReadyCanaryCacheSummary,
     PollCycleSummary,
     PollLoopSummary,
+    ProductionSupervisorCycleSummary,
+    ProductionSupervisorLoopSummary,
     StableCanaryLaunchLoopSummary,
     StableCanaryLaunchSummary,
     SystemStateObservationLoopSummary,
@@ -107,10 +111,12 @@ from carryme_worker.poller import (
     observe_system_state_once,
     poll_watchlist_once,
     run_polling_loop,
+    run_production_supervisor_cycle_once,
     run_supervised_approved_canary_scan_loop,
     run_supervised_execution_observation_loop,
     run_supervised_launch_ready_canary_cache_loop,
     run_supervised_polling_loop,
+    run_supervised_production_supervisor_loop,
     run_supervised_stable_canary_launch_loop,
     run_supervised_system_state_observation_loop,
     run_supervised_universe_scan_loop,
@@ -500,6 +506,72 @@ def test_worker_stable_canary_launch_loop_payload() -> None:
         "failures": 0,
         "launched": 1,
         "skipped": 3,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_production_supervisor_cycle_payload() -> None:
+    payload = build_production_supervisor_cycle_payload(
+        ProductionSupervisorCycleSummary(
+            checked_venues=3,
+            degraded_venues=1,
+            scanned_candidates=5,
+            approved_candidates=2,
+            saved_approved_snapshots=2,
+            scanned_launch_ready_snapshots=2,
+            launch_ready_candidates=1,
+            saved_launch_ready_snapshots=1,
+            launch_status="launched",
+            paper_trade_id=17,
+            final_pair_state="hedged",
+            observed_executions=1,
+            saved_execution_observations=1,
+            execution_alerts=0,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "checked_venues": 3,
+        "degraded_venues": 1,
+        "scanned_candidates": 5,
+        "approved_candidates": 2,
+        "saved_approved_snapshots": 2,
+        "scanned_launch_ready_snapshots": 2,
+        "launch_ready_candidates": 1,
+        "saved_launch_ready_snapshots": 1,
+        "launch_status": "launched",
+        "paper_trade_id": 17,
+        "final_pair_state": "hedged",
+        "observed_executions": 1,
+        "saved_execution_observations": 1,
+        "execution_alerts": 0,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_production_supervisor_loop_payload() -> None:
+    payload = build_production_supervisor_loop_payload(
+        ProductionSupervisorLoopSummary(
+            attempts=4,
+            successful_cycles=3,
+            failures=1,
+            launched=1,
+            skipped=2,
+            observed_executions=3,
+            execution_alerts=1,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 4,
+        "successful_cycles": 3,
+        "failures": 1,
+        "launched": 1,
+        "skipped": 2,
+        "observed_executions": 3,
+        "execution_alerts": 1,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -2561,6 +2633,363 @@ def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
     assert sleeps == [6]
 
 
+def test_run_production_supervisor_cycle_once_orders_stages(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    calls: list[str] = []
+    expected_now = datetime(2026, 3, 30, 11, 0, tzinfo=UTC)
+    forwarded_now: list[datetime | None] = []
+
+    async def fake_observe_system_state_once(
+        settings_arg: WorkerSettings,
+        *,
+        service: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> SystemStateObservationSummary:
+        assert settings_arg is settings
+        _ = service
+        _ = alert_sink
+        _ = alert_notifier
+        _ = logger
+        forwarded_now.append(now)
+        calls.append("system")
+        return SystemStateObservationSummary(
+            checked_venues=3,
+            degraded_venues=0,
+            saved_alerts=0,
+            sent_notifications=0,
+            database_path=settings.database_path,
+        )
+
+    async def fake_scan_approved_canary_once(
+        settings_arg: WorkerSettings,
+        *,
+        scanner: object | None = None,
+        approval_service: object | None = None,
+        store: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> ApprovedCanaryScanSummary:
+        assert settings_arg is settings
+        _ = scanner
+        _ = approval_service
+        _ = store
+        _ = alert_sink
+        _ = alert_notifier
+        _ = logger
+        forwarded_now.append(now)
+        calls.append("approved")
+        return ApprovedCanaryScanSummary(
+            scanned_candidates=4,
+            approved_candidates=1,
+            saved_snapshots=1,
+            alert_events=0,
+            sent_notifications=0,
+            database_path=settings.database_path,
+        )
+
+    async def fake_cache_launch_ready_canaries_once(
+        settings_arg: WorkerSettings,
+        *,
+        approved_store: object | None = None,
+        launch_ready_store: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        approval_service: object | None = None,
+        system_state_service: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> LaunchReadyCanaryCacheSummary:
+        assert settings_arg is settings
+        _ = approved_store
+        _ = launch_ready_store
+        _ = alert_sink
+        _ = alert_notifier
+        _ = approval_service
+        _ = system_state_service
+        _ = logger
+        forwarded_now.append(now)
+        calls.append("launch_ready")
+        return LaunchReadyCanaryCacheSummary(
+            scanned_snapshots=1,
+            launch_ready_candidates=1,
+            saved_snapshots=1,
+            alert_events=0,
+            sent_notifications=0,
+            database_path=settings.database_path,
+        )
+
+    async def fake_launch_latest_stable_canary_once(
+        settings_arg: WorkerSettings,
+        *,
+        api_settings: object | None = None,
+        launch_store: object | None = None,
+        now: datetime | None = None,
+    ) -> StableCanaryLaunchSummary:
+        assert settings_arg is settings
+        _ = api_settings
+        _ = launch_store
+        forwarded_now.append(now)
+        calls.append("launch")
+        return StableCanaryLaunchSummary(
+            status="launched",
+            label="arb_extended_paradex",
+            launch_ready_snapshot_id=9,
+            approved_snapshot_id=8,
+            paper_trade_id=17,
+            final_pair_state="hedged",
+            database_path=settings.database_path,
+        )
+
+    async def fake_observe_live_executions_once(
+        settings_arg: WorkerSettings,
+        *,
+        execution_store: object | None = None,
+        observation_store: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        account_service: object | None = None,
+        order_state_service: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> ExecutionObservationSummary:
+        assert settings_arg is settings
+        _ = execution_store
+        _ = observation_store
+        _ = alert_sink
+        _ = alert_notifier
+        _ = account_service
+        _ = order_state_service
+        _ = logger
+        forwarded_now.append(now)
+        calls.append("observe")
+        return ExecutionObservationSummary(
+            scanned_executions=1,
+            observed_executions=1,
+            saved_observations=1,
+            saved_alerts=0,
+            sent_notifications=0,
+            database_path=settings.database_path,
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.observe_system_state_once",
+            fake_observe_system_state_once,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller.scan_approved_canary_once",
+            fake_scan_approved_canary_once,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller.cache_launch_ready_canaries_once",
+            fake_cache_launch_ready_canaries_once,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller.launch_latest_stable_canary_once",
+            fake_launch_latest_stable_canary_once,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller.observe_live_executions_once",
+            fake_observe_live_executions_once,
+        )
+        summary = asyncio.run(
+            run_production_supervisor_cycle_once(
+                settings,
+                now=expected_now,
+            )
+        )
+
+    assert calls == ["system", "approved", "launch_ready", "launch", "observe"]
+    assert forwarded_now == [
+        expected_now,
+        expected_now,
+        expected_now,
+        expected_now,
+        expected_now,
+    ]
+    assert summary.launch_status == "launched"
+    assert summary.paper_trade_id == 17
+    assert summary.observed_executions == 1
+
+
+def test_run_supervised_production_supervisor_loop_honors_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_interval_seconds=7,
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    summaries = iter(
+        [
+            ProductionSupervisorCycleSummary(
+                checked_venues=3,
+                degraded_venues=0,
+                scanned_candidates=4,
+                approved_candidates=1,
+                saved_approved_snapshots=1,
+                scanned_launch_ready_snapshots=1,
+                launch_ready_candidates=1,
+                saved_launch_ready_snapshots=1,
+                launch_status="launched",
+                paper_trade_id=17,
+                final_pair_state="hedged",
+                observed_executions=1,
+                saved_execution_observations=1,
+                execution_alerts=0,
+                database_path=settings.database_path,
+            ),
+            ProductionSupervisorCycleSummary(
+                checked_venues=3,
+                degraded_venues=0,
+                scanned_candidates=0,
+                approved_candidates=0,
+                saved_approved_snapshots=0,
+                scanned_launch_ready_snapshots=0,
+                launch_ready_candidates=0,
+                saved_launch_ready_snapshots=0,
+                launch_status="skipped",
+                paper_trade_id=None,
+                final_pair_state=None,
+                observed_executions=0,
+                saved_execution_observations=0,
+                execution_alerts=0,
+                database_path=settings.database_path,
+            ),
+        ]
+    )
+
+    async def fake_run_production_supervisor_cycle_once(
+        settings_arg: WorkerSettings,
+        *,
+        now: datetime | None = None,
+        logger: object | None = None,
+    ) -> ProductionSupervisorCycleSummary:
+        assert settings_arg is settings
+        _ = now
+        _ = logger
+        return next(summaries)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.run_production_supervisor_cycle_once",
+            fake_run_production_supervisor_cycle_once,
+        )
+        summary = asyncio.run(
+            run_supervised_production_supervisor_loop(
+                settings,
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.launched == 1
+    assert summary.skipped == 1
+    assert summary.observed_executions == 1
+    assert summary.execution_alerts == 0
+    assert sleeps == [7]
+
+
+def test_run_supervised_production_supervisor_loop_rejects_non_positive_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    with pytest.raises(ValueError, match="max_iterations must be at least 1"):
+        asyncio.run(
+            run_supervised_production_supervisor_loop(
+                settings,
+                max_iterations=0,
+            )
+        )
+
+
+def test_run_supervised_production_supervisor_loop_applies_backoff(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_interval_seconds=3,
+        stable_canary_launch_max_backoff_seconds=8,
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    outcomes: list[ProductionSupervisorCycleSummary | Exception] = [
+        RuntimeError("temporary supervisor failure"),
+        RuntimeError("temporary supervisor failure #2"),
+        ProductionSupervisorCycleSummary(
+            checked_venues=3,
+            degraded_venues=0,
+            scanned_candidates=4,
+            approved_candidates=1,
+            saved_approved_snapshots=1,
+            scanned_launch_ready_snapshots=1,
+            launch_ready_candidates=1,
+            saved_launch_ready_snapshots=1,
+            launch_status="launched",
+            paper_trade_id=17,
+            final_pair_state="hedged",
+            observed_executions=1,
+            saved_execution_observations=1,
+            execution_alerts=0,
+            database_path=settings.database_path,
+        ),
+    ]
+
+    async def fake_run_production_supervisor_cycle_once(
+        settings_arg: WorkerSettings,
+        *,
+        logger: object | None = None,
+    ) -> ProductionSupervisorCycleSummary:
+        assert settings_arg is settings
+        _ = logger
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.run_production_supervisor_cycle_once",
+            fake_run_production_supervisor_cycle_once,
+        )
+        summary = asyncio.run(
+            run_supervised_production_supervisor_loop(
+                settings,
+                sleep=fake_sleep,
+                max_iterations=3,
+            )
+        )
+
+    assert summary.attempts == 3
+    assert summary.successful_cycles == 1
+    assert summary.failures == 2
+    assert summary.launched == 1
+    assert summary.skipped == 0
+    assert summary.observed_executions == 1
+    assert summary.execution_alerts == 0
+    assert sleeps == [3.0, 6.0]
+
+
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
     tmp_path: Path,
 ) -> None:
@@ -4340,6 +4769,36 @@ def test_worker_main_rejects_universe_scan_mode_with_iterations(
     monkeypatch.setattr(
         "sys.argv",
         ["carryme-worker", "--scan-universe-once", "--iterations", "2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        worker_main()
+
+    _, stderr = capsys.readouterr()
+    assert "only supported with the looped worker modes" in stderr
+
+
+def test_worker_main_rejects_cache_launch_ready_canary_once_with_iterations(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--cache-launch-ready-canary-once", "--iterations", "2"],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        worker_main()
+
+    _, stderr = capsys.readouterr()
+    assert "only supported with the looped worker modes" in stderr
+
+
+def test_worker_main_rejects_production_supervisor_once_with_iterations(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        ["carryme-worker", "--run-production-supervisor-once", "--iterations", "2"],
     )
 
     with pytest.raises(SystemExit, match="2"):
