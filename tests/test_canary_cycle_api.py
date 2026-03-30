@@ -684,6 +684,111 @@ def test_execute_guarded_canary_cycle_runs_open_and_close_with_balance_summary(
     assert len(pair_close_confirmation_store.list_recent(limit=10)) == 1
 
 
+def test_execute_guarded_canary_cycle_skips_unselected_live_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ETH-USD-PERP",
+                long_venue="paradex",
+                short_venue="hyperliquid",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="vip",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "hyperliquid": FundingUniverseVenueMarket(
+                    venue="hyperliquid",
+                    symbol="ETH",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ETH-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=11.0,
+    )
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        label="arb_hyperliquid_paradex",
+        canonical_symbol="ETH-USD-PERP",
+        short_venue="hyperliquid",
+        long_venue="paradex",
+        short_fee_profile="vip",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=11.0,
+        note="approved canary",
+    )
+
+    async def fake_select_approved_canary_candidate(**_: object) -> tuple[
+        FundingUniverseCanaryCandidate, RouteApprovalEntry
+    ]:
+        return candidate, approval
+
+    async def fake_run_guarded_canary_lifecycle(**kwargs: object) -> None:
+        cleanup_preview_service = cast(Any, kwargs["cleanup_preview_service"])
+        pair_close_preview_service = cast(Any, kwargs["pair_close_preview_service"])
+        cleanup_live_router = cast(Any, kwargs["cleanup_live_router"])
+        paired_service = cast(Any, kwargs["paired_service"])
+        pair_close_live_service = cast(Any, kwargs["pair_close_live_service"])
+
+        assert set(cleanup_preview_service.services) == {"hyperliquid", "paradex"}
+        assert set(pair_close_preview_service.services) == {"hyperliquid", "paradex"}
+        assert set(cleanup_live_router.services) == {"hyperliquid", "paradex"}
+        assert set(paired_service.services) == {"hyperliquid", "paradex"}
+        assert set(pair_close_live_service.services) == {"hyperliquid", "paradex"}
+        raise RuntimeError("reached lifecycle")
+
+    monkeypatch.setattr(
+        "carryme_api.app._select_approved_canary_candidate",
+        fake_select_approved_canary_candidate,
+    )
+    monkeypatch.setattr(
+        "carryme_api.app._run_guarded_canary_lifecycle",
+        fake_run_guarded_canary_lifecycle,
+    )
+
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(database_path),
+        extended_live_enabled=False,
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="0x123",
+        hyperliquid_live_enabled=True,
+        hyperliquid_account_address="0xdef",
+        hyperliquid_api_wallet_private_key="0x456",
+    )
+
+    client = TestClient(app)
+    try:
+        with pytest.raises(RuntimeError, match="reached lifecycle"):
+            client.post(
+                "/v1/executions/live/canary-cycle",
+                params={"label": "arb_hyperliquid_paradex"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_execute_guarded_canary_cycle_skips_close_when_open_is_not_hedged(
     tmp_path: Path,
 ) -> None:

@@ -5119,6 +5119,7 @@ def create_app() -> FastAPI:
         response_model=CanaryLifecycleResult,
     )
     async def execute_guarded_canary_cycle(
+        request: Request,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         universe_service: Annotated[
             OpportunityUniverseService, Depends(get_opportunity_universe_service)
@@ -5165,26 +5166,6 @@ def create_app() -> FastAPI:
             ExecutionOrderStateService,
             Depends(get_execution_order_state_service),
         ],
-        cleanup_preview_service: Annotated[
-            CleanupPreviewRouter,
-            Depends(get_cleanup_preview_service),
-        ],
-        pair_close_preview_service: Annotated[
-            PairClosePreviewService,
-            Depends(get_pair_close_preview_service),
-        ],
-        cleanup_live_router: Annotated[
-            CleanupLiveExecutionRouter,
-            Depends(get_cleanup_live_execution_router),
-        ],
-        paired_service: Annotated[
-            PairedLiveExecutionCoordinator,
-            Depends(get_paired_live_execution_coordinator),
-        ],
-        pair_close_live_service: Annotated[
-            PairCloseLiveExecutionCoordinator,
-            Depends(get_pair_close_live_execution_coordinator),
-        ],
         venues: Annotated[list[str] | None, Query()] = None,
         label: str | None = None,
         desired_notional: float | None = None,
@@ -5214,7 +5195,7 @@ def create_app() -> FastAPI:
         poll_interval_seconds: float = 2.0,
         auto_cleanup: bool = True,
         close_position: bool = True,
-    ) -> CanaryLifecycleResult:
+        ) -> CanaryLifecycleResult:
         selected, approval = await _select_approved_canary_candidate(
             universe_service=universe_service,
             approval_service=approval_service,
@@ -5238,6 +5219,65 @@ def create_app() -> FastAPI:
             exclude_symbols=exclude_symbols,
             exclude_tags=exclude_tags,
             limit=limit,
+        )
+        cleanup_preview_service = _resolve_request_dependency(
+            request,
+            get_cleanup_preview_service,
+            lambda: _build_cleanup_preview_router_for_candidate(settings, selected),
+        )
+        pair_close_preview_service = _resolve_request_dependency(
+            request,
+            get_pair_close_preview_service,
+            lambda: _build_pair_close_preview_service_for_candidate(settings, selected),
+        )
+
+        def _resolve_live_execution_service(venue: str) -> Any:
+            if venue == "extended":
+                return _resolve_request_dependency(
+                    request,
+                    get_extended_live_execution_service,
+                    lambda: get_extended_live_execution_service(settings),
+                )
+            if venue == "hyperliquid":
+                return _resolve_request_dependency(
+                    request,
+                    get_hyperliquid_live_execution_service,
+                    lambda: get_hyperliquid_live_execution_service(settings),
+                )
+            if venue == "paradex":
+                return _resolve_request_dependency(
+                    request,
+                    get_paradex_live_execution_service,
+                    lambda: get_paradex_live_execution_service(settings),
+                )
+            raise ValueError(f"Unsupported canary venue {venue!r}")
+
+        cleanup_live_router = _resolve_request_dependency(
+            request,
+            get_cleanup_live_execution_router,
+            lambda: _build_cleanup_live_execution_router_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
+            ),
+        )
+        paired_service = _resolve_request_dependency(
+            request,
+            get_paired_live_execution_coordinator,
+            lambda: _build_paired_live_execution_coordinator_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
+            ),
+        )
+        pair_close_live_service = _resolve_request_dependency(
+            request,
+            get_pair_close_live_execution_coordinator,
+            lambda: _build_pair_close_live_execution_coordinator_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
+            ),
         )
         return await _run_guarded_canary_lifecycle(
             candidate=selected,
