@@ -184,8 +184,8 @@ This is the sequence I recommend for the first real hosted rollout.
 1. merge [PR #148](https://github.com/omarespejel/carryme/pull/148)
 2. merge [PR #150](https://github.com/omarespejel/carryme/pull/150)
 3. create the Render Postgres instance
-4. apply [render.yaml](/Users/espejelomar/StarkNet/ai-agents-starknet/carryme/render.yaml)
-5. attach a shared environment group built from [.env.render.example](/Users/espejelomar/StarkNet/ai-agents-starknet/carryme/.env.render.example)
+4. apply [render.yaml](../../render.yaml)
+5. attach a shared environment group built from [.env.render.example](../../.env.render.example)
 6. keep all `*_LIVE_ENABLED=false`
 7. deploy with no venue secrets yet except what is strictly needed for auth testing
 
