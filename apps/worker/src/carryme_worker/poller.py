@@ -1401,6 +1401,9 @@ async def run_supervised_production_supervisor_loop(
 ) -> ProductionSupervisorLoopSummary:
     """Run the production supervisor loop until stopped or capped."""
 
+    if max_iterations is not None and max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
     loop_logger = logger or logging.getLogger("carryme.worker")
     supervised_stop_event = stop_event or asyncio.Event()
     attempts = 0
@@ -1444,7 +1447,11 @@ async def run_supervised_production_supervisor_loop(
                 break
             if supervised_stop_event.is_set():
                 break
-            await sleep(settings.stable_canary_launch_interval_seconds)
+            await _sleep_or_stop(
+                settings.stable_canary_launch_interval_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
         except Exception:
             failures += 1
             consecutive_failures += 1
@@ -1462,7 +1469,11 @@ async def run_supervised_production_supervisor_loop(
                 break
             if supervised_stop_event.is_set():
                 break
-            await sleep(backoff_seconds)
+            await _sleep_or_stop(
+                backoff_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
 
     return ProductionSupervisorLoopSummary(
         attempts=attempts,

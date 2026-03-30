@@ -2895,6 +2895,91 @@ def test_run_supervised_production_supervisor_loop_honors_max_iterations(
     assert sleeps == [7]
 
 
+def test_run_supervised_production_supervisor_loop_rejects_non_positive_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+
+    with pytest.raises(ValueError, match="max_iterations must be at least 1"):
+        asyncio.run(
+            run_supervised_production_supervisor_loop(
+                settings,
+                max_iterations=0,
+            )
+        )
+
+
+def test_run_supervised_production_supervisor_loop_applies_backoff(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_interval_seconds=3,
+        stable_canary_launch_max_backoff_seconds=8,
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    outcomes: list[ProductionSupervisorCycleSummary | Exception] = [
+        RuntimeError("temporary supervisor failure"),
+        ProductionSupervisorCycleSummary(
+            checked_venues=3,
+            degraded_venues=0,
+            scanned_candidates=4,
+            approved_candidates=1,
+            saved_approved_snapshots=1,
+            scanned_launch_ready_snapshots=1,
+            launch_ready_candidates=1,
+            saved_launch_ready_snapshots=1,
+            launch_status="launched",
+            paper_trade_id=17,
+            final_pair_state="hedged",
+            observed_executions=1,
+            saved_execution_observations=1,
+            execution_alerts=0,
+            database_path=settings.database_path,
+        ),
+    ]
+
+    async def fake_run_production_supervisor_cycle_once(
+        settings_arg: WorkerSettings,
+        *,
+        logger: object | None = None,
+    ) -> ProductionSupervisorCycleSummary:
+        assert settings_arg is settings
+        _ = logger
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.run_production_supervisor_cycle_once",
+            fake_run_production_supervisor_cycle_once,
+        )
+        summary = asyncio.run(
+            run_supervised_production_supervisor_loop(
+                settings,
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 1
+    assert summary.failures == 1
+    assert summary.launched == 1
+    assert summary.skipped == 0
+    assert summary.observed_executions == 1
+    assert summary.execution_alerts == 0
+    assert sleeps == [3]
+
+
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
     tmp_path: Path,
 ) -> None:
