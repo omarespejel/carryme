@@ -142,6 +142,8 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_LIMIT", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_EXTENDED_STARK_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_RECV_WINDOW_MS", raising=False)
+    monkeypatch.delenv("CARRYME_API_EXTENDED_STARK_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("CARRYME_API_PARADEX_RECV_WINDOW_MS", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_STOP_SIGNALS", raising=False)
 
 
