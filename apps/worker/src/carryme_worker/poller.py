@@ -35,6 +35,7 @@ from carryme_models import (
     LaunchReadyCanaryStability,
     OpportunityRecord,
     PaperTradeSystemState,
+    StableCanaryLaunchRecord,
     StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
     VenueSystemState,
@@ -90,6 +91,7 @@ from carryme_storage import (
     PaperTradeStore,
     PreviewConfirmationStore,
     RouteApprovalStore,
+    StableCanaryLaunchStore,
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
     load_watchlist,
@@ -305,6 +307,18 @@ class StableCanaryLaunchSummary:
     final_pair_state: str | None = None
     detail: object | None = None
     lifecycle: CanaryLifecycleResult | None = field(default=None, repr=False)
+
+
+@dataclass
+class StableCanaryLaunchLoopSummary:
+    """Summary emitted after a supervised stable-canary launch loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    launched: int
+    skipped: int
+    database_path: str
 
 
 @dataclass
@@ -1056,12 +1070,14 @@ async def launch_latest_stable_canary_once(
     settings: WorkerSettings,
     *,
     api_settings: ApiSettings | None = None,
+    launch_store: StableCanaryLaunchStore | None = None,
     now: datetime | None = None,
 ) -> StableCanaryLaunchSummary:
     """Launch the latest stable cached canary once, or skip deterministically."""
 
     runtime_settings = api_settings or _build_api_settings_from_worker_settings(settings)
     launch_ready_store = LaunchReadyCanaryStore(runtime_settings.database_path)
+    stable_launch_store = launch_store or StableCanaryLaunchStore(runtime_settings.database_path)
     route_approval_service = RouteApprovalService(
         store=RouteApprovalStore(runtime_settings.database_path)
     )
@@ -1091,6 +1107,25 @@ async def launch_latest_stable_canary_once(
                 detail=exc.detail,
             )
         raise
+
+    if snapshot.launch_ready_snapshot_id is not None:
+        previous_launch = stable_launch_store.latest_for_snapshot(
+            snapshot.launch_ready_snapshot_id
+        )
+        if previous_launch is not None:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_path,
+                label=snapshot.label,
+                launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+                approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+                paper_trade_id=previous_launch.paper_trade_id,
+                final_pair_state=previous_launch.final_pair_state,
+                detail=(
+                    "Launch-ready canary snapshot already launched by worker as "
+                    f"paper trade {previous_launch.paper_trade_id}"
+                ),
+            )
 
     try:
         lifecycle = await _run_guarded_canary_lifecycle(
@@ -1234,6 +1269,18 @@ async def launch_latest_stable_canary_once(
                 detail=exc.detail,
             )
         raise
+
+    stable_launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=timestamp,
+            status="launched",
+            label=stability.snapshot.label,
+            launch_ready_snapshot_id=stability.snapshot.launch_ready_snapshot_id or 0,
+            approved_snapshot_id=stability.snapshot.approved_snapshot.snapshot_id or 0,
+            paper_trade_id=lifecycle.paper_trade.entry_id or 0,
+            final_pair_state=lifecycle.final_pair_status.derived_state,
+        )
+    )
     return StableCanaryLaunchSummary(
         status="launched",
         database_path=settings.database_path,
@@ -1244,6 +1291,81 @@ async def launch_latest_stable_canary_once(
         final_pair_state=lifecycle.final_pair_status.derived_state,
         detail=None,
         lifecycle=lifecycle,
+    )
+
+
+async def run_supervised_stable_canary_launch_loop(
+    settings: WorkerSettings,
+    *,
+    launch_store: StableCanaryLaunchStore | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> StableCanaryLaunchLoopSummary:
+    """Run the signal-aware stable canary launch loop until stopped or capped."""
+
+    stable_launch_store = launch_store or StableCanaryLaunchStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    supervised_stop_event = stop_event or asyncio.Event()
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    launched = 0
+    skipped = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised stable canary launch cycle %s", attempts)
+        try:
+            summary = await launch_latest_stable_canary_once(
+                settings,
+                launch_store=stable_launch_store,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            if summary.status == "launched":
+                launched += 1
+            else:
+                skipped += 1
+            loop_logger.info(
+                "completed supervised stable canary launch cycle %s with status=%s",
+                attempts,
+                summary.status,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(settings.stable_canary_launch_interval_seconds)
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.stable_canary_launch_max_backoff_seconds,
+                settings.stable_canary_launch_interval_seconds
+                * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "stable canary launch cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(backoff_seconds)
+
+    return StableCanaryLaunchLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        launched=launched,
+        skipped=skipped,
+        database_path=settings.database_path,
     )
 
 

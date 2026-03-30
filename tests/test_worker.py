@@ -36,6 +36,7 @@ from carryme_models import (
     PaperTradeEntry,
     PaperTradeSystemState,
     RouteApprovalEntry,
+    StableCanaryLaunchRecord,
     StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
     TradeLegIntent,
@@ -56,6 +57,7 @@ from carryme_storage import (
     LaunchReadyCanaryStore,
     OpportunityHistoryStore,
     RouteApprovalStore,
+    StableCanaryLaunchStore,
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
 )
@@ -71,6 +73,7 @@ from carryme_worker.main import (
     build_launch_ready_canary_cache_loop_payload,
     build_launch_ready_canary_cache_payload,
     build_loop_payload,
+    build_stable_canary_launch_loop_payload,
     build_stable_canary_launch_payload,
     build_system_state_observation_loop_payload,
     build_system_state_observation_payload,
@@ -90,6 +93,7 @@ from carryme_worker.poller import (
     LaunchReadyCanaryCacheSummary,
     PollCycleSummary,
     PollLoopSummary,
+    StableCanaryLaunchLoopSummary,
     StableCanaryLaunchSummary,
     SystemStateObservationLoopSummary,
     SystemStateObservationSummary,
@@ -107,6 +111,7 @@ from carryme_worker.poller import (
     run_supervised_execution_observation_loop,
     run_supervised_launch_ready_canary_cache_loop,
     run_supervised_polling_loop,
+    run_supervised_stable_canary_launch_loop,
     run_supervised_system_state_observation_loop,
     run_supervised_universe_scan_loop,
     scan_approved_canary_once,
@@ -469,6 +474,28 @@ def test_worker_stable_canary_launch_payload() -> None:
         "paper_trade_id": 11,
         "final_pair_state": "closed",
         "detail": None,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_stable_canary_launch_loop_payload() -> None:
+    payload = build_stable_canary_launch_loop_payload(
+        StableCanaryLaunchLoopSummary(
+            attempts=4,
+            successful_cycles=4,
+            failures=0,
+            launched=1,
+            skipped=3,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 4,
+        "successful_cycles": 4,
+        "failures": 0,
+        "launched": 1,
+        "skipped": 3,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -1890,6 +1917,208 @@ def test_launch_latest_stable_canary_once_returns_launched_summary(
     assert summary.approved_snapshot_id == 8
     assert summary.paper_trade_id == 17
     assert summary.final_pair_state == "closed"
+    launch_records = StableCanaryLaunchStore(settings.database_path).list_recent(limit=10)
+    assert len(launch_records) == 1
+    assert launch_records[0].paper_trade_id == 17
+    assert launch_records[0].launch_ready_snapshot_id == 9
+
+
+def test_launch_latest_stable_canary_once_skips_when_snapshot_already_launched(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 3, 30, 10, 3, tzinfo=UTC),
+            status="launched",
+            label="arb_extended_paradex",
+            launch_ready_snapshot_id=9,
+            approved_snapshot_id=8,
+            paper_trade_id=17,
+            final_pair_state="closed",
+        )
+    )
+    snapshot = LaunchReadyCanarySnapshot(
+        launch_ready_snapshot_id=9,
+        captured_at=datetime(2026, 3, 30, 10, 1, tzinfo=UTC),
+        label="arb_extended_paradex",
+        max_snapshot_age_seconds=300,
+        approved_snapshot=ApprovedCanarySnapshot(
+            snapshot_id=8,
+            captured_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            approval=RouteApprovalEntry(
+                updated_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                short_venue="extended",
+                long_venue="paradex",
+                short_fee_profile="default",
+                long_fee_profile="pro_fastfills",
+                approved=True,
+                max_live_notional=11.0,
+                note="approved canary",
+            ),
+        ),
+        system_state=PaperTradeSystemState(
+            paper_trade_id=0,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+    stability = LaunchReadyCanaryStability(
+        snapshot=snapshot,
+        consecutive_snapshots=3,
+        stable_seconds=45.0,
+        min_snapshot_count=2,
+        min_stable_seconds=30.0,
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (
+                snapshot,
+                snapshot.approved_snapshot.candidate,
+                snapshot.approved_snapshot.approval,
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 3, 30, 10, 4, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.paper_trade_id == 17
+    assert "already launched" in cast(str, summary.detail)
+
+
+def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_interval_seconds=6,
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    summaries = iter(
+        [
+            StableCanaryLaunchSummary(
+                status="launched",
+                label="arb_extended_paradex",
+                launch_ready_snapshot_id=9,
+                approved_snapshot_id=8,
+                paper_trade_id=17,
+                final_pair_state="hedged",
+                database_path=settings.database_path,
+            ),
+            StableCanaryLaunchSummary(
+                status="skipped",
+                detail="No launch-ready canary snapshot found",
+                database_path=settings.database_path,
+            ),
+        ]
+    )
+
+    async def fake_launch_latest_stable_canary_once(
+        settings_arg: WorkerSettings,
+        *,
+        api_settings: object | None = None,
+        launch_store: object | None = None,
+        now: datetime | None = None,
+    ) -> StableCanaryLaunchSummary:
+        assert settings_arg is settings
+        _ = api_settings
+        _ = launch_store
+        _ = now
+        return next(summaries)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.launch_latest_stable_canary_once",
+            fake_launch_latest_stable_canary_once,
+        )
+        summary = asyncio.run(
+            run_supervised_stable_canary_launch_loop(
+                settings,
+                launch_store=StableCanaryLaunchStore(settings.database_path),
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.launched == 1
+    assert summary.skipped == 1
+    assert sleeps == [6]
 
 
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(

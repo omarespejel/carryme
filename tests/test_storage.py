@@ -33,6 +33,7 @@ from carryme_models import (
     PaperTradeSystemState,
     PreviewConfirmationEntry,
     RouteApprovalEntry,
+    StableCanaryLaunchRecord,
     StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
     TradeLegIntent,
@@ -54,6 +55,7 @@ from carryme_storage import (
     PaperTradeStore,
     PreviewConfirmationStore,
     RouteApprovalStore,
+    StableCanaryLaunchStore,
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
     WatchlistStore,
@@ -2537,6 +2539,31 @@ def test_launch_ready_canary_store_appends_and_lists_recent(tmp_path: Path) -> N
     assert results[0].system_state.ready is True
     assert latest is not None
     assert latest.launch_ready_snapshot_id == results[0].launch_ready_snapshot_id
+
+
+def test_stable_canary_launch_store_appends_and_filters(tmp_path: Path) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    record = store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+            status="launched",
+            label="arb_extended_paradex",
+            launch_ready_snapshot_id=9,
+            approved_snapshot_id=8,
+            paper_trade_id=17,
+            final_pair_state="closed",
+        )
+    )
+
+    results = store.list_recent(limit=10, label="arb_extended_paradex")
+    latest = store.latest_for_snapshot(9)
+
+    assert record.launch_id is not None
+    assert len(results) == 1
+    assert results[0].paper_trade_id == 17
+    assert results[0].final_pair_state == "closed"
+    assert latest is not None
+    assert latest.launch_ready_snapshot_id == 9
 
 
 def test_approved_canary_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:

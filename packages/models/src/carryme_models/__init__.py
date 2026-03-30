@@ -69,6 +69,7 @@ from carryme_models.preview import (
     VenueOrderPreview,
 )
 from carryme_models.readiness import LiveSubmissionReadiness
+from carryme_models.stable_canary_launch import StableCanaryLaunchRecord
 from carryme_models.stable_launch_ready_alert import StableLaunchReadyAlertEvent
 from carryme_models.system_state import PaperTradeSystemState, VenueSystemState
 from carryme_models.system_state_alert import SystemStateAlertEvent
@@ -148,6 +149,7 @@ __all__ = [
     "RouteAccountingSummary",
     "SystemStateAlertEvent",
     "StableLaunchReadyAlertEvent",
+    "StableCanaryLaunchRecord",
     "VenueAccountPreflight",
     "VenueBalanceDelta",
     "VenueBalanceSnapshot",

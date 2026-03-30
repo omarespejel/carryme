@@ -24,6 +24,8 @@ class WorkerSettings(BaseSettings):
     approved_canary_scan_max_backoff_seconds: int = Field(default=300, gt=0)
     launch_ready_canary_interval_seconds: int = Field(default=15, gt=0)
     launch_ready_canary_max_backoff_seconds: int = Field(default=120, gt=0)
+    stable_canary_launch_interval_seconds: int = Field(default=30, gt=0)
+    stable_canary_launch_max_backoff_seconds: int = Field(default=300, gt=0)
     launch_ready_canary_max_snapshot_age_seconds: int = Field(default=300, gt=0)
     stable_launch_ready_min_snapshot_count: int = Field(default=2, gt=0)
     stable_launch_ready_min_stable_seconds: float = Field(default=30.0, ge=0)
