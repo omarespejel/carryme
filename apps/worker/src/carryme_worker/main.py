@@ -18,6 +18,8 @@ from carryme_worker.poller import (
     LaunchReadyCanaryCacheSummary,
     PollCycleSummary,
     PollLoopSummary,
+    ProductionSupervisorCycleSummary,
+    ProductionSupervisorLoopSummary,
     StableCanaryLaunchLoopSummary,
     StableCanaryLaunchSummary,
     SystemStateObservationLoopSummary,
@@ -31,10 +33,12 @@ from carryme_worker.poller import (
     observe_system_state_once,
     poll_watchlist_once,
     run_polling_loop,
+    run_production_supervisor_cycle_once,
     run_supervised_approved_canary_scan_loop,
     run_supervised_execution_observation_loop,
     run_supervised_launch_ready_canary_cache_loop,
     run_supervised_polling_loop,
+    run_supervised_production_supervisor_loop,
     run_supervised_stable_canary_launch_loop,
     run_supervised_system_state_observation_loop,
     run_supervised_universe_scan_loop,
@@ -218,6 +222,47 @@ def build_stable_canary_launch_loop_payload(
     }
 
 
+def build_production_supervisor_cycle_payload(
+    summary: ProductionSupervisorCycleSummary,
+) -> dict[str, int | str | None]:
+    """Build a deterministic payload for one production supervisor cycle."""
+
+    return {
+        "checked_venues": summary.checked_venues,
+        "degraded_venues": summary.degraded_venues,
+        "scanned_candidates": summary.scanned_candidates,
+        "approved_candidates": summary.approved_candidates,
+        "saved_approved_snapshots": summary.saved_approved_snapshots,
+        "scanned_launch_ready_snapshots": summary.scanned_launch_ready_snapshots,
+        "launch_ready_candidates": summary.launch_ready_candidates,
+        "saved_launch_ready_snapshots": summary.saved_launch_ready_snapshots,
+        "launch_status": summary.launch_status,
+        "paper_trade_id": summary.paper_trade_id,
+        "final_pair_state": summary.final_pair_state,
+        "observed_executions": summary.observed_executions,
+        "saved_execution_observations": summary.saved_execution_observations,
+        "execution_alerts": summary.execution_alerts,
+        "database_path": summary.database_path,
+    }
+
+
+def build_production_supervisor_loop_payload(
+    summary: ProductionSupervisorLoopSummary,
+) -> dict[str, int | str]:
+    """Build a deterministic payload for the production supervisor loop."""
+
+    return {
+        "attempts": summary.attempts,
+        "successful_cycles": summary.successful_cycles,
+        "failures": summary.failures,
+        "launched": summary.launched,
+        "skipped": summary.skipped,
+        "observed_executions": summary.observed_executions,
+        "execution_alerts": summary.execution_alerts,
+        "database_path": summary.database_path,
+    }
+
+
 def build_system_state_observation_payload(
     summary: SystemStateObservationSummary,
 ) -> dict[str, int | str]:
@@ -329,6 +374,16 @@ def main() -> None:
         help="Run the signal-aware supervised stable-canary launch loop",
     )
     mode.add_argument(
+        "--run-production-supervisor-once",
+        action="store_true",
+        help="Run one end-to-end production supervisor cycle",
+    )
+    mode.add_argument(
+        "--run-production-supervisor-supervise",
+        action="store_true",
+        help="Run the signal-aware end-to-end production supervisor loop",
+    )
+    mode.add_argument(
         "--observe-executions-once",
         action="store_true",
         help="Observe recent live executions once and persist snapshots",
@@ -370,6 +425,8 @@ def main() -> None:
         args.cache_launch_ready_canary_supervise,
         args.launch_latest_stable_canary_once,
         args.launch_latest_stable_canary_supervise,
+        args.run_production_supervisor_once,
+        args.run_production_supervisor_supervise,
         args.observe_executions_once,
         args.observe_executions_supervise,
         args.observe_system_state_once,
@@ -480,6 +537,26 @@ def main() -> None:
             run_stable_canary_launch_supervised()
         )
         print(build_stable_canary_launch_loop_payload(supervised_stable_launch_summary))
+        return
+    if args.run_production_supervisor_once:
+        supervisor_summary = asyncio.run(run_production_supervisor_cycle_once(settings))
+        print(build_production_supervisor_cycle_payload(supervisor_summary))
+        return
+    if args.run_production_supervisor_supervise:
+        async def run_production_supervisor() -> ProductionSupervisorLoopSummary:
+            stop_event = asyncio.Event()
+            install_signal_handlers(
+                stop_event,
+                signals_to_handle=settings.stop_signals,
+            )
+            return await run_supervised_production_supervisor_loop(
+                settings,
+                stop_event=stop_event,
+                max_iterations=args.iterations,
+            )
+
+        supervisor_loop_summary = asyncio.run(run_production_supervisor())
+        print(build_production_supervisor_loop_payload(supervisor_loop_summary))
         return
     if args.observe_executions_once:
         observation_summary = asyncio.run(observe_live_executions_once(settings))

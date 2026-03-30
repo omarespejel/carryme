@@ -315,6 +315,41 @@ class StableCanaryLaunchLoopSummary:
 
 
 @dataclass
+class ProductionSupervisorCycleSummary:
+    """Summary emitted after one end-to-end production supervisor cycle."""
+
+    checked_venues: int
+    degraded_venues: int
+    scanned_candidates: int
+    approved_candidates: int
+    saved_approved_snapshots: int
+    scanned_launch_ready_snapshots: int
+    launch_ready_candidates: int
+    saved_launch_ready_snapshots: int
+    launch_status: Literal["launched", "skipped"]
+    paper_trade_id: int | None
+    final_pair_state: str | None
+    observed_executions: int
+    saved_execution_observations: int
+    execution_alerts: int
+    database_path: str
+
+
+@dataclass
+class ProductionSupervisorLoopSummary:
+    """Summary emitted after a supervised production supervisor loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    launched: int
+    skipped: int
+    observed_executions: int
+    execution_alerts: int
+    database_path: str
+
+
+@dataclass
 class CandidateRecordSummary:
     """Summary emitted after applying candidate thresholds to a cycle."""
 
@@ -1297,6 +1332,146 @@ async def run_supervised_stable_canary_launch_loop(
         failures=failures,
         launched=launched,
         skipped=skipped,
+        database_path=settings.database_path,
+    )
+
+
+async def run_production_supervisor_cycle_once(
+    settings: WorkerSettings,
+    *,
+    now: datetime | None = None,
+    logger: logging.Logger | None = None,
+) -> ProductionSupervisorCycleSummary:
+    """Run one end-to-end production supervisor cycle using the safe worker primitives."""
+
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    timestamp = now or datetime.now(UTC)
+
+    system_summary = await observe_system_state_once(
+        settings,
+        logger=loop_logger,
+        now=timestamp,
+    )
+    approved_summary = await scan_approved_canary_once(
+        settings,
+        logger=loop_logger,
+        now=timestamp,
+    )
+    launch_ready_summary = await cache_launch_ready_canaries_once(
+        settings,
+        logger=loop_logger,
+        now=timestamp,
+    )
+    launch_summary = await launch_latest_stable_canary_once(
+        settings,
+        now=timestamp,
+    )
+    execution_summary = await observe_live_executions_once(
+        settings,
+        logger=loop_logger,
+        now=timestamp,
+    )
+
+    return ProductionSupervisorCycleSummary(
+        checked_venues=system_summary.checked_venues,
+        degraded_venues=system_summary.degraded_venues,
+        scanned_candidates=approved_summary.scanned_candidates,
+        approved_candidates=approved_summary.approved_candidates,
+        saved_approved_snapshots=approved_summary.saved_snapshots,
+        scanned_launch_ready_snapshots=launch_ready_summary.scanned_snapshots,
+        launch_ready_candidates=launch_ready_summary.launch_ready_candidates,
+        saved_launch_ready_snapshots=launch_ready_summary.saved_snapshots,
+        launch_status=launch_summary.status,
+        paper_trade_id=launch_summary.paper_trade_id,
+        final_pair_state=launch_summary.final_pair_state,
+        observed_executions=execution_summary.observed_executions,
+        saved_execution_observations=execution_summary.saved_observations,
+        execution_alerts=execution_summary.saved_alerts,
+        database_path=settings.database_path,
+    )
+
+
+async def run_supervised_production_supervisor_loop(
+    settings: WorkerSettings,
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> ProductionSupervisorLoopSummary:
+    """Run the production supervisor loop until stopped or capped."""
+
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    supervised_stop_event = stop_event or asyncio.Event()
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    launched = 0
+    skipped = 0
+    observed_executions = 0
+    execution_alerts = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting production supervisor cycle %s", attempts)
+        try:
+            summary = await run_production_supervisor_cycle_once(
+                settings,
+                logger=loop_logger,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            if summary.launch_status == "launched":
+                launched += 1
+            else:
+                skipped += 1
+            observed_executions += summary.observed_executions
+            execution_alerts += summary.execution_alerts
+            loop_logger.info(
+                (
+                    "completed production supervisor cycle %s with launch_status=%s, "
+                    "%s approved candidates, %s launch-ready candidates, and "
+                    "%s observed executions"
+                ),
+                attempts,
+                summary.launch_status,
+                summary.approved_candidates,
+                summary.launch_ready_candidates,
+                summary.observed_executions,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(settings.stable_canary_launch_interval_seconds)
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.stable_canary_launch_max_backoff_seconds,
+                settings.stable_canary_launch_interval_seconds
+                * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "production supervisor cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(backoff_seconds)
+
+    return ProductionSupervisorLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        launched=launched,
+        skipped=skipped,
+        observed_executions=observed_executions,
+        execution_alerts=execution_alerts,
         database_path=settings.database_path,
     )
 
