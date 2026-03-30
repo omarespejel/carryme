@@ -3069,7 +3069,9 @@ def test_run_supervised_production_supervisor_loop_builds_and_reuses_stage_notif
     async def fake_sleep(seconds: float) -> None:
         _ = seconds
 
-    def build_system_notifier(settings_arg: WorkerSettings, *, logger: object | None = None) -> object:
+    def build_system_notifier(
+        settings_arg: WorkerSettings, *, logger: object | None = None
+    ) -> object:
         assert settings_arg is settings
         _ = logger
         builder_calls["system"] += 1
@@ -3083,7 +3085,9 @@ def test_run_supervised_production_supervisor_loop_builds_and_reuses_stage_notif
         builder_calls["approved"] += 1
         return approved_notifier
 
-    def build_stable_notifier(settings_arg: WorkerSettings, *, logger: object | None = None) -> object:
+    def build_stable_notifier(
+        settings_arg: WorkerSettings, *, logger: object | None = None
+    ) -> object:
         assert settings_arg is settings
         _ = logger
         builder_calls["stable"] += 1
