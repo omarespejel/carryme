@@ -474,6 +474,54 @@ def test_opportunity_universe_service_does_not_retry_http_425() -> None:
     asyncio.run(run())
 
 
+def test_opportunity_universe_service_stops_after_retry_budget_on_http_429() -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD"],
+        "paradex": ["ARB-USD-PERP"],
+    }
+    attempts: dict[tuple[str, str], int] = {}
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        key = (venue, symbol)
+        attempts[key] = attempts.get(key, 0) + 1
+        if key == ("paradex", "ARB-USD-PERP"):
+            request = httpx.Request("GET", "https://api.prod.paradex.trade/v1/markets/summary")
+            response = httpx.Response(429, request=request)
+            raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+        return _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.092,
+            20_000,
+            0.0921,
+            10_000,
+            daily_volume=250_000,
+            open_interest=400_000,
+        )
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+            snapshot_retry_attempts=2,
+            snapshot_retry_backoff_seconds=0,
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            ranking="roundtrip_pnl",
+            limit=10,
+        )
+
+        assert scan.opportunities == []
+        assert attempts[("paradex", "ARB-USD-PERP")] == 2
+
+    asyncio.run(run())
+
+
 def test_opportunity_universe_service_limits_snapshot_concurrency_by_venue() -> None:
     symbol_lists = {
         "extended": ["ARB-USD", "STRK-USD"],

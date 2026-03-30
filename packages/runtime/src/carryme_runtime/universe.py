@@ -12,6 +12,7 @@ from typing import Literal, Protocol
 
 import httpx
 from carryme_connectors import (
+    ConnectorError,
     ExtendedPublicConnector,
     HyperliquidPublicConnector,
     ParadexPublicConnector,
@@ -235,7 +236,7 @@ class OpportunityUniverseService:
         for key, task in tasks.items():
             try:
                 snapshots[key] = await task
-            except (ValueError, UpstreamDataError, httpx.HTTPError):
+            except (ValueError, UpstreamDataError, ConnectorError, httpx.HTTPError):
                 continue
         return snapshots
 
@@ -253,7 +254,7 @@ class OpportunityUniverseService:
                     return await self.fetch_snapshot(venue, symbol)
             except ValueError:
                 raise
-            except httpx.HTTPError as exc:
+            except (ConnectorError, httpx.HTTPError) as exc:
                 if attempt >= attempts or not _is_retryable_snapshot_error(exc):
                     raise
                 base_delay = self.snapshot_retry_backoff_seconds * (2 ** (attempt - 1))
@@ -285,7 +286,9 @@ def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnec
     raise ValueError(f"Unsupported venue: {venue}")
 
 
-def _is_retryable_snapshot_error(exc: httpx.HTTPError) -> bool:
+def _is_retryable_snapshot_error(exc: ConnectorError | httpx.HTTPError) -> bool:
+    if isinstance(exc, ConnectorError):
+        return exc.status_code in RETRYABLE_SNAPSHOT_STATUS_CODES
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_SNAPSHOT_STATUS_CODES
     return True
