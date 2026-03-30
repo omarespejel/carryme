@@ -102,7 +102,7 @@ class StableLaunchReadyAlertStore:
             params = (label, limit)
         else:
             params = (limit,)
-        query += " ORDER BY emitted_at DESC, rowid DESC LIMIT ?"
+        query += " ORDER BY emitted_at DESC, id DESC LIMIT ?"
 
         with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()

@@ -61,6 +61,7 @@ from carryme_runtime import (
     RouteStabilityService,
     SystemStateConfigMap,
     SystemStateService,
+    UpstreamDataError,
     build_account_preflight_configs,
     build_execution_pair_status,
     build_opportunity_record_from_universe_opportunity,
@@ -411,6 +412,15 @@ class SystemStateObservationLoopSummary:
     saved_alerts: int
     sent_notifications: int
     database_path: str
+
+
+RECOVERABLE_UNIVERSE_SCAN_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    ConnectorError,
+    UpstreamDataError,
+    httpx.HTTPError,
+    TimeoutError,
+    sqlite3.Error,
+)
 
 
 async def poll_watchlist_once(
@@ -1617,6 +1627,35 @@ async def run_supervised_universe_scan_loop(
                 break
             await _sleep_or_stop(
                 settings.universe_scan_interval_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+        except RECOVERABLE_UNIVERSE_SCAN_EXCEPTIONS as exc:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.universe_scan_max_backoff_seconds,
+                settings.universe_scan_interval_seconds * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.warning(
+                (
+                    "supervised universe scan cycle %s hit a recoverable upstream/storage "
+                    "failure (%s); backing off for %s seconds"
+                ),
+                attempts,
+                exc,
+                backoff_seconds,
+            )
+            loop_logger.debug(
+                "recoverable universe scan failure details",
+                exc_info=exc,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                backoff_seconds,
                 sleep=sleep,
                 stop_event=supervised_stop_event,
             )

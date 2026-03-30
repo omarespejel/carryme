@@ -102,7 +102,7 @@ class ApprovedCanaryAlertStore:
             params = (label, limit)
         else:
             params = (limit,)
-        query += " ORDER BY emitted_at DESC, rowid DESC LIMIT ?"
+        query += " ORDER BY emitted_at DESC, id DESC LIMIT ?"
 
         with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
@@ -111,4 +111,3 @@ class ApprovedCanaryAlertStore:
             ApprovedCanaryAlertEvent.model_validate(json.loads(event_json))
             for (event_json,) in rows
         ]
-

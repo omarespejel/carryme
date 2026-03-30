@@ -1,5 +1,8 @@
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from carryme_models import (
@@ -64,6 +67,41 @@ from carryme_storage import (
 )
 from carryme_storage.db import Database, normalize_database_url, redact_database_url
 from carryme_storage.watchlist import _parse_watchlist_payload
+
+
+class _RecordedQueryResult:
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return []
+
+
+class _RecordedQueryConnection:
+    def __init__(self, queries: list[tuple[str, tuple[object, ...] | None]]) -> None:
+        self.queries = queries
+
+    def execute(
+        self,
+        sql: str,
+        params: tuple[object, ...] | None = None,
+    ) -> _RecordedQueryResult:
+        self.queries.append((sql, params))
+        return _RecordedQueryResult()
+
+
+def _capture_recent_query(
+    store: ApprovedCanaryAlertStore | StableLaunchReadyAlertStore | SystemStateAlertStore,
+    invoke: Callable[[], object],
+) -> tuple[str, tuple[object, ...] | None]:
+    queries: list[tuple[str, tuple[object, ...] | None]] = []
+
+    @contextmanager
+    def fake_begin() -> Iterator[_RecordedQueryConnection]:
+        yield _RecordedQueryConnection(queries)
+
+    store.initialize = lambda: None  # type: ignore[method-assign]
+    cast(Any, store.database).begin = fake_begin
+    invoke()
+    assert queries
+    return queries[-1]
 
 
 def test_load_watchlist_from_pairs_object(tmp_path: Path) -> None:
@@ -2791,6 +2829,49 @@ def test_system_state_alert_store_appends_and_lists_recent(tmp_path: Path) -> No
     assert results[0].venue == "paradex"
     assert latest is not None
     assert latest.current_state.status == "maintenance"
+
+
+@pytest.mark.parametrize(
+    ("store", "kwargs"),
+    [
+        (
+            SystemStateAlertStore("postgresql://user:secret@db.example.com/carryme"),
+            {"limit": 5, "venue": "paradex"},
+        ),
+        (
+            ApprovedCanaryAlertStore("postgresql://user:secret@db.example.com/carryme"),
+            {"limit": 5, "label": "arb_extended_paradex"},
+        ),
+        (
+            StableLaunchReadyAlertStore("postgresql://user:secret@db.example.com/carryme"),
+            {"limit": 5, "label": "arb_extended_paradex"},
+        ),
+    ],
+)
+def test_alert_stores_use_explicit_primary_key_ordering_for_recent_queries(
+    store: ApprovedCanaryAlertStore | StableLaunchReadyAlertStore | SystemStateAlertStore,
+    kwargs: dict[str, object],
+) -> None:
+    if isinstance(store, SystemStateAlertStore):
+        query, params = _capture_recent_query(
+            store,
+            lambda: store.list_recent(
+                limit=cast(int, kwargs["limit"]),
+                venue=kwargs["venue"] if isinstance(kwargs["venue"], str) else None,
+            ),
+        )
+    else:
+        query, params = _capture_recent_query(
+            store,
+            lambda: store.list_recent(
+                limit=cast(int, kwargs["limit"]),
+                label=kwargs["label"] if isinstance(kwargs["label"], str) else None,
+            ),
+        )
+
+    assert "ORDER BY emitted_at DESC, id DESC LIMIT ?" in query
+    assert "rowid" not in query
+    assert params is not None
 
 
 def test_balance_snapshot_store_appends_and_filters(tmp_path: Path) -> None:
