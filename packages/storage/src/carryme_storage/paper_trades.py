@@ -1,26 +1,29 @@
-"""SQLite-backed paper trade journal storage."""
+"""Database-backed paper trade journal storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import UTC
 from pathlib import Path
 
 from carryme_models import PaperTradeEntry
+
+from carryme_storage.db import Database
 
 
 class PaperTradeStore:
     """Persist and query append-only paper trade journal entries."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the paper trade table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS paper_trade_entries (
@@ -54,8 +57,8 @@ class PaperTradeStore:
         normalized_entry = entry.model_copy(
             update={"created_at": entry.created_at.astimezone(UTC)}
         )
-        with sqlite3.connect(self.database_path) as connection:
-            cursor = connection.execute(
+        with self.database.begin() as connection:
+            row_id = connection.insert_returning_id(
                 """
                 INSERT INTO paper_trade_entries (
                     created_at,
@@ -74,7 +77,7 @@ class PaperTradeStore:
         return PaperTradeEntry.model_validate(
             {
                 **normalized_entry.model_dump(mode="json"),
-                "entry_id": cursor.lastrowid,
+                "entry_id": row_id,
             }
         )
 
@@ -82,7 +85,7 @@ class PaperTradeStore:
         """Return one paper trade entry by id."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             row = connection.execute(
                 """
                 SELECT id, entry_json
@@ -126,7 +129,7 @@ class PaperTradeStore:
             params = (limit,)
         query += " ORDER BY created_at DESC, id DESC LIMIT ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [

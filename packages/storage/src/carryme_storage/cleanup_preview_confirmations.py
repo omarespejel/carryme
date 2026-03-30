@@ -1,26 +1,28 @@
-"""SQLite-backed cleanup preview confirmation storage."""
+"""Database-backed cleanup preview confirmation storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 from carryme_models import CleanupPreviewConfirmationEntry
+
+from carryme_storage.db import Database
 
 
 class CleanupPreviewConfirmationStore:
     """Persist and query append-only cleanup preview confirmation entries."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
-        self.initialize()
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the cleanup preview confirmation table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cleanup_preview_confirmation_entries (
@@ -55,6 +57,7 @@ class CleanupPreviewConfirmationStore:
     def append(self, entry: CleanupPreviewConfirmationEntry) -> CleanupPreviewConfirmationEntry:
         """Append a cleanup preview confirmation entry and return it with its assigned id."""
 
+        self.initialize()
         normalized_label = entry.label.strip()
         if not normalized_label:
             raise ValueError("label must be non-empty")
@@ -68,8 +71,8 @@ class CleanupPreviewConfirmationStore:
                 "preview_hash": normalized_preview_hash,
             }
         )
-        with sqlite3.connect(self.database_path) as connection:
-            cursor = connection.execute(
+        with self.database.begin() as connection:
+            row_id = connection.insert_returning_id(
                 """
                 INSERT INTO cleanup_preview_confirmation_entries (
                     confirmed_at,
@@ -90,7 +93,7 @@ class CleanupPreviewConfirmationStore:
         return CleanupPreviewConfirmationEntry.model_validate(
             {
                 **normalized_entry.model_dump(mode="json"),
-                "entry_id": cursor.lastrowid,
+                "entry_id": row_id,
             }
         )
 
@@ -133,7 +136,7 @@ class CleanupPreviewConfirmationStore:
             or stored_preview_hash != normalized_preview_hash
             or stored_entry_json != normalized_entry_json
         ):
-            with sqlite3.connect(self.database_path) as connection:
+            with self.database.begin() as connection:
                 connection.execute(
                     """
                     UPDATE cleanup_preview_confirmation_entries
@@ -179,7 +182,7 @@ class CleanupPreviewConfirmationStore:
         query += " ORDER BY confirmed_at DESC, id DESC LIMIT ?"
         values.append(limit)
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, tuple(values)).fetchall()
 
         return [
@@ -211,7 +214,7 @@ class CleanupPreviewConfirmationStore:
             ORDER BY confirmed_at DESC, id DESC
             LIMIT 1
         """
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             row = connection.execute(
                 query,
                 (paper_trade_id, normalized_preview_hash),

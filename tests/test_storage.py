@@ -1,4 +1,3 @@
-import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -59,9 +58,11 @@ from carryme_storage import (
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
     WatchlistStore,
+    initialize_database_schema,
     load_watchlist,
     save_watchlist,
 )
+from carryme_storage.db import Database, normalize_database_url, redact_database_url
 from carryme_storage.watchlist import _parse_watchlist_payload
 
 
@@ -1772,6 +1773,7 @@ def test_cleanup_preview_confirmation_store_backfills_legacy_whitespace_hashes(
     tmp_path: Path,
 ) -> None:
     store = CleanupPreviewConfirmationStore(tmp_path / "history.sqlite3")
+    store.initialize()
     legacy_entry = CleanupPreviewConfirmationEntry(
         confirmed_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
         paper_trade_id=7,
@@ -1805,8 +1807,8 @@ def test_cleanup_preview_confirmation_store_backfills_legacy_whitespace_hashes(
         ),
         note="legacy cleanup confirmation",
     )
-    with sqlite3.connect(store.database_path) as connection:
-        cursor = connection.execute(
+    with store.database.begin() as connection:
+        legacy_id = connection.insert_returning_id(
             """
             INSERT INTO cleanup_preview_confirmation_entries (
                 confirmed_at,
@@ -1824,7 +1826,6 @@ def test_cleanup_preview_confirmation_store_backfills_legacy_whitespace_hashes(
                 legacy_entry.model_dump_json(),
             ),
         )
-        legacy_id = cursor.lastrowid
 
     found = store.find_latest_by_preview_hash(
         paper_trade_id=7,
@@ -1837,15 +1838,15 @@ def test_cleanup_preview_confirmation_store_backfills_legacy_whitespace_hashes(
     assert found.preview_hash == "cleanup-hash"
     assert found.preview.preview_hash == "cleanup-hash"
 
-    with sqlite3.connect(store.database_path) as connection:
-        stored = connection.execute(
+    with store.database.begin() as connection:
+        stored = connection.fetchone(
             """
             SELECT label, preview_hash, entry_json
             FROM cleanup_preview_confirmation_entries
             WHERE id = ?
             """,
             (legacy_id,),
-        ).fetchone()
+        )
 
     assert stored is not None
     stored_label, stored_preview_hash, stored_entry_json = stored
@@ -2822,3 +2823,69 @@ def test_balance_snapshot_store_appends_and_filters(tmp_path: Path) -> None:
     assert len(snapshots) == 2
     assert snapshots[0].stage == "post_close"
     assert snapshots[1].stage == "pre_open"
+
+
+def test_database_helpers_normalize_and_redact_urls() -> None:
+    assert normalize_database_url("data/carryme.sqlite3") == "sqlite:///data/carryme.sqlite3"
+    assert redact_database_url("data/carryme.sqlite3") == "data/carryme.sqlite3"
+    assert (
+        redact_database_url("postgresql+psycopg://user:secret@db.example.com/carryme")
+        == "postgresql+psycopg://***@db.example.com/carryme"
+    )
+
+
+def test_initialize_database_schema_accepts_sqlite_url(tmp_path: Path) -> None:
+    database_url = normalize_database_url(tmp_path / "schema.sqlite3")
+
+    initialize_database_schema(database_url)
+
+    with Database(database_url).begin() as connection:
+        row = connection.fetchone(
+            "SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
+            ("table", "opportunity_history"),
+        )
+
+    assert row is not None
+
+
+def test_history_store_accepts_sqlite_url(tmp_path: Path) -> None:
+    database_url = normalize_database_url(tmp_path / "history.sqlite3")
+    store = OpportunityHistoryStore(database_url)
+    record = OpportunityRecord(
+        recorded_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
+        pair=FundingPairSpec(
+            label="arb_extended_paradex",
+            left_venue="extended",
+            left_symbol="ARB-USD",
+            left_fee_profile="default",
+            right_venue="paradex",
+            right_symbol="ARB-USD-PERP",
+            right_fee_profile="pro",
+        ),
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="ARB",
+            long_venue="paradex",
+            short_venue="extended",
+            long_fee_profile="pro",
+            short_fee_profile="default",
+            gross_daily_edge=0.1,
+            entry_cost_rate=0.02,
+            round_trip_cost_rate=0.04,
+            one_day_net_edge_after_entry=0.08,
+            one_day_net_edge_after_round_trip=0.06,
+            break_even_days_entry=0.2,
+            break_even_days_round_trip=0.4,
+            capacity=CapacityEstimate(
+                short_bid_notional=500.0,
+                long_ask_notional=500.0,
+                max_entry_notional=500.0,
+                limiting_venue="paradex",
+            ),
+        ),
+    )
+
+    store.append(record)
+    results = store.list_recent(limit=10)
+
+    assert len(results) == 1
+    assert results[0].pair.label == "arb_extended_paradex"

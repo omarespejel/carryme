@@ -1,25 +1,28 @@
-"""SQLite-backed balance snapshot storage."""
+"""Database-backed balance snapshot storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 from carryme_models import VenueBalanceSnapshot
+
+from carryme_storage.db import Database
 
 
 class BalanceSnapshotStore:
     """Persist and query append-only venue balance snapshots."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the balance snapshot table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS balance_snapshot_entries (
@@ -50,8 +53,8 @@ class BalanceSnapshotStore:
         """Append one balance snapshot and return it with its assigned id."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
-            cursor = connection.execute(
+        with self.database.begin() as connection:
+            row_id = connection.insert_returning_id(
                 """
                 INSERT INTO balance_snapshot_entries (
                     captured_at,
@@ -71,7 +74,7 @@ class BalanceSnapshotStore:
                     snapshot.model_dump_json(),
                 ),
             )
-        return snapshot.model_copy(update={"snapshot_id": cursor.lastrowid})
+        return snapshot.model_copy(update={"snapshot_id": row_id})
 
     def list_recent(
         self,
@@ -108,7 +111,7 @@ class BalanceSnapshotStore:
         query += " ORDER BY captured_at DESC, id DESC LIMIT ?"
         params.append(limit)
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
 
         return [

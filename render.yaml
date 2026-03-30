@@ -1,0 +1,199 @@
+databases:
+  - name: carryme-postgres
+    databaseName: carryme
+    user: carryme
+
+services:
+  - type: web
+    name: carryme-api
+    runtime: python
+    rootDir: .
+    plan: starter
+    buildCommand: pip install uv && uv sync --frozen --all-packages
+    startCommand: sh -c 'uv run alembic upgrade head && uv run carryme-api'
+    healthCheckPath: /ready
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: carryme-postgres
+          property: connectionString
+      - key: CARRYME_API_HOST
+        value: 0.0.0.0
+      - key: CARRYME_API_ENVIRONMENT
+        value: production
+      - key: CARRYME_WORKER_ENVIRONMENT
+        value: production
+      - key: CARRYME_API_EXTENDED_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_EXTENDED_API_KEY
+        sync: false
+      - key: CARRYME_API_EXTENDED_STARK_PRIVATE_KEY
+        sync: false
+      - key: CARRYME_API_PARADEX_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_PARADEX_ACCOUNT_ADDRESS
+        sync: false
+      - key: CARRYME_API_PARADEX_PRIVATE_KEY
+        sync: false
+      - key: CARRYME_API_PARADEX_BEARER_TOKEN
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_VAULT_ADDRESS
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY
+        sync: false
+
+  - type: worker
+    name: carryme-universe-scan
+    runtime: python
+    rootDir: .
+    plan: starter
+    buildCommand: pip install uv && uv sync --frozen --all-packages
+    startCommand: uv run carryme-worker --scan-universe-supervise
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: carryme-postgres
+          property: connectionString
+      - key: CARRYME_WORKER_ENVIRONMENT
+        value: production
+
+  - type: worker
+    name: carryme-approved-canary-scan
+    runtime: python
+    rootDir: .
+    plan: starter
+    buildCommand: pip install uv && uv sync --frozen --all-packages
+    startCommand: uv run carryme-worker --scan-approved-canary-supervise
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: carryme-postgres
+          property: connectionString
+      - key: CARRYME_WORKER_ENVIRONMENT
+        value: production
+      - key: CARRYME_API_EXTENDED_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_PARADEX_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_LIVE_ENABLED
+        sync: false
+
+  - type: worker
+    name: carryme-launch-ready-cache
+    runtime: python
+    rootDir: .
+    plan: starter
+    buildCommand: pip install uv && uv sync --frozen --all-packages
+    startCommand: uv run carryme-worker --cache-launch-ready-canary-supervise
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: carryme-postgres
+          property: connectionString
+      - key: CARRYME_WORKER_ENVIRONMENT
+        value: production
+      - key: CARRYME_API_EXTENDED_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_PARADEX_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_WORKER_STABLE_LAUNCH_READY_ALERT_WEBHOOK_URL
+        sync: false
+
+  - type: worker
+    name: carryme-stable-launch
+    runtime: python
+    rootDir: .
+    plan: starter
+    buildCommand: pip install uv && uv sync --frozen --all-packages
+    startCommand: uv run carryme-worker --launch-latest-stable-canary-supervise
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: carryme-postgres
+          property: connectionString
+      - key: CARRYME_WORKER_ENVIRONMENT
+        value: production
+      - key: CARRYME_API_EXTENDED_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_EXTENDED_API_KEY
+        sync: false
+      - key: CARRYME_API_EXTENDED_STARK_PRIVATE_KEY
+        sync: false
+      - key: CARRYME_API_PARADEX_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_PARADEX_ACCOUNT_ADDRESS
+        sync: false
+      - key: CARRYME_API_PARADEX_PRIVATE_KEY
+        sync: false
+      - key: CARRYME_API_PARADEX_BEARER_TOKEN
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_VAULT_ADDRESS
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY
+        sync: false
+
+  - type: worker
+    name: carryme-system-state
+    runtime: python
+    rootDir: .
+    plan: starter
+    buildCommand: pip install uv && uv sync --frozen --all-packages
+    startCommand: uv run carryme-worker --observe-system-state-supervise
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: carryme-postgres
+          property: connectionString
+      - key: CARRYME_WORKER_ENVIRONMENT
+        value: production
+      - key: CARRYME_WORKER_SYSTEM_STATE_ALERT_WEBHOOK_URL
+        sync: false
+
+  - type: worker
+    name: carryme-execution-monitor
+    runtime: python
+    rootDir: .
+    plan: starter
+    buildCommand: pip install uv && uv sync --frozen --all-packages
+    startCommand: uv run carryme-worker --observe-executions-supervise
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: carryme-postgres
+          property: connectionString
+      - key: CARRYME_WORKER_ENVIRONMENT
+        value: production
+      - key: CARRYME_API_EXTENDED_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_EXTENDED_API_KEY
+        sync: false
+      - key: CARRYME_API_EXTENDED_STARK_PRIVATE_KEY
+        sync: false
+      - key: CARRYME_API_PARADEX_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_PARADEX_ACCOUNT_ADDRESS
+        sync: false
+      - key: CARRYME_API_PARADEX_PRIVATE_KEY
+        sync: false
+      - key: CARRYME_API_PARADEX_BEARER_TOKEN
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_LIVE_ENABLED
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_VAULT_ADDRESS
+        sync: false
+      - key: CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY
+        sync: false
+      - key: CARRYME_WORKER_EXECUTION_ALERT_WEBHOOK_URL
+        sync: false

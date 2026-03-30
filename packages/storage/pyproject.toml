@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "carryme-models",
+  "psycopg[binary]>=3.2,<4",
+  "sqlalchemy>=2.0,<3",
 ]
 
 [tool.hatch.build.targets.wheel]

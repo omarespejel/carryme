@@ -1,13 +1,14 @@
-"""SQLite-backed opportunity history storage."""
+"""Database-backed opportunity history storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from threading import Lock
 
 from carryme_models import OpportunityRecord
+
+from carryme_storage.db import Database
 
 
 def _normalize_label(label: str | None) -> str | None:
@@ -32,7 +33,10 @@ class OpportunityHistoryStore:
     """Persist and query scored opportunity history."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
         self._initialized = False
         self._initialize_lock = Lock()
 
@@ -45,8 +49,7 @@ class OpportunityHistoryStore:
         with self._initialize_lock:
             if self._initialized:
                 return
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(self.database_path) as connection:
+            with self.database.begin() as connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS opportunity_history (
@@ -80,7 +83,7 @@ class OpportunityHistoryStore:
         normalized_label = _normalize_label(record.pair.label)
         pair_payload = record.pair.model_dump()
         pair_payload["label"] = normalized_label
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 INSERT INTO opportunity_history (
@@ -119,7 +122,7 @@ class OpportunityHistoryStore:
             params = (limit,)
         query += " ORDER BY recorded_at DESC, id DESC LIMIT ?"
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
         return [
@@ -137,13 +140,16 @@ class OpportunityHistoryStore:
         """Return a cheap fingerprint for cache invalidation."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
-            count, latest_id, latest_recorded_at = connection.execute(
+        with self.database.begin() as connection:
+            row = connection.execute(
                 """
                 SELECT COUNT(*), MAX(id), MAX(recorded_at)
                 FROM opportunity_history
                 """
             ).fetchone()
+        if row is None:
+            return (0, None, None)
+        count, latest_id, latest_recorded_at = row
         return (
             int(count or 0),
             int(latest_id) if latest_id is not None else None,

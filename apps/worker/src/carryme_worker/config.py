@@ -5,6 +5,7 @@ from typing import Literal
 
 from carryme_models import SUPPORTED_UNIVERSE_VENUES
 from carryme_normalizers import get_fee_profile
+from carryme_storage.db import redact_database_url
 from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -96,7 +97,16 @@ class WorkerSettings(BaseSettings):
     approved_canary_scan_exclude_symbols: tuple[str, ...] = ()
     approved_canary_scan_exclude_tags: tuple[str, ...] = ("meme", "political")
     stop_signals: tuple[Literal["SIGINT", "SIGTERM"], ...] = ("SIGINT", "SIGTERM")
-    database_path: str = "data/carryme.sqlite3"
+    database_path: str = Field(
+        default="data/carryme.sqlite3",
+        validation_alias=AliasChoices(
+            "database_path",
+            "CARRYME_WORKER_DATABASE_PATH",
+            "CARRYME_WORKER_DATABASE_URL",
+            "CARRYME_DATABASE_URL",
+            "DATABASE_URL",
+        ),
+    )
     watchlist_path: str = "config/watchlists/default.json"
     execution_observation_limit: int = Field(default=20, gt=0)
     extended_live_enabled: bool = Field(
@@ -245,3 +255,9 @@ class WorkerSettings(BaseSettings):
                 "Missing required live credentials for enabled venues: " + ", ".join(missing)
             )
         return self
+
+    @property
+    def database_target(self) -> str:
+        """Return a log-safe identifier for the configured database."""
+
+        return redact_database_url(self.database_path)

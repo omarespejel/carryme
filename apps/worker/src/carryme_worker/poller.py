@@ -466,7 +466,7 @@ async def poll_watchlist_once(
         watched_pairs=len(pairs),
         saved_records=saved_records,
         failed_records=failed_records,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
         records=records,
     )
 
@@ -551,8 +551,8 @@ async def scan_funding_universe_once(
         scanned_opportunities=len(scan.opportunities),
         saved_records=len(persisted_records),
         alert_events=alert_events,
-        database_path=settings.database_path,
-        records=persisted_records,
+        database_path=settings.database_target,
+        records=records,
     )
 
 
@@ -828,7 +828,7 @@ async def scan_approved_canary_once(
         saved_snapshots=len(snapshots),
         alert_events=len(alerts),
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
         snapshots=snapshots,
         alerts=alerts,
     )
@@ -977,7 +977,7 @@ async def cache_launch_ready_canaries_once(
         saved_snapshots=len(snapshots),
         alert_events=len(alerts),
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
         snapshots=snapshots,
         alerts=alerts,
     )
@@ -1088,7 +1088,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
         saved_snapshots=saved_snapshots,
         alert_events=alert_events,
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -1097,7 +1097,7 @@ def _build_api_settings_from_worker_settings(settings: WorkerSettings) -> ApiSet
 
     return ApiSettings(
         environment=settings.environment,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
         watchlist_path=settings.watchlist_path,
         extended_live_enabled=settings.extended_live_enabled,
         extended_api_key=settings.extended_api_key,
@@ -1151,7 +1151,7 @@ async def launch_latest_stable_canary_once(
         if exc.status_code in {404, 409}:
             return StableCanaryLaunchSummary(
                 status="skipped",
-                database_path=settings.database_path,
+                database_path=settings.database_target,
                 detail=exc.detail,
             )
         raise
@@ -1161,7 +1161,7 @@ async def launch_latest_stable_canary_once(
         if previous_launch is not None:
             return StableCanaryLaunchSummary(
                 status="skipped",
-                database_path=settings.database_path,
+                database_path=settings.database_target,
                 label=snapshot.label,
                 launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
                 approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
@@ -1238,7 +1238,7 @@ async def launch_latest_stable_canary_once(
         if exc.status_code in {404, 409}:
             return StableCanaryLaunchSummary(
                 status="skipped",
-                database_path=settings.database_path,
+                database_path=settings.database_target,
                 label=stability.snapshot.label,
                 launch_ready_snapshot_id=stability.snapshot.launch_ready_snapshot_id,
                 approved_snapshot_id=stability.snapshot.approved_snapshot.snapshot_id,
@@ -1259,7 +1259,7 @@ async def launch_latest_stable_canary_once(
     )
     return StableCanaryLaunchSummary(
         status="launched",
-        database_path=settings.database_path,
+        database_path=settings.database_target,
         label=stability.snapshot.label,
         launch_ready_snapshot_id=stability.snapshot.launch_ready_snapshot_id,
         approved_snapshot_id=stability.snapshot.approved_snapshot.snapshot_id,
@@ -1340,7 +1340,7 @@ async def run_supervised_stable_canary_launch_loop(
         failures=failures,
         launched=launched,
         skipped=skipped,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -1409,7 +1409,7 @@ async def run_production_supervisor_cycle_once(
             + launch_ready_summary.sent_notifications
             + execution_summary.sent_notifications
         ),
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -1550,7 +1550,7 @@ async def run_supervised_production_supervisor_loop(
         observed_executions=observed_executions,
         execution_alerts=execution_alerts,
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -1650,7 +1650,7 @@ async def run_supervised_universe_scan_loop(
         scanned_opportunities=scanned_opportunities,
         saved_records=saved_records,
         alert_events=alert_events,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -1766,7 +1766,7 @@ async def run_supervised_approved_canary_scan_loop(
         saved_snapshots=saved_snapshots,
         alert_events=alert_events,
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -1815,7 +1815,7 @@ async def observe_system_state_once(
         degraded_venues=degraded_venues,
         saved_alerts=len(alerts),
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
         states=states,
         alerts=alerts,
     )
@@ -1915,7 +1915,7 @@ async def run_supervised_system_state_observation_loop(
         degraded_venues=degraded_venues,
         saved_alerts=saved_alerts,
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -2290,7 +2290,7 @@ async def observe_live_executions_once(
         saved_observations=saved_observations,
         saved_alerts=saved_alerts,
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -2411,7 +2411,7 @@ async def run_supervised_execution_observation_loop(
         saved_observations=saved_observations,
         saved_alerts=saved_alerts,
         sent_notifications=sent_notifications,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -2503,7 +2503,7 @@ async def run_polling_loop(
         successful_cycles=successful_cycles,
         failures=failures,
         saved_records=saved_records,
-        database_path=settings.database_path,
+        database_path=settings.database_target,
     )
 
 
@@ -2652,8 +2652,8 @@ async def run_supervised_polling_loop(
         successful_cycles=successful_cycles,
         failures=failures,
         saved_records=saved_records,
-        database_path=settings.database_path,
         alert_events=alert_events,
+        database_path=settings.database_target,
     )
 
 

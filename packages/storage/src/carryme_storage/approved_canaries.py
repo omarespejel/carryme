@@ -1,25 +1,28 @@
-"""SQLite-backed approved canary snapshot storage."""
+"""Database-backed approved canary snapshot storage."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 from carryme_models import ApprovedCanarySnapshot
+
+from carryme_storage.db import Database
 
 
 class ApprovedCanaryStore:
     """Persist and query approved canary snapshots."""
 
     def __init__(self, database_path: str | Path) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            Path(database_path) if "://" not in str(database_path) else str(database_path)
+        )
+        self.database = Database(database_path)
 
     def initialize(self) -> None:
         """Create the approved canary table if it does not exist."""
 
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS approved_canary_snapshots (
@@ -47,8 +50,8 @@ class ApprovedCanaryStore:
         """Append one approved canary snapshot."""
 
         self.initialize()
-        with sqlite3.connect(self.database_path) as connection:
-            cursor = connection.execute(
+        with self.database.begin() as connection:
+            row_id = connection.insert_returning_id(
                 """
                 INSERT INTO approved_canary_snapshots (
                     captured_at,
@@ -65,7 +68,7 @@ class ApprovedCanaryStore:
         return ApprovedCanarySnapshot.model_validate(
             {
                 **snapshot.model_dump(mode="json"),
-                "snapshot_id": cursor.lastrowid,
+                "snapshot_id": row_id,
             }
         )
 
@@ -89,7 +92,7 @@ class ApprovedCanaryStore:
         query += " ORDER BY captured_at DESC LIMIT ?"
         values.append(limit)
 
-        with sqlite3.connect(self.database_path) as connection:
+        with self.database.begin() as connection:
             rows = connection.execute(query, tuple(values)).fetchall()
 
         return [

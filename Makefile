@@ -1,4 +1,4 @@
-.PHONY: sync lint format typecheck test check run-api run-worker
+.PHONY: sync lint format typecheck test check db-upgrade run-api run-worker worker-ready
 
 sync:
 	uv sync --all-packages --group dev
@@ -17,8 +17,14 @@ test:
 
 check: lint typecheck test
 
+db-upgrade:
+	uv run alembic upgrade head
+
 run-api:
 	uv run carryme-api
 
 run-worker:
 	uv run carryme-worker
+
+worker-ready:
+	uv run carryme-worker --ready

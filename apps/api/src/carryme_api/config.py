@@ -5,7 +5,8 @@ from functools import lru_cache
 from pathlib import Path
 
 from carryme_runtime.preflight import LIVE_EXECUTION_VENUE_SPECS
-from pydantic import field_validator, model_validator
+from carryme_storage.db import redact_database_url
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -15,7 +16,16 @@ class ApiSettings(BaseSettings):
     """Environment-backed API settings."""
 
     environment: str = "development"
-    database_path: str = "data/carryme.sqlite3"
+    database_path: str = Field(
+        default="data/carryme.sqlite3",
+        validation_alias=AliasChoices(
+            "database_path",
+            "CARRYME_API_DATABASE_PATH",
+            "CARRYME_API_DATABASE_URL",
+            "CARRYME_DATABASE_URL",
+            "DATABASE_URL",
+        ),
+    )
     watchlist_path: str = "config/watchlists/default.json"
     extended_live_enabled: bool = False
     extended_api_key: str | None = None
@@ -66,6 +76,12 @@ class ApiSettings(BaseSettings):
                     ", ".join(missing),
                 )
         return self
+
+    @property
+    def database_target(self) -> str:
+        """Return a log-safe identifier for the configured database."""
+
+        return redact_database_url(self.database_path)
 
 
 @lru_cache

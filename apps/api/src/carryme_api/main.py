@@ -17,14 +17,14 @@ def get_server_host() -> str:
 def get_server_port() -> int:
     """Return the bind port for the API process."""
 
-    raw_port = os.getenv("CARRYME_API_PORT")
+    raw_port = os.getenv("PORT") or os.getenv("CARRYME_API_PORT")
     if raw_port is None:
         return DEFAULT_PORT
     return int(raw_port)
 
 
 def main() -> None:
-    """Run the FastAPI development server."""
+    """Run the FastAPI service."""
 
     uvicorn.run(
         "carryme_api.app:app",

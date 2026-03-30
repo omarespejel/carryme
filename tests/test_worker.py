@@ -61,6 +61,8 @@ from carryme_storage import (
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
 )
+from carryme_storage.db import DatabaseConnection
+from carryme_storage.db import redact_database_url
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
     build_approved_canary_scan_loop_payload,
@@ -75,6 +77,7 @@ from carryme_worker.main import (
     build_loop_payload,
     build_production_supervisor_cycle_payload,
     build_production_supervisor_loop_payload,
+    build_readiness_payload,
     build_stable_canary_launch_loop_payload,
     build_stable_canary_launch_payload,
     build_system_state_observation_loop_payload,
@@ -271,6 +274,34 @@ def test_worker_health_payload(monkeypatch: pytest.MonkeyPatch) -> None:
             "environment": "test",
         },
         "status": "ok",
+    }
+
+
+def test_worker_database_target_redacts_urls() -> None:
+    settings = WorkerSettings(
+        database_path="postgresql+psycopg://user:secret@db.example.com/carryme"
+    )
+
+    assert settings.database_target == redact_database_url(settings.database_path)
+    assert settings.database_target == "postgresql+psycopg://***@db.example.com/carryme"
+
+
+def test_worker_readiness_payload(tmp_path: Path) -> None:
+    payload = build_readiness_payload(
+        WorkerSettings(environment="test", database_path=str(tmp_path / "ready.sqlite3"))
+    )
+
+    assert payload.model_dump() == {
+        "service": {
+            "name": "carryme-worker",
+            "version": "0.1.0",
+            "environment": "test",
+        },
+        "status": "ready",
+        "database": {
+            "target": str(tmp_path / "ready.sqlite3"),
+            "ready": True,
+        },
     }
 
 
@@ -4537,7 +4568,7 @@ def test_observe_live_executions_once_retries_without_duplicate_alerts_after_ato
 
         def _append_on_connection(
             self,
-            connection: sqlite3.Connection,
+            connection: DatabaseConnection,
             entry: ExecutionObservationEntry,
         ) -> ExecutionObservationEntry:
             self.calls += 1
