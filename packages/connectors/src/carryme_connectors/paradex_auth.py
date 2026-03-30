@@ -76,11 +76,13 @@ class ParadexJwtTokenProvider:
         system_config_path: str = PARADEX_SYSTEM_CONFIG_PATH,
         auth_path: str = PARADEX_AUTH_PATH,
         token_lifetime_seconds: int = PARADEX_AUTH_TOKEN_LIFETIME_SECONDS,
+        token_usage: str | None = None,
     ) -> None:
         self._base_url = base_url
         self._system_config_path = system_config_path
         self._auth_path = auth_path
         self._token_lifetime_seconds = token_lifetime_seconds
+        self._token_usage = token_usage.strip().lower() if token_usage else None
 
     async def fetch_system_config(
         self,
@@ -112,6 +114,7 @@ class ParadexJwtTokenProvider:
         auth_path = build_paradex_auth_request_path(
             private_key=private_key,
             auth_path=self._auth_path,
+            token_usage=self._token_usage,
         )
         headers = build_paradex_auth_headers(
             account_address=account_address,
@@ -158,12 +161,16 @@ def build_paradex_auth_request_path(
     *,
     private_key: str,
     auth_path: str = PARADEX_AUTH_PATH,
+    token_usage: str | None = None,
 ) -> str:
     """Return the Paradex auth endpoint path that includes the subkey public key."""
 
     private_key_int = _parse_hex_value(private_key, "Paradex private key")
     public_key_int = get_public_key(private_key_int)
-    return f"{auth_path}/{hex(public_key_int)}"
+    path = f"{auth_path}/{hex(public_key_int)}"
+    if token_usage:
+        return f"{path}?token_usage={token_usage.strip().lower()}"
+    return path
 
 
 def build_paradex_auth_headers(

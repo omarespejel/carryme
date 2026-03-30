@@ -3776,6 +3776,57 @@ def test_paradex_jwt_token_provider_fetches_config_and_authenticates() -> None:
     asyncio.run(run())
 
 
+def test_build_paradex_auth_request_path_supports_interactive_usage() -> None:
+    default_path = build_paradex_auth_request_path(private_key="0x456")
+    auth_path = build_paradex_auth_request_path(
+        private_key="0x456",
+        token_usage="interactive",
+    )
+
+    assert auth_path.startswith("/v1/auth/")
+    assert auth_path == f"{default_path}?token_usage=interactive"
+
+
+def test_paradex_jwt_token_provider_supports_interactive_auth_path() -> None:
+    requests: list[str] = []
+    auth_path = build_paradex_auth_request_path(
+        private_key="0x456",
+        token_usage="interactive",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.raw_path.decode('utf-8')}")
+        if request.url.path == "/v1/system/config":
+            return httpx.Response(
+                200,
+                json={"starknet_chain_id": "PRIVATE_SN_PARACLEAR_MAINNET"},
+            )
+        if request.url.raw_path.decode("utf-8") == auth_path:
+            return httpx.Response(200, json={"jwt_token": "interactive-jwt"})
+        raise AssertionError(f"Unexpected request path: {request.url.raw_path.decode('utf-8')}")
+
+    async def run() -> None:
+        provider = ParadexJwtTokenProvider(token_usage="interactive")
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(
+            base_url="https://api.prod.paradex.trade",
+            transport=transport,
+        ) as client:
+            token = await provider.issue_jwt_token(
+                account_address="0x123",
+                private_key="0x456",
+                client=client,
+                now=1_700_000_000,
+            )
+        assert token == "interactive-jwt"
+        assert requests == [
+            "GET /v1/system/config",
+            f"POST {auth_path}",
+        ]
+
+    asyncio.run(run())
+
+
 def test_build_signed_paradex_order_payload_adds_signature_fields() -> None:
     payload = build_signed_paradex_order_payload(
         account_address="0x123",
@@ -4031,6 +4082,269 @@ def test_paradex_live_execution_service_submits_confirmed_preview(
         assert len(entry.legs[0].response_payload["attempt_history"]) == 1
         assert entry.legs[0].response_payload["observed_order_state"]["derived_state"] == "filled"
         assert seen_requests[0]["client_id"] == "carryme-pt7-paradex-buy"
+
+    asyncio.run(run())
+
+
+def test_paradex_live_execution_service_uses_interactive_auth_for_retail_fee_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_auth_paths: list[str] = []
+    seen_order_auth_headers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw_path = request.url.raw_path.decode("utf-8")
+        if request.url.path == "/v1/system/config":
+            return httpx.Response(
+                200,
+                json={"starknet_chain_id": "PRIVATE_SN_PARACLEAR_MAINNET"},
+            )
+        if raw_path.endswith("?token_usage=interactive"):
+            seen_auth_paths.append(raw_path)
+            return httpx.Response(200, json={"jwt_token": "interactive-jwt"})
+        if request.url.path.startswith("/v1/auth/"):
+            seen_auth_paths.append(raw_path)
+            return httpx.Response(200, json={"jwt_token": "default-jwt"})
+        if request.url.path == "/v1/orders":
+            seen_order_auth_headers.append(request.headers["Authorization"])
+            payload = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "order-1",
+                    "status": "NEW",
+                    "client_id": payload["client_id"],
+                },
+            )
+        assert request.url.path == "/v1/orders/order-1"
+        return httpx.Response(
+            200,
+            json={
+                "id": "order-1",
+                "client_id": "carryme-pt7-paradex-buy",
+                "status": "CLOSED",
+                "avg_fill_price": "0.0923",
+                "remaining_size": "0",
+                "size": "10845.9",
+            },
+        )
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    confirmation = PreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=7,
+        label="arb_extended_paradex_retail",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=7,
+            label="arb_extended_paradex_retail",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="retail",
+                    side="buy",
+                    target_notional=1000.0,
+                    quantity=10845.9,
+                    quantity_text="10845.90000000",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0923,
+                    worst_price_text="0.09230000",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[
+                        "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                        "CARRYME_API_PARADEX_PRIVATE_KEY",
+                    ],
+                    auth_scheme="main account address + subkey private key",
+                    payload={
+                        "market": "ARB-USD-PERP",
+                        "side": "BUY",
+                        "type": "LIMIT",
+                        "size": "10845.9",
+                        "price": "0.0923",
+                        "instruction": "IOC",
+                        "client_id": "carryme-pt7-paradex-buy",
+                    },
+                    notes=[],
+                )
+            ],
+        ),
+    )
+    paper_trade = PaperTradeEntry(
+        entry_id=7,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex_retail",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 59, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.002,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=1000.0,
+            target_notional=1000.0,
+            capacity_fraction=1.0,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="retail",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    async def run() -> None:
+        service = ParadexLiveExecutionService(
+            account_address="0xabc",
+            private_key="0x123",
+            adaptive_retry_attempts=1,
+            adaptive_retry_poll_attempts=1,
+        )
+        entry = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            executed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        )
+        assert entry.legs[0].auth_usage == "interactive"
+
+    asyncio.run(run())
+
+    assert any("?token_usage=interactive" in path for path in seen_auth_paths)
+    assert seen_order_auth_headers == ["Bearer interactive-jwt"]
+
+
+def test_paradex_live_execution_service_rejects_interactive_auth_with_non_jwt_provider() -> None:
+    class StubTokenProvider:
+        async def fetch_system_config(
+            self,
+            client: httpx.AsyncClient | None = None,
+        ) -> object:
+            raise AssertionError("should not fetch system config when interactive auth is invalid")
+
+        async def issue_jwt_token(
+            self,
+            *,
+            account_address: str,
+            private_key: str,
+            client: httpx.AsyncClient | None = None,
+            now: int | None = None,
+        ) -> str:
+            raise AssertionError("should not issue JWT when interactive auth is invalid")
+
+    confirmation = PreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=7,
+        label="arb_extended_paradex_retail",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=7,
+            label="arb_extended_paradex_retail",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="retail",
+                    side="buy",
+                    target_notional=1000.0,
+                    quantity=10845.9,
+                    quantity_text="10845.90000000",
+                    reference_price=0.0922,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0923,
+                    worst_price_text="0.09230000",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[
+                        "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                        "CARRYME_API_PARADEX_PRIVATE_KEY",
+                    ],
+                    auth_scheme="main account address + subkey private key",
+                    payload={
+                        "market": "ARB-USD-PERP",
+                        "side": "BUY",
+                        "type": "LIMIT",
+                        "size": "10845.9",
+                        "price": "0.0923",
+                        "instruction": "IOC",
+                        "client_id": "carryme-pt7-paradex-buy",
+                    },
+                    notes=[],
+                )
+            ],
+        ),
+    )
+    paper_trade = PaperTradeEntry(
+        entry_id=7,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex_retail",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 59, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.002,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=1000.0,
+            target_notional=1000.0,
+            capacity_fraction=1.0,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="retail",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+
+    async def run() -> None:
+        service = ParadexLiveExecutionService(
+            account_address="0xabc",
+            private_key="0x123",
+            token_provider=StubTokenProvider(),
+        )
+        with pytest.raises(
+            ValueError,
+            match="Interactive Paradex auth requires ParadexJwtTokenProvider",
+        ):
+            await service.submit_confirmed_preview(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+                executed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+            )
 
     asyncio.run(run())
 
