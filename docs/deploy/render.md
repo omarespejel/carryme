@@ -110,7 +110,7 @@ Do not put webhook URLs in the shared group either. Alert endpoints are service-
 |---|---|---|---|---|
 | `carryme-api` | yes | yes | all venue secrets if you want operator-triggered live actions from the API | no |
 | `carryme-universe-scan` | yes | no | no | no |
-| `carryme-approved-canary-scan` | yes | yes | no | no |
+| `carryme-approved-canary-scan` | yes | yes | no | `CARRYME_WORKER_APPROVED_CANARY_ALERT_WEBHOOK_URL` (service-level secret only) |
 | `carryme-launch-ready-cache` | yes | yes | no | `CARRYME_WORKER_STABLE_LAUNCH_READY_ALERT_WEBHOOK_URL` (service-level secret only) |
 | `carryme-stable-launch` | yes | yes | yes, for the venues you intend to launch live on | no |
 | `carryme-system-state` | yes | no | no | `CARRYME_WORKER_SYSTEM_STATE_ALERT_WEBHOOK_URL` (service-level secret only) |
