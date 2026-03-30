@@ -270,6 +270,31 @@ def get_route_stability_service(
     return _route_stability_service_for_path(settings.database_path)
 
 
+def _validate_route_stability_filters(
+    *,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+) -> None:
+    """Validate shared route-stability filter inputs."""
+
+    if not 0.0 <= min_route_stability_weight <= 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail="min_route_stability_weight must be between 0 and 1",
+        )
+    if not 0.0 <= min_route_presence_ratio <= 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail="min_route_presence_ratio must be between 0 and 1",
+        )
+    if min_route_samples < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="min_route_samples must be non-negative",
+        )
+
+
 def get_candidate_alert_store(
     settings: Annotated[ApiSettings, Depends(get_api_settings)],
 ) -> CandidateAlertStore:
@@ -3220,6 +3245,11 @@ def create_app() -> FastAPI:
     ) -> FundingUniverseScan:
         try:
             selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            _validate_route_stability_filters(
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+            )
             return await service.scan(
                 venues=selected_venues,
                 ranking=ranking,  # type: ignore[arg-type]
@@ -3271,6 +3301,11 @@ def create_app() -> FastAPI:
     ) -> FundingUniversePortfolioPlan:
         try:
             selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            _validate_route_stability_filters(
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+            )
             scan = await service.scan(
                 venues=selected_venues,
                 ranking=ranking,  # type: ignore[arg-type]

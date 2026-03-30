@@ -158,9 +158,9 @@ class ExecutionQualityService:
         for summary in self.build_index().values():
             if normalized_symbol and summary.canonical_symbol.upper() != normalized_symbol:
                 continue
-            if normalized_short_venue and summary.short_venue != normalized_short_venue:
+            if normalized_short_venue and summary.short_venue.lower() != normalized_short_venue:
                 continue
-            if normalized_long_venue and summary.long_venue != normalized_long_venue:
+            if normalized_long_venue and summary.long_venue.lower() != normalized_long_venue:
                 continue
             if summary.sample_size < min_sample_size:
                 continue

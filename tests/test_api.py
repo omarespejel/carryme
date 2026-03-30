@@ -571,11 +571,49 @@ def test_route_stability_endpoint_uses_service_dependency() -> None:
 
 def test_route_stability_service_provider_uses_shared_history_store(tmp_path: Path) -> None:
     settings = ApiSettings(database_path=str(tmp_path / "stability.sqlite3"))
-    history_store = app_module._history_store_for_path(settings.database_path)
+    history_store = get_history_store(settings)
     service = get_route_stability_service(settings)
 
-    assert service is app_module._route_stability_service_for_path(settings.database_path)
+    assert service is get_route_stability_service(settings)
     assert service.history_store is history_store
+
+
+def test_funding_universe_endpoint_rejects_invalid_route_stability_filters() -> None:
+    class StubUniverseService:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            raise AssertionError("scan should not run for invalid route-stability filters")
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe",
+            params={"min_route_stability_weight": 1.2},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "min_route_stability_weight must be between 0 and 1"
+
+
+def test_funding_universe_portfolio_endpoint_rejects_invalid_route_stability_filters() -> None:
+    class StubUniverseService:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            raise AssertionError("scan should not run for invalid route-stability filters")
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/portfolio",
+            params={"min_route_presence_ratio": -0.1},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "min_route_presence_ratio must be between 0 and 1"
 
 
 def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:
