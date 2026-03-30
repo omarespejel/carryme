@@ -398,6 +398,8 @@ def _pick_external_reference(
 
 
 def _paradex_auth_usage_for_fee_profile(fee_profile: str) -> str | None:
+    """Map retail Paradex flow to the interactive JWT auth path."""
+
     normalized = fee_profile.strip().lower()
     if normalized == "retail":
         return "interactive"
@@ -410,8 +412,27 @@ def _token_provider_for_auth_usage(
     auth_usage: str | None,
 ) -> ParadexLiveTokenProvider:
     if auth_usage == "interactive":
-        return ParadexJwtTokenProvider(token_usage="interactive")
+        return _clone_paradex_token_provider(
+            default_provider=default_provider,
+            token_usage="interactive",
+        )
     return default_provider
+
+
+def _clone_paradex_token_provider(
+    *,
+    default_provider: ParadexLiveTokenProvider,
+    token_usage: str,
+) -> ParadexLiveTokenProvider:
+    if not isinstance(default_provider, ParadexJwtTokenProvider):
+        return default_provider
+    return ParadexJwtTokenProvider(
+        base_url=default_provider._base_url,
+        system_config_path=default_provider._system_config_path,
+        auth_path=default_provider._auth_path,
+        token_lifetime_seconds=default_provider._token_lifetime_seconds,
+        token_usage=token_usage,
+    )
 
 
 def _coerce_int(value: Any) -> int | None:

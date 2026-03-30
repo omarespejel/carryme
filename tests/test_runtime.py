@@ -3777,12 +3777,14 @@ def test_paradex_jwt_token_provider_fetches_config_and_authenticates() -> None:
 
 
 def test_build_paradex_auth_request_path_supports_interactive_usage() -> None:
+    default_path = build_paradex_auth_request_path(private_key="0x456")
     auth_path = build_paradex_auth_request_path(
         private_key="0x456",
         token_usage="interactive",
     )
 
-    assert auth_path.endswith("?token_usage=interactive")
+    assert auth_path.startswith("/v1/auth/")
+    assert auth_path == f"{default_path}?token_usage=interactive"
 
 
 def test_paradex_jwt_token_provider_supports_interactive_auth_path() -> None:
@@ -4088,6 +4090,7 @@ def test_paradex_live_execution_service_uses_interactive_auth_for_retail_fee_pro
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen_auth_paths: list[str] = []
+    seen_order_auth_headers: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         raw_path = request.url.raw_path.decode("utf-8")
@@ -4096,10 +4099,14 @@ def test_paradex_live_execution_service_uses_interactive_auth_for_retail_fee_pro
                 200,
                 json={"starknet_chain_id": "PRIVATE_SN_PARACLEAR_MAINNET"},
             )
+        if raw_path.endswith("?token_usage=interactive"):
+            seen_auth_paths.append(raw_path)
+            return httpx.Response(200, json={"jwt_token": "interactive-jwt"})
         if request.url.path.startswith("/v1/auth/"):
             seen_auth_paths.append(raw_path)
-            return httpx.Response(200, json={"jwt_token": "jwt-token"})
+            return httpx.Response(200, json={"jwt_token": "default-jwt"})
         if request.url.path == "/v1/orders":
+            seen_order_auth_headers.append(request.headers["Authorization"])
             payload = json.loads(request.content.decode("utf-8"))
             return httpx.Response(
                 200,
@@ -4224,6 +4231,7 @@ def test_paradex_live_execution_service_uses_interactive_auth_for_retail_fee_pro
     asyncio.run(run())
 
     assert any("?token_usage=interactive" in path for path in seen_auth_paths)
+    assert seen_order_auth_headers == ["Bearer interactive-jwt"]
 
 
 def test_paradex_live_execution_service_retries_unfilled_orders_within_confirmed_cap(
