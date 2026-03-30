@@ -74,6 +74,7 @@ from carryme_worker.notifications import (
     ApprovedCanaryAlertNotifier,
     CompositeExecutionAlertNotifier,
     ExecutionAlertNotifier,
+    StableLaunchReadyAlertNotifier,
     SystemStateAlertNotifier,
 )
 
@@ -243,6 +244,7 @@ class LaunchReadyCanaryCacheSummary:
     launch_ready_candidates: int
     saved_snapshots: int
     alert_events: int
+    sent_notifications: int
     database_path: str
     snapshots: list[LaunchReadyCanarySnapshot] = field(default_factory=list, repr=False)
     alerts: list[StableLaunchReadyAlertEvent] = field(default_factory=list, repr=False)
@@ -259,6 +261,7 @@ class LaunchReadyCanaryCacheLoopSummary:
     launch_ready_candidates: int
     saved_snapshots: int
     alert_events: int
+    sent_notifications: int
     database_path: str
 
 
@@ -748,6 +751,7 @@ async def cache_launch_ready_canaries_once(
     approved_store: ApprovedCanaryStore | None = None,
     launch_ready_store: LaunchReadyCanaryStore | None = None,
     alert_sink: StableLaunchReadyAlertSink | None = None,
+    alert_notifier: StableLaunchReadyAlertNotifier | None = None,
     approval_service: RouteApprovalService | None = None,
     system_state_service: SystemStateService | None = None,
     logger: logging.Logger | None = None,
@@ -854,12 +858,33 @@ async def cache_launch_ready_canaries_once(
         min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
         min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
     )
+    sent_notifications = 0
+    if alert_notifier is not None:
+        for event in alerts:
+            try:
+                await alert_notifier.notify(event)
+                sent_notifications += 1
+            except Exception:
+                loop_logger.exception(
+                    "stable launch-ready alert notification failed for label=%s type=%s",
+                    (
+                        event.current_stability.snapshot.label
+                        if event.current_stability is not None
+                        else (
+                            event.previous_stability.snapshot.label
+                            if event.previous_stability is not None
+                            else None
+                        )
+                    ),
+                    event.alert_type,
+                )
 
     return LaunchReadyCanaryCacheSummary(
         scanned_snapshots=scanned_snapshots,
         launch_ready_candidates=len(snapshots),
         saved_snapshots=len(snapshots),
         alert_events=len(alerts),
+        sent_notifications=sent_notifications,
         database_path=settings.database_path,
         snapshots=snapshots,
         alerts=alerts,
@@ -872,6 +897,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
     approved_store: ApprovedCanaryStore | None = None,
     launch_ready_store: LaunchReadyCanaryStore | None = None,
     alert_sink: StableLaunchReadyAlertSink | None = None,
+    alert_notifier: StableLaunchReadyAlertNotifier | None = None,
     approval_service: RouteApprovalService | None = None,
     system_state_service: SystemStateService | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -885,7 +911,15 @@ async def run_supervised_launch_ready_canary_cache_loop(
     ready_store = launch_ready_store or LaunchReadyCanaryStore(settings.database_path)
     stable_alert_sink = alert_sink or StableLaunchReadyAlertStore(settings.database_path)
     loop_logger = logger or logging.getLogger("carryme.worker")
+    stable_launch_ready_notifier = alert_notifier
     supervised_stop_event = stop_event or asyncio.Event()
+    if stable_launch_ready_notifier is None:
+        from carryme_worker.notifications import build_stable_launch_ready_alert_notifier
+
+        stable_launch_ready_notifier = build_stable_launch_ready_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
 
     attempts = 0
     successful_cycles = 0
@@ -894,6 +928,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
     launch_ready_candidates = 0
     saved_snapshots = 0
     alert_events = 0
+    sent_notifications = 0
     consecutive_failures = 0
 
     while not supervised_stop_event.is_set():
@@ -905,6 +940,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
                 approved_store=source_store,
                 launch_ready_store=ready_store,
                 alert_sink=stable_alert_sink,
+                alert_notifier=stable_launch_ready_notifier,
                 approval_service=approval_service,
                 system_state_service=system_state_service,
                 logger=loop_logger,
@@ -915,15 +951,18 @@ async def run_supervised_launch_ready_canary_cache_loop(
             launch_ready_candidates += summary.launch_ready_candidates
             saved_snapshots += summary.saved_snapshots
             alert_events += summary.alert_events
+            sent_notifications += summary.sent_notifications
             loop_logger.info(
                 (
                     "completed supervised launch-ready canary cache cycle %s with "
-                    "%s scanned snapshots, %s saved launch-ready snapshots, and %s alerts"
+                    "%s scanned snapshots, %s saved launch-ready snapshots, %s alerts, "
+                    "and %s notifications"
                 ),
                 attempts,
                 summary.scanned_snapshots,
                 summary.saved_snapshots,
                 summary.alert_events,
+                summary.sent_notifications,
             )
             if max_iterations is not None and attempts >= max_iterations:
                 break
@@ -956,6 +995,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
         launch_ready_candidates=launch_ready_candidates,
         saved_snapshots=saved_snapshots,
         alert_events=alert_events,
+        sent_notifications=sent_notifications,
         database_path=settings.database_path,
     )
 

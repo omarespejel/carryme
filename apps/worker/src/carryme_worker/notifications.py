@@ -11,6 +11,7 @@ import httpx
 from carryme_models import (
     ApprovedCanaryAlertEvent,
     ExecutionAlertEvent,
+    StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
 )
 
@@ -35,6 +36,12 @@ class SystemStateAlertNotifier(Protocol):
     """Async notifier for system-state transition events."""
 
     async def notify(self, event: SystemStateAlertEvent) -> None: ...
+
+
+class StableLaunchReadyAlertNotifier(Protocol):
+    """Async notifier for stable launch-ready transition events."""
+
+    async def notify(self, event: StableLaunchReadyAlertEvent) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -97,6 +104,36 @@ class LoggingSystemStateAlertNotifier:
 
 
 @dataclass(frozen=True)
+class LoggingStableLaunchReadyAlertNotifier:
+    """Emit stable launch-ready alerts to the structured worker logs."""
+
+    logger: logging.Logger
+
+    async def notify(self, event: StableLaunchReadyAlertEvent) -> None:
+        current_label = (
+            event.current_stability.snapshot.label
+            if event.current_stability is not None
+            else None
+        )
+        previous_label = (
+            event.previous_stability.snapshot.label
+            if event.previous_stability is not None
+            else None
+        )
+        self.logger.warning(
+            (
+                "stable launch-ready alert emitted: type=%s current_label=%s "
+                "previous_label=%s min_snapshot_count=%s min_stable_seconds=%s"
+            ),
+            event.alert_type,
+            current_label,
+            previous_label,
+            event.min_snapshot_count,
+            event.min_stable_seconds,
+        )
+
+
+@dataclass(frozen=True)
 class WebhookExecutionAlertNotifier:
     """POST execution alerts to a configured external webhook."""
 
@@ -152,6 +189,24 @@ class WebhookSystemStateAlertNotifier:
 
 
 @dataclass(frozen=True)
+class WebhookStableLaunchReadyAlertNotifier:
+    """POST stable launch-ready alerts to a configured external webhook."""
+
+    webhook_url: str
+    timeout_seconds: float = 10.0
+
+    async def notify(self, event: StableLaunchReadyAlertEvent) -> None:
+        payload = {
+            "source": "carryme-worker",
+            "event_type": "stable_launch_ready_alert",
+            "alert": event.model_dump(mode="json"),
+        }
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(self.webhook_url, json=payload)
+            response.raise_for_status()
+
+
+@dataclass(frozen=True)
 class CompositeExecutionAlertNotifier:
     """Dispatch one execution alert to multiple downstream notifiers."""
 
@@ -199,6 +254,17 @@ class CompositeSystemStateAlertNotifier:
     notifiers: tuple[SystemStateAlertNotifier, ...]
 
     async def notify(self, event: SystemStateAlertEvent) -> None:
+        for notifier in self.notifiers:
+            await notifier.notify(event)
+
+
+@dataclass(frozen=True)
+class CompositeStableLaunchReadyAlertNotifier:
+    """Dispatch one stable launch-ready alert to multiple downstream notifiers."""
+
+    notifiers: tuple[StableLaunchReadyAlertNotifier, ...]
+
+    async def notify(self, event: StableLaunchReadyAlertEvent) -> None:
         for notifier in self.notifiers:
             await notifier.notify(event)
 
@@ -267,3 +333,24 @@ def build_system_state_alert_notifier(
             )
         )
     return CompositeSystemStateAlertNotifier(tuple(notifiers))
+
+
+def build_stable_launch_ready_alert_notifier(
+    settings: WorkerSettings,
+    *,
+    logger: logging.Logger | None = None,
+) -> CompositeStableLaunchReadyAlertNotifier:
+    """Build the default stable launch-ready alert notifier fanout for the worker."""
+
+    base_logger = logger or logging.getLogger("carryme.worker")
+    notifiers: list[StableLaunchReadyAlertNotifier] = [
+        LoggingStableLaunchReadyAlertNotifier(base_logger),
+    ]
+    if settings.stable_launch_ready_alert_webhook_url:
+        notifiers.append(
+            WebhookStableLaunchReadyAlertNotifier(
+                webhook_url=settings.stable_launch_ready_alert_webhook_url,
+                timeout_seconds=settings.stable_launch_ready_alert_webhook_timeout_seconds,
+            )
+        )
+    return CompositeStableLaunchReadyAlertNotifier(tuple(notifiers))

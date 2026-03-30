@@ -31,6 +31,7 @@ from carryme_models import (
     PaperTradeEntry,
     PaperTradeSystemState,
     RouteApprovalEntry,
+    StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
     TradeLegIntent,
     VenueAccountPreflight,
@@ -393,6 +394,7 @@ def test_worker_launch_ready_canary_cache_payload() -> None:
             launch_ready_candidates=2,
             saved_snapshots=2,
             alert_events=1,
+            sent_notifications=1,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -402,6 +404,7 @@ def test_worker_launch_ready_canary_cache_payload() -> None:
         "launch_ready_candidates": 2,
         "saved_snapshots": 2,
         "alert_events": 1,
+        "sent_notifications": 1,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -416,6 +419,7 @@ def test_worker_launch_ready_canary_cache_loop_payload() -> None:
             launch_ready_candidates=5,
             saved_snapshots=5,
             alert_events=2,
+            sent_notifications=2,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -428,6 +432,7 @@ def test_worker_launch_ready_canary_cache_loop_payload() -> None:
         "launch_ready_candidates": 5,
         "saved_snapshots": 5,
         "alert_events": 2,
+        "sent_notifications": 2,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -1409,6 +1414,7 @@ def test_run_supervised_launch_ready_canary_cache_loop_honors_max_iterations(
         approved_store: object | None = None,
         launch_ready_store: object | None = None,
         alert_sink: object | None = None,
+        alert_notifier: object | None = None,
         approval_service: object | None = None,
         system_state_service: object | None = None,
         logger: object | None = None,
@@ -1418,6 +1424,7 @@ def test_run_supervised_launch_ready_canary_cache_loop_honors_max_iterations(
         _ = approved_store
         _ = launch_ready_store
         _ = alert_sink
+        _ = alert_notifier
         _ = approval_service
         _ = system_state_service
         _ = logger
@@ -1427,6 +1434,7 @@ def test_run_supervised_launch_ready_canary_cache_loop_honors_max_iterations(
             launch_ready_candidates=1,
             saved_snapshots=1,
             alert_events=1,
+            sent_notifications=1,
             database_path=settings.database_path,
         )
 
@@ -1452,6 +1460,7 @@ def test_run_supervised_launch_ready_canary_cache_loop_honors_max_iterations(
     assert summary.launch_ready_candidates == 2
     assert summary.saved_snapshots == 2
     assert summary.alert_events == 2
+    assert summary.sent_notifications == 2
     assert sleeps == [4]
 
 
@@ -1583,13 +1592,22 @@ def test_cache_launch_ready_canaries_once_emits_stable_launch_ready_available_al
                 ),
             ]
 
+    class StubStableNotifier:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def notify(self, event: StableLaunchReadyAlertEvent) -> None:
+            self.events.append(event.alert_type)
+
     alert_store = StableLaunchReadyAlertStore(settings.database_path)
+    notifier = StubStableNotifier()
     summary = asyncio.run(
         cache_launch_ready_canaries_once(
             settings,
             approved_store=approved_store,
             launch_ready_store=launch_ready_store,
             alert_sink=alert_store,
+            alert_notifier=notifier,
             system_state_service=cast(Any, StubSystemStateService()),
             now=datetime(2026, 3, 29, 20, 1, tzinfo=UTC),
         )
@@ -1598,10 +1616,12 @@ def test_cache_launch_ready_canaries_once_emits_stable_launch_ready_available_al
     alerts = alert_store.list_recent(limit=10, label="arb_extended_paradex")
 
     assert summary.alert_events == 1
+    assert summary.sent_notifications == 1
     assert len(alerts) == 1
     assert alerts[0].alert_type == "stable_launch_ready_available"
     assert alerts[0].current_stability is not None
     assert alerts[0].current_stability.snapshot.label == "arb_extended_paradex"
+    assert notifier.events == ["stable_launch_ready_available"]
 
 
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(

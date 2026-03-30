@@ -159,6 +159,7 @@ def build_launch_ready_canary_cache_payload(
         "launch_ready_candidates": summary.launch_ready_candidates,
         "saved_snapshots": summary.saved_snapshots,
         "alert_events": summary.alert_events,
+        "sent_notifications": summary.sent_notifications,
         "database_path": summary.database_path,
     }
 
@@ -176,6 +177,7 @@ def build_launch_ready_canary_cache_loop_payload(
         "launch_ready_candidates": summary.launch_ready_candidates,
         "saved_snapshots": summary.saved_snapshots,
         "alert_events": summary.alert_events,
+        "sent_notifications": summary.sent_notifications,
         "database_path": summary.database_path,
     }
 
