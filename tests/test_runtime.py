@@ -1843,6 +1843,8 @@ def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path
         *,
         label: str,
         canonical_symbol: str,
+        left_symbol: str,
+        right_symbol: str,
         long_venue: str,
         long_fee_profile: str,
         roundtrip_edge: float,
@@ -1854,10 +1856,10 @@ def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path
                 pair=FundingPairSpec(
                     label=label,
                     left_venue="extended",
-                    left_symbol="ARB-USD" if "arb" in label else "STRK-USD",
+                    left_symbol=left_symbol,
                     left_fee_profile="default",
                     right_venue=long_venue,
-                    right_symbol="ARB-USD-PERP" if "arb" in label else "STRK",
+                    right_symbol=right_symbol,
                     right_fee_profile=long_fee_profile,
                 ),
                 opportunity=FundingArbOpportunity(
@@ -1887,6 +1889,8 @@ def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path
         window_one,
         label="arb_extended_paradex",
         canonical_symbol="ARB-USD-PERP",
+        left_symbol="ARB-USD",
+        right_symbol="ARB-USD-PERP",
         long_venue="paradex",
         long_fee_profile="pro",
         roundtrip_edge=0.0012,
@@ -1896,6 +1900,8 @@ def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path
         window_one,
         label="strk_extended_hyperliquid",
         canonical_symbol="STRK-USD-PERP",
+        left_symbol="STRK-USD",
+        right_symbol="STRK",
         long_venue="hyperliquid",
         long_fee_profile="tier0",
         roundtrip_edge=0.0001,
@@ -1905,6 +1911,8 @@ def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path
         window_two,
         label="arb_extended_paradex",
         canonical_symbol="ARB-USD-PERP",
+        left_symbol="ARB-USD",
+        right_symbol="ARB-USD-PERP",
         long_venue="paradex",
         long_fee_profile="pro",
         roundtrip_edge=0.0010,
@@ -1914,6 +1922,8 @@ def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path
         window_two,
         label="lit_extended_paradex",
         canonical_symbol="LIT-USD-PERP",
+        left_symbol="LIT-USD",
+        right_symbol="LIT-USD-PERP",
         long_venue="paradex",
         long_fee_profile="pro",
         roundtrip_edge=-0.0002,
@@ -1927,6 +1937,54 @@ def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path
     assert summaries[0].presence_ratio == pytest.approx(1.0)
     assert summaries[0].positive_roundtrip_share == pytest.approx(1.0)
     assert summaries[0].stability_weight > summaries[1].stability_weight
+
+
+def test_route_stability_service_keeps_same_second_batches_distinct(tmp_path: Path) -> None:
+    history_store = OpportunityHistoryStore(tmp_path / "route_stability_same_second.sqlite3")
+    window_one = datetime(2026, 3, 29, 12, 0, 0, 100_000, tzinfo=UTC)
+    window_two = datetime(2026, 3, 29, 12, 0, 0, 900_000, tzinfo=UTC)
+
+    for recorded_at, edge in ((window_one, 0.0010), (window_two, 0.0008)):
+        history_store.append(
+            OpportunityRecord(
+                recorded_at=recorded_at,
+                pair=FundingPairSpec(
+                    label="arb_extended_paradex",
+                    left_venue="extended",
+                    left_symbol="ARB-USD",
+                    left_fee_profile="default",
+                    right_venue="paradex",
+                    right_symbol="ARB-USD-PERP",
+                    right_fee_profile="pro",
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro",
+                    short_fee_profile="default",
+                    gross_daily_edge=edge + 0.0009,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=edge + 0.00045,
+                    one_day_net_edge_after_round_trip=edge,
+                    break_even_days_entry=0.25,
+                    break_even_days_round_trip=0.5,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1_100.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+            )
+        )
+
+    service = RouteStabilityService(history_store=history_store, min_window_cardinality=1)
+    summary = service.build_index()[("ARB-USD-PERP", "extended", "paradex", "default", "pro")]
+
+    assert summary.window_count == 2
+    assert summary.sample_size == 2
 
 
 def test_opportunity_universe_service_ranks_by_route_adjusted_quality() -> None:
@@ -2002,6 +2060,27 @@ def test_opportunity_universe_service_ranks_by_route_adjusted_quality() -> None:
             latest_recorded_at=datetime(2026, 3, 29, 11, 0, tzinfo=UTC),
             stability_weight=0.72,
             stability_score=0.000792,
+        ),
+        ("ARB-USD-PERP", "extended", "paradex", "vip", "retail"): RouteStabilitySummary(
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="vip",
+            long_fee_profile="retail",
+            sample_size=10,
+            window_count=8,
+            presence_ratio=0.95,
+            positive_roundtrip_share=1.0,
+            mean_roundtrip_edge=0.005,
+            median_roundtrip_edge=0.005,
+            edge_stddev=0.0001,
+            mean_capacity_notional=1_500.0,
+            median_capacity_notional=1_500.0,
+            capacity_stddev=25.0,
+            latest_roundtrip_edge=0.005,
+            latest_recorded_at=datetime(2026, 3, 29, 11, 5, tzinfo=UTC),
+            stability_weight=0.99,
+            stability_score=0.00495,
         ),
         ("WIF-USD-PERP", "extended", "paradex", "default", "pro"): RouteStabilitySummary(
             canonical_symbol="WIF-USD-PERP",
@@ -2090,7 +2169,7 @@ def test_build_portfolio_plan_reports_route_adjusted_round_trip_pnl() -> None:
             short_venue="extended",
             long_venue="paradex",
             sample_size=2,
-            weighted_score=0.5,
+            weighted_score=0.6,
             latest_outcome="hedged",
             hedged_count=1,
             closed_count=0,
@@ -2099,8 +2178,8 @@ def test_build_portfolio_plan_reports_route_adjusted_round_trip_pnl() -> None:
             review_required_count=0,
             pending_count=0,
         ),
-        execution_adjusted_one_day_pnl_after_round_trip=1.395,
-        execution_adjusted_quality_score=0.85,
+        execution_adjusted_one_day_pnl_after_round_trip=1.674,
+        execution_adjusted_quality_score=1.02,
         route_stability=RouteStabilitySummary(
             canonical_symbol="ARB-USD-PERP",
             short_venue="extended",
@@ -2124,7 +2203,7 @@ def test_build_portfolio_plan_reports_route_adjusted_round_trip_pnl() -> None:
         ),
         stability_adjusted_one_day_pnl_after_round_trip=1.395,
         stability_adjusted_quality_score=0.85,
-        route_adjusted_quality_score=0.6,
+        route_adjusted_quality_score=0.51,
     )
     scan = FundingUniverseScan(
         venues=["extended", "paradex"],
@@ -2138,10 +2217,10 @@ def test_build_portfolio_plan_reports_route_adjusted_round_trip_pnl() -> None:
     plan = build_portfolio_plan(scan, target_notional=1_000, max_positions=1)
 
     assert plan.stability_adjusted_estimated_one_day_pnl_after_round_trip == pytest.approx(1.395)
-    assert plan.route_adjusted_estimated_one_day_pnl_after_round_trip == pytest.approx(0.6975)
+    assert plan.route_adjusted_estimated_one_day_pnl_after_round_trip == pytest.approx(0.837)
     assert (
         plan.entries[0].route_adjusted_estimated_one_day_pnl_after_round_trip
-        == pytest.approx(0.6975)
+        == pytest.approx(0.837)
     )
 
 

@@ -385,20 +385,20 @@ def test_funding_universe_endpoint_passes_route_stability_filters() -> None:
             )
 
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
-    client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-universe",
-        params=[
-            ("venues", "extended"),
-            ("venues", "paradex"),
-            ("min_route_stability_weight", "0.2"),
-            ("min_route_presence_ratio", "0.5"),
-            ("min_route_samples", "4"),
-        ],
-    )
-
-    app.dependency_overrides.clear()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("min_route_stability_weight", "0.2"),
+                ("min_route_presence_ratio", "0.5"),
+                ("min_route_samples", "4"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     assert captured["min_route_stability_weight"] == 0.2
@@ -519,8 +519,11 @@ def test_execution_quality_service_provider_uses_shared_stores(tmp_path: Path) -
 
 
 def test_route_stability_endpoint_uses_service_dependency() -> None:
+    captured: dict[str, object] = {}
+
     class StubRouteStabilityService:
-        def list_summaries(self, **_: object) -> list[RouteStabilitySummary]:
+        def list_summaries(self, **kwargs: object) -> list[RouteStabilitySummary]:
+            captured.update(kwargs)
             return [
                 RouteStabilitySummary(
                     canonical_symbol="ARB-USD-PERP",
@@ -548,29 +551,31 @@ def test_route_stability_endpoint_uses_service_dependency() -> None:
     app.dependency_overrides[get_route_stability_service] = (
         lambda: StubRouteStabilityService()
     )
-    client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/route-stability",
-        params={"min_sample_size": 2, "min_presence_ratio": 0.5},
-    )
-
-    app.dependency_overrides.clear()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/route-stability",
+            params={"min_sample_size": 2, "min_presence_ratio": 0.5},
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["canonical_symbol"] == "ARB-USD-PERP"
     assert payload[0]["stability_weight"] == 0.6
+    assert captured["min_sample_size"] == 2
+    assert captured["min_presence_ratio"] == 0.5
 
 
 def test_route_stability_service_provider_uses_shared_history_store(tmp_path: Path) -> None:
     settings = ApiSettings(database_path=str(tmp_path / "stability.sqlite3"))
-    service = get_route_stability_service(
-        history_store=OpportunityHistoryStore(settings.database_path)
-    )
+    history_store = app_module._history_store_for_path(settings.database_path)
+    service = get_route_stability_service(settings)
 
-    assert service.history_store.database_path == Path(settings.database_path)
+    assert service is app_module._route_stability_service_for_path(settings.database_path)
+    assert service.history_store is history_store
 
 
 def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:

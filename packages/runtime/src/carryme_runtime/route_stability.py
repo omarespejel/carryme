@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import fmean, median, pstdev
+from threading import Lock
 
 from carryme_models import OpportunityRecord, RouteStabilitySummary
 from carryme_storage import OpportunityHistoryStore
@@ -45,13 +46,31 @@ class RouteStabilityService:
     history_store: OpportunityHistoryStore
     sample_limit: int = 5_000
     min_window_cardinality: int = 2
+    _cache_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _cached_fingerprint: tuple[int, int | None, str | None] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _cached_index: dict[tuple[str, str, str, str, str], RouteStabilitySummary] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def build_index(self) -> dict[tuple[str, str, str, str, str], RouteStabilitySummary]:
         """Aggregate recent opportunity history into per-route stability summaries."""
 
+        fingerprint = self.history_store.history_fingerprint()
+        with self._cache_lock:
+            if self._cached_fingerprint == fingerprint:
+                return dict(self._cached_index)
+
         records = self.history_store.list_recent(limit=self.sample_limit)
         windows_by_timestamp: dict[str, list[OpportunityRecord]] = defaultdict(list)
         for record in records:
+            # Universe worker batches persist every record with the same exact timestamp.
+            # Keep the full ISO timestamp so scans within the same second stay distinct.
             windows_by_timestamp[record.recorded_at.isoformat()].append(record)
 
         eligible_windows = {
@@ -129,7 +148,10 @@ class RouteStabilityService:
                 stability_weight=stability_weight,
                 stability_score=stability_score,
             )
-        return result
+        with self._cache_lock:
+            self._cached_fingerprint = fingerprint
+            self._cached_index = result
+        return dict(result)
 
     def list_summaries(
         self,

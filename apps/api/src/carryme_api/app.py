@@ -255,12 +255,19 @@ def get_history_store(
     return _history_store_for_path(settings.database_path)
 
 
+@lru_cache
+def _route_stability_service_for_path(database_path: str) -> RouteStabilityService:
+    """Return the shared route-stability service for the configured SQLite path."""
+
+    return RouteStabilityService(history_store=_history_store_for_path(database_path))
+
+
 def get_route_stability_service(
-    history_store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
 ) -> RouteStabilityService:
     """Return the repeated-scan route-stability service."""
 
-    return RouteStabilityService(history_store=history_store)
+    return _route_stability_service_for_path(settings.database_path)
 
 
 def get_candidate_alert_store(
