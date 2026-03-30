@@ -113,6 +113,13 @@ class WorkerSettings(BaseSettings):
             "CARRYME_API_EXTENDED_API_KEY",
         ),
     )
+    extended_stark_private_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_EXTENDED_STARK_PRIVATE_KEY",
+            "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
+        ),
+    )
     paradex_live_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices(
@@ -139,6 +146,14 @@ class WorkerSettings(BaseSettings):
         validation_alias=AliasChoices(
             "CARRYME_WORKER_PARADEX_BEARER_TOKEN",
             "CARRYME_API_PARADEX_BEARER_TOKEN",
+        ),
+    )
+    paradex_recv_window_ms: int = Field(
+        default=300000,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CARRYME_WORKER_PARADEX_RECV_WINDOW_MS",
+            "CARRYME_API_PARADEX_RECV_WINDOW_MS",
         ),
     )
     hyperliquid_live_enabled: bool = Field(
