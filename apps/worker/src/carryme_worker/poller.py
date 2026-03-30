@@ -23,6 +23,8 @@ from carryme_models import (
     FundingArbOpportunity,
     FundingUniverseScan,
     OpportunityRecord,
+    SystemStateAlertEvent,
+    VenueSystemState,
 )
 from carryme_runtime import (
     AccountPreflightConfigMap,
@@ -37,6 +39,8 @@ from carryme_runtime import (
     ParadexOrderStateObserver,
     RouteApprovalService,
     RouteStabilityService,
+    SystemStateConfigMap,
+    SystemStateService,
     build_account_preflight_configs,
     build_execution_pair_status,
     build_opportunity_record_from_universe_opportunity,
@@ -54,11 +58,17 @@ from carryme_storage import (
     ExecutionObservationStore,
     OpportunityHistoryStore,
     RouteApprovalStore,
+    SystemStateAlertStore,
     load_watchlist,
 )
 
 from carryme_worker.config import WorkerSettings
-from carryme_worker.notifications import CompositeExecutionAlertNotifier, ExecutionAlertNotifier
+from carryme_worker.notifications import (
+    ApprovedCanaryAlertNotifier,
+    CompositeExecutionAlertNotifier,
+    ExecutionAlertNotifier,
+    SystemStateAlertNotifier,
+)
 
 logger = logging.getLogger(__name__)
 OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
@@ -115,6 +125,12 @@ class ApprovedCanaryAlertSink(Protocol):
     """Append-only sink for emitted approved-canary alert events."""
 
     def append(self, event: ApprovedCanaryAlertEvent) -> None: ...
+
+
+class SystemStateAlertSink(Protocol):
+    """Append-only sink for emitted system-state alert events."""
+
+    def append(self, event: SystemStateAlertEvent) -> None: ...
 
 
 class ExecutionAlertSink(Protocol):
@@ -185,8 +201,10 @@ class ApprovedCanaryScanSummary:
     approved_candidates: int
     saved_snapshots: int
     alert_events: int
+    sent_notifications: int
     database_path: str
     snapshots: list[ApprovedCanarySnapshot] = field(default_factory=list, repr=False)
+    alerts: list[ApprovedCanaryAlertEvent] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -200,6 +218,7 @@ class ApprovedCanaryScanLoopSummary:
     approved_candidates: int
     saved_snapshots: int
     alert_events: int
+    sent_notifications: int
     database_path: str
 
 
@@ -233,6 +252,33 @@ class ExecutionObservationLoopSummary:
     scanned_executions: int
     observed_executions: int
     saved_observations: int
+    saved_alerts: int
+    sent_notifications: int
+    database_path: str
+
+
+@dataclass
+class SystemStateObservationSummary:
+    """Summary emitted after one system-state observation cycle."""
+
+    checked_venues: int
+    degraded_venues: int
+    saved_alerts: int
+    sent_notifications: int
+    database_path: str
+    states: list[VenueSystemState] = field(default_factory=list, repr=False)
+    alerts: list[SystemStateAlertEvent] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class SystemStateObservationLoopSummary:
+    """Summary emitted after a supervised system-state observation loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    checked_venues: int
+    degraded_venues: int
     saved_alerts: int
     sent_notifications: int
     database_path: str
@@ -407,6 +453,22 @@ def _build_approved_canary_fee_profile_overrides(
     return overrides or None
 
 
+def _build_system_state_configs(settings: WorkerSettings) -> SystemStateConfigMap:
+    """Build the public system-state config map from worker settings."""
+
+    return {
+        "extended": {
+            "enabled": settings.extended_live_enabled,
+        },
+        "paradex": {
+            "enabled": settings.paradex_live_enabled,
+        },
+        "hyperliquid": {
+            "enabled": settings.hyperliquid_live_enabled,
+        },
+    }
+
+
 async def scan_approved_canary_once(
     settings: WorkerSettings,
     *,
@@ -414,6 +476,8 @@ async def scan_approved_canary_once(
     approval_service: RouteApprovalService | None = None,
     store: ApprovedCanaryStore | None = None,
     alert_sink: ApprovedCanaryAlertSink | None = None,
+    alert_notifier: ApprovedCanaryAlertNotifier | None = None,
+    logger: logging.Logger | None = None,
     now: datetime | None = None,
 ) -> ApprovedCanaryScanSummary:
     """Scan the live universe for canaries that are currently operator-approved."""
@@ -421,6 +485,7 @@ async def scan_approved_canary_once(
     timestamp = now or datetime.now(UTC)
     snapshot_store = store or ApprovedCanaryStore(settings.database_path)
     approved_canary_alert_sink = alert_sink or ApprovedCanaryAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
     route_approval_service = approval_service or RouteApprovalService(
         store=RouteApprovalStore(settings.database_path)
     )
@@ -458,10 +523,7 @@ async def scan_approved_canary_once(
         approval.label
         for approval in route_approval_service.list_recent(limit=1_000, approved=True)
     }
-    previous_snapshots = {
-        label: snapshot_store.latest(label=label)
-        for label in approved_labels
-    }
+    previous_snapshots = {label: snapshot_store.latest(label=label) for label in approved_labels}
     snapshots: list[ApprovedCanarySnapshot] = []
     for candidate in approved_candidates:
         approval = route_approval_service.get_for_candidate(candidate)
@@ -479,7 +541,7 @@ async def scan_approved_canary_once(
             )
         )
 
-    alert_events = _emit_approved_canary_alerts(
+    alerts = _emit_approved_canary_alerts(
         approved_labels=approved_labels,
         previous_snapshots=previous_snapshots,
         current_snapshots=snapshots,
@@ -487,15 +549,37 @@ async def scan_approved_canary_once(
         emitted_at=timestamp,
         sink=approved_canary_alert_sink,
     )
+    sent_notifications = 0
+    if alert_notifier is not None:
+        for event in alerts:
+            try:
+                await alert_notifier.notify(event)
+                sent_notifications += 1
+            except Exception:
+                loop_logger.exception(
+                    "approved canary alert notification failed for label=%s type=%s",
+                    event.current_snapshot.label
+                    if event.current_snapshot is not None
+                    else (
+                        event.previous_snapshot.label
+                        if event.previous_snapshot is not None
+                        else None
+                    ),
+                    event.alert_type,
+                )
 
     return ApprovedCanaryScanSummary(
         scanned_candidates=len(candidates),
         approved_candidates=len(approved_candidates),
         saved_snapshots=len(snapshots),
-        alert_events=alert_events,
+        alert_events=len(alerts),
+        sent_notifications=sent_notifications,
         database_path=settings.database_path,
         snapshots=snapshots,
+        alerts=alerts,
     )
+
+
 async def run_supervised_universe_scan_loop(
     settings: WorkerSettings,
     *,
@@ -603,6 +687,7 @@ async def run_supervised_approved_canary_scan_loop(
     approval_service: RouteApprovalService | None = None,
     store: ApprovedCanaryStore | None = None,
     alert_sink: ApprovedCanaryAlertSink | None = None,
+    alert_notifier: ApprovedCanaryAlertNotifier | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     logger: logging.Logger | None = None,
     stop_event: asyncio.Event | None = None,
@@ -616,7 +701,15 @@ async def run_supervised_approved_canary_scan_loop(
     snapshot_store = store or ApprovedCanaryStore(settings.database_path)
     approved_canary_alert_sink = alert_sink or ApprovedCanaryAlertStore(settings.database_path)
     loop_logger = logger or logging.getLogger("carryme.worker")
+    approved_canary_notifier = alert_notifier
     supervised_stop_event = stop_event or asyncio.Event()
+    if approved_canary_notifier is None:
+        from carryme_worker.notifications import build_approved_canary_alert_notifier
+
+        approved_canary_notifier = build_approved_canary_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
 
     attempts = 0
     successful_cycles = 0
@@ -625,6 +718,7 @@ async def run_supervised_approved_canary_scan_loop(
     approved_candidates = 0
     saved_snapshots = 0
     alert_events = 0
+    sent_notifications = 0
     consecutive_failures = 0
 
     while not supervised_stop_event.is_set():
@@ -637,6 +731,8 @@ async def run_supervised_approved_canary_scan_loop(
                 approval_service=approval_service,
                 store=snapshot_store,
                 alert_sink=approved_canary_alert_sink,
+                alert_notifier=approved_canary_notifier,
+                logger=loop_logger,
             )
             successful_cycles += 1
             consecutive_failures = 0
@@ -644,6 +740,7 @@ async def run_supervised_approved_canary_scan_loop(
             approved_candidates += summary.approved_candidates
             saved_snapshots += summary.saved_snapshots
             alert_events += summary.alert_events
+            sent_notifications += summary.sent_notifications
             loop_logger.info(
                 (
                     "completed supervised approved canary scan cycle %s with %s candidates, "
@@ -694,8 +791,213 @@ async def run_supervised_approved_canary_scan_loop(
         approved_candidates=approved_candidates,
         saved_snapshots=saved_snapshots,
         alert_events=alert_events,
+        sent_notifications=sent_notifications,
         database_path=settings.database_path,
     )
+
+
+async def observe_system_state_once(
+    settings: WorkerSettings,
+    *,
+    service: SystemStateService | None = None,
+    alert_sink: SystemStateAlertSink | None = None,
+    alert_notifier: SystemStateAlertNotifier | None = None,
+    logger: logging.Logger | None = None,
+    now: datetime | None = None,
+) -> SystemStateObservationSummary:
+    """Probe current venue system-state and emit transition alerts."""
+
+    runtime = service or SystemStateService()
+    system_state_alert_sink = alert_sink or SystemStateAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    timestamp = now or datetime.now(UTC)
+
+    states = await runtime.probe_venues(_build_system_state_configs(settings))
+    alerts = _emit_system_state_alerts(
+        states=states,
+        sink=system_state_alert_sink,
+        emitted_at=timestamp,
+    )
+
+    sent_notifications = 0
+    if alert_notifier is not None:
+        for event in alerts:
+            try:
+                await alert_notifier.notify(event)
+                sent_notifications += 1
+            except Exception:
+                loop_logger.exception(
+                    "system state alert notification failed for venue=%s type=%s",
+                    event.venue,
+                    event.alert_type,
+                )
+
+    degraded_venues = len([state for state in states if not state.healthy and state.enabled])
+    return SystemStateObservationSummary(
+        checked_venues=len([state for state in states if state.checked]),
+        degraded_venues=degraded_venues,
+        saved_alerts=len(alerts),
+        sent_notifications=sent_notifications,
+        database_path=settings.database_path,
+        states=states,
+        alerts=alerts,
+    )
+
+
+async def run_supervised_system_state_observation_loop(
+    settings: WorkerSettings,
+    *,
+    service: SystemStateService | None = None,
+    alert_sink: SystemStateAlertSink | None = None,
+    alert_notifier: SystemStateAlertNotifier | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> SystemStateObservationLoopSummary:
+    """Run the system-state monitor until stopped or capped."""
+
+    runtime = service or SystemStateService()
+    system_state_alert_sink = alert_sink or SystemStateAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    system_state_notifier = alert_notifier
+    supervised_stop_event = stop_event or asyncio.Event()
+    if system_state_notifier is None:
+        from carryme_worker.notifications import build_system_state_alert_notifier
+
+        system_state_notifier = build_system_state_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    checked_venues = 0
+    degraded_venues = 0
+    saved_alerts = 0
+    sent_notifications = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised system-state observation cycle %s", attempts)
+        try:
+            summary = await observe_system_state_once(
+                settings,
+                service=runtime,
+                alert_sink=system_state_alert_sink,
+                alert_notifier=system_state_notifier,
+                logger=loop_logger,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            checked_venues += summary.checked_venues
+            degraded_venues += summary.degraded_venues
+            saved_alerts += summary.saved_alerts
+            sent_notifications += summary.sent_notifications
+            loop_logger.info(
+                (
+                    "completed supervised system-state observation cycle %s with "
+                    "%s checked venues, %s degraded venues, and %s alerts"
+                ),
+                attempts,
+                summary.checked_venues,
+                summary.degraded_venues,
+                summary.saved_alerts,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(settings.system_state_observation_interval_seconds)
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.system_state_observation_max_backoff_seconds,
+                settings.system_state_observation_interval_seconds
+                * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "system-state observation cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(backoff_seconds)
+
+    return SystemStateObservationLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        checked_venues=checked_venues,
+        degraded_venues=degraded_venues,
+        saved_alerts=saved_alerts,
+        sent_notifications=sent_notifications,
+        database_path=settings.database_path,
+    )
+
+
+def _emit_system_state_alerts(
+    *,
+    states: list[VenueSystemState],
+    sink: SystemStateAlertSink,
+    emitted_at: datetime,
+) -> list[SystemStateAlertEvent]:
+    """Emit transition alerts for venue system-state changes."""
+
+    events: list[SystemStateAlertEvent] = []
+    latest_by_venue = (
+        {state.venue: sink.latest(venue=state.venue) for state in states}
+        if isinstance(sink, SystemStateAlertStore)
+        else {}
+    )
+    for state in states:
+        if not state.enabled:
+            continue
+        previous_event = latest_by_venue.get(state.venue)
+        previous_state = previous_event.current_state if previous_event is not None else None
+
+        if not state.healthy:
+            if previous_state is None or previous_state.healthy:
+                event = SystemStateAlertEvent(
+                    emitted_at=emitted_at,
+                    venue=state.venue,
+                    alert_type="venue_degraded",
+                    current_state=state,
+                    previous_state=previous_state,
+                )
+                sink.append(event)
+                events.append(event)
+                continue
+            if previous_state.status != state.status:
+                event = SystemStateAlertEvent(
+                    emitted_at=emitted_at,
+                    venue=state.venue,
+                    alert_type="venue_status_changed",
+                    current_state=state,
+                    previous_state=previous_state,
+                )
+                sink.append(event)
+                events.append(event)
+            continue
+
+        if previous_state is not None and not previous_state.healthy:
+            event = SystemStateAlertEvent(
+                emitted_at=emitted_at,
+                venue=state.venue,
+                alert_type="venue_recovered",
+                current_state=state,
+                previous_state=previous_state,
+            )
+            sink.append(event)
+            events.append(event)
+
+    return events
 
 
 def _emit_approved_canary_alerts(
@@ -706,40 +1008,38 @@ def _emit_approved_canary_alerts(
     max_snapshot_age_seconds: int,
     emitted_at: datetime,
     sink: ApprovedCanaryAlertSink,
-) -> int:
+) -> list[ApprovedCanaryAlertEvent]:
     """Emit transition alerts for approved-canary availability changes."""
 
     current_by_label = {snapshot.label: snapshot for snapshot in current_snapshots}
-    alert_events = 0
+    alert_events: list[ApprovedCanaryAlertEvent] = []
     for label in sorted(approved_labels):
         previous_snapshot = previous_snapshots.get(label)
         current_snapshot = current_by_label.get(label)
 
         if current_snapshot is not None:
             if previous_snapshot is None:
-                sink.append(
-                    ApprovedCanaryAlertEvent(
-                        emitted_at=emitted_at,
-                        alert_type="approved_canary_available",
-                        max_snapshot_age_seconds=max_snapshot_age_seconds,
-                        current_snapshot=current_snapshot,
-                        previous_snapshot=None,
-                    )
+                event = ApprovedCanaryAlertEvent(
+                    emitted_at=emitted_at,
+                    alert_type="approved_canary_available",
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    current_snapshot=current_snapshot,
+                    previous_snapshot=None,
                 )
-                alert_events += 1
+                sink.append(event)
+                alert_events.append(event)
                 continue
 
             if _snapshot_payload_changed(previous_snapshot, current_snapshot):
-                sink.append(
-                    ApprovedCanaryAlertEvent(
-                        emitted_at=emitted_at,
-                        alert_type="approved_canary_changed",
-                        max_snapshot_age_seconds=max_snapshot_age_seconds,
-                        current_snapshot=current_snapshot,
-                        previous_snapshot=previous_snapshot,
-                    )
+                event = ApprovedCanaryAlertEvent(
+                    emitted_at=emitted_at,
+                    alert_type="approved_canary_changed",
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    current_snapshot=current_snapshot,
+                    previous_snapshot=previous_snapshot,
                 )
-                alert_events += 1
+                sink.append(event)
+                alert_events.append(event)
             continue
 
         if previous_snapshot is None:
@@ -749,16 +1049,15 @@ def _emit_approved_canary_alerts(
         if snapshot_age_seconds <= max_snapshot_age_seconds:
             continue
 
-        sink.append(
-            ApprovedCanaryAlertEvent(
-                emitted_at=emitted_at,
-                alert_type="approved_canary_stale",
-                max_snapshot_age_seconds=max_snapshot_age_seconds,
-                current_snapshot=None,
-                previous_snapshot=previous_snapshot,
-            )
+        event = ApprovedCanaryAlertEvent(
+            emitted_at=emitted_at,
+            alert_type="approved_canary_stale",
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            current_snapshot=None,
+            previous_snapshot=previous_snapshot,
         )
-        alert_events += 1
+        sink.append(event)
+        alert_events.append(event)
 
     return alert_events
 

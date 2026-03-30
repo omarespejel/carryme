@@ -51,6 +51,7 @@ from carryme_models import (
     RouteApprovalUpsert,
     RouteStabilitySummary,
     ServiceHealth,
+    SystemStateAlertEvent,
     TradingFeeProfile,
     VenueAccountPreflight,
     VenueBalanceSnapshot,
@@ -120,6 +121,7 @@ from carryme_storage import (
     PaperTradeStore,
     PreviewConfirmationStore,
     RouteApprovalStore,
+    SystemStateAlertStore,
     WatchlistStore,
 )
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
@@ -393,6 +395,14 @@ def get_execution_alert_store(
     """Return the shared execution alert store."""
 
     return _execution_alert_store_for_path(settings.database_path)
+
+
+def get_system_state_alert_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> SystemStateAlertStore:
+    """Return the shared system-state alert store."""
+
+    return SystemStateAlertStore(settings.database_path)
 
 
 def get_execution_observation_store(
@@ -1380,9 +1390,7 @@ def _select_latest_approved_canary_snapshot(
         )
     return (
         snapshot,
-        snapshot.candidate.model_copy(
-            update={"suggested_canary_notional": capped_notional}
-        ),
+        snapshot.candidate.model_copy(update={"suggested_canary_notional": capped_notional}),
         approval,
     )
 
@@ -1525,16 +1533,19 @@ async def _run_guarded_canary_lifecycle(
     final_pair_status = open_execution.pair_status
 
     if close_position and open_execution.pair_status.derived_state == "hedged":
-        _paper_trade, _execution, _pair_status, pair_close_preview = (
-            await _build_pair_close_context_for_paper_trade(
-                paper_trade_id=paper_trade.entry_id or 0,
-                settings=settings,
-                paper_store=paper_store,
-                execution_store=execution_store,
-                account_service=account_preflight_service,
-                order_state_service=order_state_service,
-                pair_close_service=pair_close_preview_service,
-            )
+        (
+            _paper_trade,
+            _execution,
+            _pair_status,
+            pair_close_preview,
+        ) = await _build_pair_close_context_for_paper_trade(
+            paper_trade_id=paper_trade.entry_id or 0,
+            settings=settings,
+            paper_store=paper_store,
+            execution_store=execution_store,
+            account_service=account_preflight_service,
+            order_state_service=order_state_service,
+            pair_close_service=pair_close_preview_service,
         )
         close_confirmation = _append_pair_close_confirmation_for_preview(
             paper_trade=paper_trade,
@@ -1569,9 +1580,7 @@ async def _run_guarded_canary_lifecycle(
         )
         final_pair_status = close_execution.pair_status
     elif close_position:
-        notes.append(
-            "Close step was skipped because the open step did not end in a hedged state."
-        )
+        notes.append("Close step was skipped because the open step did not end in a hedged state.")
     else:
         notes.append("Close step was disabled for this canary cycle.")
 
@@ -2226,6 +2235,17 @@ def create_app() -> FastAPI:
         limit = _validated_history_limit("limit", limit)
         try:
             return store.list_recent(limit=limit, paper_trade_id=paper_trade_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/alerts/system-state", response_model=list[SystemStateAlertEvent])
+    def system_state_alerts(
+        store: Annotated[SystemStateAlertStore, Depends(get_system_state_alert_store)],
+        limit: int = 50,
+        venue: str | None = None,
+    ) -> list[SystemStateAlertEvent]:
+        try:
+            return store.list_recent(limit=limit, venue=venue)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -4574,9 +4594,7 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/opportunities/funding-universe", response_model=FundingUniverseScan)
     async def funding_universe(
-        service: Annotated[
-            OpportunityUniverseService, Depends(get_opportunity_universe_service)
-        ],
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
         venues: Annotated[list[str] | None, Query()] = None,
         ranking: str = "route_adjusted_quality_pnl",
         extended_fee_profile: str | None = None,
@@ -4637,9 +4655,7 @@ def create_app() -> FastAPI:
         response_model=list[FundingUniverseCanaryCandidate],
     )
     async def funding_universe_canary_candidates(
-        service: Annotated[
-            OpportunityUniverseService, Depends(get_opportunity_universe_service)
-        ],
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
         approval_service: Annotated[
             RouteApprovalService,
             Depends(get_route_approval_service),
@@ -5017,9 +5033,7 @@ def create_app() -> FastAPI:
         response_model=FundingUniversePortfolioPlan,
     )
     async def funding_universe_portfolio(
-        service: Annotated[
-            OpportunityUniverseService, Depends(get_opportunity_universe_service)
-        ],
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
         venues: Annotated[list[str] | None, Query()] = None,
         ranking: str = "route_adjusted_quality_pnl",
         extended_fee_profile: str | None = None,
@@ -5087,9 +5101,7 @@ def create_app() -> FastAPI:
         response_model=list[ExecutionQualitySummary],
     )
     def execution_quality_routes(
-        service: Annotated[
-            ExecutionQualityService, Depends(get_execution_quality_service)
-        ],
+        service: Annotated[ExecutionQualityService, Depends(get_execution_quality_service)],
         canonical_symbol: str | None = None,
         short_venue: str | None = None,
         long_venue: str | None = None,
@@ -5117,9 +5129,7 @@ def create_app() -> FastAPI:
     )
     async def execution_accounting_for_paper_trade(
         paper_trade_id: int,
-        service: Annotated[
-            ExecutionAccountingService, Depends(get_execution_accounting_service)
-        ],
+        service: Annotated[ExecutionAccountingService, Depends(get_execution_accounting_service)],
     ) -> PaperTradeAccountingSummary:
         summary = service.latest_for_paper_trade(paper_trade_id)
         if summary is None:
@@ -5131,9 +5141,7 @@ def create_app() -> FastAPI:
         response_model=list[RouteAccountingSummary],
     )
     async def execution_accounting_routes(
-        service: Annotated[
-            ExecutionAccountingService, Depends(get_execution_accounting_service)
-        ],
+        service: Annotated[ExecutionAccountingService, Depends(get_execution_accounting_service)],
         canonical_symbol: str | None = None,
         label: str | None = None,
         limit: int = 50,
@@ -5151,9 +5159,7 @@ def create_app() -> FastAPI:
         response_model=list[RouteStabilitySummary],
     )
     def route_stability_routes(
-        service: Annotated[
-            RouteStabilityService, Depends(get_route_stability_service)
-        ],
+        service: Annotated[RouteStabilityService, Depends(get_route_stability_service)],
         canonical_symbol: str | None = None,
         short_venue: str | None = None,
         long_venue: str | None = None,

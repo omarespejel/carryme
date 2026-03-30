@@ -16,15 +16,19 @@ from carryme_worker.poller import (
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
+    SystemStateObservationLoopSummary,
+    SystemStateObservationSummary,
     UniverseScanLoopSummary,
     UniverseScanSummary,
     install_signal_handlers,
     observe_live_executions_once,
+    observe_system_state_once,
     poll_watchlist_once,
     run_polling_loop,
     run_supervised_approved_canary_scan_loop,
     run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
+    run_supervised_system_state_observation_loop,
     run_supervised_universe_scan_loop,
     scan_approved_canary_once,
     scan_funding_universe_once,
@@ -118,6 +122,7 @@ def build_approved_canary_scan_payload(
         "approved_candidates": summary.approved_candidates,
         "saved_snapshots": summary.saved_snapshots,
         "alert_events": summary.alert_events,
+        "sent_notifications": summary.sent_notifications,
         "database_path": summary.database_path,
     }
 
@@ -135,6 +140,38 @@ def build_approved_canary_scan_loop_payload(
         "approved_candidates": summary.approved_candidates,
         "saved_snapshots": summary.saved_snapshots,
         "alert_events": summary.alert_events,
+        "sent_notifications": summary.sent_notifications,
+        "database_path": summary.database_path,
+    }
+
+
+def build_system_state_observation_payload(
+    summary: SystemStateObservationSummary,
+) -> dict[str, int | str]:
+    """Build a deterministic summary payload for one system-state observation run."""
+
+    return {
+        "checked_venues": summary.checked_venues,
+        "degraded_venues": summary.degraded_venues,
+        "saved_alerts": summary.saved_alerts,
+        "sent_notifications": summary.sent_notifications,
+        "database_path": summary.database_path,
+    }
+
+
+def build_system_state_observation_loop_payload(
+    summary: SystemStateObservationLoopSummary,
+) -> dict[str, int | str]:
+    """Build a deterministic summary payload for a system-state monitor loop."""
+
+    return {
+        "attempts": summary.attempts,
+        "successful_cycles": summary.successful_cycles,
+        "failures": summary.failures,
+        "checked_venues": summary.checked_venues,
+        "degraded_venues": summary.degraded_venues,
+        "saved_alerts": summary.saved_alerts,
+        "sent_notifications": summary.sent_notifications,
         "database_path": summary.database_path,
     }
 
@@ -209,6 +246,16 @@ def main() -> None:
         help="Run the signal-aware supervised execution monitor loop",
     )
     parser.add_argument(
+        "--observe-system-state-once",
+        action="store_true",
+        help="Observe venue system-state once and emit transition alerts",
+    )
+    parser.add_argument(
+        "--observe-system-state-supervise",
+        action="store_true",
+        help="Run the signal-aware supervised system-state monitor loop",
+    )
+    parser.add_argument(
         "--iterations",
         type=int,
         default=None,
@@ -220,6 +267,20 @@ def main() -> None:
         help="Run the signal-aware supervised worker loop",
     )
     args = parser.parse_args()
+    mode_flags = (
+        args.once,
+        args.scan_universe_once,
+        args.scan_universe_supervise,
+        args.scan_approved_canary_once,
+        args.scan_approved_canary_supervise,
+        args.observe_executions_once,
+        args.observe_executions_supervise,
+        args.observe_system_state_once,
+        args.observe_system_state_supervise,
+        args.supervise,
+    )
+    if sum(bool(flag) for flag in mode_flags) > 1:
+        parser.error("choose only one worker mode flag")
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be at least 1")
     if args.iterations is not None and (
@@ -227,6 +288,7 @@ def main() -> None:
         or args.scan_universe_once
         or args.scan_approved_canary_once
         or args.observe_executions_once
+        or args.observe_system_state_once
     ):
         parser.error("--iterations is only supported with the looped worker modes")
 
@@ -241,6 +303,7 @@ def main() -> None:
         print(json.dumps(build_universe_scan_payload(universe_summary), indent=2))
         return
     if args.scan_universe_supervise:
+
         async def run_supervised_universe() -> UniverseScanLoopSummary:
             stop_event = asyncio.Event()
             install_signal_handlers(
@@ -261,6 +324,7 @@ def main() -> None:
         print(build_approved_canary_scan_payload(approved_canary_summary))
         return
     if args.scan_approved_canary_supervise:
+
         async def run_supervised_approved_canary() -> ApprovedCanaryScanLoopSummary:
             stop_event = asyncio.Event()
             install_signal_handlers(
@@ -274,11 +338,7 @@ def main() -> None:
             )
 
         supervised_approved_canary_summary = asyncio.run(run_supervised_approved_canary())
-        print(
-            build_approved_canary_scan_loop_payload(
-                supervised_approved_canary_summary
-            )
-        )
+        print(build_approved_canary_scan_loop_payload(supervised_approved_canary_summary))
         return
     if args.observe_executions_once:
         observation_summary = asyncio.run(observe_live_executions_once(settings))
@@ -305,6 +365,36 @@ def main() -> None:
                 indent=2,
             )
         )
+        return
+    if args.observe_system_state_once:
+        system_state_summary = asyncio.run(observe_system_state_once(settings))
+        print(json.dumps(build_system_state_observation_payload(system_state_summary), indent=2))
+        return
+    if args.observe_system_state_supervise:
+
+        async def run_system_state_supervised() -> SystemStateObservationLoopSummary:
+            stop_event = asyncio.Event()
+            install_signal_handlers(
+                stop_event,
+                signals_to_handle=settings.stop_signals,
+            )
+            return await run_supervised_system_state_observation_loop(
+                settings,
+                stop_event=stop_event,
+                max_iterations=args.iterations,
+            )
+
+        supervised_system_state_summary = asyncio.run(run_system_state_supervised())
+        print(
+            json.dumps(
+                build_system_state_observation_loop_payload(supervised_system_state_summary),
+                indent=2,
+            )
+        )
+        return
+    if args.iterations is not None:
+        loop_summary = asyncio.run(run_polling_loop(settings, iterations=args.iterations))
+        print(json.dumps(build_loop_payload(loop_summary), indent=2))
         return
     if args.supervise:
 

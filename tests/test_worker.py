@@ -8,6 +8,7 @@ from typing import Any, cast
 import httpx
 import pytest
 from carryme_models import (
+    ApprovedCanaryAlertEvent,
     ApprovedCanarySnapshot,
     CandidateAlertEvent,
     CapacityEstimate,
@@ -28,10 +29,16 @@ from carryme_models import (
     PaperTradeAccountPreflight,
     PaperTradeEntry,
     RouteApprovalEntry,
+    SystemStateAlertEvent,
     TradeLegIntent,
     VenueAccountPreflight,
+    VenueSystemState,
 )
-from carryme_runtime import AccountPreflightService, ExecutionOrderStateService
+from carryme_runtime import (
+    AccountPreflightService,
+    ExecutionOrderStateService,
+    SystemStateService,
+)
 from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
@@ -40,6 +47,7 @@ from carryme_storage import (
     ExecutionObservationStore,
     OpportunityHistoryStore,
     RouteApprovalStore,
+    SystemStateAlertStore,
 )
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
@@ -51,6 +59,8 @@ from carryme_worker.main import (
     build_execution_observation_payload,
     build_health_payload,
     build_loop_payload,
+    build_system_state_observation_loop_payload,
+    build_system_state_observation_payload,
     build_universe_scan_loop_payload,
     build_universe_scan_payload,
 )
@@ -65,16 +75,20 @@ from carryme_worker.poller import (
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
+    SystemStateObservationLoopSummary,
+    SystemStateObservationSummary,
     UniverseScanLoopSummary,
     UniverseScanSummary,
     _build_order_state_observers,
     install_signal_handlers,
     observe_live_executions_once,
+    observe_system_state_once,
     poll_watchlist_once,
     run_polling_loop,
     run_supervised_approved_canary_scan_loop,
     run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
+    run_supervised_system_state_observation_loop,
     run_supervised_universe_scan_loop,
     scan_approved_canary_once,
     scan_funding_universe_once,
@@ -319,6 +333,7 @@ def test_worker_approved_canary_scan_payload() -> None:
             approved_candidates=2,
             saved_snapshots=2,
             alert_events=1,
+            sent_notifications=1,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -328,6 +343,7 @@ def test_worker_approved_canary_scan_payload() -> None:
         "approved_candidates": 2,
         "saved_snapshots": 2,
         "alert_events": 1,
+        "sent_notifications": 1,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -342,6 +358,7 @@ def test_worker_approved_canary_scan_loop_payload() -> None:
             approved_candidates=4,
             saved_snapshots=4,
             alert_events=2,
+            sent_notifications=2,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -354,6 +371,53 @@ def test_worker_approved_canary_scan_loop_payload() -> None:
         "approved_candidates": 4,
         "saved_snapshots": 4,
         "alert_events": 2,
+        "sent_notifications": 2,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_system_state_observation_payload() -> None:
+    payload = build_system_state_observation_payload(
+        SystemStateObservationSummary(
+            checked_venues=1,
+            degraded_venues=1,
+            saved_alerts=1,
+            sent_notifications=1,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "checked_venues": 1,
+        "degraded_venues": 1,
+        "saved_alerts": 1,
+        "sent_notifications": 1,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_system_state_observation_loop_payload() -> None:
+    payload = build_system_state_observation_loop_payload(
+        SystemStateObservationLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            checked_venues=4,
+            degraded_venues=2,
+            saved_alerts=2,
+            sent_notifications=2,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "checked_venues": 4,
+        "degraded_venues": 2,
+        "saved_alerts": 2,
+        "sent_notifications": 2,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -928,9 +992,7 @@ def test_scan_approved_canary_once_saves_operator_approved_snapshots(tmp_path: P
     )
 
     class StubUniverseScanner:
-        async def scan_canary_candidates(
-            self, **_: object
-        ) -> list[FundingUniverseCanaryCandidate]:
+        async def scan_canary_candidates(self, **_: object) -> list[FundingUniverseCanaryCandidate]:
             return [candidate]
 
     settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
@@ -1044,9 +1106,7 @@ def test_scan_approved_canary_once_emits_stale_alert_for_missing_route(tmp_path:
     )
 
     class EmptyUniverseScanner:
-        async def scan_canary_candidates(
-            self, **_: object
-        ) -> list[FundingUniverseCanaryCandidate]:
+        async def scan_canary_candidates(self, **_: object) -> list[FundingUniverseCanaryCandidate]:
             return []
 
     alert_store = ApprovedCanaryAlertStore(settings.database_path)
@@ -1071,6 +1131,87 @@ def test_scan_approved_canary_once_emits_stale_alert_for_missing_route(tmp_path:
     assert alerts[0].alert_type == "approved_canary_stale"
 
 
+def test_scan_approved_canary_once_notifies_approved_canary_alerts(tmp_path: Path) -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    class StubUniverseScanner:
+        async def scan_canary_candidates(self, **_: object) -> list[FundingUniverseCanaryCandidate]:
+            return [candidate]
+
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    notified: list[str] = []
+
+    class StubNotifier:
+        async def notify(self, event: ApprovedCanaryAlertEvent) -> None:
+            notified.append(event.alert_type)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, StubUniverseScanner()),
+            store=ApprovedCanaryStore(settings.database_path),
+            alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+            alert_notifier=StubNotifier(),
+            now=datetime(2026, 3, 29, 20, 5, tzinfo=UTC),
+        )
+    )
+
+    assert summary.alert_events == 1
+    assert summary.sent_notifications == 1
+    assert notified == ["approved_canary_available"]
+
+
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
     tmp_path: Path,
 ) -> None:
@@ -1089,6 +1230,8 @@ def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
         approval_service: object | None = None,
         store: object | None = None,
         alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        logger: object | None = None,
         now: datetime | None = None,
     ) -> ApprovedCanaryScanSummary:
         assert settings_arg is settings
@@ -1096,6 +1239,8 @@ def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
         _ = approval_service
         _ = store
         _ = alert_sink
+        _ = alert_notifier
+        _ = logger
         assert now is None
         calls.append(1)
         return ApprovedCanaryScanSummary(
@@ -1103,6 +1248,7 @@ def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
             approved_candidates=1,
             saved_snapshots=1,
             alert_events=1,
+            sent_notifications=1,
             database_path=settings.database_path,
         )
 
@@ -1132,6 +1278,132 @@ def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
     assert summary.approved_candidates == 2
     assert summary.saved_snapshots == 2
     assert summary.alert_events == 2
+    assert summary.sent_notifications == 2
+    assert calls == [1, 1]
+    assert sleeps == [3.0]
+
+
+def test_observe_system_state_once_emits_and_notifies_alerts(tmp_path: Path) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            assert "paradex" in configs
+            return [
+                VenueSystemState(
+                    venue="extended",
+                    enabled=False,
+                    checked=False,
+                    healthy=True,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=False,
+                    status="maintenance",
+                    blocking_reasons=["Paradex system state is maintenance"],
+                ),
+                VenueSystemState(
+                    venue="hyperliquid",
+                    enabled=False,
+                    checked=False,
+                    healthy=True,
+                ),
+            ]
+
+    notified: list[str] = []
+
+    class StubNotifier:
+        async def notify(self, event: SystemStateAlertEvent) -> None:
+            notified.append(event.alert_type)
+
+    summary = asyncio.run(
+        observe_system_state_once(
+            settings,
+            service=cast(SystemStateService, StubSystemStateService()),
+            alert_sink=SystemStateAlertStore(settings.database_path),
+            alert_notifier=StubNotifier(),
+            now=datetime(2026, 3, 29, 20, 7, tzinfo=UTC),
+        )
+    )
+
+    alerts = SystemStateAlertStore(settings.database_path).list_recent(limit=10, venue="paradex")
+
+    assert summary.checked_venues == 1
+    assert summary.degraded_venues == 1
+    assert summary.saved_alerts == 1
+    assert summary.sent_notifications == 1
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "venue_degraded"
+    assert notified == ["venue_degraded"]
+
+
+def test_run_supervised_system_state_observation_loop_honors_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        system_state_observation_interval_seconds=3,
+    )
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def fake_observe_system_state_once(
+        settings_arg: WorkerSettings,
+        *,
+        service: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> SystemStateObservationSummary:
+        assert settings_arg is settings
+        _ = service
+        _ = alert_sink
+        _ = alert_notifier
+        _ = logger
+        assert now is None
+        calls.append(1)
+        return SystemStateObservationSummary(
+            checked_venues=1,
+            degraded_venues=1,
+            saved_alerts=1,
+            sent_notifications=1,
+            database_path=settings.database_path,
+        )
+
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    from unittest.mock import patch
+
+    with patch(
+        "carryme_worker.poller.observe_system_state_once",
+        side_effect=fake_observe_system_state_once,
+    ):
+        summary = asyncio.run(
+            run_supervised_system_state_observation_loop(
+                settings,
+                alert_sink=SystemStateAlertStore(settings.database_path),
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.checked_venues == 2
+    assert summary.degraded_venues == 2
+    assert summary.saved_alerts == 2
+    assert summary.sent_notifications == 2
     assert calls == [1, 1]
     assert sleeps == [3.0]
 
@@ -1299,6 +1571,8 @@ def test_run_supervised_universe_scan_loop_applies_backoff(tmp_path: Path) -> No
     assert summary.saved_records == 2
     assert summary.alert_events == 1
     assert sleeps == [2.0]
+
+
 def test_run_polling_loop_applies_backoff_and_saves_after_retry(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(

@@ -66,6 +66,7 @@ from carryme_models.preview import (
 )
 from carryme_models.readiness import LiveSubmissionReadiness
 from carryme_models.system_state import PaperTradeSystemState, VenueSystemState
+from carryme_models.system_state_alert import SystemStateAlertEvent
 from carryme_models.universe import (
     SUPPORTED_UNIVERSE_VENUES,
     ExecutionQualitySummary,
@@ -138,6 +139,7 @@ __all__ = [
     "TradingFeeProfile",
     "RouteStabilitySummary",
     "RouteAccountingSummary",
+    "SystemStateAlertEvent",
     "VenueAccountPreflight",
     "VenueBalanceDelta",
     "VenueBalanceSnapshot",

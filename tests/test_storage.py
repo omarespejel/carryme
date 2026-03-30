@@ -30,9 +30,11 @@ from carryme_models import (
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
     RouteApprovalEntry,
+    SystemStateAlertEvent,
     TradeLegIntent,
     VenueBalanceSnapshot,
     VenueOrderPreview,
+    VenueSystemState,
 )
 from carryme_storage import (
     ApprovedCanaryAlertStore,
@@ -47,6 +49,7 @@ from carryme_storage import (
     PaperTradeStore,
     PreviewConfirmationStore,
     RouteApprovalStore,
+    SystemStateAlertStore,
     WatchlistStore,
     load_watchlist,
     save_watchlist,
@@ -2510,6 +2513,40 @@ def test_approved_canary_alert_store_appends_and_lists_recent(tmp_path: Path) ->
     assert results[0].current_snapshot.snapshot_id == 2
     assert latest is not None
     assert latest.alert_type == "approved_canary_changed"
+
+
+def test_system_state_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:
+    store = SystemStateAlertStore(tmp_path / "history.sqlite3")
+    event = SystemStateAlertEvent(
+        emitted_at=datetime(2026, 3, 29, 14, 16, tzinfo=UTC),
+        venue="paradex",
+        alert_type="venue_degraded",
+        current_state=VenueSystemState(
+            venue="paradex",
+            enabled=True,
+            checked=True,
+            healthy=False,
+            status="maintenance",
+            blocking_reasons=["Paradex system state is maintenance"],
+        ),
+        previous_state=VenueSystemState(
+            venue="paradex",
+            enabled=True,
+            checked=True,
+            healthy=True,
+            status="ok",
+        ),
+    )
+
+    store.append(event)
+    results = store.list_recent(limit=10, venue="paradex")
+    latest = store.latest(venue="paradex")
+
+    assert len(results) == 1
+    assert results[0].alert_type == "venue_degraded"
+    assert results[0].venue == "paradex"
+    assert latest is not None
+    assert latest.current_state.status == "maintenance"
 
 
 def test_balance_snapshot_store_appends_and_filters(tmp_path: Path) -> None:
