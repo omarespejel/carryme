@@ -242,6 +242,7 @@ def build_production_supervisor_cycle_payload(
         "observed_executions": summary.observed_executions,
         "saved_execution_observations": summary.saved_execution_observations,
         "execution_alerts": summary.execution_alerts,
+        "sent_notifications": summary.sent_notifications,
         "database_path": summary.database_path,
     }
 
@@ -259,6 +260,7 @@ def build_production_supervisor_loop_payload(
         "skipped": summary.skipped,
         "observed_executions": summary.observed_executions,
         "execution_alerts": summary.execution_alerts,
+        "sent_notifications": summary.sent_notifications,
         "database_path": summary.database_path,
     }
 

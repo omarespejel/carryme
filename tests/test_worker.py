@@ -85,6 +85,12 @@ from carryme_worker.main import (
 from carryme_worker.main import (
     main as worker_main,
 )
+from carryme_worker.notifications import (
+    ApprovedCanaryAlertNotifier,
+    ExecutionAlertNotifier,
+    StableLaunchReadyAlertNotifier,
+    SystemStateAlertNotifier,
+)
 from carryme_worker.poller import (
     ApprovedCanaryScanLoopSummary,
     ApprovedCanaryScanSummary,
@@ -527,6 +533,7 @@ def test_worker_production_supervisor_cycle_payload() -> None:
             observed_executions=1,
             saved_execution_observations=1,
             execution_alerts=0,
+            sent_notifications=4,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -546,6 +553,7 @@ def test_worker_production_supervisor_cycle_payload() -> None:
         "observed_executions": 1,
         "saved_execution_observations": 1,
         "execution_alerts": 0,
+        "sent_notifications": 4,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -560,6 +568,7 @@ def test_worker_production_supervisor_loop_payload() -> None:
             skipped=2,
             observed_executions=3,
             execution_alerts=1,
+            sent_notifications=5,
             database_path="tmp/history.sqlite3",
         )
     )
@@ -572,6 +581,7 @@ def test_worker_production_supervisor_loop_payload() -> None:
         "skipped": 2,
         "observed_executions": 3,
         "execution_alerts": 1,
+        "sent_notifications": 5,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -2641,6 +2651,28 @@ def test_run_production_supervisor_cycle_once_orders_stages(
     expected_now = datetime(2026, 3, 30, 11, 0, tzinfo=UTC)
     forwarded_now: list[datetime | None] = []
 
+    class StubSystemNotifier:
+        async def notify(self, event: SystemStateAlertEvent) -> None:
+            _ = event
+
+    class StubApprovedNotifier:
+        async def notify(self, event: ApprovedCanaryAlertEvent) -> None:
+            _ = event
+
+    class StubStableNotifier:
+        async def notify(self, event: StableLaunchReadyAlertEvent) -> None:
+            _ = event
+
+    class StubExecutionNotifier:
+        async def notify(self, event: ExecutionAlertEvent) -> int:
+            _ = event
+            return 1
+
+    system_notifier: SystemStateAlertNotifier = StubSystemNotifier()
+    approved_notifier: ApprovedCanaryAlertNotifier = StubApprovedNotifier()
+    stable_notifier: StableLaunchReadyAlertNotifier = StubStableNotifier()
+    execution_notifier: ExecutionAlertNotifier = StubExecutionNotifier()
+
     async def fake_observe_system_state_once(
         settings_arg: WorkerSettings,
         *,
@@ -2653,7 +2685,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         assert settings_arg is settings
         _ = service
         _ = alert_sink
-        _ = alert_notifier
+        assert alert_notifier is system_notifier
         _ = logger
         forwarded_now.append(now)
         calls.append("system")
@@ -2661,7 +2693,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
             checked_venues=3,
             degraded_venues=0,
             saved_alerts=0,
-            sent_notifications=0,
+            sent_notifications=1,
             database_path=settings.database_path,
         )
 
@@ -2681,7 +2713,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         _ = approval_service
         _ = store
         _ = alert_sink
-        _ = alert_notifier
+        assert alert_notifier is approved_notifier
         _ = logger
         forwarded_now.append(now)
         calls.append("approved")
@@ -2690,7 +2722,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
             approved_candidates=1,
             saved_snapshots=1,
             alert_events=0,
-            sent_notifications=0,
+            sent_notifications=2,
             database_path=settings.database_path,
         )
 
@@ -2710,7 +2742,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         _ = approved_store
         _ = launch_ready_store
         _ = alert_sink
-        _ = alert_notifier
+        assert alert_notifier is stable_notifier
         _ = approval_service
         _ = system_state_service
         _ = logger
@@ -2721,7 +2753,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
             launch_ready_candidates=1,
             saved_snapshots=1,
             alert_events=0,
-            sent_notifications=0,
+            sent_notifications=3,
             database_path=settings.database_path,
         )
 
@@ -2763,7 +2795,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         _ = execution_store
         _ = observation_store
         _ = alert_sink
-        _ = alert_notifier
+        assert alert_notifier is execution_notifier
         _ = account_service
         _ = order_state_service
         _ = logger
@@ -2774,7 +2806,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
             observed_executions=1,
             saved_observations=1,
             saved_alerts=0,
-            sent_notifications=0,
+            sent_notifications=4,
             database_path=settings.database_path,
         )
 
@@ -2802,6 +2834,10 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         summary = asyncio.run(
             run_production_supervisor_cycle_once(
                 settings,
+                system_state_alert_notifier=system_notifier,
+                approved_canary_alert_notifier=approved_notifier,
+                stable_launch_ready_alert_notifier=stable_notifier,
+                execution_alert_notifier=execution_notifier,
                 now=expected_now,
             )
         )
@@ -2817,6 +2853,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
     assert summary.launch_status == "launched"
     assert summary.paper_trade_id == 17
     assert summary.observed_executions == 1
+    assert summary.sent_notifications == 10
 
 
 def test_run_supervised_production_supervisor_loop_honors_max_iterations(
@@ -2848,6 +2885,7 @@ def test_run_supervised_production_supervisor_loop_honors_max_iterations(
                 observed_executions=1,
                 saved_execution_observations=1,
                 execution_alerts=0,
+                sent_notifications=4,
                 database_path=settings.database_path,
             ),
             ProductionSupervisorCycleSummary(
@@ -2865,6 +2903,7 @@ def test_run_supervised_production_supervisor_loop_honors_max_iterations(
                 observed_executions=0,
                 saved_execution_observations=0,
                 execution_alerts=0,
+                sent_notifications=0,
                 database_path=settings.database_path,
             ),
         ]
@@ -2873,10 +2912,18 @@ def test_run_supervised_production_supervisor_loop_honors_max_iterations(
     async def fake_run_production_supervisor_cycle_once(
         settings_arg: WorkerSettings,
         *,
+        system_state_alert_notifier: object | None = None,
+        approved_canary_alert_notifier: object | None = None,
+        stable_launch_ready_alert_notifier: object | None = None,
+        execution_alert_notifier: object | None = None,
         now: datetime | None = None,
         logger: object | None = None,
     ) -> ProductionSupervisorCycleSummary:
         assert settings_arg is settings
+        _ = system_state_alert_notifier
+        _ = approved_canary_alert_notifier
+        _ = stable_launch_ready_alert_notifier
+        _ = execution_alert_notifier
         _ = now
         _ = logger
         return next(summaries)
@@ -2901,6 +2948,7 @@ def test_run_supervised_production_supervisor_loop_honors_max_iterations(
     assert summary.skipped == 1
     assert summary.observed_executions == 1
     assert summary.execution_alerts == 0
+    assert summary.sent_notifications == 4
     assert sleeps == [7]
 
 
@@ -2951,6 +2999,7 @@ def test_run_supervised_production_supervisor_loop_applies_backoff(
             observed_executions=1,
             saved_execution_observations=1,
             execution_alerts=0,
+            sent_notifications=5,
             database_path=settings.database_path,
         ),
     ]
@@ -2958,9 +3007,17 @@ def test_run_supervised_production_supervisor_loop_applies_backoff(
     async def fake_run_production_supervisor_cycle_once(
         settings_arg: WorkerSettings,
         *,
+        system_state_alert_notifier: object | None = None,
+        approved_canary_alert_notifier: object | None = None,
+        stable_launch_ready_alert_notifier: object | None = None,
+        execution_alert_notifier: object | None = None,
         logger: object | None = None,
     ) -> ProductionSupervisorCycleSummary:
         assert settings_arg is settings
+        _ = system_state_alert_notifier
+        _ = approved_canary_alert_notifier
+        _ = stable_launch_ready_alert_notifier
+        _ = execution_alert_notifier
         _ = logger
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -2987,7 +3044,142 @@ def test_run_supervised_production_supervisor_loop_applies_backoff(
     assert summary.skipped == 0
     assert summary.observed_executions == 1
     assert summary.execution_alerts == 0
+    assert summary.sent_notifications == 5
     assert sleeps == [3.0, 6.0]
+
+
+def test_run_supervised_production_supervisor_loop_builds_and_reuses_stage_notifiers(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+    )
+    system_notifier = object()
+    approved_notifier = object()
+    stable_notifier = object()
+    execution_notifier = object()
+    builder_calls = {
+        "system": 0,
+        "approved": 0,
+        "stable": 0,
+        "execution": 0,
+    }
+    cycle_calls = 0
+
+    async def fake_sleep(seconds: float) -> None:
+        _ = seconds
+
+    def build_system_notifier(
+        settings_arg: WorkerSettings, *, logger: object | None = None
+    ) -> object:
+        assert settings_arg is settings
+        _ = logger
+        builder_calls["system"] += 1
+        return system_notifier
+
+    def build_approved_notifier(
+        settings_arg: WorkerSettings, *, logger: object | None = None
+    ) -> object:
+        assert settings_arg is settings
+        _ = logger
+        builder_calls["approved"] += 1
+        return approved_notifier
+
+    def build_stable_notifier(
+        settings_arg: WorkerSettings, *, logger: object | None = None
+    ) -> object:
+        assert settings_arg is settings
+        _ = logger
+        builder_calls["stable"] += 1
+        return stable_notifier
+
+    def build_execution_notifier(
+        settings_arg: WorkerSettings, *, logger: object | None = None
+    ) -> object:
+        assert settings_arg is settings
+        _ = logger
+        builder_calls["execution"] += 1
+        return execution_notifier
+
+    async def fake_run_production_supervisor_cycle_once(
+        settings_arg: WorkerSettings,
+        *,
+        system_state_alert_notifier: object | None = None,
+        approved_canary_alert_notifier: object | None = None,
+        stable_launch_ready_alert_notifier: object | None = None,
+        execution_alert_notifier: object | None = None,
+        now: datetime | None = None,
+        logger: object | None = None,
+    ) -> ProductionSupervisorCycleSummary:
+        nonlocal cycle_calls
+        assert settings_arg is settings
+        assert system_state_alert_notifier is system_notifier
+        assert approved_canary_alert_notifier is approved_notifier
+        assert stable_launch_ready_alert_notifier is stable_notifier
+        assert execution_alert_notifier is execution_notifier
+        assert now is None
+        _ = logger
+        cycle_calls += 1
+        return ProductionSupervisorCycleSummary(
+            checked_venues=1,
+            degraded_venues=0,
+            scanned_candidates=1,
+            approved_candidates=1,
+            saved_approved_snapshots=1,
+            scanned_launch_ready_snapshots=1,
+            launch_ready_candidates=1,
+            saved_launch_ready_snapshots=1,
+            launch_status="skipped",
+            paper_trade_id=None,
+            final_pair_state=None,
+            observed_executions=0,
+            saved_execution_observations=0,
+            execution_alerts=0,
+            sent_notifications=4,
+            database_path=settings.database_path,
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.notifications.build_system_state_alert_notifier",
+            build_system_notifier,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.notifications.build_approved_canary_alert_notifier",
+            build_approved_notifier,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.notifications.build_stable_launch_ready_alert_notifier",
+            build_stable_notifier,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.notifications.build_execution_alert_notifier",
+            build_execution_notifier,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller.run_production_supervisor_cycle_once",
+            fake_run_production_supervisor_cycle_once,
+        )
+        summary = asyncio.run(
+            run_supervised_production_supervisor_loop(
+                settings,
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.skipped == 2
+    assert summary.sent_notifications == 8
+    assert cycle_calls == 2
+    assert builder_calls == {
+        "system": 1,
+        "approved": 1,
+        "stable": 1,
+        "execution": 1,
+    }
 
 
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
@@ -3120,6 +3312,54 @@ def test_observe_system_state_once_emits_and_notifies_alerts(tmp_path: Path) -> 
     assert len(alerts) == 1
     assert alerts[0].alert_type == "venue_degraded"
     assert notified == ["venue_degraded"]
+
+
+def test_observe_system_state_once_times_out_stuck_notifier(tmp_path: Path) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        system_state_alert_webhook_timeout_seconds=0.01,
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            assert "paradex" in configs
+            return [
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=False,
+                    status="maintenance",
+                    blocking_reasons=["Paradex system state is maintenance"],
+                )
+            ]
+
+    class HangingNotifier:
+        async def notify(self, event: SystemStateAlertEvent) -> None:
+            _ = event
+            await asyncio.Event().wait()
+
+    summary = asyncio.run(
+        observe_system_state_once(
+            settings,
+            service=cast(SystemStateService, StubSystemStateService()),
+            alert_sink=SystemStateAlertStore(settings.database_path),
+            alert_notifier=HangingNotifier(),
+            now=datetime(2026, 3, 29, 20, 7, tzinfo=UTC),
+        )
+    )
+
+    alerts = SystemStateAlertStore(settings.database_path).list_recent(limit=10, venue="paradex")
+
+    assert summary.checked_venues == 1
+    assert summary.degraded_venues == 1
+    assert summary.saved_alerts == 1
+    assert summary.sent_notifications == 0
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "venue_degraded"
 
 
 def test_run_supervised_system_state_observation_loop_honors_max_iterations(
