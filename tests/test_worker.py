@@ -883,6 +883,71 @@ def test_run_supervised_universe_scan_loop_rejects_non_positive_max_iterations(
         asyncio.run(run_supervised_universe_scan_loop(settings, max_iterations=0))
 
 
+def test_run_supervised_universe_scan_loop_applies_backoff(tmp_path: Path) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        universe_scan_interval_seconds=2,
+        universe_scan_max_backoff_seconds=5,
+    )
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    outcomes: list[UniverseScanSummary | Exception] = [
+        RuntimeError("temporary universe failure"),
+        UniverseScanSummary(
+            overlap_count=1,
+            scanned_opportunities=2,
+            saved_records=2,
+            alert_events=1,
+            database_path=settings.database_path,
+        ),
+    ]
+
+    async def fake_scan_funding_universe_once(
+        settings_arg: WorkerSettings,
+        *,
+        scanner: object | None = None,
+        store: object | None = None,
+        alert_sink: object | None = None,
+        now: datetime | None = None,
+    ) -> UniverseScanSummary:
+        assert settings_arg is settings
+        _ = scanner
+        _ = store
+        _ = alert_sink
+        assert now is None
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    from unittest.mock import patch
+
+    with patch(
+        "carryme_worker.poller.scan_funding_universe_once",
+        side_effect=fake_scan_funding_universe_once,
+    ):
+        summary = asyncio.run(
+            run_supervised_universe_scan_loop(
+                settings,
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 1
+    assert summary.failures == 1
+    assert summary.overlap_count == 1
+    assert summary.scanned_opportunities == 2
+    assert summary.saved_records == 2
+    assert summary.alert_events == 1
+    assert sleeps == [2.0]
+
+
 def test_run_polling_loop_applies_backoff_and_saves_after_retry(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(
