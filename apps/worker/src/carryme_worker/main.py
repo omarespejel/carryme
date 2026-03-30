@@ -18,12 +18,14 @@ from carryme_worker.poller import (
     LaunchReadyCanaryCacheSummary,
     PollCycleSummary,
     PollLoopSummary,
+    StableCanaryLaunchSummary,
     SystemStateObservationLoopSummary,
     SystemStateObservationSummary,
     UniverseScanLoopSummary,
     UniverseScanSummary,
     cache_launch_ready_canaries_once,
     install_signal_handlers,
+    launch_latest_stable_canary_once,
     observe_live_executions_once,
     observe_system_state_once,
     poll_watchlist_once,
@@ -182,6 +184,23 @@ def build_launch_ready_canary_cache_loop_payload(
     }
 
 
+def build_stable_canary_launch_payload(
+    summary: StableCanaryLaunchSummary,
+) -> dict[str, object]:
+    """Build a deterministic summary payload for one stable-canary launch attempt."""
+
+    return {
+        "status": summary.status,
+        "label": summary.label,
+        "launch_ready_snapshot_id": summary.launch_ready_snapshot_id,
+        "approved_snapshot_id": summary.approved_snapshot_id,
+        "paper_trade_id": summary.paper_trade_id,
+        "final_pair_state": summary.final_pair_state,
+        "detail": summary.detail,
+        "database_path": summary.database_path,
+    }
+
+
 def build_system_state_observation_payload(
     summary: SystemStateObservationSummary,
 ) -> dict[str, int | str]:
@@ -283,6 +302,11 @@ def main() -> None:
         help="Run the signal-aware supervised launch-ready canary cache loop",
     )
     mode.add_argument(
+        "--launch-latest-stable-canary-once",
+        action="store_true",
+        help="Launch the latest stable cached canary once behind all live gates",
+    )
+    mode.add_argument(
         "--observe-executions-once",
         action="store_true",
         help="Observe recent live executions once and persist snapshots",
@@ -322,6 +346,7 @@ def main() -> None:
         args.scan_approved_canary_supervise,
         args.cache_launch_ready_canary_once,
         args.cache_launch_ready_canary_supervise,
+        args.launch_latest_stable_canary_once,
         args.observe_executions_once,
         args.observe_executions_supervise,
         args.observe_system_state_once,
@@ -409,6 +434,10 @@ def main() -> None:
 
         supervised_launch_ready_summary = asyncio.run(run_launch_ready_supervised())
         print(build_launch_ready_canary_cache_loop_payload(supervised_launch_ready_summary))
+        return
+    if args.launch_latest_stable_canary_once:
+        launch_summary = asyncio.run(launch_latest_stable_canary_once(settings))
+        print(build_stable_canary_launch_payload(launch_summary))
         return
     if args.observe_executions_once:
         observation_summary = asyncio.run(observe_live_executions_once(settings))

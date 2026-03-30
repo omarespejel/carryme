@@ -12,9 +12,17 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol, cast
 
 import httpx
+from carryme_api.app import (
+    _build_launch_ready_canary_stability,
+    _run_guarded_canary_lifecycle,
+    _select_latest_launch_ready_canary_snapshot,
+)
+from carryme_api.config import ApiSettings
+ 
 from carryme_models import (
     ApprovedCanaryAlertEvent,
     ApprovedCanarySnapshot,
+    CanaryLifecycleResult,
     CandidateAlertEvent,
     ExecutionAlertEvent,
     ExecutionJournalEntry,
@@ -35,12 +43,25 @@ from carryme_runtime import (
     AccountPreflightConfigMap,
     AccountPreflightService,
     ConnectorError,
+    BalanceAccountingService,
+    CleanupLiveExecutionRouter,
+    CleanupPreviewRouter,
     ExecutionOrderStateService,
     ExecutionQualityService,
+    ExtendedCleanupPreviewService,
+    ExtendedLiveExecutionService,
     ExtendedOrderStateObserver,
+    HyperliquidCleanupPreviewService,
+    HyperliquidLiveExecutionService,
     HyperliquidOrderStateObserver,
     OpportunityService,
     OpportunityUniverseService,
+    OrderPreviewService,
+    PairCloseLiveExecutionCoordinator,
+    PairClosePreviewService,
+    PairedLiveExecutionCoordinator,
+    ParadexCleanupPreviewService,
+    ParadexLiveExecutionService,
     ParadexOrderStateObserver,
     RouteApprovalService,
     RouteStabilityService,
@@ -57,17 +78,23 @@ from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
+    BalanceSnapshotStore,
     CandidateAlertStore,
+    CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     LaunchReadyCanaryStore,
     OpportunityHistoryStore,
+    PairClosePreviewConfirmationStore,
+    PaperTradeStore,
+    PreviewConfirmationStore,
     RouteApprovalStore,
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
     load_watchlist,
 )
+from fastapi import HTTPException
 
 from carryme_worker.config import WorkerSettings
 from carryme_worker.notifications import (
@@ -263,6 +290,21 @@ class LaunchReadyCanaryCacheLoopSummary:
     alert_events: int
     sent_notifications: int
     database_path: str
+
+
+@dataclass
+class StableCanaryLaunchSummary:
+    """Summary emitted after attempting to launch the latest stable canary."""
+
+    status: Literal["launched", "skipped"]
+    database_path: str
+    label: str | None = None
+    launch_ready_snapshot_id: int | None = None
+    approved_snapshot_id: int | None = None
+    paper_trade_id: int | None = None
+    final_pair_state: str | None = None
+    detail: object | None = None
+    lifecycle: CanaryLifecycleResult | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -997,6 +1039,211 @@ async def run_supervised_launch_ready_canary_cache_loop(
         alert_events=alert_events,
         sent_notifications=sent_notifications,
         database_path=settings.database_path,
+    )
+
+
+def _build_api_settings_from_worker_settings(settings: WorkerSettings) -> ApiSettings:
+    """Build API settings aligned to the worker's runtime paths and environment."""
+
+    return ApiSettings(
+        environment=settings.environment,
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+    )
+
+
+async def launch_latest_stable_canary_once(
+    settings: WorkerSettings,
+    *,
+    api_settings: ApiSettings | None = None,
+    now: datetime | None = None,
+) -> StableCanaryLaunchSummary:
+    """Launch the latest stable cached canary once, or skip deterministically."""
+
+    runtime_settings = api_settings or _build_api_settings_from_worker_settings(settings)
+    launch_ready_store = LaunchReadyCanaryStore(runtime_settings.database_path)
+    route_approval_service = RouteApprovalService(
+        store=RouteApprovalStore(runtime_settings.database_path)
+    )
+    timestamp = now or datetime.now(UTC)
+
+    try:
+        stability = _build_launch_ready_canary_stability(
+            store=launch_ready_store,
+            label=None,
+            max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+            min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
+            min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
+            now=timestamp,
+        )
+        snapshot, selected, approval = _select_latest_launch_ready_canary_snapshot(
+            store=launch_ready_store,
+            approval_service=route_approval_service,
+            label=stability.snapshot.label,
+            max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+            now=timestamp,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {404, 409}:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_path,
+                detail=exc.detail,
+            )
+        raise
+
+    try:
+        lifecycle = await _run_guarded_canary_lifecycle(
+            candidate=selected,
+            approval=approval,
+            desired_notional=None,
+            note="worker stable launch-ready canary",
+            lifecycle_note=(
+                "Launched by carryme-worker from stable launch-ready snapshot "
+                f"{stability.snapshot.launch_ready_snapshot_id} after "
+                f"{stability.consecutive_snapshots} stable snapshots over "
+                f"{stability.stable_seconds:.1f}s."
+            ),
+            paper_store=PaperTradeStore(runtime_settings.database_path),
+            confirmation_store=PreviewConfirmationStore(runtime_settings.database_path),
+            pair_close_confirmation_store=PairClosePreviewConfirmationStore(
+                runtime_settings.database_path
+            ),
+            cleanup_confirmation_store=CleanupPreviewConfirmationStore(
+                runtime_settings.database_path
+            ),
+            execution_store=ExecutionJournalStore(runtime_settings.database_path),
+            observation_store=ExecutionObservationStore(runtime_settings.database_path),
+            settings=runtime_settings,
+            account_preflight_service=AccountPreflightService(),
+            system_state_service=SystemStateService(),
+            balance_service=BalanceAccountingService(
+                store=BalanceSnapshotStore(runtime_settings.database_path)
+            ),
+            order_preview_service=OrderPreviewService(),
+            order_state_service=ExecutionOrderStateService(
+                observers=_build_order_state_observers(settings)
+            ),
+            cleanup_preview_service=CleanupPreviewRouter(
+                services={
+                    "extended": ExtendedCleanupPreviewService(
+                        api_key=runtime_settings.extended_api_key or ""
+                    ),
+                    "hyperliquid": HyperliquidCleanupPreviewService(
+                        account_address=runtime_settings.hyperliquid_account_address or ""
+                    ),
+                    "paradex": ParadexCleanupPreviewService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key,
+                        bearer_token=runtime_settings.paradex_bearer_token,
+                    ),
+                }
+            ),
+            pair_close_preview_service=PairClosePreviewService(
+                services={
+                    "extended": ExtendedCleanupPreviewService(
+                        api_key=runtime_settings.extended_api_key or ""
+                    ),
+                    "hyperliquid": HyperliquidCleanupPreviewService(
+                        account_address=runtime_settings.hyperliquid_account_address or ""
+                    ),
+                    "paradex": ParadexCleanupPreviewService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key,
+                        bearer_token=runtime_settings.paradex_bearer_token,
+                    ),
+                }
+            ),
+            cleanup_live_router=CleanupLiveExecutionRouter(
+                services={
+                    "extended": ExtendedLiveExecutionService(
+                        api_key=runtime_settings.extended_api_key or "",
+                        stark_private_key=runtime_settings.extended_stark_private_key or "",
+                    ),
+                    "hyperliquid": HyperliquidLiveExecutionService(
+                        account_address=runtime_settings.hyperliquid_account_address or "",
+                        vault_address=runtime_settings.hyperliquid_vault_address,
+                        api_wallet_private_key=(
+                            runtime_settings.hyperliquid_api_wallet_private_key or ""
+                        ),
+                    ),
+                    "paradex": ParadexLiveExecutionService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key or "",
+                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
+                    ),
+                }
+            ),
+            paired_service=PairedLiveExecutionCoordinator(
+                services={
+                    "extended": ExtendedLiveExecutionService(
+                        api_key=runtime_settings.extended_api_key or "",
+                        stark_private_key=runtime_settings.extended_stark_private_key or "",
+                    ),
+                    "hyperliquid": HyperliquidLiveExecutionService(
+                        account_address=runtime_settings.hyperliquid_account_address or "",
+                        vault_address=runtime_settings.hyperliquid_vault_address,
+                        api_wallet_private_key=(
+                            runtime_settings.hyperliquid_api_wallet_private_key or ""
+                        ),
+                    ),
+                    "paradex": ParadexLiveExecutionService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key or "",
+                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
+                    ),
+                }
+            ),
+            pair_close_live_service=PairCloseLiveExecutionCoordinator(
+                services={
+                    "extended": ExtendedLiveExecutionService(
+                        api_key=runtime_settings.extended_api_key or "",
+                        stark_private_key=runtime_settings.extended_stark_private_key or "",
+                    ),
+                    "hyperliquid": HyperliquidLiveExecutionService(
+                        account_address=runtime_settings.hyperliquid_account_address or "",
+                        vault_address=runtime_settings.hyperliquid_vault_address,
+                        api_wallet_private_key=(
+                            runtime_settings.hyperliquid_api_wallet_private_key or ""
+                        ),
+                    ),
+                    "paradex": ParadexLiveExecutionService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key or "",
+                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
+                    ),
+                }
+            ),
+            approval_service=route_approval_service,
+            slippage_tolerance_bps=20,
+            open_first_venue="auto",
+            close_first_venue="auto",
+            poll_attempts=5,
+            poll_interval_seconds=2.0,
+            auto_cleanup=True,
+            close_position=True,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {404, 409}:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_path,
+                label=stability.snapshot.label,
+                launch_ready_snapshot_id=stability.snapshot.launch_ready_snapshot_id,
+                approved_snapshot_id=stability.snapshot.approved_snapshot.snapshot_id,
+                detail=exc.detail,
+            )
+        raise
+    return StableCanaryLaunchSummary(
+        status="launched",
+        database_path=settings.database_path,
+        label=stability.snapshot.label,
+        launch_ready_snapshot_id=stability.snapshot.launch_ready_snapshot_id,
+        approved_snapshot_id=stability.snapshot.approved_snapshot.snapshot_id,
+        paper_trade_id=lifecycle.paper_trade.entry_id,
+        final_pair_state=lifecycle.final_pair_status.derived_state,
+        detail=None,
+        lifecycle=lifecycle,
     )
 
 
