@@ -6,9 +6,10 @@ import asyncio
 import logging
 import math
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 from carryme_models import (
@@ -115,7 +116,7 @@ from carryme_storage import (
     RouteApprovalStore,
     WatchlistStore,
 )
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -4709,6 +4710,7 @@ def create_app() -> FastAPI:
         response_model=CanaryLifecycleResult,
     )
     async def execute_guarded_canary_cycle_from_latest_approved(
+        request: Request,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         store: Annotated[ApprovedCanaryStore, Depends(get_approved_canary_store)],
         approval_service: Annotated[
@@ -4757,18 +4759,6 @@ def create_app() -> FastAPI:
             PairClosePreviewService,
             Depends(get_pair_close_preview_service),
         ],
-        cleanup_live_router: Annotated[
-            CleanupLiveExecutionRouter,
-            Depends(get_cleanup_live_execution_router),
-        ],
-        paired_service: Annotated[
-            PairedLiveExecutionCoordinator,
-            Depends(get_paired_live_execution_coordinator),
-        ],
-        pair_close_live_service: Annotated[
-            PairCloseLiveExecutionCoordinator,
-            Depends(get_pair_close_live_execution_coordinator),
-        ],
         label: str | None = None,
         desired_notional: float | None = None,
         note: str | None = None,
@@ -4787,6 +4777,50 @@ def create_app() -> FastAPI:
             label=label,
             max_snapshot_age_seconds=max_snapshot_age_seconds,
         )
+
+        def _resolve_lazy_dependency(getter: object, builder: Callable[[], Any]) -> Any:
+            override = request.app.dependency_overrides.get(getter)
+            if override is not None:
+                return override()
+            return builder()
+
+        extended_service = _resolve_lazy_dependency(
+            get_extended_live_execution_service,
+            lambda: get_extended_live_execution_service(settings),
+        )
+        hyperliquid_service = _resolve_lazy_dependency(
+            get_hyperliquid_live_execution_service,
+            lambda: get_hyperliquid_live_execution_service(settings),
+        )
+        paradex_service = _resolve_lazy_dependency(
+            get_paradex_live_execution_service,
+            lambda: get_paradex_live_execution_service(settings),
+        )
+        cleanup_live_router = _resolve_lazy_dependency(
+            get_cleanup_live_execution_router,
+            lambda: get_cleanup_live_execution_router(
+                extended_service,
+                hyperliquid_service,
+                paradex_service,
+            ),
+        )
+        paired_service = _resolve_lazy_dependency(
+            get_paired_live_execution_coordinator,
+            lambda: get_paired_live_execution_coordinator(
+                extended_service,
+                hyperliquid_service,
+                paradex_service,
+            ),
+        )
+        pair_close_live_service = _resolve_lazy_dependency(
+            get_pair_close_live_execution_coordinator,
+            lambda: get_pair_close_live_execution_coordinator(
+                extended_service,
+                hyperliquid_service,
+                paradex_service,
+            ),
+        )
+
         return await _run_guarded_canary_lifecycle(
             candidate=selected,
             approval=approval,

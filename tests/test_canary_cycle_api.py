@@ -825,7 +825,7 @@ def test_execute_guarded_canary_cycle_from_latest_snapshot_runs_open_and_close(
                     ExecutionLegOrderState(
                         venue=leg.venue,
                         supported=True,
-                        observation_source="test",
+                        observation_source="rest_poll",
                         external_reference=leg.external_reference,
                         derived_state="filled",
                         order_status="filled",
