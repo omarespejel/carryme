@@ -14,12 +14,15 @@ from carryme_worker.poller import (
     CandidateRecordSummary,
     ExecutionObservationLoopSummary,
     ExecutionObservationSummary,
+    LaunchReadyCanaryCacheLoopSummary,
+    LaunchReadyCanaryCacheSummary,
     PollCycleSummary,
     PollLoopSummary,
     SystemStateObservationLoopSummary,
     SystemStateObservationSummary,
     UniverseScanLoopSummary,
     UniverseScanSummary,
+    cache_launch_ready_canaries_once,
     install_signal_handlers,
     observe_live_executions_once,
     observe_system_state_once,
@@ -27,6 +30,7 @@ from carryme_worker.poller import (
     run_polling_loop,
     run_supervised_approved_canary_scan_loop,
     run_supervised_execution_observation_loop,
+    run_supervised_launch_ready_canary_cache_loop,
     run_supervised_polling_loop,
     run_supervised_system_state_observation_loop,
     run_supervised_universe_scan_loop,
@@ -145,6 +149,35 @@ def build_approved_canary_scan_loop_payload(
     }
 
 
+def build_launch_ready_canary_cache_payload(
+    summary: LaunchReadyCanaryCacheSummary,
+) -> dict[str, int | str]:
+    """Build a deterministic summary payload for one launch-ready cache run."""
+
+    return {
+        "scanned_snapshots": summary.scanned_snapshots,
+        "launch_ready_candidates": summary.launch_ready_candidates,
+        "saved_snapshots": summary.saved_snapshots,
+        "database_path": summary.database_path,
+    }
+
+
+def build_launch_ready_canary_cache_loop_payload(
+    summary: LaunchReadyCanaryCacheLoopSummary,
+) -> dict[str, int | str]:
+    """Build a deterministic summary payload for the launch-ready cache loop."""
+
+    return {
+        "attempts": summary.attempts,
+        "successful_cycles": summary.successful_cycles,
+        "failures": summary.failures,
+        "scanned_snapshots": summary.scanned_snapshots,
+        "launch_ready_candidates": summary.launch_ready_candidates,
+        "saved_snapshots": summary.saved_snapshots,
+        "database_path": summary.database_path,
+    }
+
+
 def build_system_state_observation_payload(
     summary: SystemStateObservationSummary,
 ) -> dict[str, int | str]:
@@ -236,6 +269,16 @@ def main() -> None:
         help="Run the signal-aware supervised approved-canary scan loop",
     )
     mode.add_argument(
+        "--cache-launch-ready-canary-once",
+        action="store_true",
+        help="Cache fresh launch-ready canary snapshots once",
+    )
+    mode.add_argument(
+        "--cache-launch-ready-canary-supervise",
+        action="store_true",
+        help="Run the signal-aware supervised launch-ready canary cache loop",
+    )
+    mode.add_argument(
         "--observe-executions-once",
         action="store_true",
         help="Observe recent live executions once and persist snapshots",
@@ -273,6 +316,8 @@ def main() -> None:
         args.scan_universe_supervise,
         args.scan_approved_canary_once,
         args.scan_approved_canary_supervise,
+        args.cache_launch_ready_canary_once,
+        args.cache_launch_ready_canary_supervise,
         args.observe_executions_once,
         args.observe_executions_supervise,
         args.observe_system_state_once,
@@ -339,6 +384,27 @@ def main() -> None:
 
         supervised_approved_canary_summary = asyncio.run(run_supervised_approved_canary())
         print(build_approved_canary_scan_loop_payload(supervised_approved_canary_summary))
+        return
+    if args.cache_launch_ready_canary_once:
+        launch_ready_summary = asyncio.run(cache_launch_ready_canaries_once(settings))
+        print(build_launch_ready_canary_cache_payload(launch_ready_summary))
+        return
+    if args.cache_launch_ready_canary_supervise:
+
+        async def run_launch_ready_supervised() -> LaunchReadyCanaryCacheLoopSummary:
+            stop_event = asyncio.Event()
+            install_signal_handlers(
+                stop_event,
+                signals_to_handle=settings.stop_signals,
+            )
+            return await run_supervised_launch_ready_canary_cache_loop(
+                settings,
+                stop_event=stop_event,
+                max_iterations=args.iterations,
+            )
+
+        supervised_launch_ready_summary = asyncio.run(run_launch_ready_supervised())
+        print(build_launch_ready_canary_cache_loop_payload(supervised_launch_ready_summary))
         return
     if args.observe_executions_once:
         observation_summary = asyncio.run(observe_live_executions_once(settings))

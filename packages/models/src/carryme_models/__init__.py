@@ -45,6 +45,7 @@ from carryme_models.history import (
     WatchlistDocument,
 )
 from carryme_models.intent import FundingPairTradeIntent, PaperTradeEntry, TradeLegIntent
+from carryme_models.launch_ready_canary import LaunchReadyCanarySnapshot
 from carryme_models.market import MarketStats, TopOfBook
 from carryme_models.normalization import (
     FundingRateNormalization,
@@ -119,6 +120,7 @@ __all__ = [
     "FundingUniverseVenueMarket",
     "GuardedPairExecutionResult",
     "LiveSubmissionReadiness",
+    "LaunchReadyCanarySnapshot",
     "MarketIdentity",
     "MarketStats",
     "NormalizedMarketSnapshot",

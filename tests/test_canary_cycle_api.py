@@ -14,6 +14,7 @@ from carryme_api.app import (
     get_execution_journal_store,
     get_execution_observation_store,
     get_execution_order_state_service,
+    get_launch_ready_canary_store,
     get_opportunity_universe_service,
     get_order_preview_service,
     get_pair_close_live_execution_coordinator,
@@ -40,15 +41,18 @@ from carryme_models import (
     FundingUniverseCanaryCandidate,
     FundingUniverseOpportunity,
     FundingUniverseVenueMarket,
+    LaunchReadyCanarySnapshot,
     PairClosePreviewConfirmationEntry,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeOrderPreview,
+    PaperTradeSystemState,
     PreviewConfirmationEntry,
     RouteApprovalEntry,
     TradeLegIntent,
     VenueAccountPreflight,
     VenueOrderPreview,
+    VenueSystemState,
 )
 from carryme_runtime import BalanceAccountingService
 from carryme_storage import (
@@ -57,6 +61,7 @@ from carryme_storage import (
     CleanupPreviewConfirmationStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
+    LaunchReadyCanaryStore,
     PairClosePreviewConfirmationStore,
     PaperTradeStore,
     PreviewConfirmationStore,
@@ -119,6 +124,25 @@ def _route_approval() -> RouteApprovalEntry:
     )
 
 
+def _launch_ready_snapshot() -> LaunchReadyCanarySnapshot:
+    return LaunchReadyCanarySnapshot(
+        captured_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        label="arb_extended_paradex",
+        max_snapshot_age_seconds=300,
+        approved_snapshot=ApprovedCanarySnapshot(
+            snapshot_id=5,
+            captured_at=datetime(2026, 3, 30, 11, 59, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=_canary_candidate(),
+            approval=_route_approval(),
+        ),
+        system_state=_system_state(
+            healthy_extended=True,
+            healthy_paradex=True,
+        ),
+    )
+
+
 def _account_preflight(
     *,
     paper_trade: PaperTradeEntry,
@@ -163,6 +187,43 @@ def _account_preflight(
                 blocking_reasons=[],
             ),
         ],
+    )
+
+
+def _system_state(
+    *,
+    healthy_extended: bool,
+    healthy_paradex: bool,
+) -> PaperTradeSystemState:
+    blocking_reasons: list[str] = []
+    venues = [
+        VenueSystemState(
+            venue="extended",
+            enabled=True,
+            checked=False,
+            healthy=healthy_extended,
+            status=None,
+            blocking_reasons=[] if healthy_extended else ["Extended system state is degraded"],
+            notes=[],
+        ),
+        VenueSystemState(
+            venue="paradex",
+            enabled=True,
+            checked=True,
+            healthy=healthy_paradex,
+            status="ok" if healthy_paradex else "maintenance",
+            blocking_reasons=[] if healthy_paradex else ["Paradex system state is maintenance"],
+            notes=[],
+        ),
+    ]
+    for venue in venues:
+        blocking_reasons.extend(venue.blocking_reasons)
+    return PaperTradeSystemState(
+        paper_trade_id=0,
+        label="arb_extended_paradex",
+        ready=not blocking_reasons,
+        venues=venues,
+        blocking_reasons=blocking_reasons,
     )
 
 
@@ -448,9 +509,7 @@ def _override_common_dependencies(
     app.dependency_overrides[get_opportunity_universe_service] = lambda: _StubUniverseService()
     app.dependency_overrides[get_route_approval_service] = lambda: _StubRouteApprovalService()
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
-    app.dependency_overrides[get_preview_confirmation_store] = (
-        lambda: preview_confirmation_store
-    )
+    app.dependency_overrides[get_preview_confirmation_store] = lambda: preview_confirmation_store
     app.dependency_overrides[get_pair_close_preview_confirmation_store] = (
         lambda: pair_close_confirmation_store
     )
@@ -459,8 +518,8 @@ def _override_common_dependencies(
     )
     app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
     app.dependency_overrides[get_execution_observation_store] = lambda: observation_store
-    app.dependency_overrides[get_balance_accounting_service] = (
-        lambda: BalanceAccountingService(store=snapshot_store)
+    app.dependency_overrides[get_balance_accounting_service] = lambda: BalanceAccountingService(
+        store=snapshot_store
     )
     app.dependency_overrides[get_order_preview_service] = lambda: _StubOrderPreviewService()
     app.dependency_overrides[get_cleanup_preview_service] = (
@@ -581,9 +640,7 @@ def test_execute_guarded_canary_cycle_runs_open_and_close_with_balance_summary(
         observation_store=observation_store,
         snapshot_store=snapshot_store,
     )
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_execution_order_state_service] = (
         lambda: StubExecutionOrderStateService()
     )
@@ -691,9 +748,7 @@ def test_execute_guarded_canary_cycle_skips_close_when_open_is_not_hedged(
         observation_store=observation_store,
         snapshot_store=snapshot_store,
     )
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_execution_order_state_service] = (
         lambda: StubExecutionOrderStateService()
     )
@@ -845,9 +900,7 @@ def test_execute_guarded_canary_cycle_from_latest_snapshot_runs_open_and_close(
         snapshot_store=snapshot_store,
     )
     app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
-    app.dependency_overrides[get_account_preflight_service] = (
-        lambda: StubAccountPreflightService()
-    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
     app.dependency_overrides[get_execution_order_state_service] = (
         lambda: StubExecutionOrderStateService()
     )
@@ -904,6 +957,191 @@ def test_execute_guarded_canary_cycle_from_latest_snapshot_rejects_stale_snapsho
         },
     )
     app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert "stale" in response.json()["detail"]
+
+
+def test_execute_guarded_canary_cycle_from_latest_launch_ready_snapshot(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+    launch_ready_store.append(_launch_ready_snapshot())
+    paper_store = PaperTradeStore(database_path)
+    preview_confirmation_store = PreviewConfirmationStore(database_path)
+    pair_close_confirmation_store = PairClosePreviewConfirmationStore(database_path)
+    cleanup_confirmation_store = CleanupPreviewConfirmationStore(database_path)
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    snapshot_store = BalanceSnapshotStore(database_path)
+
+    class StubAccountPreflightService:
+        def __init__(self) -> None:
+            self._probe_count = 0
+
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: object,
+        ) -> PaperTradeAccountPreflight:
+            _ = configs
+            self._probe_count += 1
+            if self._probe_count in {1, 2}:
+                return _account_preflight(
+                    paper_trade=paper_trade,
+                    extended_total=5.0,
+                    paradex_total=15.0,
+                    hedged=False,
+                )
+            if self._probe_count in {3, 4, 5}:
+                return _account_preflight(
+                    paper_trade=paper_trade,
+                    extended_total=4.98,
+                    paradex_total=14.98,
+                    hedged=True,
+                )
+            return _account_preflight(
+                paper_trade=paper_trade,
+                extended_total=4.97,
+                paradex_total=14.97,
+                hedged=False,
+            )
+
+        async def probe_venues(self, _configs: object) -> list[VenueAccountPreflight]:
+            return _account_preflight(
+                paper_trade=PaperTradeEntry(
+                    created_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+                    intent=FundingPairTradeIntent(
+                        label="arb_extended_paradex",
+                        canonical_symbol="ARB-USD-PERP",
+                        source_recorded_at=datetime(2026, 3, 30, 11, 59, tzinfo=UTC),
+                        one_day_net_edge_after_entry=0.00355,
+                        break_even_days_entry=0.2,
+                        capacity_limit_notional=900.0,
+                        target_notional=11.0,
+                        capacity_fraction=1.0,
+                        max_target_notional=11.0,
+                        long_leg=TradeLegIntent(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                            fee_profile="pro_fastfills",
+                            side="buy",
+                            target_notional=11.0,
+                        ),
+                        short_leg=TradeLegIntent(
+                            venue="extended",
+                            symbol="ARB-USD",
+                            fee_profile="default",
+                            side="sell",
+                            target_notional=11.0,
+                        ),
+                    ),
+                ),
+                extended_total=4.98,
+                paradex_total=14.98,
+                hedged=True,
+            ).venues
+
+    class StubExecutionOrderStateService:
+        async def observe_execution(
+            self,
+            execution: ExecutionJournalEntry,
+            *,
+            poll_attempts: int = 1,
+            poll_interval_seconds: float = 0.0,
+        ) -> ExecutionOrderState:
+            _ = poll_attempts
+            _ = poll_interval_seconds
+            return ExecutionOrderState(
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=execution.paper_trade_id,
+                preview_hash=execution.preview_hash,
+                legs=[
+                    ExecutionLegOrderState(
+                        venue=leg.venue,
+                        supported=True,
+                        observation_source="rest_poll",
+                        external_reference=leg.external_reference,
+                        derived_state="filled",
+                        order_status="filled",
+                    )
+                    for leg in execution.legs
+                ],
+                notes=[],
+            )
+
+    _override_common_dependencies(
+        paper_store=paper_store,
+        preview_confirmation_store=preview_confirmation_store,
+        pair_close_confirmation_store=pair_close_confirmation_store,
+        cleanup_confirmation_store=cleanup_confirmation_store,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        snapshot_store=snapshot_store,
+    )
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
+    app.dependency_overrides[get_route_approval_service] = lambda: _StubRouteApprovalService()
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_execution_order_state_service] = (
+        lambda: StubExecutionOrderStateService()
+    )
+    app.dependency_overrides[get_pair_close_preview_service] = (
+        lambda: _StubPairClosePreviewService()
+    )
+    app.dependency_overrides[get_pair_close_live_execution_coordinator] = (
+        lambda: _StubPairCloseLiveExecutionCoordinator()
+    )
+
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/v1/executions/live/canary-cycle/latest-launch-ready",
+            params={
+                "label": "arb_extended_paradex",
+                "desired_notional": 11.0,
+                "poll_attempts": 1,
+                "poll_interval_seconds": 0,
+                "auto_cleanup": "false",
+                "close_position": "true",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade"]["intent"]["target_notional"] == 11.0
+    assert payload["final_pair_status"]["derived_state"] == "closed"
+    assert "Launched from launch-ready canary snapshot" in payload["notes"][0]
+
+
+def test_execute_guarded_canary_cycle_from_latest_launch_ready_rejects_stale_snapshot(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+    stale_snapshot = _launch_ready_snapshot().model_copy(
+        update={
+            "captured_at": datetime(2025, 3, 30, 11, 0, tzinfo=UTC),
+            "max_snapshot_age_seconds": 1,
+        }
+    )
+    launch_ready_store.append(stale_snapshot)
+
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
+    app.dependency_overrides[get_route_approval_service] = lambda: _StubRouteApprovalService()
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/v1/executions/live/canary-cycle/latest-launch-ready",
+            params={
+                "label": "arb_extended_paradex",
+                "max_snapshot_age_seconds": 300,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 409
     assert "stale" in response.json()["detail"]

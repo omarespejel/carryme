@@ -22,6 +22,9 @@ class WorkerSettings(BaseSettings):
     universe_scan_max_backoff_seconds: int = Field(default=300, gt=0)
     approved_canary_scan_interval_seconds: int = Field(default=30, gt=0)
     approved_canary_scan_max_backoff_seconds: int = Field(default=300, gt=0)
+    launch_ready_canary_interval_seconds: int = Field(default=15, gt=0)
+    launch_ready_canary_max_backoff_seconds: int = Field(default=120, gt=0)
+    launch_ready_canary_max_snapshot_age_seconds: int = Field(default=300, gt=0)
     approved_canary_alert_max_snapshot_age_seconds: int = Field(default=300, gt=0)
     approved_canary_alert_webhook_url: str | None = None
     approved_canary_alert_webhook_timeout_seconds: float = Field(default=10.0, gt=0)

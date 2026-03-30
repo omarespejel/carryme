@@ -35,6 +35,7 @@ from carryme_models import (
     FundingUniversePortfolioPlan,
     FundingUniverseScan,
     GuardedPairExecutionResult,
+    LaunchReadyCanarySnapshot,
     LiveSubmissionReadiness,
     OpportunityRecord,
     PairClosePreviewConfirmationEntry,
@@ -116,6 +117,7 @@ from carryme_storage import (
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
+    LaunchReadyCanaryStore,
     OpportunityHistoryStore,
     PairClosePreviewConfirmationStore,
     PaperTradeStore,
@@ -333,6 +335,14 @@ def get_approved_canary_alert_store(
     """Return the shared approved-canary alert store."""
 
     return ApprovedCanaryAlertStore(settings.database_path)
+
+
+def get_launch_ready_canary_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> LaunchReadyCanaryStore:
+    """Return the shared launch-ready canary snapshot store."""
+
+    return LaunchReadyCanaryStore(settings.database_path)
 
 
 def get_route_stability_service(
@@ -1395,6 +1405,63 @@ def _select_latest_approved_canary_snapshot(
     )
 
 
+def _select_latest_launch_ready_canary_snapshot(
+    *,
+    store: LaunchReadyCanaryStore,
+    approval_service: RouteApprovalService,
+    label: str | None,
+    max_snapshot_age_seconds: int,
+    now: datetime | None = None,
+) -> tuple[LaunchReadyCanarySnapshot, FundingUniverseCanaryCandidate, RouteApprovalEntry]:
+    snapshot = store.latest(label=label)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="No launch-ready canary snapshot found")
+    current_time = now or datetime.now(UTC)
+    snapshot_age_seconds = max(
+        0.0,
+        (current_time - snapshot.captured_at).total_seconds(),
+    )
+    effective_max_age_seconds = min(
+        max_snapshot_age_seconds,
+        snapshot.max_snapshot_age_seconds,
+    )
+    if snapshot_age_seconds > effective_max_age_seconds:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Launch-ready canary snapshot is stale "
+                f"({snapshot_age_seconds:.1f}s > {effective_max_age_seconds}s)"
+            ),
+        )
+    if not snapshot.system_state.ready:
+        raise HTTPException(
+            status_code=409,
+            detail="Latest launch-ready canary snapshot is not ready for live execution",
+        )
+    approval = approval_service.get_for_candidate(snapshot.approved_snapshot.candidate)
+    if approval is None or not approval.approved:
+        raise HTTPException(
+            status_code=409,
+            detail="Latest launch-ready canary snapshot is no longer approved for live execution",
+        )
+    capped_notional = min(
+        snapshot.approved_snapshot.candidate.suggested_canary_notional,
+        approval.max_live_notional,
+    )
+    if capped_notional <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Launch-ready canary snapshot no longer permits a positive live notional",
+        )
+    return (
+        snapshot,
+        snapshot.approved_snapshot.candidate.model_copy(
+            update={"suggested_canary_notional": capped_notional}
+        ),
+        approval,
+    )
+
+
 def _append_paper_trade_from_canary_candidate(
     *,
     candidate: FundingUniverseCanaryCandidate,
@@ -2355,6 +2422,32 @@ def create_app() -> FastAPI:
         snapshot = store.latest(label=label)
         if snapshot is None:
             raise HTTPException(status_code=404, detail="No approved canary snapshot found")
+        return snapshot
+
+    @app.get(
+        "/v1/executions/live/canary-cycle/launch-ready-snapshots",
+        response_model=list[LaunchReadyCanarySnapshot],
+    )
+    def launch_ready_canary_snapshots(
+        store: Annotated[LaunchReadyCanaryStore, Depends(get_launch_ready_canary_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[LaunchReadyCanarySnapshot]:
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return store.list_recent(limit=limit, label=label)
+
+    @app.get(
+        "/v1/executions/live/canary-cycle/latest-launch-ready",
+        response_model=LaunchReadyCanarySnapshot,
+    )
+    def latest_launch_ready_canary_snapshot(
+        store: Annotated[LaunchReadyCanaryStore, Depends(get_launch_ready_canary_store)],
+        label: str | None = None,
+    ) -> LaunchReadyCanarySnapshot:
+        snapshot = store.latest(label=label)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="No launch-ready canary snapshot found")
         return snapshot
 
     @app.get(
@@ -5000,6 +5093,170 @@ def create_app() -> FastAPI:
             lifecycle_note=(
                 "Launched from approved canary snapshot "
                 f"{snapshot.snapshot_id} captured at {snapshot.captured_at.isoformat()}."
+            ),
+            paper_store=paper_store,
+            confirmation_store=confirmation_store,
+            pair_close_confirmation_store=pair_close_confirmation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            settings=settings,
+            account_preflight_service=account_preflight_service,
+            system_state_service=system_state_service,
+            balance_service=balance_service,
+            order_preview_service=order_preview_service,
+            order_state_service=order_state_service,
+            cleanup_preview_service=cleanup_preview_service,
+            pair_close_preview_service=pair_close_preview_service,
+            cleanup_live_router=cleanup_live_router,
+            paired_service=paired_service,
+            pair_close_live_service=pair_close_live_service,
+            approval_service=approval_service,
+            slippage_tolerance_bps=slippage_tolerance_bps,
+            open_first_venue=open_first_venue,
+            close_first_venue=close_first_venue,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            auto_cleanup=auto_cleanup,
+            close_position=close_position,
+        )
+
+    @app.post(
+        "/v1/executions/live/canary-cycle/latest-launch-ready",
+        response_model=CanaryLifecycleResult,
+    )
+    async def execute_guarded_canary_cycle_from_latest_launch_ready(
+        request: Request,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        store: Annotated[
+            LaunchReadyCanaryStore,
+            Depends(get_launch_ready_canary_store),
+        ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        pair_close_confirmation_store: Annotated[
+            PairClosePreviewConfirmationStore,
+            Depends(get_pair_close_preview_confirmation_store),
+        ],
+        cleanup_confirmation_store: Annotated[
+            CleanupPreviewConfirmationStore,
+            Depends(get_cleanup_preview_confirmation_store),
+        ],
+        execution_store: Annotated[
+            ExecutionJournalStore,
+            Depends(get_execution_journal_store),
+        ],
+        observation_store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
+        account_preflight_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
+        balance_service: Annotated[
+            BalanceAccountingService,
+            Depends(get_balance_accounting_service),
+        ],
+        order_preview_service: Annotated[
+            OrderPreviewService,
+            Depends(get_order_preview_service),
+        ],
+        order_state_service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+        cleanup_preview_service: Annotated[
+            CleanupPreviewRouter,
+            Depends(get_cleanup_preview_service),
+        ],
+        pair_close_preview_service: Annotated[
+            PairClosePreviewService,
+            Depends(get_pair_close_preview_service),
+        ],
+        label: str | None = None,
+        desired_notional: float | None = None,
+        note: str | None = None,
+        max_snapshot_age_seconds: int = 300,
+        slippage_tolerance_bps: int = 20,
+        open_first_venue: str = "auto",
+        close_first_venue: str = "auto",
+        poll_attempts: int = 5,
+        poll_interval_seconds: float = 2.0,
+        auto_cleanup: bool = True,
+        close_position: bool = True,
+    ) -> CanaryLifecycleResult:
+        snapshot, selected, approval = _select_latest_launch_ready_canary_snapshot(
+            store=store,
+            approval_service=approval_service,
+            label=label,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+        )
+
+        def _resolve_lazy_dependency(getter: object, builder: Callable[[], Any]) -> Any:
+            override = request.app.dependency_overrides.get(getter)
+            if override is not None:
+                return override()
+            return builder()
+
+        extended_service = _resolve_lazy_dependency(
+            get_extended_live_execution_service,
+            lambda: get_extended_live_execution_service(settings),
+        )
+        hyperliquid_service = _resolve_lazy_dependency(
+            get_hyperliquid_live_execution_service,
+            lambda: get_hyperliquid_live_execution_service(settings),
+        )
+        paradex_service = _resolve_lazy_dependency(
+            get_paradex_live_execution_service,
+            lambda: get_paradex_live_execution_service(settings),
+        )
+        cleanup_live_router = _resolve_lazy_dependency(
+            get_cleanup_live_execution_router,
+            lambda: get_cleanup_live_execution_router(
+                extended_service,
+                hyperliquid_service,
+                paradex_service,
+            ),
+        )
+        paired_service = _resolve_lazy_dependency(
+            get_paired_live_execution_coordinator,
+            lambda: get_paired_live_execution_coordinator(
+                extended_service,
+                hyperliquid_service,
+                paradex_service,
+            ),
+        )
+        pair_close_live_service = _resolve_lazy_dependency(
+            get_pair_close_live_execution_coordinator,
+            lambda: get_pair_close_live_execution_coordinator(
+                extended_service,
+                hyperliquid_service,
+                paradex_service,
+            ),
+        )
+
+        return await _run_guarded_canary_lifecycle(
+            candidate=selected,
+            approval=approval,
+            desired_notional=desired_notional,
+            note=note,
+            lifecycle_note=(
+                "Launched from launch-ready canary snapshot "
+                f"{snapshot.launch_ready_snapshot_id} derived from approved snapshot "
+                f"{snapshot.approved_snapshot.snapshot_id} captured at "
+                f"{snapshot.captured_at.isoformat()}."
             ),
             paper_store=paper_store,
             confirmation_store=confirmation_store,

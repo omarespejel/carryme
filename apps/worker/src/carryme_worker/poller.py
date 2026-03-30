@@ -21,8 +21,11 @@ from carryme_models import (
     ExecutionObservationEntry,
     ExecutionPairStatus,
     FundingArbOpportunity,
+    FundingUniverseCanaryCandidate,
     FundingUniverseScan,
+    LaunchReadyCanarySnapshot,
     OpportunityRecord,
+    PaperTradeSystemState,
     SystemStateAlertEvent,
     VenueSystemState,
 )
@@ -56,6 +59,7 @@ from carryme_storage import (
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
+    LaunchReadyCanaryStore,
     OpportunityHistoryStore,
     RouteApprovalStore,
     SystemStateAlertStore,
@@ -219,6 +223,30 @@ class ApprovedCanaryScanLoopSummary:
     saved_snapshots: int
     alert_events: int
     sent_notifications: int
+    database_path: str
+
+
+@dataclass
+class LaunchReadyCanaryCacheSummary:
+    """Summary emitted after one launch-ready canary cache cycle."""
+
+    scanned_snapshots: int
+    launch_ready_candidates: int
+    saved_snapshots: int
+    database_path: str
+    snapshots: list[LaunchReadyCanarySnapshot] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class LaunchReadyCanaryCacheLoopSummary:
+    """Summary emitted after a supervised launch-ready canary cache loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    scanned_snapshots: int
+    launch_ready_candidates: int
+    saved_snapshots: int
     database_path: str
 
 
@@ -469,6 +497,42 @@ def _build_system_state_configs(settings: WorkerSettings) -> SystemStateConfigMa
     }
 
 
+async def _probe_candidate_system_state(
+    *,
+    settings: WorkerSettings,
+    service: SystemStateService,
+    candidate: FundingUniverseCanaryCandidate,
+    label: str,
+) -> PaperTradeSystemState:
+    """Probe only the venues touched by one canary candidate."""
+
+    all_statuses = {
+        item.venue: item
+        for item in await service.probe_venues(_build_system_state_configs(settings))
+    }
+    venue_names = [
+        candidate.opportunity.opportunity.long_venue,
+        candidate.opportunity.opportunity.short_venue,
+    ]
+    selected_names: list[str] = []
+    for venue in venue_names:
+        if venue not in selected_names:
+            selected_names.append(venue)
+    selected = [all_statuses[venue] for venue in selected_names]
+
+    blocking_reasons: list[str] = []
+    for status in selected:
+        blocking_reasons.extend(status.blocking_reasons)
+
+    return PaperTradeSystemState(
+        paper_trade_id=0,
+        label=label,
+        ready=not blocking_reasons,
+        venues=selected,
+        blocking_reasons=blocking_reasons,
+    )
+
+
 async def scan_approved_canary_once(
     settings: WorkerSettings,
     *,
@@ -577,6 +641,192 @@ async def scan_approved_canary_once(
         database_path=settings.database_path,
         snapshots=snapshots,
         alerts=alerts,
+    )
+
+
+async def cache_launch_ready_canaries_once(
+    settings: WorkerSettings,
+    *,
+    approved_store: ApprovedCanaryStore | None = None,
+    launch_ready_store: LaunchReadyCanaryStore | None = None,
+    approval_service: RouteApprovalService | None = None,
+    system_state_service: SystemStateService | None = None,
+    logger: logging.Logger | None = None,
+    now: datetime | None = None,
+) -> LaunchReadyCanaryCacheSummary:
+    """Persist fresh approved canaries whose touched venues are currently healthy."""
+
+    timestamp = now or datetime.now(UTC)
+    source_store = approved_store or ApprovedCanaryStore(settings.database_path)
+    ready_store = launch_ready_store or LaunchReadyCanaryStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    route_approval_service = approval_service or RouteApprovalService(
+        store=RouteApprovalStore(settings.database_path)
+    )
+    runtime = system_state_service or SystemStateService()
+
+    latest_approvals_by_label: set[str] = set()
+    for approval in route_approval_service.list_recent(limit=1_000, approved=True):
+        latest_approvals_by_label.add(approval.label)
+
+    scanned_snapshots = 0
+    snapshots: list[LaunchReadyCanarySnapshot] = []
+    for label in sorted(latest_approvals_by_label):
+        snapshot = source_store.latest(label=label)
+        if snapshot is None:
+            continue
+        scanned_snapshots += 1
+        snapshot_age_seconds = max(
+            0.0,
+            (timestamp - snapshot.captured_at).total_seconds(),
+        )
+        if snapshot_age_seconds > settings.launch_ready_canary_max_snapshot_age_seconds:
+            loop_logger.debug(
+                ("skipping stale approved canary snapshot label=%s age=%.1fs (max=%ss)"),
+                label,
+                snapshot_age_seconds,
+                settings.launch_ready_canary_max_snapshot_age_seconds,
+            )
+            continue
+
+        refreshed_approval = route_approval_service.get_for_candidate(snapshot.candidate)
+        if refreshed_approval is None or not refreshed_approval.approved:
+            continue
+
+        capped_notional = min(
+            snapshot.candidate.suggested_canary_notional,
+            refreshed_approval.max_live_notional,
+        )
+        if capped_notional <= 0:
+            continue
+
+        refreshed_candidate = snapshot.candidate.model_copy(
+            update={"suggested_canary_notional": capped_notional}
+        )
+        refreshed_snapshot = snapshot.model_copy(
+            update={
+                "candidate": refreshed_candidate,
+                "approval": refreshed_approval,
+            }
+        )
+        system_state = await _probe_candidate_system_state(
+            settings=settings,
+            service=runtime,
+            candidate=refreshed_candidate,
+            label=label,
+        )
+        if not system_state.ready:
+            loop_logger.debug(
+                "skipping launch-ready snapshot label=%s because system state is not ready",
+                label,
+            )
+            continue
+
+        snapshots.append(
+            ready_store.append(
+                LaunchReadyCanarySnapshot(
+                    captured_at=timestamp,
+                    label=label,
+                    max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+                    approved_snapshot=refreshed_snapshot,
+                    system_state=system_state,
+                )
+            )
+        )
+
+    return LaunchReadyCanaryCacheSummary(
+        scanned_snapshots=scanned_snapshots,
+        launch_ready_candidates=len(snapshots),
+        saved_snapshots=len(snapshots),
+        database_path=settings.database_path,
+        snapshots=snapshots,
+    )
+
+
+async def run_supervised_launch_ready_canary_cache_loop(
+    settings: WorkerSettings,
+    *,
+    approved_store: ApprovedCanaryStore | None = None,
+    launch_ready_store: LaunchReadyCanaryStore | None = None,
+    approval_service: RouteApprovalService | None = None,
+    system_state_service: SystemStateService | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> LaunchReadyCanaryCacheLoopSummary:
+    """Run the launch-ready canary cache loop until stopped or capped."""
+
+    source_store = approved_store or ApprovedCanaryStore(settings.database_path)
+    ready_store = launch_ready_store or LaunchReadyCanaryStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    supervised_stop_event = stop_event or asyncio.Event()
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    scanned_snapshots = 0
+    launch_ready_candidates = 0
+    saved_snapshots = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised launch-ready canary cache cycle %s", attempts)
+        try:
+            summary = await cache_launch_ready_canaries_once(
+                settings,
+                approved_store=source_store,
+                launch_ready_store=ready_store,
+                approval_service=approval_service,
+                system_state_service=system_state_service,
+                logger=loop_logger,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            scanned_snapshots += summary.scanned_snapshots
+            launch_ready_candidates += summary.launch_ready_candidates
+            saved_snapshots += summary.saved_snapshots
+            loop_logger.info(
+                (
+                    "completed supervised launch-ready canary cache cycle %s with "
+                    "%s scanned snapshots and %s saved launch-ready snapshots"
+                ),
+                attempts,
+                summary.scanned_snapshots,
+                summary.saved_snapshots,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(settings.launch_ready_canary_interval_seconds)
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.launch_ready_canary_max_backoff_seconds,
+                settings.launch_ready_canary_interval_seconds * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "launch-ready canary cache cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(backoff_seconds)
+
+    return LaunchReadyCanaryCacheLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        scanned_snapshots=scanned_snapshots,
+        launch_ready_candidates=launch_ready_candidates,
+        saved_snapshots=saved_snapshots,
+        database_path=settings.database_path,
     )
 
 

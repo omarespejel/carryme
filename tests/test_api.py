@@ -14,6 +14,7 @@ from carryme_api.app import (
     get_execution_accounting_service,
     get_execution_quality_service,
     get_history_store,
+    get_launch_ready_canary_store,
     get_opportunity_service,
     get_opportunity_universe_service,
     get_route_approval_service,
@@ -48,6 +49,7 @@ from carryme_models import (
     FundingUniverseOverlap,
     FundingUniverseScan,
     FundingUniverseVenueMarket,
+    LaunchReadyCanarySnapshot,
     OpportunityRecord,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
@@ -75,6 +77,7 @@ from carryme_storage import (
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
+    LaunchReadyCanaryStore,
     OpportunityHistoryStore,
     PairClosePreviewConfirmationStore,
     PaperTradeStore,
@@ -811,6 +814,209 @@ def test_latest_approved_canary_snapshot_endpoint_returns_latest(tmp_path: Path)
     payload = response.json()
     assert payload["label"] == "arb_extended_paradex"
     assert payload["approval"]["max_live_notional"] == 11.0
+
+
+def test_launch_ready_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> None:
+    approved_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=3,
+        captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    store = LaunchReadyCanaryStore(tmp_path / "history.sqlite3")
+    store.append(
+        LaunchReadyCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
+            label="arb_extended_paradex",
+            max_snapshot_age_seconds=300,
+            approved_snapshot=approved_snapshot,
+            system_state=PaperTradeSystemState(
+                paper_trade_id=0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                        status=None,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            ),
+        )
+    )
+
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/executions/live/canary-cycle/launch-ready-snapshots",
+        params={"label": "arb_extended_paradex", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["label"] == "arb_extended_paradex"
+    assert payload[0]["approved_snapshot"]["snapshot_id"] == 3
+
+
+def test_latest_launch_ready_canary_snapshot_endpoint_returns_latest(tmp_path: Path) -> None:
+    approved_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=4,
+        captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    store = LaunchReadyCanaryStore(tmp_path / "history.sqlite3")
+    store.append(
+        LaunchReadyCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
+            label="arb_extended_paradex",
+            max_snapshot_age_seconds=300,
+            approved_snapshot=approved_snapshot,
+            system_state=PaperTradeSystemState(
+                paper_trade_id=0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                        status=None,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            ),
+        )
+    )
+
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/executions/live/canary-cycle/latest-launch-ready",
+        params={"label": "arb_extended_paradex"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["label"] == "arb_extended_paradex"
+    assert payload["approved_snapshot"]["approval"]["max_live_notional"] == 11.0
 
 
 def test_approved_canary_alerts_endpoint_lists_recent(tmp_path: Path) -> None:
