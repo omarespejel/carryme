@@ -618,6 +618,162 @@ def get_hyperliquid_live_execution_service(
     )
 
 
+def _normalize_unique_venues(venues: list[str]) -> list[str]:
+    """Return normalized venues in stable order without duplicates."""
+
+    selected: list[str] = []
+    for venue in venues:
+        normalized = venue.strip().lower()
+        if normalized and normalized not in selected:
+            selected.append(normalized)
+    return selected
+
+
+def _candidate_venues(candidate: FundingUniverseCanaryCandidate) -> list[str]:
+    """Return the unique venues touched by one canary candidate."""
+
+    opportunity = candidate.opportunity.opportunity
+    return _normalize_unique_venues([opportunity.long_venue, opportunity.short_venue])
+
+
+def _build_cleanup_preview_services_for_candidate(
+    settings: ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> dict[str, Any]:
+    """Build only the cleanup-preview services required by one canary route."""
+
+    services: dict[str, Any] = {}
+    for venue in _candidate_venues(candidate):
+        if venue == "extended":
+            services[venue] = ExtendedCleanupPreviewService(
+                api_key=settings.extended_api_key or ""
+            )
+        elif venue == "hyperliquid":
+            services[venue] = HyperliquidCleanupPreviewService(
+                account_address=settings.hyperliquid_account_address or "",
+                vault_address=settings.hyperliquid_vault_address,
+            )
+        elif venue == "paradex":
+            services[venue] = ParadexCleanupPreviewService(
+                account_address=settings.paradex_account_address or "",
+                private_key=settings.paradex_private_key,
+                bearer_token=settings.paradex_bearer_token,
+            )
+        else:
+            raise ValueError(f"Unsupported canary venue {venue!r}")
+    return services
+
+
+def _build_cleanup_preview_router_for_candidate(
+    settings: ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> CleanupPreviewRouter:
+    """Build a venue-filtered cleanup preview router for one canary route."""
+
+    return CleanupPreviewRouter(
+        services=_build_cleanup_preview_services_for_candidate(settings, candidate)
+    )
+
+
+def _build_pair_close_preview_service_for_candidate(
+    settings: ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> PairClosePreviewService:
+    """Build a venue-filtered pair-close preview service for one canary route."""
+
+    return PairClosePreviewService(
+        services=_build_cleanup_preview_services_for_candidate(settings, candidate)
+    )
+
+
+def _build_live_execution_services_for_candidate(
+    settings: ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+    *,
+    live_service_resolver: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    """Build only the live execution services required by one canary route."""
+
+    services: dict[str, Any] = {}
+    for venue in _candidate_venues(candidate):
+        if live_service_resolver is not None:
+            services[venue] = live_service_resolver(venue)
+            continue
+        if venue == "extended":
+            services[venue] = get_extended_live_execution_service(settings)
+        elif venue == "hyperliquid":
+            services[venue] = get_hyperliquid_live_execution_service(settings)
+        elif venue == "paradex":
+            services[venue] = get_paradex_live_execution_service(settings)
+        else:
+            raise ValueError(f"Unsupported canary venue {venue!r}")
+    return services
+
+
+def _build_cleanup_live_execution_router_for_candidate(
+    settings: ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+    *,
+    live_service_resolver: Callable[[str], Any] | None = None,
+) -> CleanupLiveExecutionRouter:
+    """Build a venue-filtered cleanup live router for one canary route."""
+
+    return CleanupLiveExecutionRouter(
+        services=_build_live_execution_services_for_candidate(
+            settings,
+            candidate,
+            live_service_resolver=live_service_resolver,
+        )
+    )
+
+
+def _build_paired_live_execution_coordinator_for_candidate(
+    settings: ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+    *,
+    live_service_resolver: Callable[[str], Any] | None = None,
+) -> PairedLiveExecutionCoordinator:
+    """Build a venue-filtered paired live coordinator for one canary route."""
+
+    return PairedLiveExecutionCoordinator(
+        services=_build_live_execution_services_for_candidate(
+            settings,
+            candidate,
+            live_service_resolver=live_service_resolver,
+        )
+    )
+
+
+def _build_pair_close_live_execution_coordinator_for_candidate(
+    settings: ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+    *,
+    live_service_resolver: Callable[[str], Any] | None = None,
+) -> PairCloseLiveExecutionCoordinator:
+    """Build a venue-filtered pair-close live coordinator for one canary route."""
+
+    return PairCloseLiveExecutionCoordinator(
+        services=_build_live_execution_services_for_candidate(
+            settings,
+            candidate,
+            live_service_resolver=live_service_resolver,
+        )
+    )
+
+
+def _resolve_request_dependency(
+    request: Request,
+    getter: object,
+    builder: Callable[[], Any],
+) -> Any:
+    """Resolve one dependency override lazily without invoking unrelated builders."""
+
+    override = request.app.dependency_overrides.get(getter)
+    if override is not None:
+        return override()
+    return builder()
+
+
 def get_cleanup_preview_service(
     settings: Annotated[ApiSettings, Depends(get_api_settings)],
 ) -> CleanupPreviewRouter:
@@ -5166,14 +5322,6 @@ def create_app() -> FastAPI:
             ExecutionOrderStateService,
             Depends(get_execution_order_state_service),
         ],
-        cleanup_preview_service: Annotated[
-            CleanupPreviewRouter,
-            Depends(get_cleanup_preview_service),
-        ],
-        pair_close_preview_service: Annotated[
-            PairClosePreviewService,
-            Depends(get_pair_close_preview_service),
-        ],
         label: str | None = None,
         desired_notional: float | None = None,
         note: str | None = None,
@@ -5192,47 +5340,63 @@ def create_app() -> FastAPI:
             label=label,
             max_snapshot_age_seconds=max_snapshot_age_seconds,
         )
+        cleanup_preview_service = _resolve_request_dependency(
+            request,
+            get_cleanup_preview_service,
+            lambda: _build_cleanup_preview_router_for_candidate(settings, selected),
+        )
+        pair_close_preview_service = _resolve_request_dependency(
+            request,
+            get_pair_close_preview_service,
+            lambda: _build_pair_close_preview_service_for_candidate(settings, selected),
+        )
 
-        def _resolve_lazy_dependency(getter: object, builder: Callable[[], Any]) -> Any:
-            override = request.app.dependency_overrides.get(getter)
-            if override is not None:
-                return override()
-            return builder()
+        def _resolve_live_execution_service(venue: str) -> Any:
+            if venue == "extended":
+                return _resolve_request_dependency(
+                    request,
+                    get_extended_live_execution_service,
+                    lambda: get_extended_live_execution_service(settings),
+                )
+            if venue == "hyperliquid":
+                return _resolve_request_dependency(
+                    request,
+                    get_hyperliquid_live_execution_service,
+                    lambda: get_hyperliquid_live_execution_service(settings),
+                )
+            if venue == "paradex":
+                return _resolve_request_dependency(
+                    request,
+                    get_paradex_live_execution_service,
+                    lambda: get_paradex_live_execution_service(settings),
+                )
+            raise ValueError(f"Unsupported canary venue {venue!r}")
 
-        extended_service = _resolve_lazy_dependency(
-            get_extended_live_execution_service,
-            lambda: get_extended_live_execution_service(settings),
-        )
-        hyperliquid_service = _resolve_lazy_dependency(
-            get_hyperliquid_live_execution_service,
-            lambda: get_hyperliquid_live_execution_service(settings),
-        )
-        paradex_service = _resolve_lazy_dependency(
-            get_paradex_live_execution_service,
-            lambda: get_paradex_live_execution_service(settings),
-        )
-        cleanup_live_router = _resolve_lazy_dependency(
+        cleanup_live_router = _resolve_request_dependency(
+            request,
             get_cleanup_live_execution_router,
-            lambda: get_cleanup_live_execution_router(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_cleanup_live_execution_router_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
-        paired_service = _resolve_lazy_dependency(
+        paired_service = _resolve_request_dependency(
+            request,
             get_paired_live_execution_coordinator,
-            lambda: get_paired_live_execution_coordinator(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_paired_live_execution_coordinator_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
-        pair_close_live_service = _resolve_lazy_dependency(
+        pair_close_live_service = _resolve_request_dependency(
+            request,
             get_pair_close_live_execution_coordinator,
-            lambda: get_pair_close_live_execution_coordinator(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_pair_close_live_execution_coordinator_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
 
@@ -5354,47 +5518,63 @@ def create_app() -> FastAPI:
             label=label,
             max_snapshot_age_seconds=max_snapshot_age_seconds,
         )
+        cleanup_preview_service = _resolve_request_dependency(
+            request,
+            get_cleanup_preview_service,
+            lambda: _build_cleanup_preview_router_for_candidate(settings, selected),
+        )
+        pair_close_preview_service = _resolve_request_dependency(
+            request,
+            get_pair_close_preview_service,
+            lambda: _build_pair_close_preview_service_for_candidate(settings, selected),
+        )
 
-        def _resolve_lazy_dependency(getter: object, builder: Callable[[], Any]) -> Any:
-            override = request.app.dependency_overrides.get(getter)
-            if override is not None:
-                return override()
-            return builder()
+        def _resolve_live_execution_service(venue: str) -> Any:
+            if venue == "extended":
+                return _resolve_request_dependency(
+                    request,
+                    get_extended_live_execution_service,
+                    lambda: get_extended_live_execution_service(settings),
+                )
+            if venue == "hyperliquid":
+                return _resolve_request_dependency(
+                    request,
+                    get_hyperliquid_live_execution_service,
+                    lambda: get_hyperliquid_live_execution_service(settings),
+                )
+            if venue == "paradex":
+                return _resolve_request_dependency(
+                    request,
+                    get_paradex_live_execution_service,
+                    lambda: get_paradex_live_execution_service(settings),
+                )
+            raise ValueError(f"Unsupported canary venue {venue!r}")
 
-        extended_service = _resolve_lazy_dependency(
-            get_extended_live_execution_service,
-            lambda: get_extended_live_execution_service(settings),
-        )
-        hyperliquid_service = _resolve_lazy_dependency(
-            get_hyperliquid_live_execution_service,
-            lambda: get_hyperliquid_live_execution_service(settings),
-        )
-        paradex_service = _resolve_lazy_dependency(
-            get_paradex_live_execution_service,
-            lambda: get_paradex_live_execution_service(settings),
-        )
-        cleanup_live_router = _resolve_lazy_dependency(
+        cleanup_live_router = _resolve_request_dependency(
+            request,
             get_cleanup_live_execution_router,
-            lambda: get_cleanup_live_execution_router(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_cleanup_live_execution_router_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
-        paired_service = _resolve_lazy_dependency(
+        paired_service = _resolve_request_dependency(
+            request,
             get_paired_live_execution_coordinator,
-            lambda: get_paired_live_execution_coordinator(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_paired_live_execution_coordinator_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
-        pair_close_live_service = _resolve_lazy_dependency(
+        pair_close_live_service = _resolve_request_dependency(
+            request,
             get_pair_close_live_execution_coordinator,
-            lambda: get_pair_close_live_execution_coordinator(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_pair_close_live_execution_coordinator_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
 
@@ -5492,14 +5672,6 @@ def create_app() -> FastAPI:
             ExecutionOrderStateService,
             Depends(get_execution_order_state_service),
         ],
-        cleanup_preview_service: Annotated[
-            CleanupPreviewRouter,
-            Depends(get_cleanup_preview_service),
-        ],
-        pair_close_preview_service: Annotated[
-            PairClosePreviewService,
-            Depends(get_pair_close_preview_service),
-        ],
         label: str | None = None,
         desired_notional: float | None = None,
         note: str | None = None,
@@ -5527,47 +5699,63 @@ def create_app() -> FastAPI:
             label=label,
             max_snapshot_age_seconds=max_snapshot_age_seconds,
         )
+        cleanup_preview_service = _resolve_request_dependency(
+            request,
+            get_cleanup_preview_service,
+            lambda: _build_cleanup_preview_router_for_candidate(settings, selected),
+        )
+        pair_close_preview_service = _resolve_request_dependency(
+            request,
+            get_pair_close_preview_service,
+            lambda: _build_pair_close_preview_service_for_candidate(settings, selected),
+        )
 
-        def _resolve_lazy_dependency(getter: object, builder: Callable[[], Any]) -> Any:
-            override = request.app.dependency_overrides.get(getter)
-            if override is not None:
-                return override()
-            return builder()
+        def _resolve_live_execution_service(venue: str) -> Any:
+            if venue == "extended":
+                return _resolve_request_dependency(
+                    request,
+                    get_extended_live_execution_service,
+                    lambda: get_extended_live_execution_service(settings),
+                )
+            if venue == "hyperliquid":
+                return _resolve_request_dependency(
+                    request,
+                    get_hyperliquid_live_execution_service,
+                    lambda: get_hyperliquid_live_execution_service(settings),
+                )
+            if venue == "paradex":
+                return _resolve_request_dependency(
+                    request,
+                    get_paradex_live_execution_service,
+                    lambda: get_paradex_live_execution_service(settings),
+                )
+            raise ValueError(f"Unsupported canary venue {venue!r}")
 
-        extended_service = _resolve_lazy_dependency(
-            get_extended_live_execution_service,
-            lambda: get_extended_live_execution_service(settings),
-        )
-        hyperliquid_service = _resolve_lazy_dependency(
-            get_hyperliquid_live_execution_service,
-            lambda: get_hyperliquid_live_execution_service(settings),
-        )
-        paradex_service = _resolve_lazy_dependency(
-            get_paradex_live_execution_service,
-            lambda: get_paradex_live_execution_service(settings),
-        )
-        cleanup_live_router = _resolve_lazy_dependency(
+        cleanup_live_router = _resolve_request_dependency(
+            request,
             get_cleanup_live_execution_router,
-            lambda: get_cleanup_live_execution_router(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_cleanup_live_execution_router_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
-        paired_service = _resolve_lazy_dependency(
+        paired_service = _resolve_request_dependency(
+            request,
             get_paired_live_execution_coordinator,
-            lambda: get_paired_live_execution_coordinator(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_paired_live_execution_coordinator_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
-        pair_close_live_service = _resolve_lazy_dependency(
+        pair_close_live_service = _resolve_request_dependency(
+            request,
             get_pair_close_live_execution_coordinator,
-            lambda: get_pair_close_live_execution_coordinator(
-                extended_service,
-                hyperliquid_service,
-                paradex_service,
+            lambda: _build_pair_close_live_execution_coordinator_for_candidate(
+                settings,
+                selected,
+                live_service_resolver=_resolve_live_execution_service,
             ),
         )
 

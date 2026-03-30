@@ -13,7 +13,12 @@ from typing import Literal, Protocol, cast
 
 import httpx
 from carryme_api.app import (
+    _build_cleanup_live_execution_router_for_candidate,
+    _build_cleanup_preview_router_for_candidate,
     _build_launch_ready_canary_stability,
+    _build_pair_close_live_execution_coordinator_for_candidate,
+    _build_pair_close_preview_service_for_candidate,
+    _build_paired_live_execution_coordinator_for_candidate,
     _run_guarded_canary_lifecycle,
     _select_latest_launch_ready_canary_snapshot,
 )
@@ -43,25 +48,14 @@ from carryme_runtime import (
     AccountPreflightConfigMap,
     AccountPreflightService,
     BalanceAccountingService,
-    CleanupLiveExecutionRouter,
-    CleanupPreviewRouter,
     ConnectorError,
     ExecutionOrderStateService,
     ExecutionQualityService,
-    ExtendedCleanupPreviewService,
-    ExtendedLiveExecutionService,
     ExtendedOrderStateObserver,
-    HyperliquidCleanupPreviewService,
-    HyperliquidLiveExecutionService,
     HyperliquidOrderStateObserver,
     OpportunityService,
     OpportunityUniverseService,
     OrderPreviewService,
-    PairCloseLiveExecutionCoordinator,
-    PairClosePreviewService,
-    PairedLiveExecutionCoordinator,
-    ParadexCleanupPreviewService,
-    ParadexLiveExecutionService,
     ParadexOrderStateObserver,
     RouteApprovalService,
     RouteStabilityService,
@@ -1168,95 +1162,25 @@ async def launch_latest_stable_canary_once(
             order_state_service=ExecutionOrderStateService(
                 observers=_build_order_state_observers(settings)
             ),
-            cleanup_preview_service=CleanupPreviewRouter(
-                services={
-                    "extended": ExtendedCleanupPreviewService(
-                        api_key=runtime_settings.extended_api_key or ""
-                    ),
-                    "hyperliquid": HyperliquidCleanupPreviewService(
-                        account_address=runtime_settings.hyperliquid_account_address or ""
-                    ),
-                    "paradex": ParadexCleanupPreviewService(
-                        account_address=runtime_settings.paradex_account_address or "",
-                        private_key=runtime_settings.paradex_private_key,
-                        bearer_token=runtime_settings.paradex_bearer_token,
-                    ),
-                }
+            cleanup_preview_service=_build_cleanup_preview_router_for_candidate(
+                runtime_settings,
+                selected,
             ),
-            pair_close_preview_service=PairClosePreviewService(
-                services={
-                    "extended": ExtendedCleanupPreviewService(
-                        api_key=runtime_settings.extended_api_key or ""
-                    ),
-                    "hyperliquid": HyperliquidCleanupPreviewService(
-                        account_address=runtime_settings.hyperliquid_account_address or ""
-                    ),
-                    "paradex": ParadexCleanupPreviewService(
-                        account_address=runtime_settings.paradex_account_address or "",
-                        private_key=runtime_settings.paradex_private_key,
-                        bearer_token=runtime_settings.paradex_bearer_token,
-                    ),
-                }
+            pair_close_preview_service=_build_pair_close_preview_service_for_candidate(
+                runtime_settings,
+                selected,
             ),
-            cleanup_live_router=CleanupLiveExecutionRouter(
-                services={
-                    "extended": ExtendedLiveExecutionService(
-                        api_key=runtime_settings.extended_api_key or "",
-                        stark_private_key=runtime_settings.extended_stark_private_key or "",
-                    ),
-                    "hyperliquid": HyperliquidLiveExecutionService(
-                        account_address=runtime_settings.hyperliquid_account_address or "",
-                        vault_address=runtime_settings.hyperliquid_vault_address,
-                        api_wallet_private_key=(
-                            runtime_settings.hyperliquid_api_wallet_private_key or ""
-                        ),
-                    ),
-                    "paradex": ParadexLiveExecutionService(
-                        account_address=runtime_settings.paradex_account_address or "",
-                        private_key=runtime_settings.paradex_private_key or "",
-                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
-                    ),
-                }
+            cleanup_live_router=_build_cleanup_live_execution_router_for_candidate(
+                runtime_settings,
+                selected,
             ),
-            paired_service=PairedLiveExecutionCoordinator(
-                services={
-                    "extended": ExtendedLiveExecutionService(
-                        api_key=runtime_settings.extended_api_key or "",
-                        stark_private_key=runtime_settings.extended_stark_private_key or "",
-                    ),
-                    "hyperliquid": HyperliquidLiveExecutionService(
-                        account_address=runtime_settings.hyperliquid_account_address or "",
-                        vault_address=runtime_settings.hyperliquid_vault_address,
-                        api_wallet_private_key=(
-                            runtime_settings.hyperliquid_api_wallet_private_key or ""
-                        ),
-                    ),
-                    "paradex": ParadexLiveExecutionService(
-                        account_address=runtime_settings.paradex_account_address or "",
-                        private_key=runtime_settings.paradex_private_key or "",
-                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
-                    ),
-                }
+            paired_service=_build_paired_live_execution_coordinator_for_candidate(
+                runtime_settings,
+                selected,
             ),
-            pair_close_live_service=PairCloseLiveExecutionCoordinator(
-                services={
-                    "extended": ExtendedLiveExecutionService(
-                        api_key=runtime_settings.extended_api_key or "",
-                        stark_private_key=runtime_settings.extended_stark_private_key or "",
-                    ),
-                    "hyperliquid": HyperliquidLiveExecutionService(
-                        account_address=runtime_settings.hyperliquid_account_address or "",
-                        vault_address=runtime_settings.hyperliquid_vault_address,
-                        api_wallet_private_key=(
-                            runtime_settings.hyperliquid_api_wallet_private_key or ""
-                        ),
-                    ),
-                    "paradex": ParadexLiveExecutionService(
-                        account_address=runtime_settings.paradex_account_address or "",
-                        private_key=runtime_settings.paradex_private_key or "",
-                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
-                    ),
-                }
+            pair_close_live_service=_build_pair_close_live_execution_coordinator_for_candidate(
+                runtime_settings,
+                selected,
             ),
             approval_service=route_approval_service,
             slippage_tolerance_bps=20,
