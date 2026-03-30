@@ -2638,6 +2638,8 @@ def test_run_production_supervisor_cycle_once_orders_stages(
 ) -> None:
     settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
     calls: list[str] = []
+    expected_now = datetime(2026, 3, 30, 11, 0, tzinfo=UTC)
+    forwarded_now: list[datetime | None] = []
 
     async def fake_observe_system_state_once(
         settings_arg: WorkerSettings,
@@ -2653,7 +2655,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         _ = alert_sink
         _ = alert_notifier
         _ = logger
-        _ = now
+        forwarded_now.append(now)
         calls.append("system")
         return SystemStateObservationSummary(
             checked_venues=3,
@@ -2681,7 +2683,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         _ = alert_sink
         _ = alert_notifier
         _ = logger
-        _ = now
+        forwarded_now.append(now)
         calls.append("approved")
         return ApprovedCanaryScanSummary(
             scanned_candidates=4,
@@ -2712,7 +2714,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         _ = approval_service
         _ = system_state_service
         _ = logger
-        _ = now
+        forwarded_now.append(now)
         calls.append("launch_ready")
         return LaunchReadyCanaryCacheSummary(
             scanned_snapshots=1,
@@ -2733,7 +2735,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         assert settings_arg is settings
         _ = api_settings
         _ = launch_store
-        _ = now
+        forwarded_now.append(now)
         calls.append("launch")
         return StableCanaryLaunchSummary(
             status="launched",
@@ -2765,7 +2767,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         _ = account_service
         _ = order_state_service
         _ = logger
-        _ = now
+        forwarded_now.append(now)
         calls.append("observe")
         return ExecutionObservationSummary(
             scanned_executions=1,
@@ -2800,11 +2802,18 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         summary = asyncio.run(
             run_production_supervisor_cycle_once(
                 settings,
-                now=datetime(2026, 3, 30, 11, 0, tzinfo=UTC),
+                now=expected_now,
             )
         )
 
     assert calls == ["system", "approved", "launch_ready", "launch", "observe"]
+    assert forwarded_now == [
+        expected_now,
+        expected_now,
+        expected_now,
+        expected_now,
+        expected_now,
+    ]
     assert summary.launch_status == "launched"
     assert summary.paper_trade_id == 17
     assert summary.observed_executions == 1
@@ -2926,6 +2935,7 @@ def test_run_supervised_production_supervisor_loop_applies_backoff(
 
     outcomes: list[ProductionSupervisorCycleSummary | Exception] = [
         RuntimeError("temporary supervisor failure"),
+        RuntimeError("temporary supervisor failure #2"),
         ProductionSupervisorCycleSummary(
             checked_venues=3,
             degraded_venues=0,
@@ -2966,18 +2976,18 @@ def test_run_supervised_production_supervisor_loop_applies_backoff(
             run_supervised_production_supervisor_loop(
                 settings,
                 sleep=fake_sleep,
-                max_iterations=2,
+                max_iterations=3,
             )
         )
 
-    assert summary.attempts == 2
+    assert summary.attempts == 3
     assert summary.successful_cycles == 1
-    assert summary.failures == 1
+    assert summary.failures == 2
     assert summary.launched == 1
     assert summary.skipped == 0
     assert summary.observed_executions == 1
     assert summary.execution_alerts == 0
-    assert sleeps == [3]
+    assert sleeps == [3.0, 6.0]
 
 
 def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
