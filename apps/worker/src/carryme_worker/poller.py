@@ -1062,6 +1062,18 @@ def _build_api_settings_from_worker_settings(settings: WorkerSettings) -> ApiSet
         environment=settings.environment,
         database_path=settings.database_path,
         watchlist_path=settings.watchlist_path,
+        extended_live_enabled=settings.extended_live_enabled,
+        extended_api_key=settings.extended_api_key,
+        extended_stark_private_key=settings.extended_stark_private_key,
+        paradex_live_enabled=settings.paradex_live_enabled,
+        paradex_account_address=settings.paradex_account_address,
+        paradex_private_key=settings.paradex_private_key,
+        paradex_bearer_token=settings.paradex_bearer_token,
+        paradex_recv_window_ms=settings.paradex_recv_window_ms,
+        hyperliquid_live_enabled=settings.hyperliquid_live_enabled,
+        hyperliquid_account_address=settings.hyperliquid_account_address,
+        hyperliquid_vault_address=settings.hyperliquid_vault_address,
+        hyperliquid_api_wallet_private_key=settings.hyperliquid_api_wallet_private_key,
     )
 
 
