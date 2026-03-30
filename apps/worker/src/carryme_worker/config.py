@@ -16,6 +16,8 @@ class WorkerSettings(BaseSettings):
     log_level: LogLevel = "INFO"
     poll_interval_seconds: int = Field(default=30, gt=0)
     max_backoff_seconds: int = Field(default=300, gt=0)
+    universe_scan_interval_seconds: int = Field(default=60, gt=0)
+    universe_scan_max_backoff_seconds: int = Field(default=300, gt=0)
     execution_observation_interval_seconds: int = Field(default=10, gt=0)
     execution_observation_max_backoff_seconds: int = Field(default=60, gt=0)
     execution_alert_webhook_url: str | None = None
@@ -33,7 +35,10 @@ class WorkerSettings(BaseSettings):
         "quality_adjusted_roundtrip_pnl",
         "execution_adjusted_roundtrip_pnl",
         "execution_adjusted_quality_pnl",
-    ] = "execution_adjusted_quality_pnl"
+        "stability_adjusted_roundtrip_pnl",
+        "stability_adjusted_quality_pnl",
+        "route_adjusted_quality_pnl",
+    ] = "route_adjusted_quality_pnl"
     universe_scan_target_notional: float = Field(default=5_000.0, ge=0)
     universe_scan_min_capacity_notional: float = Field(default=250.0, ge=0)
     universe_scan_min_daily_volume: float = Field(default=10_000.0, ge=0)
@@ -41,6 +46,9 @@ class WorkerSettings(BaseSettings):
     universe_scan_min_roundtrip_edge: float = Field(default=0.0, ge=0)
     universe_scan_min_execution_quality_score: float = Field(default=0.0, ge=0)
     universe_scan_min_execution_samples: int = Field(default=0, ge=0)
+    universe_scan_min_route_stability_weight: float = Field(default=0.0, ge=0)
+    universe_scan_min_route_presence_ratio: float = Field(default=0.0, ge=0, le=1)
+    universe_scan_min_route_samples: int = Field(default=0, ge=0)
     universe_scan_limit: int = Field(default=10, gt=0)
     universe_scan_include_symbols: tuple[str, ...] = ()
     universe_scan_exclude_symbols: tuple[str, ...] = ()

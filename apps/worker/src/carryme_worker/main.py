@@ -14,6 +14,7 @@ from carryme_worker.poller import (
     ExecutionObservationSummary,
     PollCycleSummary,
     PollLoopSummary,
+    UniverseScanLoopSummary,
     UniverseScanSummary,
     install_signal_handlers,
     observe_live_executions_once,
@@ -21,6 +22,7 @@ from carryme_worker.poller import (
     run_polling_loop,
     run_supervised_execution_observation_loop,
     run_supervised_polling_loop,
+    run_supervised_universe_scan_loop,
     scan_funding_universe_once,
 )
 
@@ -85,6 +87,23 @@ def build_universe_scan_payload(summary: UniverseScanSummary) -> dict[str, int |
     }
 
 
+def build_universe_scan_loop_payload(
+    summary: UniverseScanLoopSummary,
+) -> dict[str, int | str]:
+    """Build a deterministic summary payload for a supervised universe-scan loop."""
+
+    return {
+        "attempts": summary.attempts,
+        "successful_cycles": summary.successful_cycles,
+        "failures": summary.failures,
+        "overlap_count": summary.overlap_count,
+        "scanned_opportunities": summary.scanned_opportunities,
+        "saved_records": summary.saved_records,
+        "alert_events": summary.alert_events,
+        "database_path": summary.database_path,
+    }
+
+
 def build_execution_observation_payload(
     summary: ExecutionObservationSummary,
 ) -> dict[str, int | str]:
@@ -130,6 +149,11 @@ def main() -> None:
         help="Scan the configured live funding universe once",
     )
     mode.add_argument(
+        "--scan-universe-supervise",
+        action="store_true",
+        help="Run the signal-aware supervised funding-universe scan loop",
+    )
+    mode.add_argument(
         "--observe-executions-once",
         action="store_true",
         help="Observe recent live executions once and persist snapshots",
@@ -151,7 +175,6 @@ def main() -> None:
         help="Run the signal-aware supervised worker loop",
     )
     args = parser.parse_args()
-
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be at least 1")
     if args.iterations is not None and (
@@ -168,6 +191,22 @@ def main() -> None:
     if args.scan_universe_once:
         universe_summary = asyncio.run(scan_funding_universe_once(settings))
         print(json.dumps(build_universe_scan_payload(universe_summary), indent=2))
+        return
+    if args.scan_universe_supervise:
+        async def run_supervised_universe() -> UniverseScanLoopSummary:
+            stop_event = asyncio.Event()
+            install_signal_handlers(
+                stop_event,
+                signals_to_handle=settings.stop_signals,
+            )
+            return await run_supervised_universe_scan_loop(
+                settings,
+                stop_event=stop_event,
+                max_iterations=args.iterations,
+            )
+
+        supervised_universe_summary = asyncio.run(run_supervised_universe())
+        print(json.dumps(build_universe_scan_loop_payload(supervised_universe_summary), indent=2))
         return
     if args.observe_executions_once:
         observation_summary = asyncio.run(observe_live_executions_once(settings))

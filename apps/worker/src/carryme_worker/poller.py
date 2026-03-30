@@ -33,6 +33,7 @@ from carryme_runtime import (
     OpportunityService,
     OpportunityUniverseService,
     ParadexOrderStateObserver,
+    RouteStabilityService,
     build_account_preflight_configs,
     build_execution_pair_status,
     build_opportunity_record_from_universe_opportunity,
@@ -86,6 +87,9 @@ class UniverseScanner(Protocol):
         min_roundtrip_edge: float,
         min_execution_quality_score: float,
         min_execution_samples: int,
+        min_route_stability_weight: float,
+        min_route_presence_ratio: float,
+        min_route_samples: int,
         include_symbols: list[str] | None,
         exclude_symbols: list[str] | None,
         exclude_tags: list[str] | None,
@@ -143,6 +147,20 @@ class UniverseScanSummary:
     alert_events: int
     database_path: str
     records: list[OpportunityRecord] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class UniverseScanLoopSummary:
+    """Summary emitted after a supervised funding-universe scan loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    overlap_count: int
+    scanned_opportunities: int
+    saved_records: int
+    alert_events: int
+    database_path: str
 
 
 @dataclass
@@ -255,7 +273,8 @@ async def scan_funding_universe_once(
         execution_quality_service=ExecutionQualityService(
             journal_store=ExecutionJournalStore(settings.database_path),
             observation_store=ExecutionObservationStore(settings.database_path),
-        )
+        ),
+        route_stability_service=RouteStabilityService(history_store=history_store),
     )
 
     async with asyncio.timeout(settings.universe_scan_timeout_seconds):
@@ -269,6 +288,9 @@ async def scan_funding_universe_once(
             min_roundtrip_edge=settings.universe_scan_min_roundtrip_edge,
             min_execution_quality_score=settings.universe_scan_min_execution_quality_score,
             min_execution_samples=settings.universe_scan_min_execution_samples,
+            min_route_stability_weight=settings.universe_scan_min_route_stability_weight,
+            min_route_presence_ratio=settings.universe_scan_min_route_presence_ratio,
+            min_route_samples=settings.universe_scan_min_route_samples,
             include_symbols=list(settings.universe_scan_include_symbols) or None,
             exclude_symbols=list(settings.universe_scan_exclude_symbols) or None,
             exclude_tags=list(settings.universe_scan_exclude_tags) or None,
@@ -315,6 +337,106 @@ async def scan_funding_universe_once(
         alert_events=alert_events,
         database_path=settings.database_path,
         records=persisted_records,
+    )
+
+
+async def run_supervised_universe_scan_loop(
+    settings: WorkerSettings,
+    *,
+    scanner: UniverseScanner | None = None,
+    store: OpportunityHistoryStore | None = None,
+    alert_sink: CandidateAlertSink | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> UniverseScanLoopSummary:
+    """Run supervised funding-universe scans until stopped or capped."""
+
+    if max_iterations is not None and max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
+    history_store = store or OpportunityHistoryStore(settings.database_path)
+    candidate_alert_sink = alert_sink or CandidateAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    supervised_stop_event = stop_event or asyncio.Event()
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    overlap_count = 0
+    scanned_opportunities = 0
+    saved_records = 0
+    alert_events = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised universe scan cycle %s", attempts)
+        try:
+            summary = await scan_funding_universe_once(
+                settings,
+                scanner=scanner,
+                store=history_store,
+                alert_sink=candidate_alert_sink,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            overlap_count += summary.overlap_count
+            scanned_opportunities += summary.scanned_opportunities
+            saved_records += summary.saved_records
+            alert_events += summary.alert_events
+            loop_logger.info(
+                (
+                    "completed supervised universe scan cycle %s with %s overlaps, "
+                    "%s ranked opportunities, %s saved records, and %s alerts"
+                ),
+                attempts,
+                summary.overlap_count,
+                summary.scanned_opportunities,
+                summary.saved_records,
+                summary.alert_events,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                settings.universe_scan_interval_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.universe_scan_max_backoff_seconds,
+                settings.universe_scan_interval_seconds * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "supervised universe scan cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                backoff_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+
+    return UniverseScanLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        overlap_count=overlap_count,
+        scanned_opportunities=scanned_opportunities,
+        saved_records=saved_records,
+        alert_events=alert_events,
+        database_path=settings.database_path,
     )
 
 
