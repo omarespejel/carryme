@@ -6,7 +6,7 @@ import json
 import logging
 
 from carryme_models import AppDescriptor, DatabaseReadiness, ServiceHealth, ServiceReadiness
-from carryme_storage.db import Database
+from carryme_storage.db import DEFAULT_DATABASE_PING_TIMEOUT_SECONDS, Database
 
 from carryme_worker.config import WorkerSettings
 from carryme_worker.poller import (
@@ -68,7 +68,9 @@ def build_readiness_payload(settings: WorkerSettings) -> ServiceReadiness:
 
     ready = True
     try:
-        Database(settings.database_path).ping()
+        Database(settings.database_path).ping_with_timeout(
+            DEFAULT_DATABASE_PING_TIMEOUT_SECONDS
+        )
     except Exception:
         ready = False
 

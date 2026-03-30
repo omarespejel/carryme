@@ -304,6 +304,38 @@ def test_worker_readiness_payload(tmp_path: Path) -> None:
     }
 
 
+def test_worker_readiness_payload_returns_degraded_when_database_ping_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from carryme_worker import main as worker_main_module
+
+    def fail_ping(self: object, timeout_seconds: float) -> None:
+        assert timeout_seconds > 0
+        raise TimeoutError("database unavailable")
+
+    monkeypatch.setattr(worker_main_module.Database, "ping_with_timeout", fail_ping)
+
+    payload = build_readiness_payload(
+        WorkerSettings(
+            environment="test",
+            database_path="postgresql+psycopg://user:secret@db.example.com/carryme",
+        )
+    )
+
+    assert payload.model_dump() == {
+        "service": {
+            "name": "carryme-worker",
+            "version": "0.1.0",
+            "environment": "test",
+        },
+        "status": "degraded",
+        "database": {
+            "target": "postgresql+psycopg://***@db.example.com/carryme",
+            "ready": False,
+        },
+    }
+
+
 def test_worker_cycle_payload() -> None:
     payload = build_cycle_payload(
         PollCycleSummary(
