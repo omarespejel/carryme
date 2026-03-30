@@ -58,7 +58,7 @@ def build_render_validation_report(
 ) -> dict[str, object]:
     """Validate the current environment for Render-style deployment."""
 
-    resolved_env = dict(env or os.environ)
+    resolved_env = dict(os.environ if env is None else env)
     missing_required = [name for name in REQUIRED_RENDER_ENV_VARS if not resolved_env.get(name)]
     warnings: list[str] = []
 

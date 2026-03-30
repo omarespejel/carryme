@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import patch
 
 from carryme_dev.render import build_render_validation_report
 
@@ -91,3 +92,26 @@ def test_render_validation_warns_on_non_production_env(tmp_path: Path) -> None:
         "CARRYME_API_ENVIRONMENT should be set to production on Render.",
         "CARRYME_WORKER_ENVIRONMENT should be set to production on Render.",
     ]
+
+
+def test_render_validation_honors_empty_explicit_env() -> None:
+    with patch.dict(
+        "os.environ",
+        {
+            "DATABASE_URL": "sqlite:///host.sqlite3",
+            "CARRYME_API_ENVIRONMENT": "production",
+            "CARRYME_WORKER_ENVIRONMENT": "production",
+        },
+        clear=True,
+    ):
+        report = build_render_validation_report({}, ping_database=False)
+
+    assert report["status"] == "degraded"
+    assert report["required_env"] == {
+        "missing": [
+            "DATABASE_URL",
+            "CARRYME_API_ENVIRONMENT",
+            "CARRYME_WORKER_ENVIRONMENT",
+        ],
+        "warnings": [],
+    }

@@ -36,6 +36,9 @@ uv run carryme-worker
 uv run carryme-worker --supervise
 uv run carryme-worker --observe-executions-supervise
 uv run carryme-worker --ready
+DATABASE_URL=sqlite:///data/render-validate.sqlite3 \
+CARRYME_API_ENVIRONMENT=production \
+CARRYME_WORKER_ENVIRONMENT=production \
 uv run carryme-render-validate --skip-db-ping
 ```
 
