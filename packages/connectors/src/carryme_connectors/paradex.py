@@ -80,14 +80,44 @@ class ParadexPublicConnector(BaseHttpConnector):
         )
 
     async def fetch_top_of_book(self, symbol: str) -> TopOfBook:
-        payload = await self._request_json("GET", f"/v1/bbo/{symbol}/interactive")
+        payload = await self._request_json("GET", f"/v1/orderbook/{symbol}/interactive")
         if not isinstance(payload, dict):
-            raise ConnectorError("Paradex BBO payload must be an object")
+            raise ConnectorError("Paradex orderbook payload must be an object")
+        best_bid = _first_level(payload.get("bids"), field="bids")
+        best_ask = _first_level(payload.get("asks"), field="asks")
+        best_bid_api = _price_size_pair(
+            payload.get("best_bid_api"),
+            field="best_bid_api",
+            optional=True,
+        )
+        best_ask_api = _price_size_pair(
+            payload.get("best_ask_api"),
+            field="best_ask_api",
+            optional=True,
+        )
+        best_bid_interactive = _price_size_pair(
+            payload.get("best_bid_interactive"),
+            field="best_bid_interactive",
+            optional=True,
+        )
+        best_ask_interactive = _price_size_pair(
+            payload.get("best_ask_interactive"),
+            field="best_ask_interactive",
+            optional=True,
+        )
         return TopOfBook(
-            best_bid_price=parse_float(payload.get("bid")),
-            best_bid_size=parse_float(payload.get("bid_size")),
-            best_ask_price=parse_float(payload.get("ask")),
-            best_ask_size=parse_float(payload.get("ask_size")),
+            best_bid_price=best_bid[0],
+            best_bid_size=best_bid[1],
+            best_ask_price=best_ask[0],
+            best_ask_size=best_ask[1],
+            best_bid_api_price=best_bid_api[0],
+            best_bid_api_size=best_bid_api[1],
+            best_ask_api_price=best_ask_api[0],
+            best_ask_api_size=best_ask_api[1],
+            best_bid_interactive_price=best_bid_interactive[0],
+            best_bid_interactive_size=best_bid_interactive[1],
+            best_ask_interactive_price=best_ask_interactive[0],
+            best_ask_interactive_size=best_ask_interactive[1],
         )
 
 
@@ -98,3 +128,33 @@ def _find_market(rows: Any, symbol: str) -> dict[str, Any]:
         if isinstance(row, dict) and row.get("symbol") == symbol:
             return row
     raise ConnectorError(f"Paradex market {symbol} not found")
+
+
+def _first_level(
+    levels: Any,
+    *,
+    field: str,
+) -> tuple[float | None, float | None]:
+    if levels is None:
+        raise ConnectorError(f"Paradex orderbook missing {field}")
+    if not isinstance(levels, list):
+        raise ConnectorError(f"Paradex orderbook {field} must be a list")
+    if not levels:
+        return None, None
+    first = levels[0]
+    return _price_size_pair(first, field=f"{field}[0]")
+
+
+def _price_size_pair(
+    raw: Any,
+    *,
+    field: str,
+    optional: bool = False,
+) -> tuple[float | None, float | None]:
+    if raw is None:
+        if optional:
+            return None, None
+        raise ConnectorError(f"Paradex orderbook missing {field}")
+    if not isinstance(raw, list | tuple) or len(raw) < 2:
+        raise ConnectorError(f"Paradex orderbook {field} must be [price, size]")
+    return parse_float(raw[0]), parse_float(raw[1])
