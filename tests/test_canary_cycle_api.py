@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from carryme_api.app import (
@@ -1335,3 +1336,168 @@ def test_execute_guarded_canary_cycle_from_latest_stable_launch_ready_rejects_un
 
     assert response.status_code == 409
     assert "not yet stable" in response.json()["detail"]
+
+
+def test_execute_guarded_canary_cycle_from_latest_stable_launch_ready_skips_unselected_live_credentials(  # noqa: E501
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ETH-USD-PERP",
+                long_venue="paradex",
+                short_venue="hyperliquid",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="vip",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "hyperliquid": FundingUniverseVenueMarket(
+                    venue="hyperliquid",
+                    symbol="ETH",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ETH-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=11.0,
+    )
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        label="arb_hyperliquid_paradex",
+        canonical_symbol="ETH-USD-PERP",
+        short_venue="hyperliquid",
+        long_venue="paradex",
+        short_fee_profile="vip",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=11.0,
+        note="approved canary",
+    )
+    snapshot = LaunchReadyCanarySnapshot(
+        captured_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        label="arb_hyperliquid_paradex",
+        max_snapshot_age_seconds=300,
+        approved_snapshot=ApprovedCanarySnapshot(
+            snapshot_id=5,
+            captured_at=datetime(2026, 3, 30, 11, 59, tzinfo=UTC),
+            label="arb_hyperliquid_paradex",
+            candidate=candidate,
+            approval=approval,
+        ),
+        system_state=PaperTradeSystemState(
+            paper_trade_id=0,
+            label="arb_hyperliquid_paradex",
+            ready=True,
+            venues=[
+                VenueSystemState(
+                    venue="hyperliquid",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                    blocking_reasons=[],
+                    notes=[],
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                    blocking_reasons=[],
+                    notes=[],
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+    launch_ready_store.append(snapshot)
+    launch_ready_store.append(
+        snapshot.model_copy(
+            update={"captured_at": datetime(2026, 3, 30, 12, 1, tzinfo=UTC)}
+        )
+    )
+
+    class StubRouteApprovalService:
+        def filter_approved_canary_candidates(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+        ) -> list[FundingUniverseCanaryCandidate]:
+            return candidates
+
+        def get_for_candidate(
+            self,
+            _candidate: FundingUniverseCanaryCandidate,
+        ) -> RouteApprovalEntry:
+            return approval
+
+        def require_live_approval(self, intent: FundingPairTradeIntent) -> RouteApprovalEntry:
+            assert intent.label == "arb_hyperliquid_paradex"
+            return approval
+
+    async def fake_run_guarded_canary_lifecycle(**kwargs: object) -> None:
+        cleanup_preview_service = cast(Any, kwargs["cleanup_preview_service"])
+        pair_close_preview_service = cast(Any, kwargs["pair_close_preview_service"])
+        cleanup_live_router = cast(Any, kwargs["cleanup_live_router"])
+        paired_service = cast(Any, kwargs["paired_service"])
+        pair_close_live_service = cast(Any, kwargs["pair_close_live_service"])
+
+        assert set(cleanup_preview_service.services) == {"hyperliquid", "paradex"}
+        assert set(pair_close_preview_service.services) == {"hyperliquid", "paradex"}
+        assert set(cleanup_live_router.services) == {"hyperliquid", "paradex"}
+        assert set(paired_service.services) == {"hyperliquid", "paradex"}
+        assert set(pair_close_live_service.services) == {"hyperliquid", "paradex"}
+        raise RuntimeError("reached lifecycle")
+
+    monkeypatch.setattr(
+        "carryme_api.app._run_guarded_canary_lifecycle",
+        fake_run_guarded_canary_lifecycle,
+    )
+
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(database_path),
+        extended_live_enabled=False,
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="0x123",
+        hyperliquid_live_enabled=True,
+        hyperliquid_account_address="0xdef",
+        hyperliquid_api_wallet_private_key="0x456",
+    )
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+
+    client = TestClient(app)
+    try:
+        with pytest.raises(RuntimeError, match="reached lifecycle"):
+            client.post(
+                "/v1/executions/live/canary-cycle/latest-stable-launch-ready",
+                params={
+                    "label": "arb_hyperliquid_paradex",
+                    "min_snapshot_count": 2,
+                    "min_stable_seconds": 30,
+                },
+            )
+    finally:
+        app.dependency_overrides.clear()
