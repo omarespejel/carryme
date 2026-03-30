@@ -332,6 +332,7 @@ class ProductionSupervisorCycleSummary:
     observed_executions: int
     saved_execution_observations: int
     execution_alerts: int
+    sent_notifications: int
     database_path: str
 
 
@@ -346,6 +347,7 @@ class ProductionSupervisorLoopSummary:
     skipped: int
     observed_executions: int
     execution_alerts: int
+    sent_notifications: int
     database_path: str
 
 
@@ -1339,6 +1341,10 @@ async def run_supervised_stable_canary_launch_loop(
 async def run_production_supervisor_cycle_once(
     settings: WorkerSettings,
     *,
+    system_state_alert_notifier: SystemStateAlertNotifier | None = None,
+    approved_canary_alert_notifier: ApprovedCanaryAlertNotifier | None = None,
+    stable_launch_ready_alert_notifier: StableLaunchReadyAlertNotifier | None = None,
+    execution_alert_notifier: ExecutionAlertNotifier | None = None,
     now: datetime | None = None,
     logger: logging.Logger | None = None,
 ) -> ProductionSupervisorCycleSummary:
@@ -1349,16 +1355,19 @@ async def run_production_supervisor_cycle_once(
 
     system_summary = await observe_system_state_once(
         settings,
+        alert_notifier=system_state_alert_notifier,
         logger=loop_logger,
         now=timestamp,
     )
     approved_summary = await scan_approved_canary_once(
         settings,
+        alert_notifier=approved_canary_alert_notifier,
         logger=loop_logger,
         now=timestamp,
     )
     launch_ready_summary = await cache_launch_ready_canaries_once(
         settings,
+        alert_notifier=stable_launch_ready_alert_notifier,
         logger=loop_logger,
         now=timestamp,
     )
@@ -1368,6 +1377,7 @@ async def run_production_supervisor_cycle_once(
     )
     execution_summary = await observe_live_executions_once(
         settings,
+        alert_notifier=execution_alert_notifier,
         logger=loop_logger,
         now=timestamp,
     )
@@ -1387,6 +1397,12 @@ async def run_production_supervisor_cycle_once(
         observed_executions=execution_summary.observed_executions,
         saved_execution_observations=execution_summary.saved_observations,
         execution_alerts=execution_summary.saved_alerts,
+        sent_notifications=(
+            system_summary.sent_notifications
+            + approved_summary.sent_notifications
+            + launch_ready_summary.sent_notifications
+            + execution_summary.sent_notifications
+        ),
         database_path=settings.database_path,
     )
 
@@ -1394,6 +1410,10 @@ async def run_production_supervisor_cycle_once(
 async def run_supervised_production_supervisor_loop(
     settings: WorkerSettings,
     *,
+    system_state_alert_notifier: SystemStateAlertNotifier | None = None,
+    approved_canary_alert_notifier: ApprovedCanaryAlertNotifier | None = None,
+    stable_launch_ready_alert_notifier: StableLaunchReadyAlertNotifier | None = None,
+    execution_alert_notifier: ExecutionAlertNotifier | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     logger: logging.Logger | None = None,
     stop_event: asyncio.Event | None = None,
@@ -1413,7 +1433,41 @@ async def run_supervised_production_supervisor_loop(
     skipped = 0
     observed_executions = 0
     execution_alerts = 0
+    sent_notifications = 0
     consecutive_failures = 0
+    system_state_notifier = system_state_alert_notifier
+    approved_canary_notifier = approved_canary_alert_notifier
+    stable_launch_ready_notifier = stable_launch_ready_alert_notifier
+    execution_notifier = execution_alert_notifier
+
+    if system_state_notifier is None:
+        from carryme_worker.notifications import build_system_state_alert_notifier
+
+        system_state_notifier = build_system_state_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
+    if approved_canary_notifier is None:
+        from carryme_worker.notifications import build_approved_canary_alert_notifier
+
+        approved_canary_notifier = build_approved_canary_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
+    if stable_launch_ready_notifier is None:
+        from carryme_worker.notifications import build_stable_launch_ready_alert_notifier
+
+        stable_launch_ready_notifier = build_stable_launch_ready_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
+    if execution_notifier is None:
+        from carryme_worker.notifications import build_execution_alert_notifier
+
+        execution_notifier = build_execution_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
 
     while not supervised_stop_event.is_set():
         attempts += 1
@@ -1421,6 +1475,10 @@ async def run_supervised_production_supervisor_loop(
         try:
             summary = await run_production_supervisor_cycle_once(
                 settings,
+                system_state_alert_notifier=system_state_notifier,
+                approved_canary_alert_notifier=approved_canary_notifier,
+                stable_launch_ready_alert_notifier=stable_launch_ready_notifier,
+                execution_alert_notifier=execution_notifier,
                 logger=loop_logger,
             )
             successful_cycles += 1
@@ -1431,17 +1489,19 @@ async def run_supervised_production_supervisor_loop(
                 skipped += 1
             observed_executions += summary.observed_executions
             execution_alerts += summary.execution_alerts
+            sent_notifications += summary.sent_notifications
             loop_logger.info(
                 (
                     "completed production supervisor cycle %s with launch_status=%s, "
-                    "%s approved candidates, %s launch-ready candidates, and "
-                    "%s observed executions"
+                    "%s approved candidates, %s launch-ready candidates, %s observed "
+                    "executions, and %s sent notifications"
                 ),
                 attempts,
                 summary.launch_status,
                 summary.approved_candidates,
                 summary.launch_ready_candidates,
                 summary.observed_executions,
+                summary.sent_notifications,
             )
             if max_iterations is not None and attempts >= max_iterations:
                 break
@@ -1483,6 +1543,7 @@ async def run_supervised_production_supervisor_loop(
         skipped=skipped,
         observed_executions=observed_executions,
         execution_alerts=execution_alerts,
+        sent_notifications=sent_notifications,
         database_path=settings.database_path,
     )
 
