@@ -94,6 +94,30 @@ def test_render_validation_warns_on_non_production_env(tmp_path: Path) -> None:
     ]
 
 
+def test_render_validation_accepts_paradex_bearer_token_alone(tmp_path: Path) -> None:
+    report = build_render_validation_report(
+        {
+            "DATABASE_URL": f"sqlite:///{tmp_path / 'render.sqlite3'}",
+            "CARRYME_API_ENVIRONMENT": "production",
+            "CARRYME_WORKER_ENVIRONMENT": "production",
+            "CARRYME_API_PARADEX_LIVE_ENABLED": "true",
+            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS": "0xabc",
+            "CARRYME_API_PARADEX_BEARER_TOKEN": "token",
+        }
+    )
+    live_venues = cast(dict[str, dict[str, Any]], report["live_venues"])
+    api_summary = cast(dict[str, Any], report["api"])
+    worker_summary = cast(dict[str, Any], report["worker"])
+
+    assert report["status"] == "ready"
+    assert live_venues["paradex"] == {
+        "enabled": True,
+        "missing_env": [],
+    }
+    assert api_summary["valid"] is True
+    assert worker_summary["valid"] is True
+
+
 def test_render_validation_honors_empty_explicit_env() -> None:
     with patch.dict(
         "os.environ",

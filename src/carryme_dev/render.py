@@ -26,13 +26,6 @@ LIVE_VENUE_ENV_VARS: dict[str, tuple[str, tuple[str, ...]]] = {
             "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY",
         ),
     ),
-    "paradex": (
-        "CARRYME_API_PARADEX_LIVE_ENABLED",
-        (
-            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
-            "CARRYME_API_PARADEX_PRIVATE_KEY",
-        ),
-    ),
     "hyperliquid": (
         "CARRYME_API_HYPERLIQUID_LIVE_ENABLED",
         (
@@ -49,6 +42,23 @@ def _is_truthy(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _paradex_missing_env(resolved_env: Mapping[str, str]) -> list[str]:
+    """Return missing Paradex credentials, honoring bearer-token auth."""
+
+    if not _is_truthy(resolved_env.get("CARRYME_API_PARADEX_LIVE_ENABLED")):
+        return []
+
+    missing: list[str] = []
+    if not resolved_env.get("CARRYME_API_PARADEX_ACCOUNT_ADDRESS"):
+        missing.append("CARRYME_API_PARADEX_ACCOUNT_ADDRESS")
+    if not (
+        resolved_env.get("CARRYME_API_PARADEX_PRIVATE_KEY")
+        or resolved_env.get("CARRYME_API_PARADEX_BEARER_TOKEN")
+    ):
+        missing.append("CARRYME_API_PARADEX_PRIVATE_KEY|CARRYME_API_PARADEX_BEARER_TOKEN")
+    return missing
 
 
 def build_render_validation_report(
@@ -104,6 +114,13 @@ def build_render_validation_report(
             "missing_env": missing,
         }
         live_missing.extend(missing)
+
+    paradex_missing = _paradex_missing_env(resolved_env)
+    live_venues["paradex"] = {
+        "enabled": _is_truthy(resolved_env.get("CARRYME_API_PARADEX_LIVE_ENABLED")),
+        "missing_env": paradex_missing,
+    }
+    live_missing.extend(paradex_missing)
 
     database_ready = False
     database_error: str | None = None
