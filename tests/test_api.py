@@ -335,7 +335,6 @@ def test_funding_universe_endpoint_passes_policy_and_execution_filters() -> None
     assert captured["fee_profile_overrides"] == {"paradex": "retail"}
     assert captured["exclude_tags"] == ["meme", "political"]
     assert captured["exclude_symbols"] == ["TRUMP-USD-PERP"]
-    assert captured["fee_profile_overrides"] == {"paradex": "retail"}
     assert captured["min_execution_quality_score"] == 0.7
 
 

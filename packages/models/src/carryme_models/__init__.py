@@ -51,6 +51,7 @@ from carryme_models.preview import (
 )
 from carryme_models.readiness import LiveSubmissionReadiness
 from carryme_models.universe import (
+    SUPPORTED_UNIVERSE_VENUES,
     ExecutionQualitySummary,
     FundingUniverseOpportunity,
     FundingUniverseOverlap,
@@ -103,6 +104,7 @@ __all__ = [
     "PaperTradeOrderPreview",
     "PreviewConfirmationEntry",
     "ServiceHealth",
+    "SUPPORTED_UNIVERSE_VENUES",
     "TopOfBook",
     "TradeLegIntent",
     "TradingFeeProfile",

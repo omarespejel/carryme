@@ -127,6 +127,17 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.watchlist_path.endswith("config/watchlists/default.json")
 
 
+def test_worker_rejects_unknown_universe_fee_profile(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text('{"pairs": []}')
+
+    with pytest.raises(ValidationError, match="Unknown fee profile"):
+        WorkerSettings(
+            watchlist_path=str(watchlist),
+            universe_scan_paradex_fee_profile="definitely-not-real",
+        )
+
+
 def test_worker_rejects_missing_watchlist_path(tmp_path: Path) -> None:
     missing = tmp_path / "missing.json"
 

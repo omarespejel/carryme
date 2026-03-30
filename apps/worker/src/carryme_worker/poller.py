@@ -447,12 +447,8 @@ def _build_universe_fee_profile_overrides(
 ) -> dict[str, str] | None:
     overrides = {
         venue: profile
-        for venue, profile in {
-            "extended": settings.universe_scan_extended_fee_profile,
-            "paradex": settings.universe_scan_paradex_fee_profile,
-            "hyperliquid": settings.universe_scan_hyperliquid_fee_profile,
-        }.items()
-        if profile
+        for venue in settings.universe_scan_venues
+        if (profile := getattr(settings, f"universe_scan_{venue}_fee_profile", None))
     }
     return overrides or None
 

@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field, model_validator
 
 from carryme_models.opportunity import FundingArbOpportunity
 
+SUPPORTED_UNIVERSE_VENUES: tuple[str, ...] = ("extended", "paradex", "hyperliquid")
+
 
 class FundingUniverseOverlap(BaseModel):
     """A canonical perp that exists on at least two venues."""
@@ -110,6 +112,21 @@ class FundingUniverseScan(BaseModel):
     overlap_count: int = Field(ge=0)
     overlaps: list[FundingUniverseOverlap] = Field(default_factory=list)
     opportunities: list[FundingUniverseOpportunity] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_fee_profiles(self) -> "FundingUniverseScan":
+        normalized_venues = {venue.strip().lower() for venue in self.venues if venue.strip()}
+        unknown = sorted(
+            venue for venue in self.fee_profiles if venue.strip().lower() not in normalized_venues
+        )
+        if unknown:
+            joined = ", ".join(unknown)
+            raise ValueError(f"fee_profiles contains venues not present in scan venues: {joined}")
+        empty = sorted(venue for venue, profile in self.fee_profiles.items() if not profile.strip())
+        if empty:
+            joined = ", ".join(empty)
+            raise ValueError(f"fee_profiles contains empty profile names for venues: {joined}")
+        return self
 
 
 class FundingUniversePortfolioEntry(BaseModel):

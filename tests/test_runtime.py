@@ -97,6 +97,7 @@ from carryme_storage import (
     ExecutionObservationStore,
     OpportunityHistoryStore,
 )
+from pydantic import ValidationError
 
 
 def _snapshot(
@@ -415,9 +416,44 @@ def test_opportunity_universe_service_applies_fee_profile_overrides() -> None:
         )
 
         assert scan.fee_profiles == {"extended": "default", "paradex": "retail"}
-        assert scan.opportunities[0].opportunity.long_fee_profile == "retail"
+        assert len(scan.opportunities) == 1
+        opportunity = scan.opportunities[0].opportunity
+        assert opportunity.long_fee_profile == "retail"
+        assert opportunity.short_fee_profile == "default"
 
     asyncio.run(run())
+
+
+def test_funding_universe_scan_rejects_unknown_fee_profile_venues() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="fee_profiles contains venues not present in scan venues: hyperliquid",
+    ):
+        FundingUniverseScan(
+            venues=["extended", "paradex"],
+            fee_profiles={"hyperliquid": "tier0"},
+            ranking="route_adjusted_quality_pnl",
+            target_notional=5_000,
+            overlap_count=0,
+            overlaps=[],
+            opportunities=[],
+        )
+
+
+def test_funding_universe_scan_rejects_empty_fee_profile_names() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="fee_profiles contains empty profile names for venues: paradex",
+    ):
+        FundingUniverseScan(
+            venues=["extended", "paradex"],
+            fee_profiles={"paradex": "   "},
+            ranking="route_adjusted_quality_pnl",
+            target_notional=5_000,
+            overlap_count=0,
+            overlaps=[],
+            opportunities=[],
+        )
 
 
 def test_opportunity_universe_service_retries_retryable_snapshot_errors() -> None:

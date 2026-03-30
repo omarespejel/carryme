@@ -12,6 +12,7 @@ from typing import Annotated
 
 import httpx
 from carryme_models import (
+    SUPPORTED_UNIVERSE_VENUES,
     AppDescriptor,
     CandidateAlertEvent,
     CleanupPreviewConfirmationEntry,
@@ -209,14 +210,15 @@ def _build_fee_profile_overrides(
     paradex_fee_profile: str | None,
     hyperliquid_fee_profile: str | None,
 ) -> dict[str, str] | None:
+    configured_profiles = {
+        "extended": extended_fee_profile,
+        "paradex": paradex_fee_profile,
+        "hyperliquid": hyperliquid_fee_profile,
+    }
     overrides = {
         venue: profile
-        for venue, profile in {
-            "extended": extended_fee_profile,
-            "paradex": paradex_fee_profile,
-            "hyperliquid": hyperliquid_fee_profile,
-        }.items()
-        if profile
+        for venue in SUPPORTED_UNIVERSE_VENUES
+        if (profile := configured_profiles.get(venue))
     }
     return overrides or None
 
@@ -3265,7 +3267,7 @@ def create_app() -> FastAPI:
         limit: int = 20,
     ) -> FundingUniverseScan:
         try:
-            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
             _validate_route_stability_filters(
                 min_route_stability_weight=min_route_stability_weight,
                 min_route_presence_ratio=min_route_presence_ratio,
@@ -3329,7 +3331,7 @@ def create_app() -> FastAPI:
         min_selected_notional: float = 0.0,
     ) -> FundingUniversePortfolioPlan:
         try:
-            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
             _validate_route_stability_filters(
                 min_route_stability_weight=min_route_stability_weight,
                 min_route_presence_ratio=min_route_presence_ratio,
