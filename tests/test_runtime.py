@@ -44,21 +44,27 @@ from carryme_models import (
     PairClosePreviewConfirmationEntry,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
+    PaperTradeSystemState,
     PreviewConfirmationEntry,
     RouteAccountingSummary,
+    RouteApprovalEntry,
     RouteStabilitySummary,
     TopOfBook,
     TradeLegIntent,
     VenueAccountPreflight,
+    VenueBalanceSnapshot,
     VenueExecutionPreflight,
     VenueOrderPreview,
+    VenueSystemState,
 )
 from carryme_normalizers import normalize_market_snapshot
 from carryme_runtime import (
     AccountPreflightService,
+    BalanceAccountingService,
     CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
     ExecutionAccountingService,
@@ -77,6 +83,7 @@ from carryme_runtime import (
     ParadexCleanupPreviewService,
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
+    RouteApprovalService,
     RouteStabilityService,
     VenueAccountProbe,
     build_execution_pair_status,
@@ -98,11 +105,14 @@ from carryme_runtime.account_preflight import (
     _row_represents_open_position,
 )
 from carryme_runtime.execution_quality import ExecutionQualityService
+from carryme_runtime.system_state import ParadexSystemStateProbe, SystemStateService
 from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import (
+    BalanceSnapshotStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
     OpportunityHistoryStore,
+    RouteApprovalStore,
 )
 from pydantic import ValidationError
 
@@ -3180,6 +3190,184 @@ def test_build_live_submission_readiness_blocks_only_zero_collateral_venues() ->
     assert readiness.blocking_reasons == [
         "Venue hyperliquid has no usable collateral for the confirmed 11.00 notional preview"
     ]
+
+
+def test_build_live_submission_readiness_blocks_degraded_system_state() -> None:
+    confirmation = PreviewConfirmationEntry(
+        entry_id=9,
+        confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+        paper_trade_id=7,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            slippage_tolerance_bps=12,
+            preview_hash="preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                    quantity=120.0,
+                    quantity_text="120.00000000",
+                    reference_price=0.0915,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=0.0916,
+                    worst_price_text="0.09160000",
+                    order_type="limit",
+                    time_in_force="ioc",
+                    http_method="POST",
+                    endpoint_path_hint="/v1/orders",
+                    required_auth_env_vars=[
+                        "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                        "CARRYME_API_PARADEX_PRIVATE_KEY",
+                    ],
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP"},
+                    notes=[],
+                )
+            ],
+        ),
+    )
+
+    readiness = build_live_submission_readiness(
+        paper_trade_id=7,
+        label="arb_extended_paradex",
+        preview_hash="preview-hash",
+        confirmations=[confirmation],
+        execution_preflight=PaperTradeExecutionPreflight(
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[],
+            blocking_reasons=[],
+        ),
+        account_preflight=PaperTradeAccountPreflight(
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[],
+            blocking_reasons=[],
+        ),
+        system_state=PaperTradeSystemState(
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            ready=False,
+            venues=[
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=False,
+                    status="maintenance",
+                    blocking_reasons=["Paradex system state is maintenance"],
+                )
+            ],
+            blocking_reasons=["Paradex system state is maintenance"],
+        ),
+    )
+
+    assert readiness.ready is False
+    assert readiness.system_state is not None
+    assert "Paradex system state is maintenance" in readiness.blocking_reasons
+
+
+def test_paradex_system_state_probe_accepts_ok_status() -> None:
+    class StubConnector:
+        def __init__(self, client: httpx.AsyncClient) -> None:
+            _ = client
+
+        async def fetch_system_state(self) -> dict[str, str]:
+            return {"status": "ok"}
+
+    probe = ParadexSystemStateProbe(connector_factory=cast(Any, StubConnector))
+
+    status = asyncio.run(probe.probe({"enabled": True}))
+
+    assert status.venue == "paradex"
+    assert status.checked is True
+    assert status.healthy is True
+    assert status.status == "ok"
+    assert status.blocking_reasons == []
+
+
+def test_system_state_service_scopes_to_paper_trade_venues() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=7,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.001,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=100.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+
+    class StubProbe:
+        def __init__(self, venue: str, healthy: bool) -> None:
+            self.venue = venue
+            self.healthy = healthy
+
+        async def probe(self, config: dict[str, bool]) -> VenueSystemState:
+            return VenueSystemState(
+                venue=self.venue,
+                enabled=config["enabled"],
+                checked=True,
+                healthy=self.healthy,
+                status="ok" if self.healthy else "maintenance",
+                blocking_reasons=[] if self.healthy else [f"{self.venue} unavailable"],
+            )
+
+    service = SystemStateService(
+        probes=cast(
+            Any,
+            {
+                "extended": StubProbe("extended", True),
+                "paradex": StubProbe("paradex", False),
+                "hyperliquid": StubProbe("hyperliquid", True),
+            },
+        ),
+    )
+
+    result = asyncio.run(
+        service.probe_paper_trade(
+            paper_trade,
+            {
+                "extended": {"enabled": True},
+                "paradex": {"enabled": True},
+                "hyperliquid": {"enabled": True},
+            },
+        )
+    )
+
+    assert result.paper_trade_id == 7
+    assert [item.venue for item in result.venues] == ["paradex", "extended"]
+    assert result.ready is False
+    assert result.blocking_reasons == ["paradex unavailable"]
 
 
 def test_build_trade_intent_sizes_by_capacity_fraction_and_cap() -> None:
@@ -10699,7 +10887,6 @@ def test_execution_accounting_service_summarizes_filled_attempt_history(tmp_path
         summary.total_estimated_fee_paid
     )
 
-
 def test_extended_live_execution_service_rejects_cleanup_for_wrong_venue() -> None:
     confirmation = CleanupPreviewConfirmationEntry(
         entry_id=11,
@@ -10843,3 +11030,157 @@ def test_require_confirmed_cleanup_preview_rejects_mismatches(
             preview_hash=preview_hash,
             confirmations=[confirmation],
         )
+
+
+def test_route_approval_service_filters_canaries_and_enforces_live_cap(
+    tmp_path: Path,
+) -> None:
+    store = RouteApprovalStore(tmp_path / "history.sqlite3")
+    service = RouteApprovalService(store=store)
+    service.upsert(
+        label="arb_extended_paradex",
+        payload=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 14, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=12.0,
+            note="canary only",
+        ),
+    )
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.0015,
+                entry_cost_rate=0.0004,
+                round_trip_cost_rate=0.0008,
+                one_day_net_edge_after_entry=0.0011,
+                one_day_net_edge_after_round_trip=0.0007,
+                break_even_days_entry=0.4,
+                break_even_days_round_trip=0.8,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1500.0,
+                    long_ask_notional=1400.0,
+                    max_entry_notional=1400.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=300.0,
+            estimated_one_day_pnl_after_round_trip=0.21,
+        ),
+        suggested_canary_notional=25.0,
+    )
+    filtered = service.filter_approved_canary_candidates([candidate])
+    permitted_intent = FundingPairTradeIntent(
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        source_recorded_at=datetime(2026, 3, 29, 14, 0, tzinfo=UTC),
+        one_day_net_edge_after_entry=0.0011,
+        break_even_days_entry=0.4,
+        capacity_limit_notional=1400.0,
+        target_notional=11.0,
+        capacity_fraction=0.25,
+        max_target_notional=11.0,
+        long_leg=TradeLegIntent(
+            venue="paradex",
+            symbol="ARB-USD-PERP",
+            fee_profile="pro_fastfills",
+            side="buy",
+            target_notional=11.0,
+        ),
+        short_leg=TradeLegIntent(
+            venue="extended",
+            symbol="ARB-USD",
+            fee_profile="default",
+            side="sell",
+            target_notional=11.0,
+        ),
+    )
+    blocked_intent = permitted_intent.model_copy(update={"target_notional": 15.0})
+
+    assert len(filtered) == 1
+    assert filtered[0].suggested_canary_notional == 12.0
+    assert service.require_live_approval(permitted_intent).max_live_notional == 12.0
+    with pytest.raises(ValueError, match="approved cap"):
+        service.require_live_approval(blocked_intent)
+
+
+def test_balance_accounting_service_summarizes_snapshots(tmp_path: Path) -> None:
+    store = BalanceSnapshotStore(tmp_path / "history.sqlite3")
+    service = BalanceAccountingService(store=store)
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="pre_open",
+            venue="extended",
+            total_collateral=4.99,
+            available_to_trade=4.99,
+            free_collateral=4.99,
+        )
+    )
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="pre_open",
+            venue="paradex",
+            total_collateral=15.0,
+            available_to_trade=15.0,
+            free_collateral=15.0,
+        )
+    )
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 20, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="post_close",
+            venue="extended",
+            total_collateral=4.90,
+            available_to_trade=4.90,
+            free_collateral=4.90,
+        )
+    )
+    store.append(
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 20, tzinfo=UTC),
+            paper_trade_id=7,
+            label="arb_extended_paradex",
+            stage="post_close",
+            venue="paradex",
+            total_collateral=14.86,
+            available_to_trade=14.86,
+            free_collateral=14.86,
+        )
+    )
+
+    summary = service.summarize_paper_trade(7)
+
+    assert summary is not None
+    assert isinstance(summary, PaperTradeBalanceDelta)
+    assert summary.snapshot_count == 4
+    assert summary.venue_count == 2
+    assert summary.total_collateral_delta == pytest.approx(-0.23)
+    assert summary.venues[0].snapshot_count == 2

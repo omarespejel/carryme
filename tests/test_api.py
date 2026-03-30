@@ -8,15 +8,24 @@ import carryme_models as carryme_models_module
 import pytest
 from carryme_api.app import (
     app,
+    get_approved_canary_alert_store,
+    get_approved_canary_store,
+    get_balance_accounting_service,
     get_execution_accounting_service,
     get_execution_quality_service,
     get_history_store,
+    get_launch_ready_canary_store,
     get_opportunity_service,
     get_opportunity_universe_service,
+    get_route_approval_service,
     get_route_stability_service,
+    get_stable_launch_ready_alert_store,
+    get_system_state_service,
 )
 from carryme_api.config import ApiSettings
 from carryme_models import (
+    ApprovedCanaryAlertEvent,
+    ApprovedCanarySnapshot,
     CandidateAlertEvent,
     CapacityEstimate,
     CleanupPreviewConfirmationEntry,
@@ -41,28 +50,43 @@ from carryme_models import (
     FundingUniverseOverlap,
     FundingUniverseScan,
     FundingUniverseVenueMarket,
+    LaunchReadyCanarySnapshot,
+    LaunchReadyCanaryStability,
     OpportunityRecord,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeOrderPreview,
+    PaperTradeSystemState,
     PreviewConfirmationEntry,
     RouteAccountingSummary,
+    RouteApprovalEntry,
+    RouteApprovalUpsert,
     RouteStabilitySummary,
+    StableLaunchReadyAlertEvent,
+    SystemStateAlertEvent,
     TradeLegIntent,
     VenueAccountPreflight,
     VenueOrderPreview,
+    VenueSystemState,
 )
 from carryme_storage import (
+    ApprovedCanaryAlertStore,
+    ApprovedCanaryStore,
+    BalanceSnapshotStore,
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
+    LaunchReadyCanaryStore,
     OpportunityHistoryStore,
     PairClosePreviewConfirmationStore,
     PaperTradeStore,
     PreviewConfirmationStore,
+    StableLaunchReadyAlertStore,
+    SystemStateAlertStore,
     WatchlistStore,
 )
 from fastapi.testclient import TestClient
@@ -446,6 +470,74 @@ def test_funding_universe_canary_endpoint_uses_policy_defaults() -> None:
     assert captured["exclude_tags"] is None
 
 
+def test_funding_universe_canary_endpoint_can_filter_approved_routes() -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    class StubUniverseService:
+        async def scan_canary_candidates(self, **_: object) -> list[FundingUniverseCanaryCandidate]:
+            return [candidate]
+
+    class StubRouteApprovalService:
+        def filter_approved_canary_candidates(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+        ) -> list[FundingUniverseCanaryCandidate]:
+            assert len(candidates) == 1
+            return [candidates[0].model_copy(update={"suggested_canary_notional": 11.0})]
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    client = TestClient(app)
+
+    response = client.get(
+        "/v1/opportunities/funding-universe/canary",
+        params={"approved_only": "true"},
+    )
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["suggested_canary_notional"] == 11.0
+
+
 def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
     class StubUniverseService:
         async def scan(self, **_: object) -> FundingUniverseScan:
@@ -507,6 +599,934 @@ def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
     assert payload["entries"][0]["opportunity"]["opportunity"]["canonical_symbol"] == "ARB-USD-PERP"
 
 
+def test_route_approvals_endpoint_uses_service_dependency() -> None:
+    captured: dict[str, object] = {}
+
+    class StubRouteApprovalService:
+        def list_recent(self, **kwargs: object) -> list[RouteApprovalEntry]:
+            captured.update(kwargs)
+            return [
+                RouteApprovalEntry(
+                    updated_at=datetime(2026, 3, 29, 16, 0, tzinfo=UTC),
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    short_venue="extended",
+                    long_venue="paradex",
+                    short_fee_profile="default",
+                    long_fee_profile="pro_fastfills",
+                    approved=True,
+                    max_live_notional=25.0,
+                    note="canary approved",
+                )
+            ]
+
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    client = TestClient(app)
+    response = client.get(
+        "/v1/opportunities/route-approvals",
+        params={"approved": "true", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["approved"] is True
+    assert captured["limit"] == 5
+    assert response.json()[0]["max_live_notional"] == 25.0
+
+
+def test_upsert_route_approval_endpoint_uses_service_dependency() -> None:
+    class StubRouteApprovalService:
+        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
+            assert label == "arb_extended_paradex"
+            assert payload.max_live_notional == 15.0
+            return RouteApprovalEntry(
+                updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+                label=label,
+                canonical_symbol=payload.canonical_symbol,
+                short_venue=payload.short_venue,
+                long_venue=payload.long_venue,
+                short_fee_profile=payload.short_fee_profile,
+                long_fee_profile=payload.long_fee_profile,
+                approved=payload.approved,
+                max_live_notional=payload.max_live_notional,
+                note=payload.note,
+            )
+
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    client = TestClient(app)
+    response = client.put(
+        "/v1/opportunities/route-approvals/arb_extended_paradex",
+        json={
+            "canonical_symbol": "ARB-USD-PERP",
+            "short_venue": "extended",
+            "long_venue": "paradex",
+            "short_fee_profile": "default",
+            "long_fee_profile": "pro_fastfills",
+            "approved": True,
+            "max_live_notional": 15.0,
+            "note": "raise canary cap",
+        },
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["label"] == "arb_extended_paradex"
+    assert payload["max_live_notional"] == 15.0
+
+
+def test_approved_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> None:
+    store = ApprovedCanaryStore(tmp_path / "history.sqlite3")
+    store.append(
+        ApprovedCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            approval=RouteApprovalEntry(
+                updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                short_venue="extended",
+                long_venue="paradex",
+                short_fee_profile="default",
+                long_fee_profile="pro_fastfills",
+                approved=True,
+                max_live_notional=11.0,
+                note="approved canary",
+            ),
+        )
+    )
+
+    app.dependency_overrides[get_approved_canary_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/opportunities/funding-universe/canary/snapshots",
+        params={"label": "arb_extended_paradex", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["label"] == "arb_extended_paradex"
+    assert payload[0]["candidate"]["suggested_canary_notional"] == 11.0
+
+
+def test_latest_approved_canary_snapshot_endpoint_returns_latest(tmp_path: Path) -> None:
+    store = ApprovedCanaryStore(tmp_path / "history.sqlite3")
+    store.append(
+        ApprovedCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            approval=RouteApprovalEntry(
+                updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                short_venue="extended",
+                long_venue="paradex",
+                short_fee_profile="default",
+                long_fee_profile="pro_fastfills",
+                approved=True,
+                max_live_notional=11.0,
+                note="approved canary",
+            ),
+        )
+    )
+
+    app.dependency_overrides[get_approved_canary_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/opportunities/funding-universe/canary/latest-approved",
+        params={"label": "arb_extended_paradex"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["label"] == "arb_extended_paradex"
+    assert payload["approval"]["max_live_notional"] == 11.0
+
+
+def test_launch_ready_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> None:
+    approved_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=3,
+        captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    store = LaunchReadyCanaryStore(tmp_path / "history.sqlite3")
+    store.append(
+        LaunchReadyCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
+            label="arb_extended_paradex",
+            max_snapshot_age_seconds=100000000,
+            approved_snapshot=approved_snapshot,
+            system_state=PaperTradeSystemState(
+                paper_trade_id=0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                        status=None,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            ),
+        )
+    )
+
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/executions/live/canary-cycle/launch-ready-snapshots",
+        params={"label": "arb_extended_paradex", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["label"] == "arb_extended_paradex"
+    assert payload[0]["approved_snapshot"]["snapshot_id"] == 3
+
+
+def test_latest_launch_ready_canary_snapshot_endpoint_returns_latest(tmp_path: Path) -> None:
+    approved_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=4,
+        captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    store = LaunchReadyCanaryStore(tmp_path / "history.sqlite3")
+    store.append(
+        LaunchReadyCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
+            label="arb_extended_paradex",
+            max_snapshot_age_seconds=100000000,
+            approved_snapshot=approved_snapshot,
+            system_state=PaperTradeSystemState(
+                paper_trade_id=0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                        status=None,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            ),
+        )
+    )
+
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/executions/live/canary-cycle/latest-launch-ready",
+        params={"label": "arb_extended_paradex"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["label"] == "arb_extended_paradex"
+    assert payload["approved_snapshot"]["approval"]["max_live_notional"] == 11.0
+
+
+def test_latest_stable_launch_ready_canary_snapshot_endpoint_returns_stability(
+    tmp_path: Path,
+) -> None:
+    approved_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=4,
+        captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    store = LaunchReadyCanaryStore(tmp_path / "history.sqlite3")
+    store.append(
+        LaunchReadyCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
+            label="arb_extended_paradex",
+            max_snapshot_age_seconds=100000000,
+            approved_snapshot=approved_snapshot,
+            system_state=PaperTradeSystemState(
+                paper_trade_id=0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                        status=None,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            ),
+        )
+    )
+    store.append(
+        LaunchReadyCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 8, tzinfo=UTC),
+            label="arb_extended_paradex",
+            max_snapshot_age_seconds=100000000,
+            approved_snapshot=approved_snapshot,
+            system_state=PaperTradeSystemState(
+                paper_trade_id=0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                        status=None,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            ),
+        )
+    )
+
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/executions/live/canary-cycle/latest-stable-launch-ready",
+        params={
+            "label": "arb_extended_paradex",
+            "max_snapshot_age_seconds": 100000000,
+            "min_snapshot_count": 2,
+            "min_stable_seconds": 30,
+        },
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["consecutive_snapshots"] == 2
+    assert payload["stable_seconds"] == 60.0
+    assert payload["snapshot"]["label"] == "arb_extended_paradex"
+
+
+def test_approved_canary_alerts_endpoint_lists_recent(tmp_path: Path) -> None:
+    store = ApprovedCanaryAlertStore(tmp_path / "history.sqlite3")
+    current_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=2,
+        captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    store.append(
+        ApprovedCanaryAlertEvent(
+            emitted_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
+            alert_type="approved_canary_available",
+            max_snapshot_age_seconds=300,
+            current_snapshot=current_snapshot,
+            previous_snapshot=None,
+        )
+    )
+
+    app.dependency_overrides[get_approved_canary_alert_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/alerts/approved-canaries",
+        params={"label": "arb_extended_paradex", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["alert_type"] == "approved_canary_available"
+    assert payload[0]["current_snapshot"]["label"] == "arb_extended_paradex"
+
+
+def test_stable_launch_ready_alerts_endpoint_lists_recent(tmp_path: Path) -> None:
+    approved_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=4,
+        captured_at=datetime(2026, 3, 29, 16, 6, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    snapshot = LaunchReadyCanarySnapshot(
+        launch_ready_snapshot_id=3,
+        captured_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
+        label="arb_extended_paradex",
+        max_snapshot_age_seconds=300,
+        approved_snapshot=approved_snapshot,
+        system_state=PaperTradeSystemState(
+            paper_trade_id=0,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+    store = StableLaunchReadyAlertStore(tmp_path / "history.sqlite3")
+    store.append(
+        StableLaunchReadyAlertEvent(
+            emitted_at=datetime(2026, 3, 29, 16, 8, tzinfo=UTC),
+            alert_type="stable_launch_ready_available",
+            max_snapshot_age_seconds=300,
+            min_snapshot_count=2,
+            min_stable_seconds=30.0,
+            current_stability=LaunchReadyCanaryStability(
+                snapshot=snapshot,
+                consecutive_snapshots=2,
+                stable_seconds=45.0,
+                min_snapshot_count=2,
+                min_stable_seconds=30.0,
+            ),
+            previous_stability=None,
+        )
+    )
+
+    app.dependency_overrides[get_stable_launch_ready_alert_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/alerts/stable-launch-ready",
+        params={"label": "arb_extended_paradex", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["alert_type"] == "stable_launch_ready_available"
+    assert payload[0]["current_stability"]["snapshot"]["label"] == "arb_extended_paradex"
+
+
+def test_system_state_alerts_endpoint_lists_recent(tmp_path: Path) -> None:
+    store = SystemStateAlertStore(tmp_path / "history.sqlite3")
+    store.append(
+        SystemStateAlertEvent(
+            emitted_at=datetime(2026, 3, 29, 16, 8, tzinfo=UTC),
+            venue="paradex",
+            alert_type="venue_degraded",
+            current_state=VenueSystemState(
+                venue="paradex",
+                enabled=True,
+                checked=True,
+                healthy=False,
+                status="maintenance",
+                blocking_reasons=["Paradex system state is maintenance"],
+            ),
+            previous_state=VenueSystemState(
+                venue="paradex",
+                enabled=True,
+                checked=True,
+                healthy=True,
+                status="ok",
+            ),
+        )
+    )
+
+    from carryme_api.app import get_system_state_alert_store
+
+    app.dependency_overrides[get_system_state_alert_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/alerts/system-state",
+        params={"venue": "paradex", "limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["venue"] == "paradex"
+    assert payload[0]["alert_type"] == "venue_degraded"
+
+
+def test_capture_balance_snapshots_for_paper_trade(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    snapshot_store = BalanceSnapshotStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 17, 0, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 16, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.001,
+                break_even_days_entry=0.5,
+                capacity_limit_notional=100.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        total_collateral=4.9,
+                        available_to_trade=4.9,
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                        total_collateral=14.8,
+                        available_to_trade=14.8,
+                        free_collateral=14.8,
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_balance_snapshot_store,
+        get_paper_trade_store,
+    )
+    from carryme_runtime import BalanceAccountingService
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_balance_snapshot_store] = lambda: snapshot_store
+    app.dependency_overrides[get_balance_accounting_service] = lambda: BalanceAccountingService(
+        store=snapshot_store
+    )
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    client = TestClient(app)
+    response = client.post(
+        f"/v1/accounting/balance-snapshots/from-paper-trade/{paper_trade.entry_id}",
+        params={"stage": "pre_open", "note": "before canary"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 2
+    assert snapshot_store.list_recent(limit=10, paper_trade_id=paper_trade.entry_id)
+
+
+def test_balance_delta_endpoint_uses_service_dependency() -> None:
+    class StubBalanceAccountingService:
+        def summarize_paper_trade(self, paper_trade_id: int) -> PaperTradeBalanceDelta:
+            assert paper_trade_id == 7
+            return PaperTradeBalanceDelta(
+                paper_trade_id=7,
+                label="arb_extended_paradex",
+                snapshot_count=4,
+                venue_count=2,
+                first_captured_at=datetime(2026, 3, 29, 17, 0, tzinfo=UTC),
+                latest_captured_at=datetime(2026, 3, 29, 17, 30, tzinfo=UTC),
+                total_collateral_delta=-0.23,
+                total_available_to_trade_delta=-0.23,
+                total_free_collateral_delta=-0.14,
+                venues=[],
+            )
+
+    app.dependency_overrides[get_balance_accounting_service] = (
+        lambda: StubBalanceAccountingService()
+    )
+    client = TestClient(app)
+    response = client.get("/v1/accounting/balance-delta/from-paper-trade/7")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == 7
+    assert payload["total_collateral_delta"] == -0.23
+
+
 def test_execution_quality_endpoint_uses_service_dependency() -> None:
     captured: dict[str, object] = {}
 
@@ -530,9 +1550,7 @@ def test_execution_quality_endpoint_uses_service_dependency() -> None:
                 )
             ]
 
-    app.dependency_overrides[get_execution_quality_service] = (
-        lambda: StubExecutionQualityService()
-    )
+    app.dependency_overrides[get_execution_quality_service] = lambda: StubExecutionQualityService()
     try:
         client = TestClient(app)
         response = client.get(
@@ -588,9 +1606,7 @@ def test_route_stability_endpoint_uses_service_dependency() -> None:
                 )
             ]
 
-    app.dependency_overrides[get_route_stability_service] = (
-        lambda: StubRouteStabilityService()
-    )
+    app.dependency_overrides[get_route_stability_service] = lambda: StubRouteStabilityService()
     try:
         client = TestClient(app)
         response = client.get(
@@ -641,9 +1657,7 @@ def test_execution_accounting_latest_endpoint_uses_service_dependency() -> None:
                 ],
             )
 
-    app.dependency_overrides[get_execution_accounting_service] = (
-        lambda: StubAccountingService()
-    )
+    app.dependency_overrides[get_execution_accounting_service] = lambda: StubAccountingService()
     client = TestClient(app)
 
     response = client.get("/v1/executions/accounting/latest/from-paper-trade/7")
@@ -684,9 +1698,7 @@ def test_execution_accounting_routes_endpoint_uses_service_dependency() -> None:
                 )
             ]
 
-    app.dependency_overrides[get_execution_accounting_service] = (
-        lambda: StubAccountingService()
-    )
+    app.dependency_overrides[get_execution_accounting_service] = lambda: StubAccountingService()
     client = TestClient(app)
 
     response = client.get(
@@ -1455,6 +2467,98 @@ def test_create_paper_trade_from_intent_persists_entry(tmp_path: Path) -> None:
     assert len(paper_store.list_recent(limit=10)) == 1
 
 
+def test_create_paper_trade_from_canary_caps_to_approved_notional(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "paper-trades.sqlite3")
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    class StubUniverseService:
+        async def scan_canary_candidates(self, **_: object) -> list[FundingUniverseCanaryCandidate]:
+            return [candidate]
+
+    class StubRouteApprovalService:
+        def filter_approved_canary_candidates(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+        ) -> list[FundingUniverseCanaryCandidate]:
+            assert len(candidates) == 1
+            return [candidates[0].model_copy(update={"suggested_canary_notional": 7.5})]
+
+        def get_for_candidate(
+            self,
+            _candidate: FundingUniverseCanaryCandidate,
+        ) -> RouteApprovalEntry:
+            return RouteApprovalEntry(
+                updated_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                short_venue="extended",
+                long_venue="paradex",
+                short_fee_profile="default",
+                long_fee_profile="pro_fastfills",
+                approved=True,
+                max_live_notional=7.5,
+                note="approved canary",
+            )
+
+    from carryme_api.app import get_paper_trade_store
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    client = TestClient(app)
+    response = client.post(
+        "/v1/paper-trades/from-canary",
+        params={
+            "label": "arb_extended_paradex",
+            "desired_notional": 20.0,
+            "note": "approved canary",
+        },
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["intent"]["target_notional"] == 7.5
+    assert payload["note"] == "approved canary"
+    assert len(paper_store.list_recent(limit=10)) == 1
+
+
 def test_paper_trades_endpoint_lists_saved_entries(tmp_path: Path) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     paper_store.append(
@@ -1549,7 +2653,65 @@ def test_mock_execution_endpoint_submits_saved_paper_trade(tmp_path: Path) -> No
     payload = response.json()
     assert payload["paper_trade_id"] == paper_trade.entry_id
     assert payload["adapter"] == "mock"
-    assert len(execution_store.list_recent(limit=10)) == 1
+
+
+def test_live_extended_execution_requires_route_approval(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+
+    class StubRouteApprovalService:
+        def require_live_approval(self, intent: FundingPairTradeIntent) -> None:
+            assert intent.label == "arb_extended_paradex"
+            raise ValueError("Live execution is blocked because this route has not been approved")
+
+    from carryme_api.app import get_api_settings, get_paper_trade_store
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
+    )
+    client = TestClient(app)
+    response = client.post(
+        f"/v1/executions/live/extended/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "preview-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert "has not been approved" in response.json()["detail"]
 
 
 def test_executions_endpoint_lists_saved_entries(tmp_path: Path) -> None:
@@ -4201,6 +5363,7 @@ def test_execute_extended_cleanup_endpoint_submits_confirmed_cleanup_preview(
     app.dependency_overrides[get_extended_live_execution_service] = (
         lambda: StubExtendedLiveExecutionService()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     client = TestClient(app)
     assert paper_trade.entry_id is not None
     response = client.post(
@@ -4456,6 +5619,7 @@ def test_execute_paradex_cleanup_endpoint_submits_confirmed_cleanup_preview(
     app.dependency_overrides[get_paradex_live_execution_service] = (
         lambda: StubParadexLiveExecutionService()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     client = TestClient(app)
     assert paper_trade.entry_id is not None
     response = client.post(
@@ -4738,6 +5902,7 @@ def test_execute_hyperliquid_cleanup_endpoint_submits_confirmed_cleanup_preview(
     app.dependency_overrides[get_hyperliquid_live_execution_service] = (
         lambda: StubHyperliquidLiveExecutionService()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     client = TestClient(app)
     assert paper_trade.entry_id is not None
     response = client.post(
@@ -5382,6 +6547,126 @@ def test_preview_confirmations_endpoint_lists_saved_entries(tmp_path: Path) -> N
     assert payload[0]["paper_trade_id"] == 7
 
 
+def test_execution_system_state_venues_endpoint_returns_probe_results() -> None:
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            assert configs["paradex"]["enabled"] is True
+            return [
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                )
+            ]
+
+    from carryme_api.app import get_api_settings
+
+    app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(paradex_live_enabled=True)
+    client = TestClient(app)
+    response = client.get("/v1/executions/system-state/venues")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == [
+        {
+            "venue": "paradex",
+            "enabled": True,
+            "checked": True,
+            "healthy": True,
+            "status": "ok",
+            "blocking_reasons": [],
+            "notes": [],
+        }
+    ]
+
+
+def test_execution_system_state_for_paper_trade_endpoint_returns_status(tmp_path: Path) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+
+    class StubSystemStateService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, dict[str, bool]],
+        ) -> PaperTradeSystemState:
+            assert paper_trade.entry_id == 1
+            assert configs["paradex"]["enabled"] is True
+            return PaperTradeSystemState(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    from carryme_api.app import get_api_settings, get_paper_trade_store
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        paradex_live_enabled=True,
+    )
+    client = TestClient(app)
+    response = client.get(f"/v1/executions/system-state/from-paper-trade/{paper_trade.entry_id}")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == paper_trade.entry_id
+    assert payload["ready"] is True
+    assert payload["venues"][1]["status"] == "ok"
+
+
 def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> None:
     paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
     confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
@@ -5500,6 +6785,35 @@ def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> No
                 ],
             )
 
+    class StubSystemStateService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, dict[str, bool]],
+        ) -> PaperTradeSystemState:
+            assert configs["paradex"]["enabled"] is True
+            return PaperTradeSystemState(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
     from carryme_api.app import (
         get_account_preflight_service,
         get_api_settings,
@@ -5510,6 +6824,7 @@ def test_live_submission_readiness_endpoint_combines_gates(tmp_path: Path) -> No
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
     app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -5646,6 +6961,33 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
                 blocking_reasons=[],
             )
 
+    class StubSystemStateService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, dict[str, bool]],
+        ) -> PaperTradeSystemState:
+            return PaperTradeSystemState(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                    VenueSystemState(
+                        venue="hyperliquid",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
     from carryme_api.app import (
         get_account_preflight_service,
         get_api_settings,
@@ -5656,6 +6998,7 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
     app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
     app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
     app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -5678,6 +7021,178 @@ def test_live_submission_readiness_endpoint_blocks_zero_hyperliquid_collateral(
     assert payload["blocking_reasons"] == [
         "Venue hyperliquid has no usable collateral for the confirmed 11.00 notional preview"
     ]
+
+
+def test_live_submission_readiness_endpoint_blocks_degraded_paradex_system_state(
+    tmp_path: Path,
+) -> None:
+    paper_store = PaperTradeStore(tmp_path / "history.sqlite3")
+    confirmation_store = PreviewConfirmationStore(tmp_path / "history.sqlite3")
+    paper_trade = paper_store.append(
+        PaperTradeEntry(
+            created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            note="operator accepted candidate",
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.00055,
+                break_even_days_entry=0.45,
+                capacity_limit_notional=4500.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+    )
+    confirmation_store.append(
+        PreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 10, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label="arb_extended_paradex",
+            preview_hash="preview-hash",
+            preview=PaperTradeOrderPreview(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label="arb_extended_paradex",
+                generated_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+                slippage_tolerance_bps=12,
+                preview_hash="preview-hash",
+                legs=[
+                    VenueOrderPreview(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=11.0,
+                        quantity=120.0,
+                        quantity_text="120.00000000",
+                        reference_price=0.0915,
+                        reference_price_source="best_ask",
+                        worst_acceptable_price=0.0916,
+                        worst_price_text="0.09160000",
+                        order_type="limit",
+                        time_in_force="ioc",
+                        http_method="POST",
+                        endpoint_path_hint="/v1/orders",
+                        required_auth_env_vars=[
+                            "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                            "CARRYME_API_PARADEX_PRIVATE_KEY",
+                        ],
+                        auth_scheme="main account address + subkey private key",
+                        payload={"market": "ARB-USD-PERP"},
+                        notes=[],
+                    )
+                ],
+            ),
+            note="operator confirmed",
+        )
+    )
+
+    class StubAccountPreflightService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, object],
+        ) -> PaperTradeAccountPreflight:
+            return PaperTradeAccountPreflight(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[],
+                blocking_reasons=[],
+            )
+
+    class StubSystemStateService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            configs: dict[str, dict[str, bool]],
+        ) -> PaperTradeSystemState:
+            assert configs["paradex"]["enabled"] is True
+            return PaperTradeSystemState(
+                paper_trade_id=paper_trade.entry_id or 0,
+                label=paper_trade.intent.label,
+                ready=False,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=False,
+                        status="maintenance",
+                        blocking_reasons=["Paradex system state is maintenance"],
+                    ),
+                ],
+                blocking_reasons=["Paradex system state is maintenance"],
+            )
+
+    from carryme_api.app import (
+        get_account_preflight_service,
+        get_api_settings,
+        get_paper_trade_store,
+        get_preview_confirmation_store,
+    )
+
+    app.dependency_overrides[get_paper_trade_store] = lambda: paper_store
+    app.dependency_overrides[get_preview_confirmation_store] = lambda: confirmation_store
+    app.dependency_overrides[get_account_preflight_service] = lambda: StubAccountPreflightService()
+    app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="paradex-private",
+    )
+    client = TestClient(app)
+    response = client.get(
+        f"/v1/executions/readiness/from-paper-trade/{paper_trade.entry_id}",
+        params={"preview_hash": "preview-hash"},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["system_state"]["venues"][1]["status"] == "maintenance"
+    assert "Paradex system state is maintenance" in payload["blocking_reasons"]
+
+
+class _AllowAllRouteApprovalService:
+    def require_live_approval(self, intent: FundingPairTradeIntent) -> RouteApprovalEntry:
+        return RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            label=intent.label,
+            canonical_symbol=intent.canonical_symbol,
+            short_venue=intent.short_leg.venue,
+            long_venue=intent.long_leg.venue,
+            short_fee_profile=intent.short_leg.fee_profile,
+            long_fee_profile=intent.long_leg.fee_profile,
+            approved=True,
+            max_live_notional=max(intent.target_notional, 10_000.0),
+            note="test allow",
+        )
 
 
 def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Path) -> None:
@@ -5853,6 +7368,7 @@ def test_paradex_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pat
     app.dependency_overrides[get_paradex_live_execution_service] = (
         lambda: StubParadexLiveExecutionService()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -6044,6 +7560,7 @@ def test_extended_live_execution_endpoint_submits_confirmed_preview(tmp_path: Pa
     app.dependency_overrides[get_extended_live_execution_service] = (
         lambda: StubExtendedLiveExecutionService()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -6237,6 +7754,7 @@ def test_hyperliquid_live_execution_endpoint_submits_confirmed_preview(tmp_path:
     app.dependency_overrides[get_hyperliquid_live_execution_service] = (
         lambda: StubHyperliquidLiveExecutionService()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -6451,6 +7969,7 @@ def test_paired_live_execution_endpoint_submits_both_legs(tmp_path: Path) -> Non
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -6665,6 +8184,7 @@ def test_paired_live_execution_endpoint_defaults_first_venue_to_auto(tmp_path: P
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",
@@ -7010,6 +8530,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_cleanup_live_execution_router] = (
         lambda: StubCleanupLiveExecutionRouter()
@@ -7397,6 +8918,7 @@ def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirma
         get_paired_live_execution_coordinator,
         get_paper_trade_store,
         get_preview_confirmation_store,
+        get_route_approval_service,
     )
 
     account_service = StubAccountPreflightService()
@@ -7413,6 +8935,7 @@ def test_guarded_paired_live_execution_endpoint_reuses_existing_cleanup_confirma
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_cleanup_live_execution_router] = (
         lambda: StubCleanupLiveExecutionRouter()
@@ -7784,6 +9307,7 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_cleanup_preview_service] = lambda: StubCleanupPreviewService()
     app.dependency_overrides[get_cleanup_live_execution_router] = (
         lambda: StubCleanupLiveExecutionRouter()
@@ -8025,6 +9549,7 @@ def test_guarded_paired_live_execution_endpoint_rejects_duplicate_retry(
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: StubPairedLiveExecutionCoordinator()
     )
+    app.dependency_overrides[get_route_approval_service] = lambda: _AllowAllRouteApprovalService()
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         extended_live_enabled=True,
         extended_api_key="extended-key",

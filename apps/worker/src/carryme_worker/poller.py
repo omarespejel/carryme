@@ -12,46 +12,99 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol, cast
 
 import httpx
+from carryme_api.app import (
+    _build_launch_ready_canary_stability,
+    _run_guarded_canary_lifecycle,
+    _select_latest_launch_ready_canary_snapshot,
+)
+from carryme_api.config import ApiSettings
 from carryme_models import (
+    ApprovedCanaryAlertEvent,
+    ApprovedCanarySnapshot,
+    CanaryLifecycleResult,
     CandidateAlertEvent,
     ExecutionAlertEvent,
     ExecutionJournalEntry,
     ExecutionObservationEntry,
     ExecutionPairStatus,
     FundingArbOpportunity,
+    FundingUniverseCanaryCandidate,
     FundingUniverseScan,
+    LaunchReadyCanarySnapshot,
+    LaunchReadyCanaryStability,
     OpportunityRecord,
+    PaperTradeSystemState,
+    StableCanaryLaunchRecord,
+    StableLaunchReadyAlertEvent,
+    SystemStateAlertEvent,
+    VenueSystemState,
 )
 from carryme_runtime import (
     AccountPreflightConfigMap,
     AccountPreflightService,
+    BalanceAccountingService,
+    CleanupLiveExecutionRouter,
+    CleanupPreviewRouter,
     ConnectorError,
     ExecutionOrderStateService,
     ExecutionQualityService,
+    ExtendedCleanupPreviewService,
+    ExtendedLiveExecutionService,
     ExtendedOrderStateObserver,
+    HyperliquidCleanupPreviewService,
+    HyperliquidLiveExecutionService,
     HyperliquidOrderStateObserver,
     OpportunityService,
     OpportunityUniverseService,
+    OrderPreviewService,
+    PairCloseLiveExecutionCoordinator,
+    PairClosePreviewService,
+    PairedLiveExecutionCoordinator,
+    ParadexCleanupPreviewService,
+    ParadexLiveExecutionService,
     ParadexOrderStateObserver,
+    RouteApprovalService,
     RouteStabilityService,
+    SystemStateConfigMap,
+    SystemStateService,
     build_account_preflight_configs,
     build_execution_pair_status,
     build_opportunity_record_from_universe_opportunity,
+    build_pair_spec_from_universe_opportunity,
     filter_candidate_records,
     reconcile_execution,
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_storage import (
+    ApprovedCanaryAlertStore,
+    ApprovedCanaryStore,
+    BalanceSnapshotStore,
     CandidateAlertStore,
+    CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
+    LaunchReadyCanaryStore,
     OpportunityHistoryStore,
+    PairClosePreviewConfirmationStore,
+    PaperTradeStore,
+    PreviewConfirmationStore,
+    RouteApprovalStore,
+    StableCanaryLaunchStore,
+    StableLaunchReadyAlertStore,
+    SystemStateAlertStore,
     load_watchlist,
 )
+from fastapi import HTTPException
 
 from carryme_worker.config import WorkerSettings
-from carryme_worker.notifications import CompositeExecutionAlertNotifier, ExecutionAlertNotifier
+from carryme_worker.notifications import (
+    ApprovedCanaryAlertNotifier,
+    CompositeExecutionAlertNotifier,
+    ExecutionAlertNotifier,
+    StableLaunchReadyAlertNotifier,
+    SystemStateAlertNotifier,
+)
 
 logger = logging.getLogger(__name__)
 OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
@@ -102,6 +155,24 @@ class CandidateAlertSink(Protocol):
     """Append-only sink for emitted candidate alert events."""
 
     def append(self, event: CandidateAlertEvent) -> bool: ...
+
+
+class ApprovedCanaryAlertSink(Protocol):
+    """Append-only sink for emitted approved-canary alert events."""
+
+    def append(self, event: ApprovedCanaryAlertEvent) -> None: ...
+
+
+class SystemStateAlertSink(Protocol):
+    """Append-only sink for emitted system-state alert events."""
+
+    def append(self, event: SystemStateAlertEvent) -> None: ...
+
+
+class StableLaunchReadyAlertSink(Protocol):
+    """Append-only sink for stable launch-ready alert events."""
+
+    def append(self, event: StableLaunchReadyAlertEvent) -> None: ...
 
 
 class ExecutionAlertSink(Protocol):
@@ -165,6 +236,91 @@ class UniverseScanLoopSummary:
 
 
 @dataclass
+class ApprovedCanaryScanSummary:
+    """Summary emitted after one approved-canary scan."""
+
+    scanned_candidates: int
+    approved_candidates: int
+    saved_snapshots: int
+    alert_events: int
+    sent_notifications: int
+    database_path: str
+    snapshots: list[ApprovedCanarySnapshot] = field(default_factory=list, repr=False)
+    alerts: list[ApprovedCanaryAlertEvent] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class ApprovedCanaryScanLoopSummary:
+    """Summary emitted after a supervised approved-canary scan loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    scanned_candidates: int
+    approved_candidates: int
+    saved_snapshots: int
+    alert_events: int
+    sent_notifications: int
+    database_path: str
+
+
+@dataclass
+class LaunchReadyCanaryCacheSummary:
+    """Summary emitted after one launch-ready canary cache cycle."""
+
+    scanned_snapshots: int
+    launch_ready_candidates: int
+    saved_snapshots: int
+    alert_events: int
+    sent_notifications: int
+    database_path: str
+    snapshots: list[LaunchReadyCanarySnapshot] = field(default_factory=list, repr=False)
+    alerts: list[StableLaunchReadyAlertEvent] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class LaunchReadyCanaryCacheLoopSummary:
+    """Summary emitted after a supervised launch-ready canary cache loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    scanned_snapshots: int
+    launch_ready_candidates: int
+    saved_snapshots: int
+    alert_events: int
+    sent_notifications: int
+    database_path: str
+
+
+@dataclass
+class StableCanaryLaunchSummary:
+    """Summary emitted after attempting to launch the latest stable canary."""
+
+    status: Literal["launched", "skipped"]
+    database_path: str
+    label: str | None = None
+    launch_ready_snapshot_id: int | None = None
+    approved_snapshot_id: int | None = None
+    paper_trade_id: int | None = None
+    final_pair_state: str | None = None
+    detail: object | None = None
+    lifecycle: CanaryLifecycleResult | None = field(default=None, repr=False)
+
+
+@dataclass
+class StableCanaryLaunchLoopSummary:
+    """Summary emitted after a supervised stable-canary launch loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    launched: int
+    skipped: int
+    database_path: str
+
+
+@dataclass
 class CandidateRecordSummary:
     """Summary emitted after applying candidate thresholds to a cycle."""
 
@@ -194,6 +350,33 @@ class ExecutionObservationLoopSummary:
     scanned_executions: int
     observed_executions: int
     saved_observations: int
+    saved_alerts: int
+    sent_notifications: int
+    database_path: str
+
+
+@dataclass
+class SystemStateObservationSummary:
+    """Summary emitted after one system-state observation cycle."""
+
+    checked_venues: int
+    degraded_venues: int
+    saved_alerts: int
+    sent_notifications: int
+    database_path: str
+    states: list[VenueSystemState] = field(default_factory=list, repr=False)
+    alerts: list[SystemStateAlertEvent] = field(default_factory=list, repr=False)
+
+
+@dataclass
+class SystemStateObservationLoopSummary:
+    """Summary emitted after a supervised system-state observation loop."""
+
+    attempts: int
+    successful_cycles: int
+    failures: int
+    checked_venues: int
+    degraded_venues: int
     saved_alerts: int
     sent_notifications: int
     database_path: str
@@ -342,6 +525,846 @@ async def scan_funding_universe_once(
     )
 
 
+def _build_universe_fee_profile_overrides(
+    settings: WorkerSettings,
+) -> dict[str, str] | None:
+    overrides = {
+        venue: profile
+        for venue in settings.universe_scan_venues
+        if (profile := getattr(settings, f"universe_scan_{venue}_fee_profile", None))
+    }
+    return overrides or None
+
+
+def _build_approved_canary_fee_profile_overrides(
+    settings: WorkerSettings,
+) -> dict[str, str] | None:
+    overrides = {
+        venue: profile
+        for venue, profile in {
+            "extended": settings.approved_canary_scan_extended_fee_profile,
+            "paradex": settings.approved_canary_scan_paradex_fee_profile,
+            "hyperliquid": settings.approved_canary_scan_hyperliquid_fee_profile,
+        }.items()
+        if profile
+    }
+    return overrides or None
+
+
+def _build_system_state_configs(settings: WorkerSettings) -> SystemStateConfigMap:
+    """Build the public system-state config map from worker settings."""
+
+    return {
+        "extended": {
+            "enabled": settings.extended_live_enabled,
+        },
+        "paradex": {
+            "enabled": settings.paradex_live_enabled,
+        },
+        "hyperliquid": {
+            "enabled": settings.hyperliquid_live_enabled,
+        },
+    }
+
+
+async def _probe_candidate_system_state(
+    *,
+    settings: WorkerSettings,
+    service: SystemStateService,
+    candidate: FundingUniverseCanaryCandidate,
+    label: str,
+) -> PaperTradeSystemState:
+    """Probe only the venues touched by one canary candidate."""
+
+    all_statuses = {
+        item.venue: item
+        for item in await service.probe_venues(_build_system_state_configs(settings))
+    }
+    venue_names = [
+        candidate.opportunity.opportunity.long_venue,
+        candidate.opportunity.opportunity.short_venue,
+    ]
+    selected_names: list[str] = []
+    for venue in venue_names:
+        if venue not in selected_names:
+            selected_names.append(venue)
+    selected = [all_statuses[venue] for venue in selected_names]
+
+    blocking_reasons: list[str] = []
+    for status in selected:
+        blocking_reasons.extend(status.blocking_reasons)
+
+    return PaperTradeSystemState(
+        paper_trade_id=0,
+        label=label,
+        ready=not blocking_reasons,
+        venues=selected,
+        blocking_reasons=blocking_reasons,
+    )
+
+
+def _launch_ready_snapshot_payload_changed(
+    previous_snapshot: LaunchReadyCanarySnapshot,
+    current_snapshot: LaunchReadyCanarySnapshot,
+) -> bool:
+    """Return whether the meaningful launch-ready payload changed."""
+
+    previous_payload = _normalized_launch_ready_snapshot_payload(previous_snapshot)
+    current_payload = _normalized_launch_ready_snapshot_payload(current_snapshot)
+    return previous_payload != current_payload
+
+
+def _normalized_launch_ready_snapshot_payload(
+    snapshot: LaunchReadyCanarySnapshot,
+) -> dict[str, object]:
+    """Return a stable, order-insensitive payload for one launch-ready snapshot."""
+
+    payload = snapshot.model_dump(
+        mode="python",
+        exclude={
+            "launch_ready_snapshot_id": True,
+            "captured_at": True,
+            "approved_snapshot": {"snapshot_id", "captured_at"},
+        },
+    )
+    system_state = cast(dict[str, object] | None, payload.get("system_state"))
+    if isinstance(system_state, dict):
+        venues = system_state.get("venues")
+        if isinstance(venues, list):
+            system_state["venues"] = sorted(
+                venues,
+                key=lambda venue: str(cast(dict[str, object], venue)["venue"]),
+            )
+    return payload
+
+
+def _build_latest_launch_ready_stability(
+    *,
+    store: LaunchReadyCanaryStore,
+    label: str,
+    max_snapshot_age_seconds: int,
+    min_snapshot_count: int,
+    min_stable_seconds: float,
+    now: datetime,
+) -> LaunchReadyCanaryStability | None:
+    """Return the latest stable launch-ready snapshot for one label, if any."""
+
+    latest_snapshot = store.latest(label=label)
+    if latest_snapshot is None:
+        return None
+    snapshot_age_seconds = max(
+        0.0,
+        (now - latest_snapshot.captured_at).total_seconds(),
+    )
+    effective_max_age_seconds = min(
+        max_snapshot_age_seconds,
+        latest_snapshot.max_snapshot_age_seconds,
+    )
+    if snapshot_age_seconds > effective_max_age_seconds:
+        return None
+
+    snapshots = store.list_recent(limit=max(min_snapshot_count + 5, 20), label=label)
+    chain: list[LaunchReadyCanarySnapshot] = []
+    for snapshot in snapshots:
+        if _launch_ready_snapshot_payload_changed(snapshot, latest_snapshot):
+            break
+        chain.append(snapshot)
+
+    consecutive_snapshots = len(chain)
+    oldest_snapshot = chain[-1]
+    stable_seconds = max(
+        0.0,
+        (latest_snapshot.captured_at - oldest_snapshot.captured_at).total_seconds(),
+    )
+    if consecutive_snapshots < min_snapshot_count:
+        return None
+    if stable_seconds < min_stable_seconds:
+        return None
+    return LaunchReadyCanaryStability(
+        snapshot=latest_snapshot,
+        consecutive_snapshots=consecutive_snapshots,
+        stable_seconds=stable_seconds,
+        min_snapshot_count=min_snapshot_count,
+        min_stable_seconds=min_stable_seconds,
+    )
+
+
+async def scan_approved_canary_once(
+    settings: WorkerSettings,
+    *,
+    scanner: OpportunityUniverseService | None = None,
+    approval_service: RouteApprovalService | None = None,
+    store: ApprovedCanaryStore | None = None,
+    alert_sink: ApprovedCanaryAlertSink | None = None,
+    alert_notifier: ApprovedCanaryAlertNotifier | None = None,
+    logger: logging.Logger | None = None,
+    now: datetime | None = None,
+) -> ApprovedCanaryScanSummary:
+    """Scan the live universe for canaries that are currently operator-approved."""
+
+    timestamp = now or datetime.now(UTC)
+    snapshot_store = store or ApprovedCanaryStore(settings.database_path)
+    approved_canary_alert_sink = alert_sink or ApprovedCanaryAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    route_approval_service = approval_service or RouteApprovalService(
+        store=RouteApprovalStore(settings.database_path)
+    )
+    runtime = scanner or OpportunityUniverseService(
+        execution_quality_service=ExecutionQualityService(
+            journal_store=ExecutionJournalStore(settings.database_path),
+            observation_store=ExecutionObservationStore(settings.database_path),
+        ),
+        route_stability_service=RouteStabilityService(
+            history_store=OpportunityHistoryStore(settings.database_path)
+        ),
+    )
+
+    candidates = await runtime.scan_canary_candidates(
+        venues=list(settings.approved_canary_scan_venues),
+        fee_profile_overrides=_build_approved_canary_fee_profile_overrides(settings),
+        target_notional=settings.approved_canary_scan_target_notional,
+        canary_max_notional=settings.approved_canary_scan_max_notional,
+        min_capacity_notional=settings.approved_canary_scan_min_capacity_notional,
+        min_daily_volume=settings.approved_canary_scan_min_daily_volume,
+        min_open_interest=settings.approved_canary_scan_min_open_interest,
+        min_roundtrip_edge=settings.approved_canary_scan_min_roundtrip_edge,
+        min_execution_quality_score=settings.approved_canary_scan_min_execution_quality_score,
+        min_execution_samples=settings.approved_canary_scan_min_execution_samples,
+        min_route_stability_weight=settings.approved_canary_scan_min_route_stability_weight,
+        min_route_presence_ratio=settings.approved_canary_scan_min_route_presence_ratio,
+        min_route_samples=settings.approved_canary_scan_min_route_samples,
+        include_symbols=list(settings.approved_canary_scan_include_symbols) or None,
+        exclude_symbols=list(settings.approved_canary_scan_exclude_symbols) or None,
+        exclude_tags=list(settings.approved_canary_scan_exclude_tags) or None,
+        limit=settings.approved_canary_scan_limit,
+    )
+    approved_candidates = route_approval_service.filter_approved_canary_candidates(candidates)
+    approved_labels = {
+        approval.label
+        for approval in route_approval_service.list_recent(limit=1_000, approved=True)
+    }
+    previous_snapshots = {label: snapshot_store.latest(label=label) for label in approved_labels}
+    snapshots: list[ApprovedCanarySnapshot] = []
+    for candidate in approved_candidates:
+        approval = route_approval_service.get_for_candidate(candidate)
+        if approval is None or not approval.approved:
+            continue
+        label = build_pair_spec_from_universe_opportunity(candidate.opportunity).label
+        snapshots.append(
+            snapshot_store.append(
+                ApprovedCanarySnapshot(
+                    captured_at=timestamp,
+                    label=label or approval.label,
+                    candidate=candidate,
+                    approval=approval,
+                )
+            )
+        )
+
+    alerts = _emit_approved_canary_alerts(
+        approved_labels=approved_labels,
+        previous_snapshots=previous_snapshots,
+        current_snapshots=snapshots,
+        max_snapshot_age_seconds=settings.approved_canary_alert_max_snapshot_age_seconds,
+        emitted_at=timestamp,
+        sink=approved_canary_alert_sink,
+    )
+    sent_notifications = 0
+    if alert_notifier is not None:
+        for event in alerts:
+            try:
+                await alert_notifier.notify(event)
+                sent_notifications += 1
+            except Exception:
+                loop_logger.exception(
+                    "approved canary alert notification failed for label=%s type=%s",
+                    event.current_snapshot.label
+                    if event.current_snapshot is not None
+                    else (
+                        event.previous_snapshot.label
+                        if event.previous_snapshot is not None
+                        else None
+                    ),
+                    event.alert_type,
+                )
+
+    return ApprovedCanaryScanSummary(
+        scanned_candidates=len(candidates),
+        approved_candidates=len(approved_candidates),
+        saved_snapshots=len(snapshots),
+        alert_events=len(alerts),
+        sent_notifications=sent_notifications,
+        database_path=settings.database_path,
+        snapshots=snapshots,
+        alerts=alerts,
+    )
+
+
+async def cache_launch_ready_canaries_once(
+    settings: WorkerSettings,
+    *,
+    approved_store: ApprovedCanaryStore | None = None,
+    launch_ready_store: LaunchReadyCanaryStore | None = None,
+    alert_sink: StableLaunchReadyAlertSink | None = None,
+    alert_notifier: StableLaunchReadyAlertNotifier | None = None,
+    approval_service: RouteApprovalService | None = None,
+    system_state_service: SystemStateService | None = None,
+    logger: logging.Logger | None = None,
+    now: datetime | None = None,
+) -> LaunchReadyCanaryCacheSummary:
+    """Persist fresh approved canaries whose touched venues are currently healthy."""
+
+    timestamp = now or datetime.now(UTC)
+    source_store = approved_store or ApprovedCanaryStore(settings.database_path)
+    ready_store = launch_ready_store or LaunchReadyCanaryStore(settings.database_path)
+    stable_alert_sink = alert_sink or StableLaunchReadyAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    route_approval_service = approval_service or RouteApprovalService(
+        store=RouteApprovalStore(settings.database_path)
+    )
+    runtime = system_state_service or SystemStateService()
+
+    latest_approvals_by_label: set[str] = set()
+    for approval in route_approval_service.list_recent(limit=1_000, approved=True):
+        latest_approvals_by_label.add(approval.label)
+
+    previous_stabilities = {
+        label: (
+            latest_alert.current_stability
+            if isinstance(stable_alert_sink, StableLaunchReadyAlertStore)
+            and (latest_alert := stable_alert_sink.latest(label=label)) is not None
+            else None
+        )
+        for label in sorted(latest_approvals_by_label)
+    }
+
+    scanned_snapshots = 0
+    snapshots: list[LaunchReadyCanarySnapshot] = []
+    for label in sorted(latest_approvals_by_label):
+        snapshot = source_store.latest(label=label)
+        if snapshot is None:
+            continue
+        scanned_snapshots += 1
+        snapshot_age_seconds = max(
+            0.0,
+            (timestamp - snapshot.captured_at).total_seconds(),
+        )
+        if snapshot_age_seconds > settings.launch_ready_canary_max_snapshot_age_seconds:
+            loop_logger.debug(
+                ("skipping stale approved canary snapshot label=%s age=%.1fs (max=%ss)"),
+                label,
+                snapshot_age_seconds,
+                settings.launch_ready_canary_max_snapshot_age_seconds,
+            )
+            continue
+
+        refreshed_approval = route_approval_service.get_for_candidate(snapshot.candidate)
+        if refreshed_approval is None or not refreshed_approval.approved:
+            continue
+
+        capped_notional = min(
+            snapshot.candidate.suggested_canary_notional,
+            refreshed_approval.max_live_notional,
+        )
+        if capped_notional <= 0:
+            continue
+
+        refreshed_candidate = snapshot.candidate.model_copy(
+            update={"suggested_canary_notional": capped_notional}
+        )
+        refreshed_snapshot = snapshot.model_copy(
+            update={
+                "candidate": refreshed_candidate,
+                "approval": refreshed_approval,
+            }
+        )
+        system_state = await _probe_candidate_system_state(
+            settings=settings,
+            service=runtime,
+            candidate=refreshed_candidate,
+            label=label,
+        )
+        if not system_state.ready:
+            loop_logger.debug(
+                "skipping launch-ready snapshot label=%s because system state is not ready",
+                label,
+            )
+            continue
+
+        snapshots.append(
+            ready_store.append(
+                LaunchReadyCanarySnapshot(
+                    captured_at=timestamp,
+                    label=label,
+                    max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+                    approved_snapshot=refreshed_snapshot,
+                    system_state=system_state,
+                )
+            )
+        )
+
+    alerts = _emit_stable_launch_ready_alerts(
+        labels=set(latest_approvals_by_label),
+        previous_stabilities=previous_stabilities,
+        store=ready_store,
+        sink=stable_alert_sink,
+        emitted_at=timestamp,
+        max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+        min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
+        min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
+    )
+    sent_notifications = 0
+    if alert_notifier is not None:
+        for event in alerts:
+            try:
+                await alert_notifier.notify(event)
+                sent_notifications += 1
+            except Exception:
+                loop_logger.exception(
+                    "stable launch-ready alert notification failed for label=%s type=%s",
+                    (
+                        event.current_stability.snapshot.label
+                        if event.current_stability is not None
+                        else (
+                            event.previous_stability.snapshot.label
+                            if event.previous_stability is not None
+                            else None
+                        )
+                    ),
+                    event.alert_type,
+                )
+
+    return LaunchReadyCanaryCacheSummary(
+        scanned_snapshots=scanned_snapshots,
+        launch_ready_candidates=len(snapshots),
+        saved_snapshots=len(snapshots),
+        alert_events=len(alerts),
+        sent_notifications=sent_notifications,
+        database_path=settings.database_path,
+        snapshots=snapshots,
+        alerts=alerts,
+    )
+
+
+async def run_supervised_launch_ready_canary_cache_loop(
+    settings: WorkerSettings,
+    *,
+    approved_store: ApprovedCanaryStore | None = None,
+    launch_ready_store: LaunchReadyCanaryStore | None = None,
+    alert_sink: StableLaunchReadyAlertSink | None = None,
+    alert_notifier: StableLaunchReadyAlertNotifier | None = None,
+    approval_service: RouteApprovalService | None = None,
+    system_state_service: SystemStateService | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> LaunchReadyCanaryCacheLoopSummary:
+    """Run the launch-ready canary cache loop until stopped or capped."""
+
+    source_store = approved_store or ApprovedCanaryStore(settings.database_path)
+    ready_store = launch_ready_store or LaunchReadyCanaryStore(settings.database_path)
+    stable_alert_sink = alert_sink or StableLaunchReadyAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    stable_launch_ready_notifier = alert_notifier
+    supervised_stop_event = stop_event or asyncio.Event()
+    if stable_launch_ready_notifier is None:
+        from carryme_worker.notifications import build_stable_launch_ready_alert_notifier
+
+        stable_launch_ready_notifier = build_stable_launch_ready_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    scanned_snapshots = 0
+    launch_ready_candidates = 0
+    saved_snapshots = 0
+    alert_events = 0
+    sent_notifications = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised launch-ready canary cache cycle %s", attempts)
+        try:
+            summary = await cache_launch_ready_canaries_once(
+                settings,
+                approved_store=source_store,
+                launch_ready_store=ready_store,
+                alert_sink=stable_alert_sink,
+                alert_notifier=stable_launch_ready_notifier,
+                approval_service=approval_service,
+                system_state_service=system_state_service,
+                logger=loop_logger,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            scanned_snapshots += summary.scanned_snapshots
+            launch_ready_candidates += summary.launch_ready_candidates
+            saved_snapshots += summary.saved_snapshots
+            alert_events += summary.alert_events
+            sent_notifications += summary.sent_notifications
+            loop_logger.info(
+                (
+                    "completed supervised launch-ready canary cache cycle %s with "
+                    "%s scanned snapshots, %s saved launch-ready snapshots, %s alerts, "
+                    "and %s notifications"
+                ),
+                attempts,
+                summary.scanned_snapshots,
+                summary.saved_snapshots,
+                summary.alert_events,
+                summary.sent_notifications,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(settings.launch_ready_canary_interval_seconds)
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.launch_ready_canary_max_backoff_seconds,
+                settings.launch_ready_canary_interval_seconds * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "launch-ready canary cache cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(backoff_seconds)
+
+    return LaunchReadyCanaryCacheLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        scanned_snapshots=scanned_snapshots,
+        launch_ready_candidates=launch_ready_candidates,
+        saved_snapshots=saved_snapshots,
+        alert_events=alert_events,
+        sent_notifications=sent_notifications,
+        database_path=settings.database_path,
+    )
+
+
+def _build_api_settings_from_worker_settings(settings: WorkerSettings) -> ApiSettings:
+    """Build API settings aligned to the worker's runtime paths and environment."""
+
+    return ApiSettings(
+        environment=settings.environment,
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+    )
+
+
+async def launch_latest_stable_canary_once(
+    settings: WorkerSettings,
+    *,
+    api_settings: ApiSettings | None = None,
+    launch_store: StableCanaryLaunchStore | None = None,
+    now: datetime | None = None,
+) -> StableCanaryLaunchSummary:
+    """Launch the latest stable cached canary once, or skip deterministically."""
+
+    runtime_settings = api_settings or _build_api_settings_from_worker_settings(settings)
+    launch_ready_store = LaunchReadyCanaryStore(runtime_settings.database_path)
+    stable_launch_store = launch_store or StableCanaryLaunchStore(runtime_settings.database_path)
+    route_approval_service = RouteApprovalService(
+        store=RouteApprovalStore(runtime_settings.database_path)
+    )
+    timestamp = now or datetime.now(UTC)
+
+    try:
+        stability = _build_launch_ready_canary_stability(
+            store=launch_ready_store,
+            label=None,
+            max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+            min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
+            min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
+            now=timestamp,
+        )
+        snapshot, selected, approval = _select_latest_launch_ready_canary_snapshot(
+            store=launch_ready_store,
+            approval_service=route_approval_service,
+            label=stability.snapshot.label,
+            max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+            now=timestamp,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {404, 409}:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_path,
+                detail=exc.detail,
+            )
+        raise
+
+    if snapshot.launch_ready_snapshot_id is not None:
+        previous_launch = stable_launch_store.latest_for_snapshot(snapshot.launch_ready_snapshot_id)
+        if previous_launch is not None:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_path,
+                label=snapshot.label,
+                launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+                approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+                paper_trade_id=previous_launch.paper_trade_id,
+                final_pair_state=previous_launch.final_pair_state,
+                detail=(
+                    "Launch-ready canary snapshot already launched by worker as "
+                    f"paper trade {previous_launch.paper_trade_id}"
+                ),
+            )
+
+    try:
+        lifecycle = await _run_guarded_canary_lifecycle(
+            candidate=selected,
+            approval=approval,
+            desired_notional=None,
+            note="worker stable launch-ready canary",
+            lifecycle_note=(
+                "Launched by carryme-worker from stable launch-ready snapshot "
+                f"{stability.snapshot.launch_ready_snapshot_id} after "
+                f"{stability.consecutive_snapshots} stable snapshots over "
+                f"{stability.stable_seconds:.1f}s."
+            ),
+            paper_store=PaperTradeStore(runtime_settings.database_path),
+            confirmation_store=PreviewConfirmationStore(runtime_settings.database_path),
+            pair_close_confirmation_store=PairClosePreviewConfirmationStore(
+                runtime_settings.database_path
+            ),
+            cleanup_confirmation_store=CleanupPreviewConfirmationStore(
+                runtime_settings.database_path
+            ),
+            execution_store=ExecutionJournalStore(runtime_settings.database_path),
+            observation_store=ExecutionObservationStore(runtime_settings.database_path),
+            settings=runtime_settings,
+            account_preflight_service=AccountPreflightService(),
+            system_state_service=SystemStateService(),
+            balance_service=BalanceAccountingService(
+                store=BalanceSnapshotStore(runtime_settings.database_path)
+            ),
+            order_preview_service=OrderPreviewService(),
+            order_state_service=ExecutionOrderStateService(
+                observers=_build_order_state_observers(settings)
+            ),
+            cleanup_preview_service=CleanupPreviewRouter(
+                services={
+                    "extended": ExtendedCleanupPreviewService(
+                        api_key=runtime_settings.extended_api_key or ""
+                    ),
+                    "hyperliquid": HyperliquidCleanupPreviewService(
+                        account_address=runtime_settings.hyperliquid_account_address or ""
+                    ),
+                    "paradex": ParadexCleanupPreviewService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key,
+                        bearer_token=runtime_settings.paradex_bearer_token,
+                    ),
+                }
+            ),
+            pair_close_preview_service=PairClosePreviewService(
+                services={
+                    "extended": ExtendedCleanupPreviewService(
+                        api_key=runtime_settings.extended_api_key or ""
+                    ),
+                    "hyperliquid": HyperliquidCleanupPreviewService(
+                        account_address=runtime_settings.hyperliquid_account_address or ""
+                    ),
+                    "paradex": ParadexCleanupPreviewService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key,
+                        bearer_token=runtime_settings.paradex_bearer_token,
+                    ),
+                }
+            ),
+            cleanup_live_router=CleanupLiveExecutionRouter(
+                services={
+                    "extended": ExtendedLiveExecutionService(
+                        api_key=runtime_settings.extended_api_key or "",
+                        stark_private_key=runtime_settings.extended_stark_private_key or "",
+                    ),
+                    "hyperliquid": HyperliquidLiveExecutionService(
+                        account_address=runtime_settings.hyperliquid_account_address or "",
+                        vault_address=runtime_settings.hyperliquid_vault_address,
+                        api_wallet_private_key=(
+                            runtime_settings.hyperliquid_api_wallet_private_key or ""
+                        ),
+                    ),
+                    "paradex": ParadexLiveExecutionService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key or "",
+                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
+                    ),
+                }
+            ),
+            paired_service=PairedLiveExecutionCoordinator(
+                services={
+                    "extended": ExtendedLiveExecutionService(
+                        api_key=runtime_settings.extended_api_key or "",
+                        stark_private_key=runtime_settings.extended_stark_private_key or "",
+                    ),
+                    "hyperliquid": HyperliquidLiveExecutionService(
+                        account_address=runtime_settings.hyperliquid_account_address or "",
+                        vault_address=runtime_settings.hyperliquid_vault_address,
+                        api_wallet_private_key=(
+                            runtime_settings.hyperliquid_api_wallet_private_key or ""
+                        ),
+                    ),
+                    "paradex": ParadexLiveExecutionService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key or "",
+                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
+                    ),
+                }
+            ),
+            pair_close_live_service=PairCloseLiveExecutionCoordinator(
+                services={
+                    "extended": ExtendedLiveExecutionService(
+                        api_key=runtime_settings.extended_api_key or "",
+                        stark_private_key=runtime_settings.extended_stark_private_key or "",
+                    ),
+                    "hyperliquid": HyperliquidLiveExecutionService(
+                        account_address=runtime_settings.hyperliquid_account_address or "",
+                        vault_address=runtime_settings.hyperliquid_vault_address,
+                        api_wallet_private_key=(
+                            runtime_settings.hyperliquid_api_wallet_private_key or ""
+                        ),
+                    ),
+                    "paradex": ParadexLiveExecutionService(
+                        account_address=runtime_settings.paradex_account_address or "",
+                        private_key=runtime_settings.paradex_private_key or "",
+                        recv_window_ms=runtime_settings.paradex_recv_window_ms,
+                    ),
+                }
+            ),
+            approval_service=route_approval_service,
+            slippage_tolerance_bps=20,
+            open_first_venue="auto",
+            close_first_venue="auto",
+            poll_attempts=5,
+            poll_interval_seconds=2.0,
+            auto_cleanup=True,
+            close_position=True,
+        )
+    except HTTPException as exc:
+        if exc.status_code in {404, 409}:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_path,
+                label=stability.snapshot.label,
+                launch_ready_snapshot_id=stability.snapshot.launch_ready_snapshot_id,
+                approved_snapshot_id=stability.snapshot.approved_snapshot.snapshot_id,
+                detail=exc.detail,
+            )
+        raise
+
+    stable_launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=timestamp,
+            status="launched",
+            label=stability.snapshot.label,
+            launch_ready_snapshot_id=stability.snapshot.launch_ready_snapshot_id or 0,
+            approved_snapshot_id=stability.snapshot.approved_snapshot.snapshot_id or 0,
+            paper_trade_id=lifecycle.paper_trade.entry_id or 0,
+            final_pair_state=lifecycle.final_pair_status.derived_state,
+        )
+    )
+    return StableCanaryLaunchSummary(
+        status="launched",
+        database_path=settings.database_path,
+        label=stability.snapshot.label,
+        launch_ready_snapshot_id=stability.snapshot.launch_ready_snapshot_id,
+        approved_snapshot_id=stability.snapshot.approved_snapshot.snapshot_id,
+        paper_trade_id=lifecycle.paper_trade.entry_id,
+        final_pair_state=lifecycle.final_pair_status.derived_state,
+        detail=None,
+        lifecycle=lifecycle,
+    )
+
+
+async def run_supervised_stable_canary_launch_loop(
+    settings: WorkerSettings,
+    *,
+    launch_store: StableCanaryLaunchStore | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> StableCanaryLaunchLoopSummary:
+    """Run the signal-aware stable canary launch loop until stopped or capped."""
+
+    stable_launch_store = launch_store or StableCanaryLaunchStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    supervised_stop_event = stop_event or asyncio.Event()
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    launched = 0
+    skipped = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised stable canary launch cycle %s", attempts)
+        try:
+            summary = await launch_latest_stable_canary_once(
+                settings,
+                launch_store=stable_launch_store,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            if summary.status == "launched":
+                launched += 1
+            else:
+                skipped += 1
+            loop_logger.info(
+                "completed supervised stable canary launch cycle %s with status=%s",
+                attempts,
+                summary.status,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(settings.stable_canary_launch_interval_seconds)
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.stable_canary_launch_max_backoff_seconds,
+                settings.stable_canary_launch_interval_seconds * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "stable canary launch cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(backoff_seconds)
+
+    return StableCanaryLaunchLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        launched=launched,
+        skipped=skipped,
+        database_path=settings.database_path,
+    )
+
+
 async def run_supervised_universe_scan_loop(
     settings: WorkerSettings,
     *,
@@ -442,15 +1465,478 @@ async def run_supervised_universe_scan_loop(
     )
 
 
-def _build_universe_fee_profile_overrides(
+async def run_supervised_approved_canary_scan_loop(
     settings: WorkerSettings,
-) -> dict[str, str] | None:
-    overrides = {
-        venue: profile
-        for venue in settings.universe_scan_venues
-        if (profile := getattr(settings, f"universe_scan_{venue}_fee_profile", None))
-    }
-    return overrides or None
+    *,
+    scanner: OpportunityUniverseService | None = None,
+    approval_service: RouteApprovalService | None = None,
+    store: ApprovedCanaryStore | None = None,
+    alert_sink: ApprovedCanaryAlertSink | None = None,
+    alert_notifier: ApprovedCanaryAlertNotifier | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> ApprovedCanaryScanLoopSummary:
+    """Run supervised approved-canary scans until stopped or capped."""
+
+    if max_iterations is not None and max_iterations < 1:
+        raise ValueError("max_iterations must be at least 1")
+
+    snapshot_store = store or ApprovedCanaryStore(settings.database_path)
+    approved_canary_alert_sink = alert_sink or ApprovedCanaryAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    approved_canary_notifier = alert_notifier
+    supervised_stop_event = stop_event or asyncio.Event()
+    if approved_canary_notifier is None:
+        from carryme_worker.notifications import build_approved_canary_alert_notifier
+
+        approved_canary_notifier = build_approved_canary_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    scanned_candidates = 0
+    approved_candidates = 0
+    saved_snapshots = 0
+    alert_events = 0
+    sent_notifications = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised approved canary scan cycle %s", attempts)
+        try:
+            summary = await scan_approved_canary_once(
+                settings,
+                scanner=scanner,
+                approval_service=approval_service,
+                store=snapshot_store,
+                alert_sink=approved_canary_alert_sink,
+                alert_notifier=approved_canary_notifier,
+                logger=loop_logger,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            scanned_candidates += summary.scanned_candidates
+            approved_candidates += summary.approved_candidates
+            saved_snapshots += summary.saved_snapshots
+            alert_events += summary.alert_events
+            sent_notifications += summary.sent_notifications
+            loop_logger.info(
+                (
+                    "completed supervised approved canary scan cycle %s with %s candidates, "
+                    "%s approved candidates, %s saved snapshots, and %s alerts"
+                ),
+                attempts,
+                summary.scanned_candidates,
+                summary.approved_candidates,
+                summary.saved_snapshots,
+                summary.alert_events,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                settings.approved_canary_scan_interval_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.approved_canary_scan_max_backoff_seconds,
+                settings.approved_canary_scan_interval_seconds * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "supervised approved canary scan cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await _sleep_or_stop(
+                backoff_seconds,
+                sleep=sleep,
+                stop_event=supervised_stop_event,
+            )
+
+    return ApprovedCanaryScanLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        scanned_candidates=scanned_candidates,
+        approved_candidates=approved_candidates,
+        saved_snapshots=saved_snapshots,
+        alert_events=alert_events,
+        sent_notifications=sent_notifications,
+        database_path=settings.database_path,
+    )
+
+
+async def observe_system_state_once(
+    settings: WorkerSettings,
+    *,
+    service: SystemStateService | None = None,
+    alert_sink: SystemStateAlertSink | None = None,
+    alert_notifier: SystemStateAlertNotifier | None = None,
+    logger: logging.Logger | None = None,
+    now: datetime | None = None,
+) -> SystemStateObservationSummary:
+    """Probe current venue system-state and emit transition alerts."""
+
+    runtime = service or SystemStateService()
+    system_state_alert_sink = alert_sink or SystemStateAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    timestamp = now or datetime.now(UTC)
+
+    states = await runtime.probe_venues(_build_system_state_configs(settings))
+    alerts = _emit_system_state_alerts(
+        states=states,
+        sink=system_state_alert_sink,
+        emitted_at=timestamp,
+    )
+
+    sent_notifications = 0
+    if alert_notifier is not None:
+        for event in alerts:
+            try:
+                await alert_notifier.notify(event)
+                sent_notifications += 1
+            except Exception:
+                loop_logger.exception(
+                    "system state alert notification failed for venue=%s type=%s",
+                    event.venue,
+                    event.alert_type,
+                )
+
+    degraded_venues = len([state for state in states if not state.healthy and state.enabled])
+    return SystemStateObservationSummary(
+        checked_venues=len([state for state in states if state.checked]),
+        degraded_venues=degraded_venues,
+        saved_alerts=len(alerts),
+        sent_notifications=sent_notifications,
+        database_path=settings.database_path,
+        states=states,
+        alerts=alerts,
+    )
+
+
+async def run_supervised_system_state_observation_loop(
+    settings: WorkerSettings,
+    *,
+    service: SystemStateService | None = None,
+    alert_sink: SystemStateAlertSink | None = None,
+    alert_notifier: SystemStateAlertNotifier | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    logger: logging.Logger | None = None,
+    stop_event: asyncio.Event | None = None,
+    max_iterations: int | None = None,
+) -> SystemStateObservationLoopSummary:
+    """Run the system-state monitor until stopped or capped."""
+
+    runtime = service or SystemStateService()
+    system_state_alert_sink = alert_sink or SystemStateAlertStore(settings.database_path)
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    system_state_notifier = alert_notifier
+    supervised_stop_event = stop_event or asyncio.Event()
+    if system_state_notifier is None:
+        from carryme_worker.notifications import build_system_state_alert_notifier
+
+        system_state_notifier = build_system_state_alert_notifier(
+            settings,
+            logger=loop_logger,
+        )
+
+    attempts = 0
+    successful_cycles = 0
+    failures = 0
+    checked_venues = 0
+    degraded_venues = 0
+    saved_alerts = 0
+    sent_notifications = 0
+    consecutive_failures = 0
+
+    while not supervised_stop_event.is_set():
+        attempts += 1
+        loop_logger.info("starting supervised system-state observation cycle %s", attempts)
+        try:
+            summary = await observe_system_state_once(
+                settings,
+                service=runtime,
+                alert_sink=system_state_alert_sink,
+                alert_notifier=system_state_notifier,
+                logger=loop_logger,
+            )
+            successful_cycles += 1
+            consecutive_failures = 0
+            checked_venues += summary.checked_venues
+            degraded_venues += summary.degraded_venues
+            saved_alerts += summary.saved_alerts
+            sent_notifications += summary.sent_notifications
+            loop_logger.info(
+                (
+                    "completed supervised system-state observation cycle %s with "
+                    "%s checked venues, %s degraded venues, and %s alerts"
+                ),
+                attempts,
+                summary.checked_venues,
+                summary.degraded_venues,
+                summary.saved_alerts,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(settings.system_state_observation_interval_seconds)
+        except Exception:
+            failures += 1
+            consecutive_failures += 1
+            backoff_seconds = min(
+                settings.system_state_observation_max_backoff_seconds,
+                settings.system_state_observation_interval_seconds
+                * (2 ** (consecutive_failures - 1)),
+            )
+            loop_logger.exception(
+                "system-state observation cycle %s failed; backing off for %s seconds",
+                attempts,
+                backoff_seconds,
+            )
+            if max_iterations is not None and attempts >= max_iterations:
+                break
+            if supervised_stop_event.is_set():
+                break
+            await sleep(backoff_seconds)
+
+    return SystemStateObservationLoopSummary(
+        attempts=attempts,
+        successful_cycles=successful_cycles,
+        failures=failures,
+        checked_venues=checked_venues,
+        degraded_venues=degraded_venues,
+        saved_alerts=saved_alerts,
+        sent_notifications=sent_notifications,
+        database_path=settings.database_path,
+    )
+
+
+def _emit_system_state_alerts(
+    *,
+    states: list[VenueSystemState],
+    sink: SystemStateAlertSink,
+    emitted_at: datetime,
+) -> list[SystemStateAlertEvent]:
+    """Emit transition alerts for venue system-state changes."""
+
+    events: list[SystemStateAlertEvent] = []
+    latest_by_venue = (
+        {state.venue: sink.latest(venue=state.venue) for state in states}
+        if isinstance(sink, SystemStateAlertStore)
+        else {}
+    )
+    for state in states:
+        if not state.enabled:
+            continue
+        previous_event = latest_by_venue.get(state.venue)
+        previous_state = previous_event.current_state if previous_event is not None else None
+
+        if not state.healthy:
+            if previous_state is None or previous_state.healthy:
+                event = SystemStateAlertEvent(
+                    emitted_at=emitted_at,
+                    venue=state.venue,
+                    alert_type="venue_degraded",
+                    current_state=state,
+                    previous_state=previous_state,
+                )
+                sink.append(event)
+                events.append(event)
+                continue
+            if previous_state.status != state.status:
+                event = SystemStateAlertEvent(
+                    emitted_at=emitted_at,
+                    venue=state.venue,
+                    alert_type="venue_status_changed",
+                    current_state=state,
+                    previous_state=previous_state,
+                )
+                sink.append(event)
+                events.append(event)
+            continue
+
+        if previous_state is not None and not previous_state.healthy:
+            event = SystemStateAlertEvent(
+                emitted_at=emitted_at,
+                venue=state.venue,
+                alert_type="venue_recovered",
+                current_state=state,
+                previous_state=previous_state,
+            )
+            sink.append(event)
+            events.append(event)
+
+    return events
+
+
+def _emit_approved_canary_alerts(
+    *,
+    approved_labels: set[str],
+    previous_snapshots: dict[str, ApprovedCanarySnapshot | None],
+    current_snapshots: list[ApprovedCanarySnapshot],
+    max_snapshot_age_seconds: int,
+    emitted_at: datetime,
+    sink: ApprovedCanaryAlertSink,
+) -> list[ApprovedCanaryAlertEvent]:
+    """Emit transition alerts for approved-canary availability changes."""
+
+    current_by_label = {snapshot.label: snapshot for snapshot in current_snapshots}
+    alert_events: list[ApprovedCanaryAlertEvent] = []
+    for label in sorted(approved_labels):
+        previous_snapshot = previous_snapshots.get(label)
+        current_snapshot = current_by_label.get(label)
+
+        if current_snapshot is not None:
+            if previous_snapshot is None:
+                event = ApprovedCanaryAlertEvent(
+                    emitted_at=emitted_at,
+                    alert_type="approved_canary_available",
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    current_snapshot=current_snapshot,
+                    previous_snapshot=None,
+                )
+                sink.append(event)
+                alert_events.append(event)
+                continue
+
+            if _snapshot_payload_changed(previous_snapshot, current_snapshot):
+                event = ApprovedCanaryAlertEvent(
+                    emitted_at=emitted_at,
+                    alert_type="approved_canary_changed",
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    current_snapshot=current_snapshot,
+                    previous_snapshot=previous_snapshot,
+                )
+                sink.append(event)
+                alert_events.append(event)
+            continue
+
+        if previous_snapshot is None:
+            continue
+
+        snapshot_age_seconds = (emitted_at - previous_snapshot.captured_at).total_seconds()
+        if snapshot_age_seconds <= max_snapshot_age_seconds:
+            continue
+
+        event = ApprovedCanaryAlertEvent(
+            emitted_at=emitted_at,
+            alert_type="approved_canary_stale",
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            current_snapshot=None,
+            previous_snapshot=previous_snapshot,
+        )
+        sink.append(event)
+        alert_events.append(event)
+
+    return alert_events
+
+
+def _emit_stable_launch_ready_alerts(
+    *,
+    labels: set[str],
+    previous_stabilities: dict[str, LaunchReadyCanaryStability | None],
+    store: LaunchReadyCanaryStore,
+    sink: StableLaunchReadyAlertSink,
+    emitted_at: datetime,
+    max_snapshot_age_seconds: int,
+    min_snapshot_count: int,
+    min_stable_seconds: float,
+) -> list[StableLaunchReadyAlertEvent]:
+    """Emit transition alerts for stable launch-ready availability changes."""
+
+    alert_events: list[StableLaunchReadyAlertEvent] = []
+    for label in sorted(labels):
+        previous_stability = previous_stabilities.get(label)
+        current_stability = _build_latest_launch_ready_stability(
+            store=store,
+            label=label,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            min_snapshot_count=min_snapshot_count,
+            min_stable_seconds=min_stable_seconds,
+            now=emitted_at,
+        )
+
+        if current_stability is not None:
+            if previous_stability is None:
+                event = StableLaunchReadyAlertEvent(
+                    emitted_at=emitted_at,
+                    alert_type="stable_launch_ready_available",
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    min_snapshot_count=min_snapshot_count,
+                    min_stable_seconds=min_stable_seconds,
+                    current_stability=current_stability,
+                    previous_stability=None,
+                )
+                sink.append(event)
+                alert_events.append(event)
+                continue
+
+            if _launch_ready_snapshot_payload_changed(
+                previous_stability.snapshot,
+                current_stability.snapshot,
+            ):
+                event = StableLaunchReadyAlertEvent(
+                    emitted_at=emitted_at,
+                    alert_type="stable_launch_ready_changed",
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    min_snapshot_count=min_snapshot_count,
+                    min_stable_seconds=min_stable_seconds,
+                    current_stability=current_stability,
+                    previous_stability=previous_stability,
+                )
+                sink.append(event)
+                alert_events.append(event)
+            continue
+
+        if previous_stability is None:
+            continue
+
+        event = StableLaunchReadyAlertEvent(
+            emitted_at=emitted_at,
+            alert_type="stable_launch_ready_stale",
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            min_snapshot_count=min_snapshot_count,
+            min_stable_seconds=min_stable_seconds,
+            current_stability=None,
+            previous_stability=previous_stability,
+        )
+        sink.append(event)
+        alert_events.append(event)
+
+    return alert_events
+
+
+def _snapshot_payload_changed(
+    previous_snapshot: ApprovedCanarySnapshot,
+    current_snapshot: ApprovedCanarySnapshot,
+) -> bool:
+    """Return whether the meaningful approved-canary payload changed."""
+
+    previous_payload = previous_snapshot.model_dump(
+        mode="python",
+        exclude={"snapshot_id", "captured_at"},
+    )
+    current_payload = current_snapshot.model_dump(
+        mode="python",
+        exclude={"snapshot_id", "captured_at"},
+    )
+    return previous_payload != current_payload
 
 
 def summarize_candidates(

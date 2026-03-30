@@ -4,6 +4,7 @@ from carryme_models import (
     LiveSubmissionReadiness,
     PaperTradeAccountPreflight,
     PaperTradeExecutionPreflight,
+    PaperTradeSystemState,
     PreviewConfirmationEntry,
     VenueAccountPreflight,
 )
@@ -19,6 +20,7 @@ def build_live_submission_readiness(
     confirmations: list[PreviewConfirmationEntry],
     execution_preflight: PaperTradeExecutionPreflight,
     account_preflight: PaperTradeAccountPreflight,
+    system_state: PaperTradeSystemState | None = None,
 ) -> LiveSubmissionReadiness:
     """Build one combined readiness decision for a saved paper trade."""
 
@@ -45,6 +47,8 @@ def build_live_submission_readiness(
 
     blocking_reasons.extend(execution_preflight.blocking_reasons)
     blocking_reasons.extend(account_preflight.blocking_reasons)
+    if system_state is not None:
+        blocking_reasons.extend(system_state.blocking_reasons)
 
     deduped_reasons: list[str] = []
     for reason in blocking_reasons:
@@ -60,6 +64,7 @@ def build_live_submission_readiness(
         ready=not deduped_reasons,
         execution_preflight=execution_preflight,
         account_preflight=account_preflight,
+        system_state=system_state,
         blocking_reasons=deduped_reasons,
     )
 

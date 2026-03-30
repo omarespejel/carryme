@@ -3,11 +3,14 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
+from carryme_api.config import ApiSettings
 from carryme_models import (
+    ApprovedCanaryAlertEvent,
+    ApprovedCanarySnapshot,
     CandidateAlertEvent,
     CapacityEstimate,
     ExecutionAlertEvent,
@@ -16,33 +19,64 @@ from carryme_models import (
     ExecutionLegResult,
     ExecutionObservationEntry,
     ExecutionOrderState,
+    ExecutionPairStatus,
+    ExecutionReconciliation,
+    ExecutionVenueReconciliation,
     FundingArbOpportunity,
     FundingPairSpec,
     FundingPairTradeIntent,
+    FundingUniverseCanaryCandidate,
     FundingUniverseOpportunity,
     FundingUniverseScan,
     FundingUniverseVenueMarket,
+    LaunchReadyCanarySnapshot,
+    LaunchReadyCanaryStability,
     OpportunityRecord,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
+    PaperTradeSystemState,
+    RouteApprovalEntry,
+    StableCanaryLaunchRecord,
+    StableLaunchReadyAlertEvent,
+    SystemStateAlertEvent,
     TradeLegIntent,
     VenueAccountPreflight,
+    VenueSystemState,
 )
-from carryme_runtime import AccountPreflightService, ExecutionOrderStateService
+from carryme_runtime import (
+    AccountPreflightService,
+    ExecutionOrderStateService,
+    SystemStateService,
+)
 from carryme_storage import (
+    ApprovedCanaryAlertStore,
+    ApprovedCanaryStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
+    LaunchReadyCanaryStore,
     OpportunityHistoryStore,
+    RouteApprovalStore,
+    StableCanaryLaunchStore,
+    StableLaunchReadyAlertStore,
+    SystemStateAlertStore,
 )
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
+    build_approved_canary_scan_loop_payload,
+    build_approved_canary_scan_payload,
     build_candidate_payload,
     build_cycle_payload,
     build_execution_observation_loop_payload,
     build_execution_observation_payload,
     build_health_payload,
+    build_launch_ready_canary_cache_loop_payload,
+    build_launch_ready_canary_cache_payload,
     build_loop_payload,
+    build_stable_canary_launch_loop_payload,
+    build_stable_canary_launch_payload,
+    build_system_state_observation_loop_payload,
+    build_system_state_observation_payload,
     build_universe_scan_loop_payload,
     build_universe_scan_payload,
 )
@@ -50,24 +84,41 @@ from carryme_worker.main import (
     main as worker_main,
 )
 from carryme_worker.poller import (
+    ApprovedCanaryScanLoopSummary,
+    ApprovedCanaryScanSummary,
     CandidateRecordSummary,
     ExecutionObservationLoopSummary,
     ExecutionObservationSummary,
+    LaunchReadyCanaryCacheLoopSummary,
+    LaunchReadyCanaryCacheSummary,
     PollCycleSummary,
     PollLoopSummary,
+    StableCanaryLaunchLoopSummary,
+    StableCanaryLaunchSummary,
+    SystemStateObservationLoopSummary,
+    SystemStateObservationSummary,
     UniverseScanLoopSummary,
     UniverseScanSummary,
     _build_order_state_observers,
+    cache_launch_ready_canaries_once,
     install_signal_handlers,
+    launch_latest_stable_canary_once,
     observe_live_executions_once,
+    observe_system_state_once,
     poll_watchlist_once,
     run_polling_loop,
+    run_supervised_approved_canary_scan_loop,
     run_supervised_execution_observation_loop,
+    run_supervised_launch_ready_canary_cache_loop,
     run_supervised_polling_loop,
+    run_supervised_stable_canary_launch_loop,
+    run_supervised_system_state_observation_loop,
     run_supervised_universe_scan_loop,
+    scan_approved_canary_once,
     scan_funding_universe_once,
     summarize_candidates,
 )
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 
@@ -296,6 +347,200 @@ def test_worker_universe_scan_loop_payload() -> None:
         "scanned_opportunities": 12,
         "saved_records": 12,
         "alert_events": 4,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_approved_canary_scan_payload() -> None:
+    payload = build_approved_canary_scan_payload(
+        ApprovedCanaryScanSummary(
+            scanned_candidates=4,
+            approved_candidates=2,
+            saved_snapshots=2,
+            alert_events=1,
+            sent_notifications=1,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "scanned_candidates": 4,
+        "approved_candidates": 2,
+        "saved_snapshots": 2,
+        "alert_events": 1,
+        "sent_notifications": 1,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_approved_canary_scan_loop_payload() -> None:
+    payload = build_approved_canary_scan_loop_payload(
+        ApprovedCanaryScanLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            scanned_candidates=9,
+            approved_candidates=4,
+            saved_snapshots=4,
+            alert_events=2,
+            sent_notifications=2,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "scanned_candidates": 9,
+        "approved_candidates": 4,
+        "saved_snapshots": 4,
+        "alert_events": 2,
+        "sent_notifications": 2,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_launch_ready_canary_cache_payload() -> None:
+    payload = build_launch_ready_canary_cache_payload(
+        LaunchReadyCanaryCacheSummary(
+            scanned_snapshots=3,
+            launch_ready_candidates=2,
+            saved_snapshots=2,
+            alert_events=1,
+            sent_notifications=1,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "scanned_snapshots": 3,
+        "launch_ready_candidates": 2,
+        "saved_snapshots": 2,
+        "alert_events": 1,
+        "sent_notifications": 1,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_launch_ready_canary_cache_loop_payload() -> None:
+    payload = build_launch_ready_canary_cache_loop_payload(
+        LaunchReadyCanaryCacheLoopSummary(
+            attempts=4,
+            successful_cycles=3,
+            failures=1,
+            scanned_snapshots=9,
+            launch_ready_candidates=5,
+            saved_snapshots=5,
+            alert_events=2,
+            sent_notifications=2,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 4,
+        "successful_cycles": 3,
+        "failures": 1,
+        "scanned_snapshots": 9,
+        "launch_ready_candidates": 5,
+        "saved_snapshots": 5,
+        "alert_events": 2,
+        "sent_notifications": 2,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_stable_canary_launch_payload() -> None:
+    payload = build_stable_canary_launch_payload(
+        StableCanaryLaunchSummary(
+            status="launched",
+            label="arb_extended_paradex",
+            launch_ready_snapshot_id=7,
+            approved_snapshot_id=5,
+            paper_trade_id=11,
+            final_pair_state="closed",
+            detail=None,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "status": "launched",
+        "label": "arb_extended_paradex",
+        "launch_ready_snapshot_id": 7,
+        "approved_snapshot_id": 5,
+        "paper_trade_id": 11,
+        "final_pair_state": "closed",
+        "detail": None,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_stable_canary_launch_loop_payload() -> None:
+    payload = build_stable_canary_launch_loop_payload(
+        StableCanaryLaunchLoopSummary(
+            attempts=4,
+            successful_cycles=4,
+            failures=0,
+            launched=1,
+            skipped=3,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 4,
+        "successful_cycles": 4,
+        "failures": 0,
+        "launched": 1,
+        "skipped": 3,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_system_state_observation_payload() -> None:
+    payload = build_system_state_observation_payload(
+        SystemStateObservationSummary(
+            checked_venues=1,
+            degraded_venues=1,
+            saved_alerts=1,
+            sent_notifications=1,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "checked_venues": 1,
+        "degraded_venues": 1,
+        "saved_alerts": 1,
+        "sent_notifications": 1,
+        "database_path": "tmp/history.sqlite3",
+    }
+
+
+def test_worker_system_state_observation_loop_payload() -> None:
+    payload = build_system_state_observation_loop_payload(
+        SystemStateObservationLoopSummary(
+            attempts=3,
+            successful_cycles=2,
+            failures=1,
+            checked_venues=4,
+            degraded_venues=2,
+            saved_alerts=2,
+            sent_notifications=2,
+            database_path="tmp/history.sqlite3",
+        )
+    )
+
+    assert payload == {
+        "attempts": 3,
+        "successful_cycles": 2,
+        "failures": 1,
+        "checked_venues": 4,
+        "degraded_venues": 2,
+        "saved_alerts": 2,
+        "sent_notifications": 2,
         "database_path": "tmp/history.sqlite3",
     }
 
@@ -830,6 +1075,1247 @@ def test_scan_funding_universe_once_passes_fee_profile_overrides(tmp_path: Path)
     }
 
 
+def test_scan_approved_canary_once_saves_operator_approved_snapshots(tmp_path: Path) -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    class StubUniverseScanner:
+        async def scan_canary_candidates(self, **_: object) -> list[FundingUniverseCanaryCandidate]:
+            return [candidate]
+
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+    alert_store = ApprovedCanaryAlertStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, StubUniverseScanner()),
+            store=snapshot_store,
+            alert_sink=alert_store,
+            now=datetime(2026, 3, 29, 20, 5, tzinfo=UTC),
+        )
+    )
+
+    snapshots = snapshot_store.list_recent(limit=10)
+    alerts = alert_store.list_recent(limit=10, label="arb_extended_paradex")
+
+    assert summary.scanned_candidates == 1
+    assert summary.approved_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert summary.alert_events == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].label == "arb_extended_paradex"
+    assert snapshots[0].candidate.suggested_canary_notional == 11.0
+    assert snapshots[0].approval.max_live_notional == 11.0
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "approved_canary_available"
+
+
+def test_scan_approved_canary_once_emits_stale_alert_for_missing_route(tmp_path: Path) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        approved_canary_alert_max_snapshot_age_seconds=300,
+    )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+    snapshot_store.append(
+        ApprovedCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            approval=approval_store.list_recent(limit=1, label="arb_extended_paradex")[0],
+        )
+    )
+
+    class EmptyUniverseScanner:
+        async def scan_canary_candidates(self, **_: object) -> list[FundingUniverseCanaryCandidate]:
+            return []
+
+    alert_store = ApprovedCanaryAlertStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, EmptyUniverseScanner()),
+            store=snapshot_store,
+            alert_sink=alert_store,
+            now=datetime(2026, 3, 29, 20, 6, tzinfo=UTC),
+        )
+    )
+
+    alerts = alert_store.list_recent(limit=10, label="arb_extended_paradex")
+
+    assert summary.scanned_candidates == 0
+    assert summary.approved_candidates == 0
+    assert summary.saved_snapshots == 0
+    assert summary.alert_events == 1
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "approved_canary_stale"
+
+
+def test_scan_approved_canary_once_notifies_approved_canary_alerts(tmp_path: Path) -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    class StubUniverseScanner:
+        async def scan_canary_candidates(self, **_: object) -> list[FundingUniverseCanaryCandidate]:
+            return [candidate]
+
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    notified: list[str] = []
+
+    class StubNotifier:
+        async def notify(self, event: ApprovedCanaryAlertEvent) -> None:
+            notified.append(event.alert_type)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, StubUniverseScanner()),
+            store=ApprovedCanaryStore(settings.database_path),
+            alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+            alert_notifier=StubNotifier(),
+            now=datetime(2026, 3, 29, 20, 5, tzinfo=UTC),
+        )
+    )
+
+    assert summary.alert_events == 1
+    assert summary.sent_notifications == 1
+    assert notified == ["approved_canary_available"]
+
+
+def test_cache_launch_ready_canaries_once_saves_fresh_ready_snapshots(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval = approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    approved_store.append(
+        ApprovedCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 20, 5, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=25.0,
+            ),
+            approval=approval,
+        )
+    )
+
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            return [
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+                VenueSystemState(
+                    venue="hyperliquid",
+                    enabled=False,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+            ]
+
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    summary = asyncio.run(
+        cache_launch_ready_canaries_once(
+            settings,
+            approved_store=approved_store,
+            launch_ready_store=launch_ready_store,
+            system_state_service=cast(Any, StubSystemStateService()),
+            now=datetime(2026, 3, 29, 20, 6, tzinfo=UTC),
+        )
+    )
+
+    snapshots = launch_ready_store.list_recent(limit=10, label="arb_extended_paradex")
+
+    assert summary.scanned_snapshots == 1
+    assert summary.launch_ready_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert summary.alert_events == 0
+    assert len(snapshots) == 1
+    assert snapshots[0].approved_snapshot.approval.max_live_notional == 11.0
+    assert snapshots[0].approved_snapshot.candidate.suggested_canary_notional == 11.0
+    assert snapshots[0].system_state.ready is True
+
+
+def test_run_supervised_launch_ready_canary_cache_loop_honors_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        launch_ready_canary_interval_seconds=4,
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def fake_cache_launch_ready_canaries_once(
+        settings_arg: WorkerSettings,
+        *,
+        approved_store: object | None = None,
+        launch_ready_store: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        approval_service: object | None = None,
+        system_state_service: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> LaunchReadyCanaryCacheSummary:
+        assert settings_arg is settings
+        _ = approved_store
+        _ = launch_ready_store
+        _ = alert_sink
+        _ = alert_notifier
+        _ = approval_service
+        _ = system_state_service
+        _ = logger
+        _ = now
+        return LaunchReadyCanaryCacheSummary(
+            scanned_snapshots=2,
+            launch_ready_candidates=1,
+            saved_snapshots=1,
+            alert_events=1,
+            sent_notifications=1,
+            database_path=settings.database_path,
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.cache_launch_ready_canaries_once",
+            fake_cache_launch_ready_canaries_once,
+        )
+        summary = asyncio.run(
+            run_supervised_launch_ready_canary_cache_loop(
+                settings,
+                approved_store=ApprovedCanaryStore(settings.database_path),
+                launch_ready_store=LaunchReadyCanaryStore(settings.database_path),
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.scanned_snapshots == 4
+    assert summary.launch_ready_candidates == 2
+    assert summary.saved_snapshots == 2
+    assert summary.alert_events == 2
+    assert summary.sent_notifications == 2
+    assert sleeps == [4]
+
+
+def test_cache_launch_ready_canaries_once_emits_stable_launch_ready_available_alert(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        stable_launch_ready_min_snapshot_count=2,
+        stable_launch_ready_min_stable_seconds=30.0,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval = approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    approved_store.append(
+        ApprovedCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            approval=approval,
+        )
+    )
+    approved_snapshot = approved_store.latest(label="arb_extended_paradex")
+    assert approved_snapshot is not None
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    launch_ready_store.append(
+        LaunchReadyCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            max_snapshot_age_seconds=300,
+            approved_snapshot=approved_snapshot,
+            system_state=PaperTradeSystemState(
+                paper_trade_id=0,
+                label="arb_extended_paradex",
+                ready=True,
+                venues=[
+                    VenueSystemState(
+                        venue="extended",
+                        enabled=True,
+                        checked=False,
+                        healthy=True,
+                        status=None,
+                    ),
+                    VenueSystemState(
+                        venue="paradex",
+                        enabled=True,
+                        checked=True,
+                        healthy=True,
+                        status="ok",
+                    ),
+                ],
+                blocking_reasons=[],
+            ),
+        )
+    )
+
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            return [
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ]
+
+    class StubStableNotifier:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def notify(self, event: StableLaunchReadyAlertEvent) -> None:
+            self.events.append(event.alert_type)
+
+    alert_store = StableLaunchReadyAlertStore(settings.database_path)
+    notifier = StubStableNotifier()
+    summary = asyncio.run(
+        cache_launch_ready_canaries_once(
+            settings,
+            approved_store=approved_store,
+            launch_ready_store=launch_ready_store,
+            alert_sink=alert_store,
+            alert_notifier=notifier,
+            system_state_service=cast(Any, StubSystemStateService()),
+            now=datetime(2026, 3, 29, 20, 1, tzinfo=UTC),
+        )
+    )
+
+    alerts = alert_store.list_recent(limit=10, label="arb_extended_paradex")
+
+    assert summary.alert_events == 1
+    assert summary.sent_notifications == 1
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "stable_launch_ready_available"
+    assert alerts[0].current_stability is not None
+    assert alerts[0].current_stability.snapshot.label == "arb_extended_paradex"
+    assert notifier.events == ["stable_launch_ready_available"]
+
+
+def test_launch_latest_stable_canary_once_skips_when_no_stable_snapshot(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                HTTPException(status_code=404, detail="No launch-ready canary snapshot found")
+            ),
+        )
+        summary = asyncio.run(launch_latest_stable_canary_once(settings))
+
+    assert summary.status == "skipped"
+    assert summary.detail == "No launch-ready canary snapshot found"
+    assert summary.paper_trade_id is None
+
+
+def test_launch_latest_stable_canary_once_returns_launched_summary(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=11.0,
+        note="approved canary",
+    )
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=11.0,
+    )
+    snapshot = LaunchReadyCanarySnapshot(
+        launch_ready_snapshot_id=9,
+        captured_at=datetime(2026, 3, 30, 10, 1, tzinfo=UTC),
+        label="arb_extended_paradex",
+        max_snapshot_age_seconds=300,
+        approved_snapshot=ApprovedCanarySnapshot(
+            snapshot_id=8,
+            captured_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=candidate,
+            approval=approval,
+        ),
+        system_state=PaperTradeSystemState(
+            paper_trade_id=0,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+    stability = LaunchReadyCanaryStability(
+        snapshot=snapshot,
+        consecutive_snapshots=3,
+        stable_seconds=45.0,
+        min_snapshot_count=2,
+        min_stable_seconds=30.0,
+    )
+
+    class StubLifecycleResult:
+        def __init__(self) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=17,
+                created_at=datetime(2026, 3, 30, 10, 2, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 30, 10, 1, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00355,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=900.0,
+                    target_notional=11.0,
+                    capacity_fraction=11.0 / 900.0,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=31,
+                paper_trade_id=17,
+                preview_hash="preview",
+                derived_state="closed",
+                recommended_action="no_action",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=31,
+                    paper_trade_id=17,
+                    preview_hash="preview",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=31,
+                    paper_trade_id=17,
+                    preview_hash="preview",
+                    status="accepted",
+                    recommended_action="no_action",
+                    matched_all_leg_symbols=True,
+                    venues=[
+                        ExecutionVenueReconciliation(
+                            venue="extended",
+                            authenticated=True,
+                            ready=True,
+                            matched_leg_symbols=["ARB-USD"],
+                            unmatched_leg_symbols=[],
+                        ),
+                        ExecutionVenueReconciliation(
+                            venue="paradex",
+                            authenticated=True,
+                            ready=True,
+                            matched_leg_symbols=["ARB-USD-PERP"],
+                            unmatched_leg_symbols=[],
+                        ),
+                    ],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+
+    async def run_stub_lifecycle(**_: object) -> StubLifecycleResult:
+        return StubLifecycleResult()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                now=datetime(2026, 3, 30, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.label == "arb_extended_paradex"
+    assert summary.launch_ready_snapshot_id == 9
+    assert summary.approved_snapshot_id == 8
+    assert summary.paper_trade_id == 17
+    assert summary.final_pair_state == "closed"
+    launch_records = StableCanaryLaunchStore(settings.database_path).list_recent(limit=10)
+    assert len(launch_records) == 1
+    assert launch_records[0].paper_trade_id == 17
+    assert launch_records[0].launch_ready_snapshot_id == 9
+
+
+def test_launch_latest_stable_canary_once_skips_when_snapshot_already_launched(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 3, 30, 10, 3, tzinfo=UTC),
+            status="launched",
+            label="arb_extended_paradex",
+            launch_ready_snapshot_id=9,
+            approved_snapshot_id=8,
+            paper_trade_id=17,
+            final_pair_state="closed",
+        )
+    )
+    snapshot = LaunchReadyCanarySnapshot(
+        launch_ready_snapshot_id=9,
+        captured_at=datetime(2026, 3, 30, 10, 1, tzinfo=UTC),
+        label="arb_extended_paradex",
+        max_snapshot_age_seconds=300,
+        approved_snapshot=ApprovedCanarySnapshot(
+            snapshot_id=8,
+            captured_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            approval=RouteApprovalEntry(
+                updated_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                short_venue="extended",
+                long_venue="paradex",
+                short_fee_profile="default",
+                long_fee_profile="pro_fastfills",
+                approved=True,
+                max_live_notional=11.0,
+                note="approved canary",
+            ),
+        ),
+        system_state=PaperTradeSystemState(
+            paper_trade_id=0,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+    stability = LaunchReadyCanaryStability(
+        snapshot=snapshot,
+        consecutive_snapshots=3,
+        stable_seconds=45.0,
+        min_snapshot_count=2,
+        min_stable_seconds=30.0,
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (
+                snapshot,
+                snapshot.approved_snapshot.candidate,
+                snapshot.approved_snapshot.approval,
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 3, 30, 10, 4, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.paper_trade_id == 17
+    assert "already launched" in cast(str, summary.detail)
+
+
+def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_interval_seconds=6,
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    summaries = iter(
+        [
+            StableCanaryLaunchSummary(
+                status="launched",
+                label="arb_extended_paradex",
+                launch_ready_snapshot_id=9,
+                approved_snapshot_id=8,
+                paper_trade_id=17,
+                final_pair_state="hedged",
+                database_path=settings.database_path,
+            ),
+            StableCanaryLaunchSummary(
+                status="skipped",
+                detail="No launch-ready canary snapshot found",
+                database_path=settings.database_path,
+            ),
+        ]
+    )
+
+    async def fake_launch_latest_stable_canary_once(
+        settings_arg: WorkerSettings,
+        *,
+        api_settings: object | None = None,
+        launch_store: object | None = None,
+        now: datetime | None = None,
+    ) -> StableCanaryLaunchSummary:
+        assert settings_arg is settings
+        _ = api_settings
+        _ = launch_store
+        _ = now
+        return next(summaries)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.launch_latest_stable_canary_once",
+            fake_launch_latest_stable_canary_once,
+        )
+        summary = asyncio.run(
+            run_supervised_stable_canary_launch_loop(
+                settings,
+                launch_store=StableCanaryLaunchStore(settings.database_path),
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.launched == 1
+    assert summary.skipped == 1
+    assert sleeps == [6]
+
+
+def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        approved_canary_scan_interval_seconds=3,
+    )
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def fake_scan_approved_canary_once(
+        settings_arg: WorkerSettings,
+        *,
+        scanner: object | None = None,
+        approval_service: object | None = None,
+        store: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> ApprovedCanaryScanSummary:
+        assert settings_arg is settings
+        _ = scanner
+        _ = approval_service
+        _ = store
+        _ = alert_sink
+        _ = alert_notifier
+        _ = logger
+        assert now is None
+        calls.append(1)
+        return ApprovedCanaryScanSummary(
+            scanned_candidates=2,
+            approved_candidates=1,
+            saved_snapshots=1,
+            alert_events=1,
+            sent_notifications=1,
+            database_path=settings.database_path,
+        )
+
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    from unittest.mock import patch
+
+    with patch(
+        "carryme_worker.poller.scan_approved_canary_once",
+        side_effect=fake_scan_approved_canary_once,
+    ):
+        summary = asyncio.run(
+            run_supervised_approved_canary_scan_loop(
+                settings,
+                store=ApprovedCanaryStore(settings.database_path),
+                alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.scanned_candidates == 4
+    assert summary.approved_candidates == 2
+    assert summary.saved_snapshots == 2
+    assert summary.alert_events == 2
+    assert summary.sent_notifications == 2
+    assert calls == [1, 1]
+    assert sleeps == [3.0]
+
+
+def test_observe_system_state_once_emits_and_notifies_alerts(tmp_path: Path) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            assert "paradex" in configs
+            return [
+                VenueSystemState(
+                    venue="extended",
+                    enabled=False,
+                    checked=False,
+                    healthy=True,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=False,
+                    status="maintenance",
+                    blocking_reasons=["Paradex system state is maintenance"],
+                ),
+                VenueSystemState(
+                    venue="hyperliquid",
+                    enabled=False,
+                    checked=False,
+                    healthy=True,
+                ),
+            ]
+
+    notified: list[str] = []
+
+    class StubNotifier:
+        async def notify(self, event: SystemStateAlertEvent) -> None:
+            notified.append(event.alert_type)
+
+    summary = asyncio.run(
+        observe_system_state_once(
+            settings,
+            service=cast(SystemStateService, StubSystemStateService()),
+            alert_sink=SystemStateAlertStore(settings.database_path),
+            alert_notifier=StubNotifier(),
+            now=datetime(2026, 3, 29, 20, 7, tzinfo=UTC),
+        )
+    )
+
+    alerts = SystemStateAlertStore(settings.database_path).list_recent(limit=10, venue="paradex")
+
+    assert summary.checked_venues == 1
+    assert summary.degraded_venues == 1
+    assert summary.saved_alerts == 1
+    assert summary.sent_notifications == 1
+    assert len(alerts) == 1
+    assert alerts[0].alert_type == "venue_degraded"
+    assert notified == ["venue_degraded"]
+
+
+def test_run_supervised_system_state_observation_loop_honors_max_iterations(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        system_state_observation_interval_seconds=3,
+    )
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def fake_observe_system_state_once(
+        settings_arg: WorkerSettings,
+        *,
+        service: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> SystemStateObservationSummary:
+        assert settings_arg is settings
+        _ = service
+        _ = alert_sink
+        _ = alert_notifier
+        _ = logger
+        assert now is None
+        calls.append(1)
+        return SystemStateObservationSummary(
+            checked_venues=1,
+            degraded_venues=1,
+            saved_alerts=1,
+            sent_notifications=1,
+            database_path=settings.database_path,
+        )
+
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    from unittest.mock import patch
+
+    with patch(
+        "carryme_worker.poller.observe_system_state_once",
+        side_effect=fake_observe_system_state_once,
+    ):
+        summary = asyncio.run(
+            run_supervised_system_state_observation_loop(
+                settings,
+                alert_sink=SystemStateAlertStore(settings.database_path),
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert summary.successful_cycles == 2
+    assert summary.failures == 0
+    assert summary.checked_venues == 2
+    assert summary.degraded_venues == 2
+    assert summary.saved_alerts == 2
+    assert summary.sent_notifications == 2
+    assert calls == [1, 1]
+    assert sleeps == [3.0]
+
+
 def test_run_supervised_universe_scan_loop_honors_max_iterations(tmp_path: Path) -> None:
     class StubUniverseScanner:
         async def scan(self, **_: object) -> FundingUniverseScan:
@@ -993,6 +2479,8 @@ def test_run_supervised_universe_scan_loop_applies_backoff(tmp_path: Path) -> No
     assert summary.saved_records == 2
     assert summary.alert_events == 1
     assert sleeps == [2.0]
+
+
 def test_run_polling_loop_applies_backoff_and_saves_after_retry(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(
