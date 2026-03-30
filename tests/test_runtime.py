@@ -554,8 +554,10 @@ def test_opportunity_universe_service_limits_snapshot_concurrency_by_venue() -> 
                 max_venue_inflight["paradex"],
                 venue_inflight["paradex"],
             )
-            await asyncio.sleep(0.01)
-            venue_inflight["paradex"] -= 1
+            try:
+                await asyncio.sleep(0.01)
+            finally:
+                venue_inflight["paradex"] -= 1
         return snapshots[(venue, symbol)]
 
     async def run() -> None:

@@ -288,6 +288,8 @@ def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnec
 
 def _is_retryable_snapshot_error(exc: ConnectorError | httpx.HTTPError) -> bool:
     if isinstance(exc, ConnectorError):
+        if exc.status_code is None:
+            return True
         return exc.status_code in RETRYABLE_SNAPSHOT_STATUS_CODES
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_SNAPSHOT_STATUS_CODES
