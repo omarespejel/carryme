@@ -17,8 +17,10 @@ from carryme_connectors import (
 from carryme_models import (
     CapacityEstimate,
     CleanupPreviewConfirmationEntry,
+    ExecutionAccountingSummary,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
+    ExecutionLegAccounting,
     ExecutionLegOrderState,
     ExecutionLegResult,
     ExecutionObservationEntry,
@@ -40,11 +42,13 @@ from carryme_models import (
     NormalizedMarketSnapshot,
     OpportunityRecord,
     PairClosePreviewConfirmationEntry,
+    PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
+    RouteAccountingSummary,
     RouteStabilitySummary,
     TopOfBook,
     TradeLegIntent,
@@ -57,6 +61,7 @@ from carryme_runtime import (
     AccountPreflightService,
     CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
+    ExecutionAccountingService,
     ExtendedCleanupPreviewService,
     ExtendedLiveExecutionService,
     HyperliquidCleanupPreviewService,
@@ -10596,6 +10601,103 @@ def test_cleanup_live_execution_router_rejects_mismatched_trade_or_non_reduce_on
             )
 
     asyncio.run(run())
+
+
+def test_execution_accounting_service_summarizes_filled_attempt_history(tmp_path: Path) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = PaperTradeEntry(
+        entry_id=7,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0005,
+            break_even_days_entry=0.5,
+            capacity_limit_notional=4500.0,
+            target_notional=11.0,
+            capacity_fraction=0.25,
+            max_target_notional=11.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=11.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=11.0,
+            ),
+        ),
+    )
+    saved = store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 1, tzinfo=UTC),
+            adapter="paradex_cleanup_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            paper_trade=paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
+                    target_notional=21.48,
+                    status="submitted",
+                    simulated=False,
+                    auth_usage="subkey_jwt",
+                    response_payload={
+                        "attempt_history": [
+                            {
+                                "observed_order_state": {
+                                    "derived_state": "unfilled",
+                                    "size": "241.9",
+                                    "remaining_size": "241.9",
+                                    "avg_fill_price": "",
+                                }
+                            },
+                            {
+                                "observed_order_state": {
+                                    "derived_state": "filled",
+                                    "size": "241.9",
+                                    "remaining_size": "0",
+                                    "avg_fill_price": "0.0881",
+                                }
+                            },
+                        ]
+                    },
+                )
+            ],
+        )
+    )
+
+    service = ExecutionAccountingService(journal_store=store)
+    summary = service.summarize_entry(saved)
+    paper_trade_summary = service.latest_for_paper_trade(7)
+    route_summaries = service.list_route_summaries(limit=10)
+
+    assert isinstance(summary, ExecutionAccountingSummary)
+    assert summary.filled_leg_count == 1
+    assert summary.total_filled_notional == pytest.approx(241.9 * 0.0881)
+    assert summary.total_estimated_fee_paid == pytest.approx((241.9 * 0.0881) * 0.0002)
+    assert isinstance(summary.legs[0], ExecutionLegAccounting)
+    assert summary.legs[0].derived_fill_state == "filled"
+    assert paper_trade_summary is not None
+    assert isinstance(paper_trade_summary, PaperTradeAccountingSummary)
+    assert paper_trade_summary.total_estimated_fee_paid == pytest.approx(
+        summary.total_estimated_fee_paid
+    )
+    assert route_summaries
+    assert isinstance(route_summaries[0], RouteAccountingSummary)
+    assert route_summaries[0].total_estimated_fee_paid == pytest.approx(
+        summary.total_estimated_fee_paid
+    )
 
 
 def test_extended_live_execution_service_rejects_cleanup_for_wrong_venue() -> None:

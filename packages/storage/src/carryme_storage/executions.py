@@ -424,3 +424,34 @@ class ExecutionJournalStore:
                 "entry_id": stored_id,
             }
         )
+
+    def list_for_paper_trade(
+        self,
+        paper_trade_id: int,
+        *,
+        limit: int = 100,
+    ) -> list[ExecutionJournalEntry]:
+        """Return recent execution journal entries for one paper trade."""
+
+        self.initialize()
+        with sqlite3.connect(self.database_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT id, entry_json
+                FROM execution_journal_entries
+                WHERE paper_trade_id = ?
+                ORDER BY executed_at DESC, id DESC
+                LIMIT ?
+                """,
+                (paper_trade_id, limit),
+            ).fetchall()
+
+        return [
+            ExecutionJournalEntry.model_validate(
+                {
+                    **json.loads(entry_json),
+                    "entry_id": stored_id,
+                }
+            )
+            for stored_id, entry_json in rows
+        ]

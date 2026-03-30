@@ -17,6 +17,7 @@ from carryme_runtime.confirmation import (
     require_confirmed_preview,
 )
 from carryme_runtime.execution import ExecutionAdapter, MockExecutionAdapter
+from carryme_runtime.execution_accounting import ExecutionAccountingService
 from carryme_runtime.execution_order_state import (
     ExecutionOrderStateService,
     ExtendedOrderStateObserver,
@@ -64,6 +65,7 @@ __all__ = [
     "CleanupLiveExecutionRouter",
     "CleanupPreviewRouter",
     "ExecutionAdapter",
+    "ExecutionAccountingService",
     "ExecutionQualityService",
     "ExecutionOrderStateService",
     "build_execution_pair_status",
