@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import itertools
 import math
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol
 
 import httpx
 from carryme_connectors import (
+    ConnectorError,
     ExtendedPublicConnector,
     HyperliquidPublicConnector,
     ParadexPublicConnector,
@@ -63,6 +65,12 @@ DEFAULT_FEE_PROFILES: dict[str, str] = {
     "hyperliquid": "tier0",
     "paradex": "pro",
 }
+DEFAULT_SNAPSHOT_CONCURRENCY_BY_VENUE: dict[str, int] = {
+    "extended": 8,
+    "hyperliquid": 8,
+    "paradex": 3,
+}
+RETRYABLE_SNAPSHOT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 UNIVERSE_RANKINGS: tuple[UniverseRanking, ...] = (
     "roundtrip_edge",
     "entry_edge",
@@ -85,6 +93,11 @@ class OpportunityUniverseService:
     list_symbols: VenueSymbolLister = field(default_factory=lambda: list_live_symbols)
     fetch_snapshot: SnapshotFetcher = field(default_factory=lambda: fetch_live_snapshot)
     default_fee_profiles: dict[str, str] = field(default_factory=_default_universe_fee_profiles)
+    snapshot_concurrency_by_venue: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_SNAPSHOT_CONCURRENCY_BY_VENUE)
+    )
+    snapshot_retry_attempts: int = 3
+    snapshot_retry_backoff_seconds: float = 0.25
     execution_quality_service: ExecutionQualityService | None = None
 
     async def scan(
@@ -204,8 +217,18 @@ class OpportunityUniverseService:
         self,
         overlaps: list[FundingUniverseOverlap],
     ) -> dict[tuple[str, str], NormalizedMarketSnapshot]:
+        semaphores = {
+            venue: asyncio.Semaphore(max(self.snapshot_concurrency_by_venue.get(venue, 1), 1))
+            for venue in VENUE_REGISTRY
+        }
         tasks = {
-            (venue, symbol): asyncio.create_task(self.fetch_snapshot(venue, symbol))
+            (venue, symbol): asyncio.create_task(
+                self._fetch_snapshot_with_controls(
+                    venue,
+                    symbol,
+                    semaphore=semaphores[venue],
+                )
+            )
             for overlap in overlaps
             for venue, symbol in overlap.venue_symbols.items()
         }
@@ -213,9 +236,30 @@ class OpportunityUniverseService:
         for key, task in tasks.items():
             try:
                 snapshots[key] = await task
-            except (ValueError, UpstreamDataError, httpx.HTTPError):
+            except (ValueError, UpstreamDataError, ConnectorError, httpx.HTTPError):
                 continue
         return snapshots
+
+    async def _fetch_snapshot_with_controls(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        semaphore: asyncio.Semaphore,
+    ) -> NormalizedMarketSnapshot:
+        attempts = max(self.snapshot_retry_attempts, 1)
+        for attempt in range(1, attempts + 1):
+            try:
+                async with semaphore:
+                    return await self.fetch_snapshot(venue, symbol)
+            except ValueError:
+                raise
+            except (ConnectorError, httpx.HTTPError) as exc:
+                if attempt >= attempts or not _is_retryable_snapshot_error(exc):
+                    raise
+                base_delay = self.snapshot_retry_backoff_seconds * (2 ** (attempt - 1))
+                await asyncio.sleep(base_delay * random.uniform(0.75, 1.25))
+        raise RuntimeError("unreachable snapshot retry loop")
 
 
 async def list_live_symbols(venue: str) -> list[str]:
@@ -240,6 +284,16 @@ def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnec
     if venue == "paradex":
         return ParadexPublicConnector(client)
     raise ValueError(f"Unsupported venue: {venue}")
+
+
+def _is_retryable_snapshot_error(exc: ConnectorError | httpx.HTTPError) -> bool:
+    if isinstance(exc, ConnectorError):
+        if exc.status_code is None:
+            return True
+        return exc.status_code in RETRYABLE_SNAPSHOT_STATUS_CODES
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in RETRYABLE_SNAPSHOT_STATUS_CODES
+    return True
 
 
 def _build_universe_opportunity(
