@@ -16,7 +16,7 @@ For the current system shape, Render is the right first host:
 
 ## Services
 
-The committed [render.yaml](/Users/espejelomar/StarkNet/ai-agents-starknet/carryme/render.yaml) defines:
+The committed [render.yaml](../../render.yaml) defines:
 
 1. `carryme-api`
 2. `carryme-universe-scan`

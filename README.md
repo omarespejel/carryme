@@ -54,5 +54,5 @@ uv run carryme-worker --observe-executions-supervise --iterations 3
 
 The production target is Render with managed Postgres and split background workers.
 
-1. Blueprint: [render.yaml](/Users/espejelomar/StarkNet/ai-agents-starknet/carryme/render.yaml)
-2. Deployment guide: [docs/deploy/render.md](/Users/espejelomar/StarkNet/ai-agents-starknet/carryme/docs/deploy/render.md)
+1. Blueprint: [render.yaml](render.yaml)
+2. Deployment guide: [docs/deploy/render.md](docs/deploy/render.md)
