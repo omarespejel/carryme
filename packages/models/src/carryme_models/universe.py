@@ -1,6 +1,7 @@
 """Funding-universe discovery and ranking models."""
 
 import math
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -53,6 +54,30 @@ class ExecutionQualitySummary(BaseModel):
     pending_count: int = Field(default=0, ge=0)
 
 
+class RouteStabilitySummary(BaseModel):
+    """Repeated-scan stability summary for one routed venue direction."""
+
+    canonical_symbol: str = Field(min_length=1)
+    short_venue: str = Field(min_length=1)
+    long_venue: str = Field(min_length=1)
+    short_fee_profile: str = Field(min_length=1)
+    long_fee_profile: str = Field(min_length=1)
+    sample_size: int = Field(ge=0)
+    window_count: int = Field(ge=0)
+    presence_ratio: float = Field(ge=0, le=1)
+    positive_roundtrip_share: float = Field(ge=0, le=1)
+    mean_roundtrip_edge: float
+    median_roundtrip_edge: float
+    edge_stddev: float = Field(ge=0)
+    mean_capacity_notional: float | None = Field(default=None, ge=0)
+    median_capacity_notional: float | None = Field(default=None, ge=0)
+    capacity_stddev: float | None = Field(default=None, ge=0)
+    latest_roundtrip_edge: float | None = None
+    latest_recorded_at: datetime | None = None
+    stability_weight: float = Field(ge=0, le=1)
+    stability_score: float
+
+
 class FundingUniverseOpportunity(BaseModel):
     """A scored funding opportunity enriched with universe-level context."""
 
@@ -67,8 +92,12 @@ class FundingUniverseOpportunity(BaseModel):
     estimated_one_day_pnl_after_round_trip: float | None = None
     quality_score: float | None = None
     execution_quality: ExecutionQualitySummary | None = None
+    route_stability: RouteStabilitySummary | None = None
     execution_adjusted_one_day_pnl_after_round_trip: float | None = None
     execution_adjusted_quality_score: float | None = None
+    stability_adjusted_one_day_pnl_after_round_trip: float | None = None
+    stability_adjusted_quality_score: float | None = None
+    route_adjusted_quality_score: float | None = None
 
 
 class FundingUniverseScan(BaseModel):
@@ -90,6 +119,8 @@ class FundingUniversePortfolioEntry(BaseModel):
     estimated_one_day_pnl_after_entry: float
     estimated_one_day_pnl_after_round_trip: float
     execution_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    stability_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    route_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
 
 
 class FundingUniversePortfolioPlan(BaseModel):
@@ -102,6 +133,8 @@ class FundingUniversePortfolioPlan(BaseModel):
     estimated_one_day_pnl_after_entry: float
     estimated_one_day_pnl_after_round_trip: float
     execution_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    stability_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    route_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
     entries: list[FundingUniversePortfolioEntry] = Field(default_factory=list)
 
     @model_validator(mode="after")

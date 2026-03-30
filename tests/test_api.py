@@ -12,6 +12,7 @@ from carryme_api.app import (
     get_history_store,
     get_opportunity_service,
     get_opportunity_universe_service,
+    get_route_stability_service,
 )
 from carryme_api.config import ApiSettings
 from carryme_models import (
@@ -42,6 +43,7 @@ from carryme_models import (
     PaperTradeEntry,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
+    RouteStabilitySummary,
     TradeLegIntent,
     VenueAccountPreflight,
     VenueOrderPreview,
@@ -327,7 +329,7 @@ def test_funding_universe_endpoint_passes_policy_and_execution_filters() -> None
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
-    assert captured["ranking"] == "execution_adjusted_quality_pnl"
+    assert captured["ranking"] == "route_adjusted_quality_pnl"
     assert captured["include_symbols"] == ["ARB-USD-PERP"]
     assert captured["exclude_tags"] == ["meme", "political"]
     assert captured["exclude_symbols"] == ["TRUMP-USD-PERP"]
@@ -365,6 +367,43 @@ def test_funding_universe_endpoint_passes_min_execution_samples() -> None:
 
     assert response.status_code == 200
     assert captured["min_execution_samples"] == 3
+
+
+def test_funding_universe_endpoint_passes_route_stability_filters() -> None:
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan(self, **kwargs: object) -> FundingUniverseScan:
+            captured.update(kwargs)
+            return FundingUniverseScan(
+                venues=["extended", "paradex"],
+                ranking=cast(str, kwargs["ranking"]),
+                target_notional=cast(float, kwargs["target_notional"]),
+                overlap_count=0,
+                overlaps=[],
+                opportunities=[],
+            )
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("min_route_stability_weight", "0.2"),
+                ("min_route_presence_ratio", "0.5"),
+                ("min_route_samples", "4"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["min_route_stability_weight"] == 0.2
+    assert captured["min_route_presence_ratio"] == 0.5
+    assert captured["min_route_samples"] == 4
 
 
 def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:
@@ -477,6 +516,104 @@ def test_execution_quality_service_provider_uses_shared_stores(tmp_path: Path) -
 
     assert service.journal_store.database_path == Path(settings.database_path)
     assert service.observation_store.database_path == Path(settings.database_path)
+
+
+def test_route_stability_endpoint_uses_service_dependency() -> None:
+    captured: dict[str, object] = {}
+
+    class StubRouteStabilityService:
+        def list_summaries(self, **kwargs: object) -> list[RouteStabilitySummary]:
+            captured.update(kwargs)
+            return [
+                RouteStabilitySummary(
+                    canonical_symbol="ARB-USD-PERP",
+                    short_venue="extended",
+                    long_venue="paradex",
+                    short_fee_profile="default",
+                    long_fee_profile="pro",
+                    sample_size=3,
+                    window_count=3,
+                    presence_ratio=0.75,
+                    positive_roundtrip_share=1.0,
+                    mean_roundtrip_edge=0.0012,
+                    median_roundtrip_edge=0.0011,
+                    edge_stddev=0.0001,
+                    mean_capacity_notional=900.0,
+                    median_capacity_notional=900.0,
+                    capacity_stddev=50.0,
+                    latest_roundtrip_edge=0.001,
+                    latest_recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+                    stability_weight=0.6,
+                    stability_score=0.00072,
+                )
+            ]
+
+    app.dependency_overrides[get_route_stability_service] = (
+        lambda: StubRouteStabilityService()
+    )
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/route-stability",
+            params={"min_sample_size": 2, "min_presence_ratio": 0.5},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["canonical_symbol"] == "ARB-USD-PERP"
+    assert payload[0]["stability_weight"] == 0.6
+    assert captured["min_sample_size"] == 2
+    assert captured["min_presence_ratio"] == 0.5
+
+
+def test_route_stability_service_provider_uses_shared_history_store(tmp_path: Path) -> None:
+    settings = ApiSettings(database_path=str(tmp_path / "stability.sqlite3"))
+    history_store = get_history_store(settings)
+    service = get_route_stability_service(settings)
+
+    assert service is get_route_stability_service(settings)
+    assert service.history_store is history_store
+
+
+def test_funding_universe_endpoint_rejects_invalid_route_stability_filters() -> None:
+    class StubUniverseService:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            raise AssertionError("scan should not run for invalid route-stability filters")
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe",
+            params={"min_route_stability_weight": 1.2},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "min_route_stability_weight must be between 0 and 1"
+
+
+def test_funding_universe_portfolio_endpoint_rejects_invalid_route_stability_filters() -> None:
+    class StubUniverseService:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            raise AssertionError("scan should not run for invalid route-stability filters")
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/portfolio",
+            params={"min_route_presence_ratio": -0.1},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "min_route_presence_ratio must be between 0 and 1"
 
 
 def test_history_endpoint_reads_saved_records(tmp_path: Path) -> None:

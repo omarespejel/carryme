@@ -43,6 +43,7 @@ from carryme_models import (
     PaperTradeExecutionPreflight,
     PaperTradeOrderPreview,
     PreviewConfirmationEntry,
+    RouteStabilitySummary,
     TopOfBook,
     TradeLegIntent,
     VenueAccountPreflight,
@@ -69,6 +70,7 @@ from carryme_runtime import (
     ParadexCleanupPreviewService,
     ParadexLiveExecutionService,
     ParadexOrderStateObserver,
+    RouteStabilityService,
     VenueAccountProbe,
     build_execution_pair_status,
     build_live_submission_readiness,
@@ -90,7 +92,11 @@ from carryme_runtime.account_preflight import (
 )
 from carryme_runtime.execution_quality import ExecutionQualityService
 from carryme_runtime.universe_policy import passes_symbol_policy
-from carryme_storage import ExecutionJournalStore, ExecutionObservationStore
+from carryme_storage import (
+    ExecutionJournalStore,
+    ExecutionObservationStore,
+    OpportunityHistoryStore,
+)
 
 
 def _snapshot(
@@ -1919,11 +1925,401 @@ def test_build_portfolio_plan_reports_execution_adjusted_round_trip_pnl() -> Non
         == pytest.approx(1.55)
     )
 
-
 def test_passes_symbol_policy_accepts_single_string_inputs() -> None:
     assert passes_symbol_policy("ARB-USD-PERP", include_symbols="ARB-USD-PERP")
     assert not passes_symbol_policy("ARB-USD-PERP", exclude_symbols="ARB-USD-PERP")
     assert not passes_symbol_policy("TRUMP-USD-PERP", exclude_tags="political")
+
+
+def test_route_stability_service_summarizes_repeated_scan_windows(tmp_path: Path) -> None:
+    history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    window_one = datetime(2026, 3, 29, 10, 0, tzinfo=UTC)
+    window_two = datetime(2026, 3, 29, 10, 5, tzinfo=UTC)
+
+    def append_record(
+        recorded_at: datetime,
+        *,
+        label: str,
+        canonical_symbol: str,
+        left_symbol: str,
+        right_symbol: str,
+        long_venue: str,
+        long_fee_profile: str,
+        roundtrip_edge: float,
+        capacity_notional: float,
+    ) -> None:
+        history_store.append(
+            OpportunityRecord(
+                recorded_at=recorded_at,
+                pair=FundingPairSpec(
+                    label=label,
+                    left_venue="extended",
+                    left_symbol=left_symbol,
+                    left_fee_profile="default",
+                    right_venue=long_venue,
+                    right_symbol=right_symbol,
+                    right_fee_profile=long_fee_profile,
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol=canonical_symbol,
+                    long_venue=long_venue,
+                    short_venue="extended",
+                    long_fee_profile=long_fee_profile,
+                    short_fee_profile="default",
+                    gross_daily_edge=roundtrip_edge + 0.0009,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=roundtrip_edge + 0.00045,
+                    one_day_net_edge_after_round_trip=roundtrip_edge,
+                    break_even_days_entry=0.25,
+                    break_even_days_round_trip=0.5,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=capacity_notional + 200.0,
+                        long_ask_notional=capacity_notional,
+                        max_entry_notional=capacity_notional,
+                        limiting_venue=long_venue,
+                    ),
+                ),
+            )
+        )
+
+    append_record(
+        window_one,
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        left_symbol="ARB-USD",
+        right_symbol="ARB-USD-PERP",
+        long_venue="paradex",
+        long_fee_profile="pro",
+        roundtrip_edge=0.0012,
+        capacity_notional=900.0,
+    )
+    append_record(
+        window_one,
+        label="strk_extended_hyperliquid",
+        canonical_symbol="STRK-USD-PERP",
+        left_symbol="STRK-USD",
+        right_symbol="STRK",
+        long_venue="hyperliquid",
+        long_fee_profile="tier0",
+        roundtrip_edge=0.0001,
+        capacity_notional=500.0,
+    )
+    append_record(
+        window_two,
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        left_symbol="ARB-USD",
+        right_symbol="ARB-USD-PERP",
+        long_venue="paradex",
+        long_fee_profile="pro",
+        roundtrip_edge=0.0010,
+        capacity_notional=950.0,
+    )
+    append_record(
+        window_two,
+        label="lit_extended_paradex",
+        canonical_symbol="LIT-USD-PERP",
+        left_symbol="LIT-USD",
+        right_symbol="LIT-USD-PERP",
+        long_venue="paradex",
+        long_fee_profile="pro",
+        roundtrip_edge=-0.0002,
+        capacity_notional=450.0,
+    )
+
+    service = RouteStabilityService(history_store=history_store)
+    summaries = service.list_summaries(limit=10)
+
+    assert summaries[0].canonical_symbol == "ARB-USD-PERP"
+    assert summaries[0].presence_ratio == pytest.approx(1.0)
+    assert summaries[0].positive_roundtrip_share == pytest.approx(1.0)
+    assert summaries[0].stability_weight > summaries[1].stability_weight
+
+
+def test_route_stability_service_keeps_same_second_batches_distinct(tmp_path: Path) -> None:
+    history_store = OpportunityHistoryStore(tmp_path / "route_stability_same_second.sqlite3")
+    window_one = datetime(2026, 3, 29, 12, 0, 0, 100_000, tzinfo=UTC)
+    window_two = datetime(2026, 3, 29, 12, 0, 0, 900_000, tzinfo=UTC)
+
+    for recorded_at, edge in ((window_one, 0.0010), (window_two, 0.0008)):
+        history_store.append(
+            OpportunityRecord(
+                recorded_at=recorded_at,
+                pair=FundingPairSpec(
+                    label="arb_extended_paradex",
+                    left_venue="extended",
+                    left_symbol="ARB-USD",
+                    left_fee_profile="default",
+                    right_venue="paradex",
+                    right_symbol="ARB-USD-PERP",
+                    right_fee_profile="pro",
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro",
+                    short_fee_profile="default",
+                    gross_daily_edge=edge + 0.0009,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=edge + 0.00045,
+                    one_day_net_edge_after_round_trip=edge,
+                    break_even_days_entry=0.25,
+                    break_even_days_round_trip=0.5,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1_100.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+            )
+        )
+
+    service = RouteStabilityService(history_store=history_store, min_window_cardinality=1)
+    summary = service.build_index()[("ARB-USD-PERP", "extended", "paradex", "default", "pro")]
+
+    assert summary.window_count == 2
+    assert summary.sample_size == 2
+
+
+def test_opportunity_universe_service_ranks_by_route_adjusted_quality() -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD", "WIF-USD"],
+        "paradex": ["ARB-USD-PERP", "WIF-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "ARB-USD"): _snapshot(
+            "extended",
+            "ARB-USD",
+            0.000013,
+            0.09,
+            20_000,
+            0.0901,
+            18_000,
+            daily_volume=200_000,
+            open_interest=500_000,
+        ),
+        ("paradex", "ARB-USD-PERP"): _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0006,
+            0.09,
+            18_000,
+            0.0901,
+            17_000,
+            daily_volume=180_000,
+            open_interest=480_000,
+        ),
+        ("extended", "WIF-USD"): _snapshot(
+            "extended",
+            "WIF-USD",
+            0.000013,
+            0.18,
+            8_000,
+            0.1805,
+            6_000,
+            daily_volume=60_000,
+            open_interest=90_000,
+        ),
+        ("paradex", "WIF-USD-PERP"): _snapshot(
+            "paradex",
+            "WIF-USD-PERP",
+            -0.0011,
+            0.18,
+            7_000,
+            0.1805,
+            5_500,
+            daily_volume=55_000,
+            open_interest=80_000,
+        ),
+    }
+
+    route_stability_index = {
+        ("ARB-USD-PERP", "extended", "paradex", "default", "pro"): RouteStabilitySummary(
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            sample_size=6,
+            window_count=5,
+            presence_ratio=0.83,
+            positive_roundtrip_share=1.0,
+            mean_roundtrip_edge=0.0011,
+            median_roundtrip_edge=0.00105,
+            edge_stddev=0.00008,
+            mean_capacity_notional=950.0,
+            median_capacity_notional=940.0,
+            capacity_stddev=40.0,
+            latest_roundtrip_edge=0.0010,
+            latest_recorded_at=datetime(2026, 3, 29, 11, 0, tzinfo=UTC),
+            stability_weight=0.72,
+            stability_score=0.000792,
+        ),
+        ("ARB-USD-PERP", "extended", "paradex", "vip", "retail"): RouteStabilitySummary(
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="vip",
+            long_fee_profile="retail",
+            sample_size=10,
+            window_count=8,
+            presence_ratio=0.95,
+            positive_roundtrip_share=1.0,
+            mean_roundtrip_edge=0.005,
+            median_roundtrip_edge=0.005,
+            edge_stddev=0.0001,
+            mean_capacity_notional=1_500.0,
+            median_capacity_notional=1_500.0,
+            capacity_stddev=25.0,
+            latest_roundtrip_edge=0.005,
+            latest_recorded_at=datetime(2026, 3, 29, 11, 5, tzinfo=UTC),
+            stability_weight=0.99,
+            stability_score=0.00495,
+        ),
+        ("WIF-USD-PERP", "extended", "paradex", "default", "pro"): RouteStabilitySummary(
+            canonical_symbol="WIF-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            sample_size=3,
+            window_count=1,
+            presence_ratio=0.25,
+            positive_roundtrip_share=0.67,
+            mean_roundtrip_edge=0.0016,
+            median_roundtrip_edge=0.0017,
+            edge_stddev=0.0009,
+            mean_capacity_notional=400.0,
+            median_capacity_notional=380.0,
+            capacity_stddev=150.0,
+            latest_roundtrip_edge=-0.0001,
+            latest_recorded_at=datetime(2026, 3, 29, 11, 0, tzinfo=UTC),
+            stability_weight=0.08,
+            stability_score=0.000128,
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    class StubRouteStabilityService:
+        def build_index(self) -> dict[tuple[str, str, str, str, str], RouteStabilitySummary]:
+            return route_stability_index
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+            route_stability_service=cast(RouteStabilityService, StubRouteStabilityService()),
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            ranking="route_adjusted_quality_pnl",
+            target_notional=5_000,
+            limit=10,
+        )
+
+        assert scan.opportunities[0].opportunity.canonical_symbol == "ARB-USD-PERP"
+        assert scan.opportunities[0].route_adjusted_quality_score is not None
+        assert (
+            scan.opportunities[0].route_adjusted_quality_score
+            > cast(float, scan.opportunities[1].route_adjusted_quality_score)
+        )
+
+    asyncio.run(run())
+
+
+def test_build_portfolio_plan_reports_route_adjusted_round_trip_pnl() -> None:
+    opportunity = FundingUniverseOpportunity(
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="ARB-USD-PERP",
+            long_venue="paradex",
+            short_venue="extended",
+            long_fee_profile="pro",
+            short_fee_profile="default",
+            gross_daily_edge=0.004,
+            entry_cost_rate=0.00045,
+            round_trip_cost_rate=0.0009,
+            one_day_net_edge_after_entry=0.00355,
+            one_day_net_edge_after_round_trip=0.0031,
+            break_even_days_entry=0.2,
+            break_even_days_round_trip=0.3,
+            capacity=CapacityEstimate(
+                short_bid_notional=1400.0,
+                long_ask_notional=900.0,
+                max_entry_notional=900.0,
+                limiting_venue="paradex",
+            ),
+        ),
+        deployable_notional=900.0,
+        estimated_one_day_pnl_after_entry=3.195,
+        estimated_one_day_pnl_after_round_trip=2.79,
+        quality_score=1.7,
+        execution_quality=ExecutionQualitySummary(
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            sample_size=2,
+            weighted_score=0.6,
+            latest_outcome="hedged",
+            hedged_count=1,
+            closed_count=0,
+            unfilled_count=1,
+            cleanup_needed_count=0,
+            review_required_count=0,
+            pending_count=0,
+        ),
+        execution_adjusted_one_day_pnl_after_round_trip=1.674,
+        execution_adjusted_quality_score=1.02,
+        route_stability=RouteStabilitySummary(
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            sample_size=4,
+            window_count=4,
+            presence_ratio=0.8,
+            positive_roundtrip_share=1.0,
+            mean_roundtrip_edge=0.003,
+            median_roundtrip_edge=0.003,
+            edge_stddev=0.0002,
+            mean_capacity_notional=850.0,
+            median_capacity_notional=850.0,
+            capacity_stddev=25.0,
+            latest_roundtrip_edge=0.0031,
+            latest_recorded_at=datetime(2026, 3, 29, 11, 30, tzinfo=UTC),
+            stability_weight=0.5,
+            stability_score=0.0015,
+        ),
+        stability_adjusted_one_day_pnl_after_round_trip=1.395,
+        stability_adjusted_quality_score=0.85,
+        route_adjusted_quality_score=0.51,
+    )
+    scan = FundingUniverseScan(
+        venues=["extended", "paradex"],
+        ranking="route_adjusted_quality_pnl",
+        target_notional=1_000,
+        overlap_count=1,
+        overlaps=[],
+        opportunities=[opportunity],
+    )
+
+    plan = build_portfolio_plan(scan, target_notional=1_000, max_positions=1)
+
+    assert plan.stability_adjusted_estimated_one_day_pnl_after_round_trip == pytest.approx(1.395)
+    assert plan.route_adjusted_estimated_one_day_pnl_after_round_trip == pytest.approx(0.837)
+    assert (
+        plan.entries[0].route_adjusted_estimated_one_day_pnl_after_round_trip
+        == pytest.approx(0.837)
+    )
 
 
 def test_build_live_submission_readiness_requires_confirmation_and_preflights() -> None:

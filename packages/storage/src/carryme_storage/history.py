@@ -132,3 +132,20 @@ class OpportunityHistoryStore:
             )
             for recorded_at, pair_json, opportunity_json in rows
         ]
+
+    def history_fingerprint(self) -> tuple[int, int | None, str | None]:
+        """Return a cheap fingerprint for cache invalidation."""
+
+        self.initialize()
+        with sqlite3.connect(self.database_path) as connection:
+            count, latest_id, latest_recorded_at = connection.execute(
+                """
+                SELECT COUNT(*), MAX(id), MAX(recorded_at)
+                FROM opportunity_history
+                """
+            ).fetchone()
+        return (
+            int(count or 0),
+            int(latest_id) if latest_id is not None else None,
+            latest_recorded_at,
+        )

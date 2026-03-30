@@ -58,6 +58,7 @@ from carryme_models.universe import (
     FundingUniversePortfolioPlan,
     FundingUniverseScan,
     FundingUniverseVenueMarket,
+    RouteStabilitySummary,
 )
 
 __all__ = [
@@ -105,6 +106,7 @@ __all__ = [
     "TopOfBook",
     "TradeLegIntent",
     "TradingFeeProfile",
+    "RouteStabilitySummary",
     "VenueAccountPreflight",
     "VenueExecutionPreflight",
     "VenueOrderPreview",

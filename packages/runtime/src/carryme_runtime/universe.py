@@ -30,6 +30,7 @@ from carryme_models import (
     FundingUniverseVenueMarket,
     NormalizedMarketSnapshot,
     OpportunityRecord,
+    RouteStabilitySummary,
 )
 from carryme_normalizers import get_fee_profile, normalize_symbol
 from carryme_scoring import score_funding_pair
@@ -41,6 +42,7 @@ from carryme_runtime.opportunities import (
     UpstreamDataError,
     fetch_live_snapshot,
 )
+from carryme_runtime.route_stability import RouteStabilityService
 from carryme_runtime.universe_policy import passes_symbol_policy, policy_tags_for_symbol
 
 UniverseRanking = Literal[
@@ -51,6 +53,9 @@ UniverseRanking = Literal[
     "quality_adjusted_roundtrip_pnl",
     "execution_adjusted_roundtrip_pnl",
     "execution_adjusted_quality_pnl",
+    "stability_adjusted_roundtrip_pnl",
+    "stability_adjusted_quality_pnl",
+    "route_adjusted_quality_pnl",
 ]
 
 
@@ -79,6 +84,9 @@ UNIVERSE_RANKINGS: tuple[UniverseRanking, ...] = (
     "quality_adjusted_roundtrip_pnl",
     "execution_adjusted_roundtrip_pnl",
     "execution_adjusted_quality_pnl",
+    "stability_adjusted_roundtrip_pnl",
+    "stability_adjusted_quality_pnl",
+    "route_adjusted_quality_pnl",
 )
 
 
@@ -99,6 +107,7 @@ class OpportunityUniverseService:
     snapshot_retry_attempts: int = 3
     snapshot_retry_backoff_seconds: float = 0.25
     execution_quality_service: ExecutionQualityService | None = None
+    route_stability_service: RouteStabilityService | None = None
 
     async def scan(
         self,
@@ -112,6 +121,9 @@ class OpportunityUniverseService:
         min_roundtrip_edge: float = 0.0,
         min_execution_quality_score: float = 0.0,
         min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.0,
+        min_route_presence_ratio: float = 0.0,
+        min_route_samples: int = 0,
         include_symbols: list[str] | None = None,
         exclude_symbols: list[str] | None = None,
         exclude_tags: list[str] | None = None,
@@ -130,6 +142,11 @@ class OpportunityUniverseService:
             self.execution_quality_service.prior_score
             if self.execution_quality_service is not None
             else 1.0
+        )
+        route_stability_index = (
+            self.route_stability_service.build_index()
+            if self.route_stability_service is not None
+            else {}
         )
 
         opportunities: list[FundingUniverseOpportunity] = []
@@ -159,6 +176,7 @@ class OpportunityUniverseService:
                     target_notional=target_notional,
                     execution_quality_index=execution_quality_index,
                     execution_prior_score=execution_prior_score,
+                    route_stability_index=route_stability_index,
                 )
                 if not _passes_filters(
                     scored,
@@ -169,6 +187,9 @@ class OpportunityUniverseService:
                     min_execution_quality_score=min_execution_quality_score,
                     default_execution_quality_score=execution_prior_score,
                     min_execution_samples=min_execution_samples,
+                    min_route_stability_weight=min_route_stability_weight,
+                    min_route_presence_ratio=min_route_presence_ratio,
+                    min_route_samples=min_route_samples,
                 ):
                     continue
                 opportunities.append(scored)
@@ -305,6 +326,9 @@ def _build_universe_opportunity(
     target_notional: float,
     execution_quality_index: dict[tuple[str, str, str], ExecutionQualitySummary],
     execution_prior_score: float,
+    route_stability_index: dict[
+        tuple[str, str, str, str, str], RouteStabilitySummary
+    ],
 ) -> FundingUniverseOpportunity:
     opportunity = score_funding_pair(
         left,
@@ -344,6 +368,15 @@ def _build_universe_opportunity(
         if execution_quality is not None
         else execution_prior_score
     )
+    route_stability = route_stability_index.get(
+        (
+            opportunity.canonical_symbol,
+            opportunity.short_venue,
+            opportunity.long_venue,
+            opportunity.short_fee_profile,
+            opportunity.long_fee_profile,
+        )
+    )
     execution_adjusted_round_trip_pnl = (
         pnl_after_round_trip * execution_quality_score
         if pnl_after_round_trip is not None
@@ -353,6 +386,21 @@ def _build_universe_opportunity(
         quality_score * execution_quality_score
         if quality_score is not None
         else quality_score
+    )
+    stability_adjusted_round_trip_pnl = (
+        pnl_after_round_trip * route_stability.stability_weight
+        if pnl_after_round_trip is not None and route_stability is not None
+        else pnl_after_round_trip
+    )
+    stability_adjusted_quality_score = (
+        quality_score * route_stability.stability_weight
+        if quality_score is not None and route_stability is not None
+        else quality_score
+    )
+    route_adjusted_quality_score = (
+        execution_adjusted_quality_score * route_stability.stability_weight
+        if execution_adjusted_quality_score is not None and route_stability is not None
+        else execution_adjusted_quality_score
     )
     return FundingUniverseOpportunity(
         opportunity=opportunity,
@@ -366,8 +414,12 @@ def _build_universe_opportunity(
         estimated_one_day_pnl_after_round_trip=pnl_after_round_trip,
         quality_score=quality_score,
         execution_quality=execution_quality,
+        route_stability=route_stability,
         execution_adjusted_one_day_pnl_after_round_trip=execution_adjusted_round_trip_pnl,
         execution_adjusted_quality_score=execution_adjusted_quality_score,
+        stability_adjusted_one_day_pnl_after_round_trip=stability_adjusted_round_trip_pnl,
+        stability_adjusted_quality_score=stability_adjusted_quality_score,
+        route_adjusted_quality_score=route_adjusted_quality_score,
     )
 
 
@@ -446,6 +498,9 @@ def _passes_filters(
     min_execution_quality_score: float,
     default_execution_quality_score: float,
     min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
 ) -> bool:
     deployable_notional = opportunity.deployable_notional or 0.0
     if deployable_notional < min_capacity_notional:
@@ -468,7 +523,28 @@ def _passes_filters(
     )
     if execution_quality_score < min_execution_quality_score:
         return False
-    return execution_sample_size >= min_execution_samples
+    if execution_sample_size < min_execution_samples:
+        return False
+    route_stability_weight = (
+        opportunity.route_stability.stability_weight
+        if opportunity.route_stability is not None
+        else 1.0
+    )
+    route_presence_ratio = (
+        opportunity.route_stability.presence_ratio
+        if opportunity.route_stability is not None
+        else 0.0
+    )
+    route_sample_size = (
+        opportunity.route_stability.sample_size
+        if opportunity.route_stability is not None
+        else 0
+    )
+    if route_stability_weight < min_route_stability_weight:
+        return False
+    if route_presence_ratio < min_route_presence_ratio:
+        return False
+    return route_sample_size >= min_route_samples
 
 
 def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRanking) -> float:
@@ -484,6 +560,12 @@ def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRan
         return opportunity.execution_adjusted_one_day_pnl_after_round_trip or float("-inf")
     if ranking == "execution_adjusted_quality_pnl":
         return opportunity.execution_adjusted_quality_score or float("-inf")
+    if ranking == "stability_adjusted_roundtrip_pnl":
+        return opportunity.stability_adjusted_one_day_pnl_after_round_trip or float("-inf")
+    if ranking == "route_adjusted_quality_pnl":
+        return opportunity.route_adjusted_quality_score or float("-inf")
+    if ranking == "stability_adjusted_quality_pnl":
+        return opportunity.stability_adjusted_quality_score or float("-inf")
     return opportunity.quality_score or float("-inf")
 
 
@@ -531,6 +613,8 @@ def build_portfolio_plan(
     total_entry_pnl = 0.0
     total_round_trip_pnl = 0.0
     total_execution_adjusted_round_trip_pnl = 0.0
+    total_stability_adjusted_round_trip_pnl = 0.0
+    total_route_adjusted_round_trip_pnl = 0.0
 
     for opportunity in scan.opportunities:
         if remaining <= 0 or len(entries) >= max_positions:
@@ -545,10 +629,19 @@ def build_portfolio_plan(
 
         entry_edge = opportunity.opportunity.one_day_net_edge_after_entry
         round_trip_edge = opportunity.opportunity.one_day_net_edge_after_round_trip
+        stability_weight = (
+            opportunity.route_stability.stability_weight
+            if opportunity.route_stability is not None
+            else 1.0
+        )
         entry_pnl = selected_notional * entry_edge
         round_trip_pnl = selected_notional * round_trip_edge
         execution_weight = _execution_weight(opportunity)
         execution_adjusted_round_trip_pnl = selected_notional * round_trip_edge * execution_weight
+        stability_adjusted_round_trip_pnl = selected_notional * round_trip_edge * stability_weight
+        route_adjusted_round_trip_pnl = (
+            selected_notional * round_trip_edge * execution_weight * stability_weight
+        )
 
         entries.append(
             FundingUniversePortfolioEntry(
@@ -559,12 +652,20 @@ def build_portfolio_plan(
                 execution_adjusted_estimated_one_day_pnl_after_round_trip=(
                     execution_adjusted_round_trip_pnl
                 ),
+                stability_adjusted_estimated_one_day_pnl_after_round_trip=(
+                    stability_adjusted_round_trip_pnl
+                ),
+                route_adjusted_estimated_one_day_pnl_after_round_trip=(
+                    route_adjusted_round_trip_pnl
+                ),
             )
         )
         remaining -= selected_notional
         total_entry_pnl += entry_pnl
         total_round_trip_pnl += round_trip_pnl
         total_execution_adjusted_round_trip_pnl += execution_adjusted_round_trip_pnl
+        total_stability_adjusted_round_trip_pnl += stability_adjusted_round_trip_pnl
+        total_route_adjusted_round_trip_pnl += route_adjusted_round_trip_pnl
         selected_symbols.add(canonical_symbol)
 
     allocated = target_notional - remaining
@@ -577,6 +678,12 @@ def build_portfolio_plan(
         estimated_one_day_pnl_after_round_trip=total_round_trip_pnl,
         execution_adjusted_estimated_one_day_pnl_after_round_trip=(
             total_execution_adjusted_round_trip_pnl
+        ),
+        stability_adjusted_estimated_one_day_pnl_after_round_trip=(
+            total_stability_adjusted_round_trip_pnl
+        ),
+        route_adjusted_estimated_one_day_pnl_after_round_trip=(
+            total_route_adjusted_round_trip_pnl
         ),
         entries=entries,
     )
