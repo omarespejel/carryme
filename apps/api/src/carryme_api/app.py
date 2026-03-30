@@ -12,6 +12,7 @@ from typing import Annotated
 
 import httpx
 from carryme_models import (
+    SUPPORTED_UNIVERSE_VENUES,
     AppDescriptor,
     CandidateAlertEvent,
     CleanupPreviewConfirmationEntry,
@@ -201,6 +202,25 @@ def _execution_observation_store_for_path(database_path: str) -> ExecutionObserv
     """Return a shared execution observation store for the configured SQLite path."""
 
     return ExecutionObservationStore(database_path)
+
+
+def _build_fee_profile_overrides(
+    *,
+    extended_fee_profile: str | None,
+    paradex_fee_profile: str | None,
+    hyperliquid_fee_profile: str | None,
+) -> dict[str, str] | None:
+    configured_profiles = {
+        "extended": extended_fee_profile,
+        "paradex": paradex_fee_profile,
+        "hyperliquid": hyperliquid_fee_profile,
+    }
+    overrides = {
+        venue: profile
+        for venue in SUPPORTED_UNIVERSE_VENUES
+        if (profile := configured_profiles.get(venue))
+    }
+    return overrides or None
 
 
 def get_opportunity_service() -> OpportunityService:
@@ -3228,6 +3248,9 @@ def create_app() -> FastAPI:
         ],
         venues: Annotated[list[str] | None, Query()] = None,
         ranking: str = "route_adjusted_quality_pnl",
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = None,
+        hyperliquid_fee_profile: str | None = None,
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
@@ -3244,7 +3267,7 @@ def create_app() -> FastAPI:
         limit: int = 20,
     ) -> FundingUniverseScan:
         try:
-            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
             _validate_route_stability_filters(
                 min_route_stability_weight=min_route_stability_weight,
                 min_route_presence_ratio=min_route_presence_ratio,
@@ -3253,6 +3276,11 @@ def create_app() -> FastAPI:
             return await service.scan(
                 venues=selected_venues,
                 ranking=ranking,  # type: ignore[arg-type]
+                fee_profile_overrides=_build_fee_profile_overrides(
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                ),
                 target_notional=target_notional,
                 min_capacity_notional=min_capacity_notional,
                 min_daily_volume=min_daily_volume,
@@ -3283,6 +3311,9 @@ def create_app() -> FastAPI:
         ],
         venues: Annotated[list[str] | None, Query()] = None,
         ranking: str = "route_adjusted_quality_pnl",
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = None,
+        hyperliquid_fee_profile: str | None = None,
         target_notional: float = 5_000.0,
         min_capacity_notional: float = 0.0,
         min_daily_volume: float = 0.0,
@@ -3300,7 +3331,7 @@ def create_app() -> FastAPI:
         min_selected_notional: float = 0.0,
     ) -> FundingUniversePortfolioPlan:
         try:
-            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
             _validate_route_stability_filters(
                 min_route_stability_weight=min_route_stability_weight,
                 min_route_presence_ratio=min_route_presence_ratio,
@@ -3309,6 +3340,11 @@ def create_app() -> FastAPI:
             scan = await service.scan(
                 venues=selected_venues,
                 ranking=ranking,  # type: ignore[arg-type]
+                fee_profile_overrides=_build_fee_profile_overrides(
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                ),
                 target_notional=target_notional,
                 min_capacity_notional=min_capacity_notional,
                 min_daily_volume=min_daily_volume,

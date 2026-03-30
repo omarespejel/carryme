@@ -3,7 +3,9 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from carryme_models import SUPPORTED_UNIVERSE_VENUES
+from carryme_normalizers import get_fee_profile
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
@@ -26,7 +28,7 @@ class WorkerSettings(BaseSettings):
     universe_scan_timeout_seconds: float = Field(default=30.0, gt=0)
     min_candidate_entry_edge: float = Field(default=0.0, ge=0)
     min_candidate_capacity_notional: float = Field(default=0.0, ge=0)
-    universe_scan_venues: tuple[str, ...] = ("extended", "paradex", "hyperliquid")
+    universe_scan_venues: tuple[str, ...] = SUPPORTED_UNIVERSE_VENUES
     universe_scan_ranking: Literal[
         "roundtrip_edge",
         "entry_edge",
@@ -39,6 +41,9 @@ class WorkerSettings(BaseSettings):
         "stability_adjusted_quality_pnl",
         "route_adjusted_quality_pnl",
     ] = "route_adjusted_quality_pnl"
+    universe_scan_extended_fee_profile: str | None = None
+    universe_scan_paradex_fee_profile: str | None = None
+    universe_scan_hyperliquid_fee_profile: str | None = None
     universe_scan_target_notional: float = Field(default=5_000.0, ge=0)
     universe_scan_min_capacity_notional: float = Field(default=250.0, ge=0)
     universe_scan_min_daily_volume: float = Field(default=10_000.0, ge=0)
@@ -133,6 +138,27 @@ class WorkerSettings(BaseSettings):
         extra="ignore",
         populate_by_name=True,
     )
+
+    @field_validator(
+        "universe_scan_extended_fee_profile",
+        "universe_scan_paradex_fee_profile",
+        "universe_scan_hyperliquid_fee_profile",
+    )
+    @classmethod
+    def validate_universe_fee_profile(cls, value: str | None, info: ValidationInfo) -> str | None:
+        """Fail fast when configured universe fee profiles are unknown."""
+
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("fee profile name must not be empty")
+        field_name = info.field_name
+        if field_name is None:
+            raise ValueError("fee profile validator requires a field name")
+        venue = field_name.removeprefix("universe_scan_").removesuffix("_fee_profile")
+        get_fee_profile(venue, normalized)
+        return normalized
 
     @field_validator("watchlist_path")
     @classmethod

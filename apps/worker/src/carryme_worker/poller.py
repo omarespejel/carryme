@@ -80,6 +80,7 @@ class UniverseScanner(Protocol):
         *,
         venues: list[str],
         ranking: str,
+        fee_profile_overrides: dict[str, str] | None,
         target_notional: float,
         min_capacity_notional: float,
         min_daily_volume: float,
@@ -281,6 +282,7 @@ async def scan_funding_universe_once(
         scan = await runtime.scan(
             venues=list(settings.universe_scan_venues),
             ranking=settings.universe_scan_ranking,
+            fee_profile_overrides=_build_universe_fee_profile_overrides(settings),
             target_notional=settings.universe_scan_target_notional,
             min_capacity_notional=settings.universe_scan_min_capacity_notional,
             min_daily_volume=settings.universe_scan_min_daily_volume,
@@ -438,6 +440,17 @@ async def run_supervised_universe_scan_loop(
         alert_events=alert_events,
         database_path=settings.database_path,
     )
+
+
+def _build_universe_fee_profile_overrides(
+    settings: WorkerSettings,
+) -> dict[str, str] | None:
+    overrides = {
+        venue: profile
+        for venue in settings.universe_scan_venues
+        if (profile := getattr(settings, f"universe_scan_{venue}_fee_profile", None))
+    }
+    return overrides or None
 
 
 def summarize_candidates(

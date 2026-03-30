@@ -127,6 +127,17 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.watchlist_path.endswith("config/watchlists/default.json")
 
 
+def test_worker_rejects_unknown_universe_fee_profile(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text('{"pairs": []}')
+
+    with pytest.raises(ValidationError, match="Unknown fee profile"):
+        WorkerSettings(
+            watchlist_path=str(watchlist),
+            universe_scan_paradex_fee_profile="definitely-not-real",
+        )
+
+
 def test_worker_rejects_missing_watchlist_path(tmp_path: Path) -> None:
     missing = tmp_path / "missing.json"
 
@@ -783,6 +794,42 @@ def test_scan_funding_universe_once_passes_route_stability_filters(tmp_path: Pat
     assert captured["min_route_samples"] == 4
 
 
+def test_scan_funding_universe_once_passes_fee_profile_overrides(tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class StubUniverseScanner:
+        async def scan(self, **kwargs: object) -> FundingUniverseScan:
+            captured.update(kwargs)
+            return FundingUniverseScan(
+                venues=["extended", "paradex"],
+                fee_profiles=cast(dict[str, str], kwargs["fee_profile_overrides"] or {}),
+                ranking=cast(str, kwargs["ranking"]),
+                target_notional=cast(float, kwargs["target_notional"]),
+                overlap_count=0,
+                overlaps=[],
+                opportunities=[],
+            )
+
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        universe_scan_extended_fee_profile="default",
+        universe_scan_paradex_fee_profile="retail",
+    )
+
+    asyncio.run(
+        scan_funding_universe_once(
+            settings,
+            scanner=StubUniverseScanner(),
+            store=OpportunityHistoryStore(settings.database_path),
+        )
+    )
+
+    assert captured["fee_profile_overrides"] == {
+        "extended": "default",
+        "paradex": "retail",
+    }
+
+
 def test_run_supervised_universe_scan_loop_honors_max_iterations(tmp_path: Path) -> None:
     class StubUniverseScanner:
         async def scan(self, **_: object) -> FundingUniverseScan:
@@ -946,8 +993,6 @@ def test_run_supervised_universe_scan_loop_applies_backoff(tmp_path: Path) -> No
     assert summary.saved_records == 2
     assert summary.alert_events == 1
     assert sleeps == [2.0]
-
-
 def test_run_polling_loop_applies_backoff_and_saves_after_retry(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text(
