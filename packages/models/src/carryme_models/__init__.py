@@ -53,6 +53,7 @@ from carryme_models.readiness import LiveSubmissionReadiness
 from carryme_models.universe import (
     SUPPORTED_UNIVERSE_VENUES,
     ExecutionQualitySummary,
+    FundingUniverseCanaryCandidate,
     FundingUniverseOpportunity,
     FundingUniverseOverlap,
     FundingUniversePortfolioEntry,
@@ -80,6 +81,7 @@ __all__ = [
     "ExecutionVenueReconciliation",
     "ObservationSource",
     "ExecutionQualitySummary",
+    "FundingUniverseCanaryCandidate",
     "FundingPairSpec",
     "FundingRateNormalization",
     "FundingArbOpportunity",

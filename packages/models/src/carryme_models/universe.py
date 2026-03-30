@@ -137,6 +137,13 @@ class FundingUniverseScan(BaseModel):
         return self
 
 
+class FundingUniverseCanaryCandidate(BaseModel):
+    """A route approved for a tiny controlled live-money canary."""
+
+    opportunity: FundingUniverseOpportunity
+    suggested_canary_notional: float = Field(ge=0)
+
+
 class FundingUniversePortfolioEntry(BaseModel):
     """A selected allocation within a funding-universe portfolio plan."""
 

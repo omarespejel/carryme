@@ -27,6 +27,7 @@ from carryme_models import (
     ExecutionReconciliation,
     FundingArbOpportunity,
     FundingPairTradeIntent,
+    FundingUniverseCanaryCandidate,
     FundingUniversePortfolioPlan,
     FundingUniverseScan,
     GuardedPairExecutionResult,
@@ -3299,6 +3300,64 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/opportunities/funding-universe/canary",
+        response_model=list[FundingUniverseCanaryCandidate],
+    )
+    async def funding_universe_canary_candidates(
+        service: Annotated[
+            OpportunityUniverseService, Depends(get_opportunity_universe_service)
+        ],
+        venues: Annotated[list[str] | None, Query()] = None,
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = "pro_fastfills",
+        hyperliquid_fee_profile: str | None = None,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.35,
+        min_route_presence_ratio: float = 0.35,
+        min_route_samples: int = 2,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+        limit: int = 10,
+    ) -> list[FundingUniverseCanaryCandidate]:
+        try:
+            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            return await service.scan_canary_candidates(
+                venues=selected_venues,
+                fee_profile_overrides=_build_fee_profile_overrides(
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                ),
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get(
