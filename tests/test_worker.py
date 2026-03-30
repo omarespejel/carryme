@@ -118,7 +118,6 @@ from carryme_worker.poller import (
     scan_funding_universe_once,
     summarize_candidates,
 )
-from pydantic import ValidationError
 from fastapi import HTTPException
 from pydantic import ValidationError
 

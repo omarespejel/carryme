@@ -18,7 +18,6 @@ from carryme_api.app import (
     _select_latest_launch_ready_canary_snapshot,
 )
 from carryme_api.config import ApiSettings
- 
 from carryme_models import (
     ApprovedCanaryAlertEvent,
     ApprovedCanarySnapshot,
@@ -43,10 +42,10 @@ from carryme_models import (
 from carryme_runtime import (
     AccountPreflightConfigMap,
     AccountPreflightService,
-    ConnectorError,
     BalanceAccountingService,
     CleanupLiveExecutionRouter,
     CleanupPreviewRouter,
+    ConnectorError,
     ExecutionOrderStateService,
     ExecutionQualityService,
     ExtendedCleanupPreviewService,
@@ -1109,9 +1108,7 @@ async def launch_latest_stable_canary_once(
         raise
 
     if snapshot.launch_ready_snapshot_id is not None:
-        previous_launch = stable_launch_store.latest_for_snapshot(
-            snapshot.launch_ready_snapshot_id
-        )
+        previous_launch = stable_launch_store.latest_for_snapshot(snapshot.launch_ready_snapshot_id)
         if previous_launch is not None:
             return StableCanaryLaunchSummary(
                 status="skipped",
@@ -1345,8 +1342,7 @@ async def run_supervised_stable_canary_launch_loop(
             consecutive_failures += 1
             backoff_seconds = min(
                 settings.stable_canary_launch_max_backoff_seconds,
-                settings.stable_canary_launch_interval_seconds
-                * (2 ** (consecutive_failures - 1)),
+                settings.stable_canary_launch_interval_seconds * (2 ** (consecutive_failures - 1)),
             )
             loop_logger.exception(
                 "stable canary launch cycle %s failed; backing off for %s seconds",
