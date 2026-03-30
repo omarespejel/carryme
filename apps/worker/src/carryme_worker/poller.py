@@ -24,8 +24,10 @@ from carryme_models import (
     FundingUniverseCanaryCandidate,
     FundingUniverseScan,
     LaunchReadyCanarySnapshot,
+    LaunchReadyCanaryStability,
     OpportunityRecord,
     PaperTradeSystemState,
+    StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
     VenueSystemState,
 )
@@ -62,6 +64,7 @@ from carryme_storage import (
     LaunchReadyCanaryStore,
     OpportunityHistoryStore,
     RouteApprovalStore,
+    StableLaunchReadyAlertStore,
     SystemStateAlertStore,
     load_watchlist,
 )
@@ -135,6 +138,12 @@ class SystemStateAlertSink(Protocol):
     """Append-only sink for emitted system-state alert events."""
 
     def append(self, event: SystemStateAlertEvent) -> None: ...
+
+
+class StableLaunchReadyAlertSink(Protocol):
+    """Append-only sink for stable launch-ready alert events."""
+
+    def append(self, event: StableLaunchReadyAlertEvent) -> None: ...
 
 
 class ExecutionAlertSink(Protocol):
@@ -233,8 +242,10 @@ class LaunchReadyCanaryCacheSummary:
     scanned_snapshots: int
     launch_ready_candidates: int
     saved_snapshots: int
+    alert_events: int
     database_path: str
     snapshots: list[LaunchReadyCanarySnapshot] = field(default_factory=list, repr=False)
+    alerts: list[StableLaunchReadyAlertEvent] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -247,6 +258,7 @@ class LaunchReadyCanaryCacheLoopSummary:
     scanned_snapshots: int
     launch_ready_candidates: int
     saved_snapshots: int
+    alert_events: int
     database_path: str
 
 
@@ -533,6 +545,92 @@ async def _probe_candidate_system_state(
     )
 
 
+def _launch_ready_snapshot_payload_changed(
+    previous_snapshot: LaunchReadyCanarySnapshot,
+    current_snapshot: LaunchReadyCanarySnapshot,
+) -> bool:
+    """Return whether the meaningful launch-ready payload changed."""
+
+    previous_payload = _normalized_launch_ready_snapshot_payload(previous_snapshot)
+    current_payload = _normalized_launch_ready_snapshot_payload(current_snapshot)
+    return previous_payload != current_payload
+
+
+def _normalized_launch_ready_snapshot_payload(
+    snapshot: LaunchReadyCanarySnapshot,
+) -> dict[str, object]:
+    """Return a stable, order-insensitive payload for one launch-ready snapshot."""
+
+    payload = snapshot.model_dump(
+        mode="python",
+        exclude={
+            "launch_ready_snapshot_id": True,
+            "captured_at": True,
+            "approved_snapshot": {"snapshot_id", "captured_at"},
+        },
+    )
+    system_state = cast(dict[str, object] | None, payload.get("system_state"))
+    if isinstance(system_state, dict):
+        venues = system_state.get("venues")
+        if isinstance(venues, list):
+            system_state["venues"] = sorted(
+                venues,
+                key=lambda venue: str(cast(dict[str, object], venue)["venue"]),
+            )
+    return payload
+
+
+def _build_latest_launch_ready_stability(
+    *,
+    store: LaunchReadyCanaryStore,
+    label: str,
+    max_snapshot_age_seconds: int,
+    min_snapshot_count: int,
+    min_stable_seconds: float,
+    now: datetime,
+) -> LaunchReadyCanaryStability | None:
+    """Return the latest stable launch-ready snapshot for one label, if any."""
+
+    latest_snapshot = store.latest(label=label)
+    if latest_snapshot is None:
+        return None
+    snapshot_age_seconds = max(
+        0.0,
+        (now - latest_snapshot.captured_at).total_seconds(),
+    )
+    effective_max_age_seconds = min(
+        max_snapshot_age_seconds,
+        latest_snapshot.max_snapshot_age_seconds,
+    )
+    if snapshot_age_seconds > effective_max_age_seconds:
+        return None
+
+    snapshots = store.list_recent(limit=max(min_snapshot_count + 5, 20), label=label)
+    chain: list[LaunchReadyCanarySnapshot] = []
+    for snapshot in snapshots:
+        if _launch_ready_snapshot_payload_changed(snapshot, latest_snapshot):
+            break
+        chain.append(snapshot)
+
+    consecutive_snapshots = len(chain)
+    oldest_snapshot = chain[-1]
+    stable_seconds = max(
+        0.0,
+        (latest_snapshot.captured_at - oldest_snapshot.captured_at).total_seconds(),
+    )
+    if consecutive_snapshots < min_snapshot_count:
+        return None
+    if stable_seconds < min_stable_seconds:
+        return None
+    return LaunchReadyCanaryStability(
+        snapshot=latest_snapshot,
+        consecutive_snapshots=consecutive_snapshots,
+        stable_seconds=stable_seconds,
+        min_snapshot_count=min_snapshot_count,
+        min_stable_seconds=min_stable_seconds,
+    )
+
+
 async def scan_approved_canary_once(
     settings: WorkerSettings,
     *,
@@ -649,6 +747,7 @@ async def cache_launch_ready_canaries_once(
     *,
     approved_store: ApprovedCanaryStore | None = None,
     launch_ready_store: LaunchReadyCanaryStore | None = None,
+    alert_sink: StableLaunchReadyAlertSink | None = None,
     approval_service: RouteApprovalService | None = None,
     system_state_service: SystemStateService | None = None,
     logger: logging.Logger | None = None,
@@ -659,6 +758,7 @@ async def cache_launch_ready_canaries_once(
     timestamp = now or datetime.now(UTC)
     source_store = approved_store or ApprovedCanaryStore(settings.database_path)
     ready_store = launch_ready_store or LaunchReadyCanaryStore(settings.database_path)
+    stable_alert_sink = alert_sink or StableLaunchReadyAlertStore(settings.database_path)
     loop_logger = logger or logging.getLogger("carryme.worker")
     route_approval_service = approval_service or RouteApprovalService(
         store=RouteApprovalStore(settings.database_path)
@@ -668,6 +768,16 @@ async def cache_launch_ready_canaries_once(
     latest_approvals_by_label: set[str] = set()
     for approval in route_approval_service.list_recent(limit=1_000, approved=True):
         latest_approvals_by_label.add(approval.label)
+
+    previous_stabilities = {
+        label: (
+            latest_alert.current_stability
+            if isinstance(stable_alert_sink, StableLaunchReadyAlertStore)
+            and (latest_alert := stable_alert_sink.latest(label=label)) is not None
+            else None
+        )
+        for label in sorted(latest_approvals_by_label)
+    }
 
     scanned_snapshots = 0
     snapshots: list[LaunchReadyCanarySnapshot] = []
@@ -734,12 +844,25 @@ async def cache_launch_ready_canaries_once(
             )
         )
 
+    alerts = _emit_stable_launch_ready_alerts(
+        labels=set(latest_approvals_by_label),
+        previous_stabilities=previous_stabilities,
+        store=ready_store,
+        sink=stable_alert_sink,
+        emitted_at=timestamp,
+        max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+        min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
+        min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
+    )
+
     return LaunchReadyCanaryCacheSummary(
         scanned_snapshots=scanned_snapshots,
         launch_ready_candidates=len(snapshots),
         saved_snapshots=len(snapshots),
+        alert_events=len(alerts),
         database_path=settings.database_path,
         snapshots=snapshots,
+        alerts=alerts,
     )
 
 
@@ -748,6 +871,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
     *,
     approved_store: ApprovedCanaryStore | None = None,
     launch_ready_store: LaunchReadyCanaryStore | None = None,
+    alert_sink: StableLaunchReadyAlertSink | None = None,
     approval_service: RouteApprovalService | None = None,
     system_state_service: SystemStateService | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -759,6 +883,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
 
     source_store = approved_store or ApprovedCanaryStore(settings.database_path)
     ready_store = launch_ready_store or LaunchReadyCanaryStore(settings.database_path)
+    stable_alert_sink = alert_sink or StableLaunchReadyAlertStore(settings.database_path)
     loop_logger = logger or logging.getLogger("carryme.worker")
     supervised_stop_event = stop_event or asyncio.Event()
 
@@ -768,6 +893,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
     scanned_snapshots = 0
     launch_ready_candidates = 0
     saved_snapshots = 0
+    alert_events = 0
     consecutive_failures = 0
 
     while not supervised_stop_event.is_set():
@@ -778,6 +904,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
                 settings,
                 approved_store=source_store,
                 launch_ready_store=ready_store,
+                alert_sink=stable_alert_sink,
                 approval_service=approval_service,
                 system_state_service=system_state_service,
                 logger=loop_logger,
@@ -787,14 +914,16 @@ async def run_supervised_launch_ready_canary_cache_loop(
             scanned_snapshots += summary.scanned_snapshots
             launch_ready_candidates += summary.launch_ready_candidates
             saved_snapshots += summary.saved_snapshots
+            alert_events += summary.alert_events
             loop_logger.info(
                 (
                     "completed supervised launch-ready canary cache cycle %s with "
-                    "%s scanned snapshots and %s saved launch-ready snapshots"
+                    "%s scanned snapshots, %s saved launch-ready snapshots, and %s alerts"
                 ),
                 attempts,
                 summary.scanned_snapshots,
                 summary.saved_snapshots,
+                summary.alert_events,
             )
             if max_iterations is not None and attempts >= max_iterations:
                 break
@@ -826,6 +955,7 @@ async def run_supervised_launch_ready_canary_cache_loop(
         scanned_snapshots=scanned_snapshots,
         launch_ready_candidates=launch_ready_candidates,
         saved_snapshots=saved_snapshots,
+        alert_events=alert_events,
         database_path=settings.database_path,
     )
 
@@ -1305,6 +1435,81 @@ def _emit_approved_canary_alerts(
             max_snapshot_age_seconds=max_snapshot_age_seconds,
             current_snapshot=None,
             previous_snapshot=previous_snapshot,
+        )
+        sink.append(event)
+        alert_events.append(event)
+
+    return alert_events
+
+
+def _emit_stable_launch_ready_alerts(
+    *,
+    labels: set[str],
+    previous_stabilities: dict[str, LaunchReadyCanaryStability | None],
+    store: LaunchReadyCanaryStore,
+    sink: StableLaunchReadyAlertSink,
+    emitted_at: datetime,
+    max_snapshot_age_seconds: int,
+    min_snapshot_count: int,
+    min_stable_seconds: float,
+) -> list[StableLaunchReadyAlertEvent]:
+    """Emit transition alerts for stable launch-ready availability changes."""
+
+    alert_events: list[StableLaunchReadyAlertEvent] = []
+    for label in sorted(labels):
+        previous_stability = previous_stabilities.get(label)
+        current_stability = _build_latest_launch_ready_stability(
+            store=store,
+            label=label,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            min_snapshot_count=min_snapshot_count,
+            min_stable_seconds=min_stable_seconds,
+            now=emitted_at,
+        )
+
+        if current_stability is not None:
+            if previous_stability is None:
+                event = StableLaunchReadyAlertEvent(
+                    emitted_at=emitted_at,
+                    alert_type="stable_launch_ready_available",
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    min_snapshot_count=min_snapshot_count,
+                    min_stable_seconds=min_stable_seconds,
+                    current_stability=current_stability,
+                    previous_stability=None,
+                )
+                sink.append(event)
+                alert_events.append(event)
+                continue
+
+            if _launch_ready_snapshot_payload_changed(
+                previous_stability.snapshot,
+                current_stability.snapshot,
+            ):
+                event = StableLaunchReadyAlertEvent(
+                    emitted_at=emitted_at,
+                    alert_type="stable_launch_ready_changed",
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    min_snapshot_count=min_snapshot_count,
+                    min_stable_seconds=min_stable_seconds,
+                    current_stability=current_stability,
+                    previous_stability=previous_stability,
+                )
+                sink.append(event)
+                alert_events.append(event)
+            continue
+
+        if previous_stability is None:
+            continue
+
+        event = StableLaunchReadyAlertEvent(
+            emitted_at=emitted_at,
+            alert_type="stable_launch_ready_stale",
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            min_snapshot_count=min_snapshot_count,
+            min_stable_seconds=min_stable_seconds,
+            current_stability=None,
+            previous_stability=previous_stability,
         )
         sink.append(event)
         alert_events.append(event)

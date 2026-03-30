@@ -14,6 +14,7 @@ from carryme_storage.pair_close_preview_confirmations import PairClosePreviewCon
 from carryme_storage.paper_trades import PaperTradeStore
 from carryme_storage.preview_confirmations import PreviewConfirmationStore
 from carryme_storage.route_approvals import RouteApprovalStore
+from carryme_storage.stable_launch_ready_alerts import StableLaunchReadyAlertStore
 from carryme_storage.system_state_alerts import SystemStateAlertStore
 from carryme_storage.watchlist import WatchlistStore, load_watchlist, save_watchlist
 
@@ -32,6 +33,7 @@ __all__ = [
     "PaperTradeStore",
     "PreviewConfirmationStore",
     "RouteApprovalStore",
+    "StableLaunchReadyAlertStore",
     "SystemStateAlertStore",
     "WatchlistStore",
     "load_watchlist",

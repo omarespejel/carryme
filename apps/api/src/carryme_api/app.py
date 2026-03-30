@@ -53,6 +53,7 @@ from carryme_models import (
     RouteApprovalUpsert,
     RouteStabilitySummary,
     ServiceHealth,
+    StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
     TradingFeeProfile,
     VenueAccountPreflight,
@@ -124,6 +125,7 @@ from carryme_storage import (
     PaperTradeStore,
     PreviewConfirmationStore,
     RouteApprovalStore,
+    StableLaunchReadyAlertStore,
     SystemStateAlertStore,
     WatchlistStore,
 )
@@ -344,6 +346,14 @@ def get_launch_ready_canary_store(
     """Return the shared launch-ready canary snapshot store."""
 
     return LaunchReadyCanaryStore(settings.database_path)
+
+
+def get_stable_launch_ready_alert_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> StableLaunchReadyAlertStore:
+    """Return the shared stable launch-ready alert store."""
+
+    return StableLaunchReadyAlertStore(settings.database_path)
 
 
 def get_route_stability_service(
@@ -1467,23 +1477,31 @@ def _launch_ready_snapshot_payload_changed(
     previous_snapshot: LaunchReadyCanarySnapshot,
     current_snapshot: LaunchReadyCanarySnapshot,
 ) -> bool:
-    previous_payload = previous_snapshot.model_dump(
-        mode="python",
-        exclude={
-            "launch_ready_snapshot_id": True,
-            "captured_at": True,
-            "approved_snapshot": {"snapshot_id", "captured_at"},
-        },
-    )
-    current_payload = current_snapshot.model_dump(
-        mode="python",
-        exclude={
-            "launch_ready_snapshot_id": True,
-            "captured_at": True,
-            "approved_snapshot": {"snapshot_id", "captured_at"},
-        },
-    )
+    previous_payload = _normalized_launch_ready_snapshot_payload(previous_snapshot)
+    current_payload = _normalized_launch_ready_snapshot_payload(current_snapshot)
     return previous_payload != current_payload
+
+
+def _normalized_launch_ready_snapshot_payload(
+    snapshot: LaunchReadyCanarySnapshot,
+) -> dict[str, object]:
+    payload = snapshot.model_dump(
+        mode="python",
+        exclude={
+            "launch_ready_snapshot_id": True,
+            "captured_at": True,
+            "approved_snapshot": {"snapshot_id", "captured_at"},
+        },
+    )
+    system_state = payload.get("system_state")
+    if isinstance(system_state, dict):
+        venues = system_state.get("venues")
+        if isinstance(venues, list):
+            system_state["venues"] = sorted(
+                venues,
+                key=lambda venue: venue["venue"],
+            )
+    return payload
 
 
 def _build_launch_ready_canary_stability(
@@ -2579,6 +2597,22 @@ def create_app() -> FastAPI:
         limit: int = 50,
         label: str | None = None,
     ) -> list[ApprovedCanaryAlertEvent]:
+        if limit < 0:
+            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        return store.list_recent(limit=limit, label=label)
+
+    @app.get(
+        "/v1/alerts/stable-launch-ready",
+        response_model=list[StableLaunchReadyAlertEvent],
+    )
+    def stable_launch_ready_alerts(
+        store: Annotated[
+            StableLaunchReadyAlertStore,
+            Depends(get_stable_launch_ready_alert_store),
+        ],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[StableLaunchReadyAlertEvent]:
         if limit < 0:
             raise HTTPException(status_code=400, detail="limit must be non-negative")
         return store.list_recent(limit=limit, label=label)
