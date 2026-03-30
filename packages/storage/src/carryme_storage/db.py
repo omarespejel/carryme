@@ -18,6 +18,10 @@ def normalize_database_url(database: str | Path) -> str:
 
     raw = str(database)
     if "://" in raw:
+        if raw.startswith("postgresql://"):
+            return raw.replace("postgresql://", "postgresql+psycopg://", 1)
+        if raw.startswith("postgres://"):
+            return raw.replace("postgres://", "postgresql+psycopg://", 1)
         return raw
     if raw == ":memory:":
         return "sqlite:///:memory:"

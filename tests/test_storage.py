@@ -2829,6 +2829,14 @@ def test_database_helpers_normalize_and_redact_urls() -> None:
     assert normalize_database_url("data/carryme.sqlite3") == "sqlite:///data/carryme.sqlite3"
     assert redact_database_url("data/carryme.sqlite3") == "data/carryme.sqlite3"
     assert (
+        normalize_database_url("postgresql://user:secret@db.example.com/carryme")
+        == "postgresql+psycopg://user:secret@db.example.com/carryme"
+    )
+    assert (
+        normalize_database_url("postgres://user:secret@db.example.com/carryme")
+        == "postgresql+psycopg://user:secret@db.example.com/carryme"
+    )
+    assert (
         redact_database_url("postgresql+psycopg://user:secret@db.example.com/carryme")
         == "postgresql+psycopg://***@db.example.com/carryme"
     )
