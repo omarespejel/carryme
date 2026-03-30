@@ -122,7 +122,8 @@ def build_render_validation_report(
     }
     live_missing.extend(paradex_missing)
 
-    database_ready = False
+    database_ready: bool | None = False
+    database_skipped = False
     database_error: str | None = None
     if ping_database:
         if "DATABASE_URL" not in resolved_env:
@@ -134,7 +135,8 @@ def build_render_validation_report(
             except Exception as error:  # pragma: no cover
                 database_error = str(error)
     else:
-        database_ready = True
+        database_ready = None
+        database_skipped = True
 
     status = "ready"
     if (
@@ -143,7 +145,7 @@ def build_render_validation_report(
         or api_error is not None
         or worker_error is not None
         or live_missing
-        or not database_ready
+        or (database_ready is False)
     ):
         status = "degraded"
 
@@ -156,6 +158,7 @@ def build_render_validation_report(
         "database": {
             "target": api_database_target,
             "ready": database_ready,
+            "skipped": database_skipped,
             "error": database_error,
         },
         "api": {

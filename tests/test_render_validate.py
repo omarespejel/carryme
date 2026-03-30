@@ -36,6 +36,7 @@ def test_render_validation_accepts_sqlite_database_url_for_smoke(tmp_path: Path)
     assert report["database"] == {
         "target": str(target),
         "ready": True,
+        "skipped": False,
         "error": None,
     }
     assert report["api"] == {
@@ -118,6 +119,32 @@ def test_render_validation_accepts_paradex_bearer_token_alone(tmp_path: Path) ->
     assert worker_summary["valid"] is True
 
 
+def test_render_validation_flags_missing_hyperliquid_credentials(tmp_path: Path) -> None:
+    report = build_render_validation_report(
+        {
+            "DATABASE_URL": f"sqlite:///{tmp_path / 'render.sqlite3'}",
+            "CARRYME_API_ENVIRONMENT": "production",
+            "CARRYME_WORKER_ENVIRONMENT": "production",
+            "CARRYME_API_HYPERLIQUID_LIVE_ENABLED": "true",
+        }
+    )
+    live_venues = cast(dict[str, dict[str, Any]], report["live_venues"])
+    api_summary = cast(dict[str, Any], report["api"])
+    worker_summary = cast(dict[str, Any], report["worker"])
+
+    assert report["status"] == "degraded"
+    assert live_venues["hyperliquid"] == {
+        "enabled": True,
+        "missing_env": [
+            "CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS",
+            "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+        ],
+    }
+    assert api_summary["valid"] is True
+    assert worker_summary["valid"] is False
+    assert "hyperliquid_account_address" in str(worker_summary["error"])
+
+
 def test_render_validation_honors_empty_explicit_env() -> None:
     with patch.dict(
         "os.environ",
@@ -138,4 +165,10 @@ def test_render_validation_honors_empty_explicit_env() -> None:
             "CARRYME_WORKER_ENVIRONMENT",
         ],
         "warnings": [],
+    }
+    assert report["database"] == {
+        "target": "data/carryme.sqlite3",
+        "ready": None,
+        "skipped": True,
+        "error": None,
     }
