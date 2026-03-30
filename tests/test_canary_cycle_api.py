@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -110,9 +110,10 @@ def _canary_candidate() -> FundingUniverseCanaryCandidate:
     )
 
 
-def _route_approval() -> RouteApprovalEntry:
+def _route_approval(base_time: datetime | None = None) -> RouteApprovalEntry:
+    captured_at = base_time or datetime.now(UTC)
     return RouteApprovalEntry(
-        updated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        updated_at=captured_at,
         label="arb_extended_paradex",
         canonical_symbol="ARB-USD-PERP",
         short_venue="extended",
@@ -125,17 +126,18 @@ def _route_approval() -> RouteApprovalEntry:
     )
 
 
-def _launch_ready_snapshot() -> LaunchReadyCanarySnapshot:
+def _launch_ready_snapshot(base_time: datetime | None = None) -> LaunchReadyCanarySnapshot:
+    captured_at = base_time or datetime.now(UTC)
     return LaunchReadyCanarySnapshot(
-        captured_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        captured_at=captured_at,
         label="arb_extended_paradex",
         max_snapshot_age_seconds=300,
         approved_snapshot=ApprovedCanarySnapshot(
             snapshot_id=5,
-            captured_at=datetime(2026, 3, 30, 11, 59, tzinfo=UTC),
+            captured_at=captured_at - timedelta(minutes=1),
             label="arb_extended_paradex",
             candidate=_canary_candidate(),
-            approval=_route_approval(),
+            approval=_route_approval(captured_at),
         ),
         system_state=_system_state(
             healthy_extended=True,
@@ -1258,15 +1260,11 @@ def test_execute_guarded_canary_cycle_from_latest_stable_launch_ready_snapshot(
 ) -> None:
     database_path = tmp_path / "history.sqlite3"
     launch_ready_store = LaunchReadyCanaryStore(database_path)
+    base_time = datetime.now(UTC) - timedelta(minutes=2)
+    snapshot = _launch_ready_snapshot(base_time)
+    launch_ready_store.append(snapshot)
     launch_ready_store.append(
-        _launch_ready_snapshot().model_copy(
-            update={"captured_at": datetime(2026, 3, 30, 12, 0, tzinfo=UTC)}
-        )
-    )
-    launch_ready_store.append(
-        _launch_ready_snapshot().model_copy(
-            update={"captured_at": datetime(2026, 3, 30, 12, 1, tzinfo=UTC)}
-        )
+        snapshot.model_copy(update={"captured_at": base_time + timedelta(minutes=1)})
     )
     paper_store = PaperTradeStore(database_path)
     preview_confirmation_store = PreviewConfirmationStore(database_path)
@@ -1449,6 +1447,7 @@ def test_execute_guarded_canary_cycle_from_latest_stable_launch_ready_skips_unse
 ) -> None:
     database_path = tmp_path / "history.sqlite3"
     launch_ready_store = LaunchReadyCanaryStore(database_path)
+    base_time = datetime.now(UTC) - timedelta(minutes=2)
 
     candidate = FundingUniverseCanaryCandidate(
         opportunity=FundingUniverseOpportunity(
@@ -1488,7 +1487,7 @@ def test_execute_guarded_canary_cycle_from_latest_stable_launch_ready_skips_unse
         suggested_canary_notional=11.0,
     )
     approval = RouteApprovalEntry(
-        updated_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        updated_at=base_time,
         label="arb_hyperliquid_paradex",
         canonical_symbol="ETH-USD-PERP",
         short_venue="hyperliquid",
@@ -1500,12 +1499,12 @@ def test_execute_guarded_canary_cycle_from_latest_stable_launch_ready_skips_unse
         note="approved canary",
     )
     snapshot = LaunchReadyCanarySnapshot(
-        captured_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+        captured_at=base_time,
         label="arb_hyperliquid_paradex",
         max_snapshot_age_seconds=300,
         approved_snapshot=ApprovedCanarySnapshot(
             snapshot_id=5,
-            captured_at=datetime(2026, 3, 30, 11, 59, tzinfo=UTC),
+            captured_at=base_time - timedelta(minutes=1),
             label="arb_hyperliquid_paradex",
             candidate=candidate,
             approval=approval,
@@ -1540,7 +1539,7 @@ def test_execute_guarded_canary_cycle_from_latest_stable_launch_ready_skips_unse
     launch_ready_store.append(snapshot)
     launch_ready_store.append(
         snapshot.model_copy(
-            update={"captured_at": datetime(2026, 3, 30, 12, 1, tzinfo=UTC)}
+            update={"captured_at": base_time + timedelta(minutes=1)}
         )
     )
 

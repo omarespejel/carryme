@@ -20,6 +20,9 @@ dependencies = [
   "carryme-storage",
 ]
 
+[project.scripts]
+carryme-render-validate = "carryme_dev.render:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/carryme_dev"]
 

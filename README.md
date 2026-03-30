@@ -36,6 +36,10 @@ uv run carryme-worker
 uv run carryme-worker --supervise
 uv run carryme-worker --observe-executions-supervise
 uv run carryme-worker --ready
+DATABASE_URL=sqlite:///data/render-validate.sqlite3 \
+CARRYME_API_ENVIRONMENT=production \
+CARRYME_WORKER_ENVIRONMENT=production \
+uv run carryme-render-validate --skip-db-ping
 ```
 
 Useful worker modes:
@@ -56,3 +60,4 @@ The production target is Render with managed Postgres and split background worke
 
 1. Blueprint: [render.yaml](render.yaml)
 2. Deployment guide: [docs/deploy/render.md](docs/deploy/render.md)
+3. Render env template: [.env.render.example](.env.render.example)
