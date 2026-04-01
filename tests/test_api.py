@@ -26,6 +26,8 @@ from carryme_api.app import (
 from carryme_api.config import ApiSettings
 from carryme_models import (
     ApprovedCanaryAlertEvent,
+    ApprovedCanaryBasketEntry,
+    ApprovedCanaryBasketPlan,
     ApprovedCanarySnapshot,
     CandidateAlertEvent,
     CapacityEstimate,
@@ -595,6 +597,139 @@ def test_funding_universe_canary_endpoint_can_filter_approved_routes() -> None:
     payload = response.json()
     assert len(payload) == 1
     assert payload[0]["suggested_canary_notional"] == 11.0
+
+
+def test_approved_canary_basket_endpoint_uses_service_dependency() -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="S-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.0025,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00205,
+                one_day_net_edge_after_round_trip=0.0016,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.4,
+                capacity=CapacityEstimate(
+                    short_bid_notional=2000.0,
+                    long_ask_notional=300.0,
+                    max_entry_notional=300.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="S-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="S-USD-PERP",
+                ),
+            },
+            deployable_notional=300.0,
+            estimated_one_day_pnl_after_entry=0.615,
+            estimated_one_day_pnl_after_round_trip=0.48,
+            execution_adjusted_one_day_pnl_after_round_trip=0.36,
+            stability_adjusted_one_day_pnl_after_round_trip=0.24,
+        ),
+        suggested_canary_notional=11.0,
+    )
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        def resolve_fee_profiles(
+            self,
+            *,
+            venues: list[str],
+            fee_profile_overrides: dict[str, str] | None = None,
+        ) -> dict[str, str]:
+            assert venues == ["extended", "paradex"]
+            assert fee_profile_overrides == {"paradex": "pro_fastfills"}
+            return {"extended": "default", "paradex": "pro_fastfills"}
+
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            return [candidate]
+
+    class StubRouteApprovalService:
+        def build_approved_canary_basket_plan(
+            self,
+            *,
+            candidates: list[FundingUniverseCanaryCandidate],
+            venues: list[str],
+            fee_profiles: dict[str, str],
+            target_notional: float,
+        ) -> ApprovedCanaryBasketPlan:
+            assert candidates == [candidate]
+            assert target_notional == 5000.0
+            return ApprovedCanaryBasketPlan(
+                venues=venues,
+                fee_profiles=fee_profiles,
+                target_notional=5000.0,
+                allocated_notional=11.0,
+                unused_notional=4989.0,
+                estimated_one_day_pnl_after_entry=0.02255,
+                estimated_one_day_pnl_after_round_trip=0.0176,
+                execution_adjusted_estimated_one_day_pnl_after_round_trip=0.0132,
+                stability_adjusted_estimated_one_day_pnl_after_round_trip=0.0088,
+                route_adjusted_estimated_one_day_pnl_after_round_trip=0.0066,
+                entries=[
+                    ApprovedCanaryBasketEntry(
+                        label="s_extended_paradex",
+                        approval=RouteApprovalEntry(
+                            updated_at=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+                            label="s_extended_paradex",
+                            canonical_symbol="S-USD-PERP",
+                            short_venue="extended",
+                            long_venue="paradex",
+                            short_fee_profile="default",
+                            long_fee_profile="pro_fastfills",
+                            approved=True,
+                            max_live_notional=11.0,
+                            note="approved",
+                        ),
+                        candidate=candidate,
+                        selected_notional=11.0,
+                        estimated_one_day_pnl_after_entry=0.02255,
+                        estimated_one_day_pnl_after_round_trip=0.0176,
+                        execution_adjusted_estimated_one_day_pnl_after_round_trip=0.0132,
+                        stability_adjusted_estimated_one_day_pnl_after_round_trip=0.0088,
+                        route_adjusted_estimated_one_day_pnl_after_round_trip=0.0066,
+                    )
+                ],
+            )
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approved-basket",
+            params=[("venues", "extended"), ("venues", "paradex")],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["fee_profile_overrides"] == {"paradex": "pro_fastfills"}
+    assert captured["min_route_stability_weight"] == 0.10
+    assert captured["min_route_presence_ratio"] == 0.15
+    payload = response.json()
+    assert payload["fee_profiles"]["extended"] == "default"
+    assert payload["fee_profiles"]["paradex"] == "pro_fastfills"
+    assert payload["target_notional"] == 5000.0
+    assert payload["allocated_notional"] == 11.0
+    assert payload["unused_notional"] == 4989.0
+    assert payload["entries"][0]["label"] == "s_extended_paradex"
+    assert payload["entries"][0]["selected_notional"] == 11.0
 
 
 def test_funding_universe_portfolio_endpoint_uses_service_dependency() -> None:

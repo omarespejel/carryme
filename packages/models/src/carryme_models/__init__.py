@@ -80,6 +80,8 @@ from carryme_models.system_state import PaperTradeSystemState, VenueSystemState
 from carryme_models.system_state_alert import SystemStateAlertEvent
 from carryme_models.universe import (
     SUPPORTED_UNIVERSE_VENUES,
+    ApprovedCanaryBasketEntry,
+    ApprovedCanaryBasketPlan,
     ExecutionQualitySummary,
     FundingUniverseCanaryCandidate,
     FundingUniverseOpportunity,
@@ -93,6 +95,8 @@ from carryme_models.universe import (
 
 __all__ = [
     "AppDescriptor",
+    "ApprovedCanaryBasketEntry",
+    "ApprovedCanaryBasketPlan",
     "ApprovedCanaryAlertEvent",
     "ApprovedCanarySnapshot",
     "CapacityEstimate",
