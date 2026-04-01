@@ -523,8 +523,8 @@ def test_funding_universe_canary_endpoint_uses_policy_defaults() -> None:
     assert captured["fee_profile_overrides"] == {"paradex": "pro_fastfills"}
     assert captured["min_execution_quality_score"] == 0.5
     assert captured["min_execution_samples"] == 0
-    assert captured["min_route_stability_weight"] == 0.35
-    assert captured["min_route_presence_ratio"] == 0.35
+    assert captured["min_route_stability_weight"] == 0.10
+    assert captured["min_route_presence_ratio"] == 0.15
     assert captured["min_route_samples"] == 2
     assert captured["exclude_tags"] is None
 
