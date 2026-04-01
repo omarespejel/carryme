@@ -89,8 +89,8 @@ class WorkerSettings(BaseSettings):
     approved_canary_scan_min_roundtrip_edge: float = 0.0
     approved_canary_scan_min_execution_quality_score: float = 0.5
     approved_canary_scan_min_execution_samples: int = 0
-    approved_canary_scan_min_route_stability_weight: float = 0.35
-    approved_canary_scan_min_route_presence_ratio: float = 0.35
+    approved_canary_scan_min_route_stability_weight: float = 0.10
+    approved_canary_scan_min_route_presence_ratio: float = 0.15
     approved_canary_scan_min_route_samples: int = 2
     approved_canary_scan_limit: int = 5
     approved_canary_scan_include_symbols: tuple[str, ...] = ()

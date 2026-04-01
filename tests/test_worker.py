@@ -191,6 +191,10 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.universe_scan_min_route_samples == 0
     assert settings.universe_scan_min_execution_samples == 0
     assert settings.universe_scan_limit == 10
+    assert settings.approved_canary_scan_min_execution_quality_score == 0.5
+    assert settings.approved_canary_scan_min_route_stability_weight == 0.10
+    assert settings.approved_canary_scan_min_route_presence_ratio == 0.15
+    assert settings.approved_canary_scan_min_route_samples == 2
     assert settings.paradex_recv_window_ms == 300000
     assert settings.stop_signals == ("SIGINT", "SIGTERM")
     assert settings.database_path == "data/carryme.sqlite3"
