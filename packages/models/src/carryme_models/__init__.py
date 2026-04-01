@@ -18,7 +18,12 @@ from carryme_models.balance_accounting import (
     VenueBalanceDelta,
     VenueBalanceSnapshot,
 )
-from carryme_models.canary import CanaryLifecycleResult
+from carryme_models.canary import (
+    CanaryBasketBalanceDelta,
+    CanaryBasketLaunchResult,
+    CanaryBasketRouteOutcome,
+    CanaryLifecycleResult,
+)
 from carryme_models.confirmation import (
     CleanupPreviewConfirmationEntry,
     PairClosePreviewConfirmationEntry,
@@ -101,6 +106,9 @@ __all__ = [
     "ApprovedCanarySnapshot",
     "CapacityEstimate",
     "CandidateAlertEvent",
+    "CanaryBasketBalanceDelta",
+    "CanaryBasketLaunchResult",
+    "CanaryBasketRouteOutcome",
     "CanaryLifecycleResult",
     "ExecutionAlertEvent",
     "PaperTradeBalanceDelta",

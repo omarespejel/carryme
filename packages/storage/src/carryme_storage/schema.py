@@ -10,6 +10,7 @@ from carryme_storage.alerts import CandidateAlertStore
 from carryme_storage.approved_canaries import ApprovedCanaryStore
 from carryme_storage.approved_canary_alerts import ApprovedCanaryAlertStore
 from carryme_storage.balance_snapshots import BalanceSnapshotStore
+from carryme_storage.canary_basket_launches import CanaryBasketLaunchStore
 from carryme_storage.cleanup_preview_confirmations import CleanupPreviewConfirmationStore
 from carryme_storage.execution_alerts import ExecutionAlertStore
 from carryme_storage.execution_observations import ExecutionObservationStore
@@ -40,6 +41,7 @@ SCHEMA_TABLES: Sequence[str] = (
     "approved_canary_snapshots",
     "approved_canary_alert_events",
     "balance_snapshot_entries",
+    "canary_basket_launch_records",
     "cleanup_preview_confirmation_entries",
     "execution_alert_events",
     "execution_observation_entries",
@@ -60,6 +62,7 @@ _STORE_FACTORIES: Sequence[StoreFactory] = (
     ApprovedCanaryStore,
     ApprovedCanaryAlertStore,
     BalanceSnapshotStore,
+    CanaryBasketLaunchStore,
     CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
     ExecutionObservationStore,

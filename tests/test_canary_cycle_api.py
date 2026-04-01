@@ -9,6 +9,7 @@ from carryme_api.app import (
     get_api_settings,
     get_approved_canary_store,
     get_balance_accounting_service,
+    get_canary_basket_launch_store,
     get_cleanup_live_execution_router,
     get_cleanup_preview_confirmation_store,
     get_cleanup_preview_service,
@@ -25,10 +26,14 @@ from carryme_api.app import (
     get_paper_trade_store,
     get_preview_confirmation_store,
     get_route_approval_service,
+    get_system_state_service,
 )
 from carryme_api.config import ApiSettings
 from carryme_models import (
+    ApprovedCanaryBasketEntry,
+    ApprovedCanaryBasketPlan,
     ApprovedCanarySnapshot,
+    CanaryBasketLaunchResult,
     CapacityEstimate,
     ExecutionCleanupPreview,
     ExecutionJournalEntry,
@@ -59,6 +64,7 @@ from carryme_runtime import BalanceAccountingService
 from carryme_storage import (
     ApprovedCanaryStore,
     BalanceSnapshotStore,
+    CanaryBasketLaunchStore,
     CleanupPreviewConfirmationStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
@@ -534,6 +540,165 @@ def _override_common_dependencies(
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: _StubPairedLiveExecutionCoordinator()
     )
+
+
+def test_execute_guarded_approved_canary_basket_uses_shared_cap_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    paper_store = PaperTradeStore(database_path)
+    preview_confirmation_store = PreviewConfirmationStore(database_path)
+    pair_close_confirmation_store = PairClosePreviewConfirmationStore(database_path)
+    cleanup_confirmation_store = CleanupPreviewConfirmationStore(database_path)
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    snapshot_store = BalanceSnapshotStore(database_path)
+    basket_store = CanaryBasketLaunchStore(database_path)
+
+    _override_common_dependencies(
+        paper_store=paper_store,
+        preview_confirmation_store=preview_confirmation_store,
+        pair_close_confirmation_store=pair_close_confirmation_store,
+        cleanup_confirmation_store=cleanup_confirmation_store,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        snapshot_store=snapshot_store,
+    )
+    app.dependency_overrides[get_canary_basket_launch_store] = lambda: basket_store
+    app.dependency_overrides[get_account_preflight_service] = lambda: object()
+    app.dependency_overrides[get_system_state_service] = lambda: object()
+    app.dependency_overrides[get_execution_order_state_service] = lambda: object()
+
+    basket_plan = ApprovedCanaryBasketPlan(
+        venues=["extended", "paradex"],
+        fee_profiles={"extended": "default", "paradex": "pro_fastfills"},
+        target_notional=20.0,
+        allocated_notional=11.0,
+        unused_notional=9.0,
+        estimated_one_day_pnl_after_entry=0.02255,
+        estimated_one_day_pnl_after_round_trip=0.0176,
+        execution_adjusted_estimated_one_day_pnl_after_round_trip=0.0132,
+        stability_adjusted_estimated_one_day_pnl_after_round_trip=0.0088,
+        route_adjusted_estimated_one_day_pnl_after_round_trip=0.0066,
+        entries=[
+            ApprovedCanaryBasketEntry(
+                label="arb_extended_paradex",
+                approval=_route_approval(),
+                candidate=_canary_candidate(),
+                selected_notional=11.0,
+                estimated_one_day_pnl_after_entry=0.02255,
+                estimated_one_day_pnl_after_round_trip=0.0176,
+                execution_adjusted_estimated_one_day_pnl_after_round_trip=0.0132,
+                stability_adjusted_estimated_one_day_pnl_after_round_trip=0.0088,
+                route_adjusted_estimated_one_day_pnl_after_round_trip=0.0066,
+            )
+        ],
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_scan_approved_canary_basket_plan(**kwargs: object) -> ApprovedCanaryBasketPlan:
+        captured.update(kwargs)
+        return basket_plan
+
+    async def fake_execute_approved_canary_basket_plan(
+        **kwargs: object,
+    ) -> CanaryBasketLaunchResult:
+        assert kwargs["basket_plan"] == basket_plan
+        assert kwargs["continue_on_failure"] is False
+        return CanaryBasketLaunchResult(
+            launched_at=datetime(2026, 4, 1, 14, 0, tzinfo=UTC),
+            status="completed",
+            basket_plan=basket_plan,
+            route_count=0,
+            successful_route_count=0,
+            failed_route_count=0,
+            routes=[],
+            balance_delta=None,
+            notes=[],
+        )
+
+    monkeypatch.setattr(
+        "carryme_api.app._scan_approved_canary_basket_plan",
+        fake_scan_approved_canary_basket_plan,
+    )
+    monkeypatch.setattr(
+        "carryme_api.app._execute_approved_canary_basket_plan",
+        fake_execute_approved_canary_basket_plan,
+    )
+
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/v1/executions/live/canary-cycle/approved-basket",
+            params=[("venues", "extended"), ("venues", "paradex")],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["target_notional"] == 5000.0
+    payload = response.json()
+    assert payload["basket_plan"]["allocated_notional"] == 11.0
+    assert payload["basket_plan"]["unused_notional"] == 9.0
+
+
+def test_approved_canary_basket_launches_endpoint_lists_recent(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    store = CanaryBasketLaunchStore(database_path)
+    candidate = _canary_candidate()
+    approval = _route_approval()
+    basket_plan = ApprovedCanaryBasketPlan(
+        venues=["extended", "paradex"],
+        fee_profiles={"extended": "default", "paradex": "pro_fastfills"},
+        target_notional=11.0,
+        allocated_notional=11.0,
+        unused_notional=0.0,
+        estimated_one_day_pnl_after_entry=0.02255,
+        estimated_one_day_pnl_after_round_trip=0.0176,
+        execution_adjusted_estimated_one_day_pnl_after_round_trip=0.0132,
+        stability_adjusted_estimated_one_day_pnl_after_round_trip=0.0088,
+        route_adjusted_estimated_one_day_pnl_after_round_trip=0.0066,
+        entries=[
+            ApprovedCanaryBasketEntry(
+                label="arb_extended_paradex",
+                approval=approval,
+                candidate=candidate,
+                selected_notional=11.0,
+                estimated_one_day_pnl_after_entry=0.02255,
+                estimated_one_day_pnl_after_round_trip=0.0176,
+                execution_adjusted_estimated_one_day_pnl_after_round_trip=0.0132,
+                stability_adjusted_estimated_one_day_pnl_after_round_trip=0.0088,
+                route_adjusted_estimated_one_day_pnl_after_round_trip=0.0066,
+            )
+        ],
+    )
+    store.append(
+        CanaryBasketLaunchResult(
+            launched_at=datetime(2026, 4, 1, 14, 0, tzinfo=UTC),
+            status="completed",
+            basket_plan=basket_plan,
+            route_count=1,
+            successful_route_count=1,
+            failed_route_count=0,
+            routes=[],
+            balance_delta=None,
+            notes=[],
+        )
+    )
+    app.dependency_overrides[get_canary_basket_launch_store] = lambda: store
+    client = TestClient(app)
+
+    try:
+        response = client.get("/v1/executions/live/canary-cycle/approved-baskets")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["status"] == "completed"
+    assert payload[0]["basket_plan"]["entries"][0]["label"] == "arb_extended_paradex"
 
 
 def test_execute_guarded_canary_cycle_runs_open_and_close_with_balance_summary(
