@@ -1632,6 +1632,130 @@ def test_execution_quality_service_keeps_persisted_outcome_when_latest_entry_cha
     assert summary.weighted_score == pytest.approx((2 * 0.65) / 3)
 
 
+def test_execution_quality_service_skips_reclassification_without_entry_identity(
+    tmp_path: Path,
+) -> None:
+    journal_store = ExecutionJournalStore(tmp_path / "execution-quality-null-ids.sqlite3")
+    observation_store = ExecutionObservationStore(tmp_path / "execution-quality-null-ids.sqlite3")
+
+    original_entry = journal_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 12, 6, tzinfo=UTC),
+            adapter="extended_cleanup_live",
+            mode="live",
+            status="submitted",
+            paper_trade_id=1,
+            preview_hash="cleanup-hash",
+            confirmation_entry_id=1,
+            paper_trade=PaperTradeEntry(
+                entry_id=1,
+                created_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label="s_extended_paradex",
+                    canonical_symbol="S-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 11, 59, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.001,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.1,
+                    max_target_notional=100.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="S-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="S-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="S-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    request_payload={"reduce_only": True},
+                )
+            ],
+        )
+    )
+
+    order_state = ExecutionOrderState(
+        execution_entry_id=None,
+        paper_trade_id=1,
+        preview_hash="cleanup-hash",
+        legs=[],
+        notes=[],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=None,
+        paper_trade_id=1,
+        preview_hash="cleanup-hash",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="extended",
+                authenticated=True,
+                ready=True,
+                available_to_trade=4.8,
+                position_symbols=[],
+            ),
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                free_collateral=14.8,
+                position_symbols=[],
+            ),
+        ],
+        notes=[],
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 12, 7, tzinfo=UTC),
+            context="guarded_pair_poll",
+            execution_entry_id=original_entry.entry_id,
+            paper_trade_id=1,
+            preview_hash="cleanup-hash",
+            order_state=order_state,
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=None,
+                paper_trade_id=1,
+                preview_hash="cleanup-hash",
+                derived_state="review_required",
+                recommended_action="manual_review_required",
+                order_state=order_state,
+                reconciliation=reconciliation,
+                notes=[],
+            ),
+        )
+    )
+
+    summary = ExecutionQualityService(
+        journal_store=journal_store,
+        observation_store=observation_store,
+    ).build_index()[("S-USD-PERP", "extended", "paradex")]
+
+    assert summary.sample_size == 1
+    assert summary.latest_outcome == "review_required"
+    assert summary.closed_count == 0
+    assert summary.review_required_count == 1
+    assert summary.weighted_score == pytest.approx((2 * 0.65) / 3)
+
+
 def test_execution_quality_service_lists_ranked_summaries(tmp_path: Path) -> None:
     journal_store = ExecutionJournalStore(tmp_path / "execution-quality-list.sqlite3")
     observation_store = ExecutionObservationStore(tmp_path / "execution-quality-list.sqlite3")
