@@ -460,6 +460,16 @@ def _reprice_leg_within_confirmed_cap(
     if top_of_book is None:
         raise ValueError(f"Paradex is missing top-of-book data for {leg.symbol}")
 
+    current_limit_text = None
+    payload_price = leg.payload.get("price")
+    if isinstance(payload_price, str) and payload_price:
+        current_limit_text = payload_price
+    else:
+        current_limit_text = leg.worst_price_text
+
+    current_limit = Decimal(current_limit_text)
+    confirmed_limit = Decimal(leg.worst_price_text)
+
     if leg.side == "buy":
         book_price = top_of_book.best_ask_price
         if book_price is None or book_price <= 0:
@@ -471,10 +481,10 @@ def _reprice_leg_within_confirmed_cap(
                 top_of_book.best_ask_size,
             )
         candidate = Decimal(str(book_price)) * (
-            Decimal("1") + (Decimal(book_slippage_bps) / Decimal(10_000))
+            Decimal("1")
+            + ((Decimal(book_slippage_bps) * Decimal(attempt_index)) / Decimal(10_000))
         )
-        confirmed_limit = Decimal(leg.worst_price_text)
-        adjusted = min(candidate, confirmed_limit)
+        adjusted = min(max(candidate, current_limit), confirmed_limit)
     else:
         book_price = top_of_book.best_bid_price
         if book_price is None or book_price <= 0:
@@ -486,10 +496,10 @@ def _reprice_leg_within_confirmed_cap(
                 top_of_book.best_bid_size,
             )
         candidate = Decimal(str(book_price)) * (
-            Decimal("1") - (Decimal(book_slippage_bps) / Decimal(10_000))
+            Decimal("1")
+            - ((Decimal(book_slippage_bps) * Decimal(attempt_index)) / Decimal(10_000))
         )
-        confirmed_limit = Decimal(leg.worst_price_text)
-        adjusted = max(candidate, confirmed_limit)
+        adjusted = max(min(candidate, current_limit), confirmed_limit)
 
     price_increment = Decimal(str(leg.price_increment)) if leg.price_increment is not None else None
     snapped = _snap_price(adjusted, price_increment, side=leg.side)
@@ -506,8 +516,9 @@ def _reprice_leg_within_confirmed_cap(
     notes = [
         *leg.notes,
         (
-            "Retry repriced against the current Paradex top-of-book without exceeding "
-            "the confirmed worst acceptable price."
+            "Retry repriced against the current Paradex top-of-book without getting "
+            "less aggressive than the previous attempt or exceeding the confirmed "
+            "worst acceptable price."
         ),
     ]
     return leg.model_copy(

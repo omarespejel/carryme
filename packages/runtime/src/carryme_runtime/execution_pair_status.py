@@ -70,10 +70,15 @@ def build_execution_pair_status(
         else:
             recommended_action = "complete_or_unwind_missing_leg"
             notes.append("Only part of the intended hedge is present in live position state.")
-    elif _is_cleanup_execution(entry) and any_filled and not any_position:
+    elif (
+        _is_cleanup_execution(entry)
+        and not any_position
+        and not any_open
+        and not any_partial_fill
+    ):
         derived_state = "closed"
         recommended_action = "no_action"
-        notes.append("Reduce-only cleanup execution filled and no live positions remain.")
+        notes.append("Reduce-only cleanup execution left no live positions remaining.")
     elif any_filled:
         derived_state = "review_required"
         recommended_action = "manual_review_required"
