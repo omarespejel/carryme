@@ -11734,11 +11734,14 @@ def test_route_approval_service_builds_approved_canary_basket_plan(
     plan = service.build_approved_canary_basket_plan(
         candidates=[candidate],
         venues=["extended", "paradex"],
-        fee_profiles={"paradex": "pro_fastfills"},
+        fee_profiles={"extended": "default", "paradex": "pro_fastfills"},
+        target_notional=25.0,
     )
 
-    assert plan.target_notional == 11.0
+    assert plan.target_notional == 25.0
     assert plan.allocated_notional == 11.0
+    assert plan.unused_notional == 14.0
+    assert plan.fee_profiles == {"extended": "default", "paradex": "pro_fastfills"}
     assert len(plan.entries) == 1
     assert plan.entries[0].label == "s_extended_paradex"
     assert plan.entries[0].selected_notional == 11.0
@@ -11749,6 +11752,85 @@ def test_route_approval_service_builds_approved_canary_basket_plan(
         0
     ].route_adjusted_estimated_one_day_pnl_after_round_trip == pytest.approx(
         0.48 * (11.0 / 300.0) * (0.36 / 0.48) * 0.4
+    )
+
+
+def test_route_approval_service_preserves_missing_adjusted_pnl_in_basket_plan(
+    tmp_path: Path,
+) -> None:
+    store = RouteApprovalStore(tmp_path / "basket-missing-adjusted.sqlite3")
+    service = RouteApprovalService(store=store)
+    service.upsert(
+        label="s_extended_paradex",
+        payload=RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="missing adjusted metrics",
+        ),
+    )
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="S-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.0025,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00205,
+                one_day_net_edge_after_round_trip=0.0016,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.4,
+                capacity=CapacityEstimate(
+                    short_bid_notional=2000.0,
+                    long_ask_notional=300.0,
+                    max_entry_notional=300.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="S-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="S-USD-PERP",
+                ),
+            },
+            deployable_notional=300.0,
+            estimated_one_day_pnl_after_entry=0.615,
+            estimated_one_day_pnl_after_round_trip=0.48,
+            execution_adjusted_one_day_pnl_after_round_trip=None,
+            stability_adjusted_one_day_pnl_after_round_trip=None,
+            route_stability=None,
+        ),
+        suggested_canary_notional=11.0,
+    )
+
+    plan = service.build_approved_canary_basket_plan(
+        candidates=[candidate],
+        venues=["extended", "paradex"],
+        fee_profiles={"extended": "default", "paradex": "pro_fastfills"},
+        target_notional=11.0,
+    )
+
+    assert plan.execution_adjusted_estimated_one_day_pnl_after_round_trip is None
+    assert plan.stability_adjusted_estimated_one_day_pnl_after_round_trip is None
+    assert (
+        plan.entries[0].execution_adjusted_estimated_one_day_pnl_after_round_trip is None
+    )
+    assert (
+        plan.entries[0].stability_adjusted_estimated_one_day_pnl_after_round_trip is None
     )
 
 

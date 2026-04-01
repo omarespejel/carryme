@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TypedDict
 
 from carryme_models import (
     ApprovedCanaryBasketEntry,
@@ -17,6 +18,14 @@ from carryme_models import (
 from carryme_storage import RouteApprovalStore
 
 from carryme_runtime.universe import build_pair_spec_from_universe_opportunity
+
+
+class _ScaledCandidatePnl(TypedDict):
+    entry: float
+    round_trip: float
+    execution_adjusted: float | None
+    stability_adjusted: float | None
+    route_adjusted: float
 
 
 @dataclass
@@ -138,23 +147,29 @@ class RouteApprovalService:
         candidates: list[FundingUniverseCanaryCandidate],
         venues: list[str],
         fee_profiles: dict[str, str],
+        target_notional: float,
     ) -> ApprovedCanaryBasketPlan:
         """Return a capped live-approved canary basket plan."""
 
         approved_candidates = self.filter_approved_canary_candidates(candidates)
         entries: list[ApprovedCanaryBasketEntry] = []
+        remaining_notional = max(0.0, target_notional)
         total_notional = 0.0
         total_entry_pnl = 0.0
         total_round_trip_pnl = 0.0
-        total_execution_adjusted_round_trip_pnl = 0.0
-        total_stability_adjusted_round_trip_pnl = 0.0
+        total_execution_adjusted_round_trip_pnl: float | None = 0.0
+        total_stability_adjusted_round_trip_pnl: float | None = 0.0
         total_route_adjusted_round_trip_pnl = 0.0
 
         for candidate in approved_candidates:
+            if remaining_notional <= 0:
+                break
             approval = self.get_for_candidate(candidate)
             if approval is None or not approval.approved:
                 continue
-            selected_notional = candidate.suggested_canary_notional
+            selected_notional = min(candidate.suggested_canary_notional, remaining_notional)
+            if selected_notional <= 0:
+                continue
             scaled = _scaled_candidate_pnl(
                 opportunity=candidate.opportunity,
                 selected_notional=selected_notional,
@@ -181,16 +196,23 @@ class RouteApprovalService:
             total_notional += selected_notional
             total_entry_pnl += scaled["entry"]
             total_round_trip_pnl += scaled["round_trip"]
-            total_execution_adjusted_round_trip_pnl += scaled["execution_adjusted"]
-            total_stability_adjusted_round_trip_pnl += scaled["stability_adjusted"]
+            total_execution_adjusted_round_trip_pnl = _sum_optional(
+                total_execution_adjusted_round_trip_pnl,
+                scaled["execution_adjusted"],
+            )
+            total_stability_adjusted_round_trip_pnl = _sum_optional(
+                total_stability_adjusted_round_trip_pnl,
+                scaled["stability_adjusted"],
+            )
             total_route_adjusted_round_trip_pnl += scaled["route_adjusted"]
+            remaining_notional -= selected_notional
 
         return ApprovedCanaryBasketPlan(
             venues=venues,
             fee_profiles=fee_profiles,
-            target_notional=total_notional,
+            target_notional=target_notional,
             allocated_notional=total_notional,
-            unused_notional=0.0,
+            unused_notional=max(0.0, remaining_notional),
             estimated_one_day_pnl_after_entry=total_entry_pnl,
             estimated_one_day_pnl_after_round_trip=total_round_trip_pnl,
             execution_adjusted_estimated_one_day_pnl_after_round_trip=(
@@ -210,7 +232,7 @@ def _scaled_candidate_pnl(
     *,
     opportunity: FundingUniverseOpportunity,
     selected_notional: float,
-) -> dict[str, float]:
+) -> _ScaledCandidatePnl:
     deployable_notional = opportunity.deployable_notional or 0.0
     if deployable_notional <= 0 or selected_notional <= 0:
         return {
@@ -242,11 +264,21 @@ def _scaled_candidate_pnl(
     return {
         "entry": _scaled(opportunity.estimated_one_day_pnl_after_entry),
         "round_trip": scaled_round_trip,
-        "execution_adjusted": _scaled(
-            opportunity.execution_adjusted_one_day_pnl_after_round_trip
+        "execution_adjusted": (
+            None
+            if opportunity.execution_adjusted_one_day_pnl_after_round_trip is None
+            else _scaled(opportunity.execution_adjusted_one_day_pnl_after_round_trip)
         ),
-        "stability_adjusted": _scaled(
-            opportunity.stability_adjusted_one_day_pnl_after_round_trip
+        "stability_adjusted": (
+            None
+            if opportunity.stability_adjusted_one_day_pnl_after_round_trip is None
+            else _scaled(opportunity.stability_adjusted_one_day_pnl_after_round_trip)
         ),
         "route_adjusted": scaled_round_trip * execution_weight * stability_weight,
     }
+
+
+def _sum_optional(total: float | None, value: float | None) -> float | None:
+    if total is None or value is None:
+        return None
+    return total + value

@@ -643,6 +643,16 @@ def test_approved_canary_basket_endpoint_uses_service_dependency() -> None:
     captured: dict[str, object] = {}
 
     class StubUniverseService:
+        def resolve_fee_profiles(
+            self,
+            *,
+            venues: list[str],
+            fee_profile_overrides: dict[str, str] | None = None,
+        ) -> dict[str, str]:
+            assert venues == ["extended", "paradex"]
+            assert fee_profile_overrides == {"paradex": "pro_fastfills"}
+            return {"extended": "default", "paradex": "pro_fastfills"}
+
         async def scan_canary_candidates(
             self, **kwargs: object
         ) -> list[FundingUniverseCanaryCandidate]:
@@ -656,14 +666,16 @@ def test_approved_canary_basket_endpoint_uses_service_dependency() -> None:
             candidates: list[FundingUniverseCanaryCandidate],
             venues: list[str],
             fee_profiles: dict[str, str],
+            target_notional: float,
         ) -> ApprovedCanaryBasketPlan:
             assert candidates == [candidate]
+            assert target_notional == 5000.0
             return ApprovedCanaryBasketPlan(
                 venues=venues,
                 fee_profiles=fee_profiles,
-                target_notional=11.0,
+                target_notional=5000.0,
                 allocated_notional=11.0,
-                unused_notional=0.0,
+                unused_notional=4989.0,
                 estimated_one_day_pnl_after_entry=0.02255,
                 estimated_one_day_pnl_after_round_trip=0.0176,
                 execution_adjusted_estimated_one_day_pnl_after_round_trip=0.0132,
@@ -697,20 +709,25 @@ def test_approved_canary_basket_endpoint_uses_service_dependency() -> None:
 
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
     app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
-    client = TestClient(app)
-
-    response = client.get(
-        "/v1/opportunities/funding-universe/canary/approved-basket",
-        params=[("venues", "extended"), ("venues", "paradex")],
-    )
-
-    app.dependency_overrides.clear()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approved-basket",
+            params=[("venues", "extended"), ("venues", "paradex")],
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
+    assert captured["fee_profile_overrides"] == {"paradex": "pro_fastfills"}
     assert captured["min_route_stability_weight"] == 0.10
     assert captured["min_route_presence_ratio"] == 0.15
     payload = response.json()
+    assert payload["fee_profiles"]["extended"] == "default"
+    assert payload["fee_profiles"]["paradex"] == "pro_fastfills"
+    assert payload["target_notional"] == 5000.0
     assert payload["allocated_notional"] == 11.0
+    assert payload["unused_notional"] == 4989.0
     assert payload["entries"][0]["label"] == "s_extended_paradex"
     assert payload["entries"][0]["selected_notional"] == 11.0
 

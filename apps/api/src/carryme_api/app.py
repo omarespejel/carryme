@@ -2746,14 +2746,19 @@ def create_app() -> FastAPI:
     ) -> ApprovedCanaryBasketPlan:
         try:
             selected_venues = venues or ["extended", "paradex", "hyperliquid"]
-            fee_profiles = _build_fee_profile_overrides(
+            fee_profile_overrides = _build_fee_profile_overrides(
                 extended_fee_profile=extended_fee_profile,
                 paradex_fee_profile=paradex_fee_profile,
                 hyperliquid_fee_profile=hyperliquid_fee_profile,
             ) or {}
-            candidates = await service.scan_canary_candidates(
+            resolved_fee_profiles = service.resolve_fee_profiles(
                 venues=selected_venues,
-                fee_profile_overrides=fee_profiles,
+                fee_profile_overrides=fee_profile_overrides,
+            )
+            resolved_venues = list(resolved_fee_profiles)
+            candidates = await service.scan_canary_candidates(
+                venues=resolved_venues,
+                fee_profile_overrides=fee_profile_overrides or None,
                 target_notional=target_notional,
                 canary_max_notional=canary_max_notional,
                 min_capacity_notional=min_capacity_notional,
@@ -2772,8 +2777,9 @@ def create_app() -> FastAPI:
             )
             return approval_service.build_approved_canary_basket_plan(
                 candidates=candidates,
-                venues=selected_venues,
-                fee_profiles=fee_profiles,
+                venues=resolved_venues,
+                fee_profiles=resolved_fee_profiles,
+                target_notional=target_notional,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

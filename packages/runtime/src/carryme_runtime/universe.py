@@ -111,6 +111,21 @@ class OpportunityUniverseService:
     execution_quality_service: ExecutionQualityService | None = None
     route_stability_service: RouteStabilityService | None = None
 
+    def resolve_fee_profiles(
+        self,
+        *,
+        venues: list[str],
+        fee_profile_overrides: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        """Return the normalized venue fee-profile map used for universe scans."""
+
+        normalized_venues = _normalize_venues(venues)
+        return _resolve_fee_profiles(
+            normalized_venues,
+            self.default_fee_profiles,
+            fee_profile_overrides,
+        )
+
     async def scan_canary_candidates(
         self,
         *,
