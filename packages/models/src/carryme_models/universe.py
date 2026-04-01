@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from carryme_models.approval import RouteApprovalEntry
 from carryme_models.opportunity import FundingArbOpportunity
 
 SUPPORTED_UNIVERSE_VENUES: tuple[str, ...] = ("extended", "paradex", "hyperliquid")
@@ -142,6 +143,50 @@ class FundingUniverseCanaryCandidate(BaseModel):
 
     opportunity: FundingUniverseOpportunity
     suggested_canary_notional: float = Field(ge=0)
+
+
+class ApprovedCanaryBasketEntry(BaseModel):
+    """One currently launchable approved canary route."""
+
+    label: str = Field(min_length=1)
+    approval: RouteApprovalEntry
+    candidate: FundingUniverseCanaryCandidate
+    selected_notional: float = Field(ge=0)
+    estimated_one_day_pnl_after_entry: float
+    estimated_one_day_pnl_after_round_trip: float
+    execution_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    stability_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    route_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+
+
+class ApprovedCanaryBasketPlan(BaseModel):
+    """A ranked basket of live-approved canary routes."""
+
+    venues: list[str] = Field(default_factory=list)
+    fee_profiles: dict[str, str] = Field(default_factory=dict)
+    target_notional: float = Field(ge=0)
+    allocated_notional: float = Field(ge=0)
+    unused_notional: float = Field(ge=0)
+    estimated_one_day_pnl_after_entry: float
+    estimated_one_day_pnl_after_round_trip: float
+    execution_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    stability_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    route_adjusted_estimated_one_day_pnl_after_round_trip: float | None = None
+    entries: list[ApprovedCanaryBasketEntry] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_totals(self) -> "ApprovedCanaryBasketPlan":
+        if not math.isclose(
+            self.target_notional,
+            self.allocated_notional + self.unused_notional,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "Approved canary basket target_notional must equal "
+                "allocated_notional + unused_notional"
+            )
+        return self
 
 
 class FundingUniversePortfolioEntry(BaseModel):

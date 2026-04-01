@@ -16,6 +16,7 @@ from carryme_models import (
     SUPPORTED_UNIVERSE_VENUES,
     AppDescriptor,
     ApprovedCanaryAlertEvent,
+    ApprovedCanaryBasketPlan,
     ApprovedCanarySnapshot,
     CanaryLifecycleResult,
     CandidateAlertEvent,
@@ -2710,6 +2711,74 @@ def create_app() -> FastAPI:
             canonical_symbol=canonical_symbol,
             approved=approved,
         )
+
+    @app.get(
+        "/v1/opportunities/funding-universe/canary/approved-basket",
+        response_model=ApprovedCanaryBasketPlan,
+    )
+    async def approved_canary_basket(
+        service: Annotated[
+            OpportunityUniverseService, Depends(get_opportunity_universe_service)
+        ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        venues: Annotated[list[str] | None, Query()] = None,
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = "pro_fastfills",
+        hyperliquid_fee_profile: str | None = None,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.10,
+        min_route_presence_ratio: float = 0.15,
+        min_route_samples: int = 2,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+        limit: int = 10,
+    ) -> ApprovedCanaryBasketPlan:
+        try:
+            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
+            fee_profiles = _build_fee_profile_overrides(
+                extended_fee_profile=extended_fee_profile,
+                paradex_fee_profile=paradex_fee_profile,
+                hyperliquid_fee_profile=hyperliquid_fee_profile,
+            ) or {}
+            candidates = await service.scan_canary_candidates(
+                venues=selected_venues,
+                fee_profile_overrides=fee_profiles,
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+                limit=limit,
+            )
+            return approval_service.build_approved_canary_basket_plan(
+                candidates=candidates,
+                venues=selected_venues,
+                fee_profiles=fee_profiles,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get(
         "/v1/opportunities/funding-universe/canary/snapshots",
