@@ -7,6 +7,7 @@ import logging
 import math
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Annotated, Any
@@ -18,6 +19,9 @@ from carryme_models import (
     ApprovedCanaryAlertEvent,
     ApprovedCanaryBasketPlan,
     ApprovedCanarySnapshot,
+    CanaryBasketBalanceDelta,
+    CanaryBasketLaunchResult,
+    CanaryBasketRouteOutcome,
     CanaryLifecycleResult,
     CandidateAlertEvent,
     CleanupPreviewConfirmationEntry,
@@ -117,6 +121,7 @@ from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
     BalanceSnapshotStore,
+    CanaryBasketLaunchStore,
     CandidateAlertStore,
     CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
@@ -153,6 +158,17 @@ APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
 MAX_HISTORY_LIMIT = 1000
 PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _CanaryExecutionServices:
+    """Candidate-scoped live execution services."""
+
+    cleanup_preview_service: CleanupPreviewRouter
+    pair_close_preview_service: PairClosePreviewService
+    cleanup_live_router: CleanupLiveExecutionRouter
+    paired_service: PairedLiveExecutionCoordinator
+    pair_close_live_service: PairCloseLiveExecutionCoordinator
 
 
 class ConfirmPreviewRequest(BaseModel):
@@ -350,6 +366,14 @@ def get_launch_ready_canary_store(
     """Return the shared launch-ready canary snapshot store."""
 
     return LaunchReadyCanaryStore(settings.database_path)
+
+
+def get_canary_basket_launch_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> CanaryBasketLaunchStore:
+    """Return the shared canary basket launch store."""
+
+    return CanaryBasketLaunchStore(settings.database_path)
 
 
 def get_stable_launch_ready_alert_store(
@@ -776,6 +800,82 @@ def _resolve_request_dependency(
     if override is not None:
         return override()
     return builder()
+
+
+def _resolve_canary_execution_services_for_candidate(
+    *,
+    request: Request,
+    settings: ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> _CanaryExecutionServices:
+    """Resolve candidate-scoped execution services with request overrides applied."""
+
+    cleanup_preview_service = _resolve_request_dependency(
+        request,
+        get_cleanup_preview_service,
+        lambda: _build_cleanup_preview_router_for_candidate(settings, candidate),
+    )
+    pair_close_preview_service = _resolve_request_dependency(
+        request,
+        get_pair_close_preview_service,
+        lambda: _build_pair_close_preview_service_for_candidate(settings, candidate),
+    )
+
+    def _resolve_live_execution_service(venue: str) -> Any:
+        if venue == "extended":
+            return _resolve_request_dependency(
+                request,
+                get_extended_live_execution_service,
+                lambda: get_extended_live_execution_service(settings),
+            )
+        if venue == "hyperliquid":
+            return _resolve_request_dependency(
+                request,
+                get_hyperliquid_live_execution_service,
+                lambda: get_hyperliquid_live_execution_service(settings),
+            )
+        if venue == "paradex":
+            return _resolve_request_dependency(
+                request,
+                get_paradex_live_execution_service,
+                lambda: get_paradex_live_execution_service(settings),
+            )
+        raise ValueError(f"Unsupported canary venue {venue!r}")
+
+    cleanup_live_router = _resolve_request_dependency(
+        request,
+        get_cleanup_live_execution_router,
+        lambda: _build_cleanup_live_execution_router_for_candidate(
+            settings,
+            candidate,
+            live_service_resolver=_resolve_live_execution_service,
+        ),
+    )
+    paired_service = _resolve_request_dependency(
+        request,
+        get_paired_live_execution_coordinator,
+        lambda: _build_paired_live_execution_coordinator_for_candidate(
+            settings,
+            candidate,
+            live_service_resolver=_resolve_live_execution_service,
+        ),
+    )
+    pair_close_live_service = _resolve_request_dependency(
+        request,
+        get_pair_close_live_execution_coordinator,
+        lambda: _build_pair_close_live_execution_coordinator_for_candidate(
+            settings,
+            candidate,
+            live_service_resolver=_resolve_live_execution_service,
+        ),
+    )
+    return _CanaryExecutionServices(
+        cleanup_preview_service=cleanup_preview_service,
+        pair_close_preview_service=pair_close_preview_service,
+        cleanup_live_router=cleanup_live_router,
+        paired_service=paired_service,
+        pair_close_live_service=pair_close_live_service,
+    )
 
 
 def get_cleanup_preview_service(
@@ -1526,8 +1626,77 @@ async def _select_approved_canary_candidate(
         raise HTTPException(
             status_code=409,
             detail="Selected canary route is no longer approved for live execution",
-        )
+    )
     return selected, approval
+
+
+async def _scan_approved_canary_basket_plan(
+    *,
+    universe_service: OpportunityUniverseService,
+    approval_service: RouteApprovalService,
+    venues: list[str] | None,
+    extended_fee_profile: str | None,
+    paradex_fee_profile: str | None,
+    hyperliquid_fee_profile: str | None,
+    target_notional: float,
+    canary_max_notional: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+    include_symbols: list[str] | None,
+    exclude_symbols: list[str] | None,
+    exclude_tags: list[str] | None,
+    limit: int,
+) -> ApprovedCanaryBasketPlan:
+    """Build one approved-canary basket plan from the live opportunity universe."""
+
+    selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
+    _validate_route_stability_filters(
+        min_route_stability_weight=min_route_stability_weight,
+        min_route_presence_ratio=min_route_presence_ratio,
+        min_route_samples=min_route_samples,
+    )
+    fee_profile_overrides = _build_fee_profile_overrides(
+        extended_fee_profile=extended_fee_profile,
+        paradex_fee_profile=paradex_fee_profile,
+        hyperliquid_fee_profile=hyperliquid_fee_profile,
+    ) or {}
+    resolved_fee_profiles = universe_service.resolve_fee_profiles(
+        venues=selected_venues,
+        fee_profile_overrides=fee_profile_overrides,
+    )
+    resolved_venues = list(resolved_fee_profiles)
+    candidates = await universe_service.scan_canary_candidates(
+        venues=resolved_venues,
+        fee_profile_overrides=fee_profile_overrides or None,
+        target_notional=target_notional,
+        canary_max_notional=canary_max_notional,
+        min_capacity_notional=min_capacity_notional,
+        min_daily_volume=min_daily_volume,
+        min_open_interest=min_open_interest,
+        min_roundtrip_edge=min_roundtrip_edge,
+        min_execution_quality_score=min_execution_quality_score,
+        min_execution_samples=min_execution_samples,
+        min_route_stability_weight=min_route_stability_weight,
+        min_route_presence_ratio=min_route_presence_ratio,
+        min_route_samples=min_route_samples,
+        include_symbols=include_symbols,
+        exclude_symbols=exclude_symbols,
+        exclude_tags=exclude_tags,
+        limit=limit,
+    )
+    return approval_service.build_approved_canary_basket_plan(
+        candidates=candidates,
+        venues=resolved_venues,
+        fee_profiles=resolved_fee_profiles,
+        target_notional=target_notional,
+    )
 
 
 def _select_latest_approved_canary_snapshot(
@@ -1942,6 +2111,192 @@ async def _run_guarded_canary_lifecycle(
         final_pair_status=final_pair_status,
         notes=notes,
     )
+
+
+def _http_exception_detail_string(detail: object) -> str:
+    """Normalize FastAPI exception detail payloads for persisted basket outcomes."""
+
+    if isinstance(detail, str):
+        return detail
+    return str(detail)
+
+
+def _summarize_canary_basket_balance_delta(
+    route_outcomes: list[CanaryBasketRouteOutcome],
+) -> CanaryBasketBalanceDelta | None:
+    """Aggregate route-level balance deltas for one basket execution."""
+
+    route_deltas = [
+        outcome.result.balance_delta
+        for outcome in route_outcomes
+        if outcome.result is not None and outcome.result.balance_delta is not None
+    ]
+    if not route_deltas:
+        return None
+
+    collateral_total = 0.0
+    available_total = 0.0
+    free_total = 0.0
+    have_collateral = False
+    have_available = False
+    have_free = False
+    for delta in route_deltas:
+        if delta.total_collateral_delta is not None:
+            collateral_total += delta.total_collateral_delta
+            have_collateral = True
+        if delta.total_available_to_trade_delta is not None:
+            available_total += delta.total_available_to_trade_delta
+            have_available = True
+        if delta.total_free_collateral_delta is not None:
+            free_total += delta.total_free_collateral_delta
+            have_free = True
+
+    return CanaryBasketBalanceDelta(
+        route_count=len(route_outcomes),
+        successful_route_count=sum(1 for item in route_outcomes if item.status == "completed"),
+        total_collateral_delta=collateral_total if have_collateral else None,
+        total_available_to_trade_delta=available_total if have_available else None,
+        total_free_collateral_delta=free_total if have_free else None,
+        routes=route_deltas,
+    )
+
+
+async def _execute_approved_canary_basket_plan(
+    *,
+    request: Request,
+    settings: ApiSettings,
+    basket_plan: ApprovedCanaryBasketPlan,
+    note: str | None,
+    paper_store: PaperTradeStore,
+    confirmation_store: PreviewConfirmationStore,
+    pair_close_confirmation_store: PairClosePreviewConfirmationStore,
+    cleanup_confirmation_store: CleanupPreviewConfirmationStore,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    account_preflight_service: AccountPreflightService,
+    system_state_service: SystemStateService,
+    balance_service: BalanceAccountingService,
+    order_preview_service: OrderPreviewService,
+    order_state_service: ExecutionOrderStateService,
+    approval_service: RouteApprovalService,
+    basket_store: CanaryBasketLaunchStore,
+    slippage_tolerance_bps: int,
+    open_first_venue: str,
+    close_first_venue: str,
+    poll_attempts: int,
+    poll_interval_seconds: float,
+    auto_cleanup: bool,
+    close_position: bool,
+    continue_on_failure: bool,
+) -> CanaryBasketLaunchResult:
+    """Launch one approved basket sequentially and persist the aggregated result."""
+
+    launched_at = datetime.now(UTC)
+    route_outcomes: list[CanaryBasketRouteOutcome] = []
+    notes: list[str] = []
+    for index, entry in enumerate(basket_plan.entries, start=1):
+        candidate = entry.candidate.model_copy(
+            update={"suggested_canary_notional": entry.selected_notional}
+        )
+        services = _resolve_canary_execution_services_for_candidate(
+            request=request,
+            settings=settings,
+            candidate=candidate,
+        )
+        route_note = (
+            f"approved canary basket route {index}/{len(basket_plan.entries)}"
+            + (f" :: {note}" if note else "")
+        )
+        try:
+            result = await _run_guarded_canary_lifecycle(
+                candidate=candidate,
+                approval=entry.approval,
+                desired_notional=entry.selected_notional,
+                note=route_note,
+                lifecycle_note=(
+                    "Approved canary basket launch started at "
+                    f"{launched_at.isoformat()}."
+                ),
+                paper_store=paper_store,
+                confirmation_store=confirmation_store,
+                pair_close_confirmation_store=pair_close_confirmation_store,
+                cleanup_confirmation_store=cleanup_confirmation_store,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                settings=settings,
+                account_preflight_service=account_preflight_service,
+                system_state_service=system_state_service,
+                balance_service=balance_service,
+                order_preview_service=order_preview_service,
+                order_state_service=order_state_service,
+                cleanup_preview_service=services.cleanup_preview_service,
+                pair_close_preview_service=services.pair_close_preview_service,
+                cleanup_live_router=services.cleanup_live_router,
+                paired_service=services.paired_service,
+                pair_close_live_service=services.pair_close_live_service,
+                approval_service=approval_service,
+                slippage_tolerance_bps=slippage_tolerance_bps,
+                open_first_venue=open_first_venue,
+                close_first_venue=close_first_venue,
+                poll_attempts=poll_attempts,
+                poll_interval_seconds=poll_interval_seconds,
+                auto_cleanup=auto_cleanup,
+                close_position=close_position,
+            )
+        except HTTPException as exc:
+            route_outcomes.append(
+                CanaryBasketRouteOutcome(
+                    label=entry.label,
+                    selected_notional=entry.selected_notional,
+                    status="failed",
+                    error=_http_exception_detail_string(exc.detail),
+                )
+            )
+            notes.append(
+                f"Route {entry.label} failed with HTTP {exc.status_code}: "
+                f"{_http_exception_detail_string(exc.detail)}"
+            )
+            if not continue_on_failure:
+                break
+            continue
+        except Exception as exc:
+            route_outcomes.append(
+                CanaryBasketRouteOutcome(
+                    label=entry.label,
+                    selected_notional=entry.selected_notional,
+                    status="failed",
+                    error=str(exc),
+                )
+            )
+            notes.append(f"Route {entry.label} failed: {exc}")
+            if not continue_on_failure:
+                break
+            continue
+
+        route_outcomes.append(
+            CanaryBasketRouteOutcome(
+                label=entry.label,
+                selected_notional=entry.selected_notional,
+                status="completed",
+                paper_trade_id=result.paper_trade.entry_id,
+                result=result,
+            )
+        )
+
+    successful_route_count = sum(1 for item in route_outcomes if item.status == "completed")
+    failed_route_count = sum(1 for item in route_outcomes if item.status == "failed")
+    record = CanaryBasketLaunchResult(
+        launched_at=launched_at,
+        status="completed" if failed_route_count == 0 else "completed_with_failures",
+        basket_plan=basket_plan,
+        route_count=len(route_outcomes),
+        successful_route_count=successful_route_count,
+        failed_route_count=failed_route_count,
+        routes=route_outcomes,
+        balance_delta=_summarize_canary_basket_balance_delta(route_outcomes),
+        notes=notes,
+    )
+    return basket_store.append(record)
 
 
 async def _capture_authenticated_balance_snapshots_for_paper_trade(
@@ -2745,20 +3100,13 @@ def create_app() -> FastAPI:
         limit: int = 10,
     ) -> ApprovedCanaryBasketPlan:
         try:
-            selected_venues = venues or ["extended", "paradex", "hyperliquid"]
-            fee_profile_overrides = _build_fee_profile_overrides(
+            return await _scan_approved_canary_basket_plan(
+                universe_service=service,
+                approval_service=approval_service,
+                venues=venues,
                 extended_fee_profile=extended_fee_profile,
                 paradex_fee_profile=paradex_fee_profile,
                 hyperliquid_fee_profile=hyperliquid_fee_profile,
-            ) or {}
-            resolved_fee_profiles = service.resolve_fee_profiles(
-                venues=selected_venues,
-                fee_profile_overrides=fee_profile_overrides,
-            )
-            resolved_venues = list(resolved_fee_profiles)
-            candidates = await service.scan_canary_candidates(
-                venues=resolved_venues,
-                fee_profile_overrides=fee_profile_overrides or None,
                 target_notional=target_notional,
                 canary_max_notional=canary_max_notional,
                 min_capacity_notional=min_capacity_notional,
@@ -2774,12 +3122,6 @@ def create_app() -> FastAPI:
                 exclude_symbols=exclude_symbols,
                 exclude_tags=exclude_tags,
                 limit=limit,
-            )
-            return approval_service.build_approved_canary_basket_plan(
-                candidates=candidates,
-                venues=resolved_venues,
-                fee_profiles=resolved_fee_profiles,
-                target_notional=target_notional,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -5229,6 +5571,167 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post(
+        "/v1/executions/live/canary-cycle/approved-basket",
+        response_model=CanaryBasketLaunchResult,
+    )
+    async def execute_guarded_approved_canary_basket(
+        request: Request,
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        universe_service: Annotated[
+            OpportunityUniverseService, Depends(get_opportunity_universe_service)
+        ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        basket_store: Annotated[
+            CanaryBasketLaunchStore,
+            Depends(get_canary_basket_launch_store),
+        ],
+        paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        confirmation_store: Annotated[
+            PreviewConfirmationStore,
+            Depends(get_preview_confirmation_store),
+        ],
+        pair_close_confirmation_store: Annotated[
+            PairClosePreviewConfirmationStore,
+            Depends(get_pair_close_preview_confirmation_store),
+        ],
+        cleanup_confirmation_store: Annotated[
+            CleanupPreviewConfirmationStore,
+            Depends(get_cleanup_preview_confirmation_store),
+        ],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        observation_store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
+        account_preflight_service: Annotated[
+            AccountPreflightService,
+            Depends(get_account_preflight_service),
+        ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
+        balance_service: Annotated[
+            BalanceAccountingService,
+            Depends(get_balance_accounting_service),
+        ],
+        order_preview_service: Annotated[
+            OrderPreviewService,
+            Depends(get_order_preview_service),
+        ],
+        order_state_service: Annotated[
+            ExecutionOrderStateService,
+            Depends(get_execution_order_state_service),
+        ],
+        venues: Annotated[list[str] | None, Query()] = None,
+        note: str | None = None,
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = "pro_fastfills",
+        hyperliquid_fee_profile: str | None = None,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.10,
+        min_route_presence_ratio: float = 0.15,
+        min_route_samples: int = 2,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+        limit: int = 10,
+        slippage_tolerance_bps: int = 20,
+        open_first_venue: str = "auto",
+        close_first_venue: str = "auto",
+        poll_attempts: int = 5,
+        poll_interval_seconds: float = 2.0,
+        auto_cleanup: bool = True,
+        close_position: bool = True,
+        continue_on_failure: bool = True,
+    ) -> CanaryBasketLaunchResult:
+        try:
+            basket_plan = await _scan_approved_canary_basket_plan(
+                universe_service=universe_service,
+                approval_service=approval_service,
+                venues=venues,
+                extended_fee_profile=extended_fee_profile,
+                paradex_fee_profile=paradex_fee_profile,
+                hyperliquid_fee_profile=hyperliquid_fee_profile,
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if not basket_plan.entries:
+            raise HTTPException(
+                status_code=404,
+                detail="No approved canary basket routes matched the requested filters",
+            )
+        return await _execute_approved_canary_basket_plan(
+            request=request,
+            settings=settings,
+            basket_plan=basket_plan,
+            note=note,
+            paper_store=paper_store,
+            confirmation_store=confirmation_store,
+            pair_close_confirmation_store=pair_close_confirmation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            account_preflight_service=account_preflight_service,
+            system_state_service=system_state_service,
+            balance_service=balance_service,
+            order_preview_service=order_preview_service,
+            order_state_service=order_state_service,
+            approval_service=approval_service,
+            basket_store=basket_store,
+            slippage_tolerance_bps=slippage_tolerance_bps,
+            open_first_venue=open_first_venue,
+            close_first_venue=close_first_venue,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            auto_cleanup=auto_cleanup,
+            close_position=close_position,
+            continue_on_failure=continue_on_failure,
+        )
+
+    @app.get(
+        "/v1/executions/live/canary-cycle/approved-baskets",
+        response_model=list[CanaryBasketLaunchResult],
+    )
+    def approved_canary_basket_launches(
+        store: Annotated[
+            CanaryBasketLaunchStore,
+            Depends(get_canary_basket_launch_store),
+        ],
+        limit: int = 50,
+        status: str | None = None,
+    ) -> list[CanaryBasketLaunchResult]:
+        limit = _validated_history_limit("limit", limit)
+        return store.list_recent(limit=limit, status=status)
 
     @app.post(
         "/v1/executions/live/canary-cycle",

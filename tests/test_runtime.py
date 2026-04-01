@@ -11755,6 +11755,120 @@ def test_route_approval_service_builds_approved_canary_basket_plan(
     )
 
 
+def test_route_approval_service_caps_approved_canary_basket_by_target_notional(
+    tmp_path: Path,
+) -> None:
+    store = RouteApprovalStore(tmp_path / "basket-cap.sqlite3")
+    service = RouteApprovalService(store=store)
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+        label="s_extended_paradex",
+        canonical_symbol="S-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=11.0,
+        note="capped route",
+    )
+    second_approval = approval.model_copy(
+        update={
+            "label": "ondo_paradex_extended",
+            "canonical_symbol": "ONDO-USD-PERP",
+            "short_venue": "paradex",
+            "long_venue": "extended",
+            "short_fee_profile": "pro_fastfills",
+            "long_fee_profile": "default",
+        }
+    )
+    service.upsert(label=approval.label, payload=approval)
+    service.upsert(label=second_approval.label, payload=second_approval)
+
+    def _candidate(
+        *,
+        symbol: str,
+        short_venue: str,
+        long_venue: str,
+        short_symbol: str,
+        long_symbol: str,
+    ) -> FundingUniverseCanaryCandidate:
+        return FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol=symbol,
+                    long_venue=long_venue,
+                    short_venue=short_venue,
+                    long_fee_profile="pro_fastfills"
+                    if long_venue == "paradex"
+                    else "default",
+                    short_fee_profile="pro_fastfills"
+                    if short_venue == "paradex"
+                    else "default",
+                    gross_daily_edge=0.002,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00155,
+                    one_day_net_edge_after_round_trip=0.0011,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.4,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=2000.0,
+                        long_ask_notional=300.0,
+                        max_entry_notional=300.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    short_venue: FundingUniverseVenueMarket(
+                        venue=short_venue,
+                        symbol=short_symbol,
+                    ),
+                    long_venue: FundingUniverseVenueMarket(
+                        venue=long_venue,
+                        symbol=long_symbol,
+                    ),
+                },
+                deployable_notional=300.0,
+                estimated_one_day_pnl_after_entry=0.465,
+                estimated_one_day_pnl_after_round_trip=0.33,
+            ),
+            suggested_canary_notional=11.0,
+        )
+
+    plan = service.build_approved_canary_basket_plan(
+        candidates=[
+            _candidate(
+                symbol="S-USD-PERP",
+                short_venue="extended",
+                long_venue="paradex",
+                short_symbol="S-USD",
+                long_symbol="S-USD-PERP",
+            ),
+            _candidate(
+                symbol="ONDO-USD-PERP",
+                short_venue="paradex",
+                long_venue="extended",
+                short_symbol="ONDO-USD-PERP",
+                long_symbol="ONDO-USD",
+            ),
+        ],
+        venues=["extended", "paradex"],
+        fee_profiles={"extended": "default", "paradex": "pro_fastfills"},
+        target_notional=15.0,
+    )
+
+    assert plan.target_notional == 15.0
+    assert plan.allocated_notional == 15.0
+    assert plan.unused_notional == 0.0
+    assert [entry.label for entry in plan.entries] == [
+        "s_extended_paradex",
+        "ondo_paradex_extended",
+    ]
+    assert plan.entries[0].selected_notional == 11.0
+    assert plan.entries[1].selected_notional == 4.0
+
+
 def test_route_approval_service_preserves_missing_adjusted_pnl_in_basket_plan(
     tmp_path: Path,
 ) -> None:
