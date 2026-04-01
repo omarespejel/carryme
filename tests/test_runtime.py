@@ -5102,7 +5102,7 @@ def test_paradex_live_execution_service_retries_unfilled_orders_within_confirmed
         assert entry.legs[0].external_reference == "order-2"
         assert entry.legs[0].request_payload is not None
         assert entry.legs[0].request_payload["client_id"] == "carryme-pt7-paradex-buy-r2"
-        assert entry.legs[0].request_payload["price"] == "0.09220000"
+        assert entry.legs[0].request_payload["price"] == "0.09230000"
         response_payload = entry.legs[0].response_payload
         assert isinstance(response_payload, dict)
         attempt_history = response_payload["attempt_history"]
@@ -5119,6 +5119,10 @@ def test_paradex_live_execution_service_retries_unfilled_orders_within_confirmed
         assert [item["client_id"] for item in seen_requests] == [
             "carryme-pt7-paradex-buy",
             "carryme-pt7-paradex-buy-r2",
+        ]
+        assert [item["price"] for item in seen_requests] == [
+            "0.09230000",
+            "0.09230000",
         ]
 
     asyncio.run(run())
@@ -8641,6 +8645,100 @@ def test_build_execution_pair_status_marks_single_leg_cleanup_as_cleanup_needed(
 
     assert status.derived_state == "cleanup_needed"
     assert status.recommended_action == "close_open_leg"
+
+
+def test_build_execution_pair_status_marks_single_leg_cleanup_as_closed_when_positions_are_flat(
+) -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=35,
+        executed_at=datetime(2026, 3, 29, 20, 5, tzinfo=UTC),
+        adapter="extended_cleanup_live",
+        mode="live",
+        status="submitted",
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-flat",
+        confirmation_entry_id=13,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 3, 29, 19, 50, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="arb_extended_paradex",
+                canonical_symbol="ARB-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 19, 45, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0012,
+                break_even_days_entry=0.35,
+                capacity_limit_notional=1000.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="cleanup-order",
+                request_payload={"reduceOnly": True},
+            )
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=35,
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-flat",
+        legs=[
+            ExecutionLegOrderState(
+                venue="extended",
+                supported=True,
+                external_reference="cleanup-order",
+                derived_state="unknown",
+            )
+        ],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=35,
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-flat",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="extended",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                matched_leg_symbols=[],
+                unmatched_leg_symbols=["ARB-USD"],
+            )
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "closed"
+    assert status.recommended_action == "no_action"
+    assert any("no live positions remaining" in note.lower() for note in status.notes)
 
 
 def test_extended_cleanup_preview_service_builds_reduce_only_close(
