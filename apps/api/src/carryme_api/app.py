@@ -5655,7 +5655,7 @@ def create_app() -> FastAPI:
         poll_interval_seconds: float = 2.0,
         auto_cleanup: bool = True,
         close_position: bool = True,
-        continue_on_failure: bool = True,
+        continue_on_failure: bool = False,
     ) -> CanaryBasketLaunchResult:
         try:
             basket_plan = await _scan_approved_canary_basket_plan(

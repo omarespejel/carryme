@@ -605,6 +605,7 @@ def test_execute_guarded_approved_canary_basket_uses_shared_cap_plan(
         **kwargs: object,
     ) -> CanaryBasketLaunchResult:
         assert kwargs["basket_plan"] == basket_plan
+        assert kwargs["continue_on_failure"] is False
         return CanaryBasketLaunchResult(
             launched_at=datetime(2026, 4, 1, 14, 0, tzinfo=UTC),
             status="completed",
