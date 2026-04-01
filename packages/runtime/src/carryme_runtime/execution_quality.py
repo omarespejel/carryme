@@ -199,6 +199,8 @@ def _effective_outcome(
     pair_status = observation.pair_status
     if pair_status is None:
         raise ValueError("observation must include pair_status")
+    if pair_status.execution_entry_id != entry.entry_id:
+        return pair_status.derived_state
     if pair_status.derived_state != "review_required":
         return pair_status.derived_state
     recomputed = build_execution_pair_status(
