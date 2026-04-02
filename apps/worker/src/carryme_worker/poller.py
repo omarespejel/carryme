@@ -811,14 +811,26 @@ async def scan_approved_canary_once(
     ] = {}
     scanned_labels: set[str] = set()
     scanned_candidates = 0
-    for label_index, label in enumerate(approvals_by_label, start=1):
-        if label_index > settings.approved_canary_scan_limit:
-            loop_logger.info(
-                "approved canary exact scan limit reached at %s labels",
-                settings.approved_canary_scan_limit,
-            )
-            break
+
+    selected_labels = list(approvals_by_label)[: settings.approved_canary_scan_limit]
+    if len(selected_labels) < len(approvals_by_label):
+        loop_logger.info(
+            "approved canary exact scan limit reached at %s labels",
+            settings.approved_canary_scan_limit,
+        )
+
+    async def _scan_label(
+        label: str,
+    ) -> tuple[
+        str,
+        int,
+        bool,
+        FundingUniverseCanaryCandidate | None,
+        RouteApprovalEntry | None,
+    ]:
+        best_match: tuple[FundingUniverseCanaryCandidate, RouteApprovalEntry] | None = None
         label_scanned = False
+        scanned_candidate_count = 0
         for approved_route in approvals_by_label[label]:
             try:
                 async with asyncio.timeout(settings.universe_scan_timeout_seconds):
@@ -862,16 +874,26 @@ async def scan_approved_canary_once(
                 )
                 continue
             label_scanned = True
-            scanned_candidates += candidate_count
+            scanned_candidate_count += candidate_count
             if candidate is None:
                 continue
-            existing = approved_matches_by_label.get(approved_route.label)
+            existing = best_match
             if existing is None or _rank_approved_canary_candidate(
                 candidate
             ) > _rank_approved_canary_candidate(existing[0]):
-                approved_matches_by_label[approved_route.label] = (candidate, approved_route)
+                best_match = (candidate, approved_route)
+        if best_match is None:
+            return label, scanned_candidate_count, label_scanned, None, None
+        candidate, matched_approval = best_match
+        return label, scanned_candidate_count, label_scanned, candidate, matched_approval
+
+    results = await asyncio.gather(*(_scan_label(label) for label in selected_labels))
+    for label, candidate_count, label_scanned, candidate, matched_approval in results:
+        scanned_candidates += candidate_count
         if label_scanned:
             scanned_labels.add(label)
+        if candidate is not None and matched_approval is not None:
+            approved_matches_by_label[label] = (candidate, matched_approval)
     previous_snapshots = {label: snapshot_store.latest(label=label) for label in scanned_labels}
     snapshots: list[ApprovedCanarySnapshot] = []
     approved_matches = list(approved_matches_by_label.values())
