@@ -51,7 +51,10 @@ class HyperliquidCleanupPreviewService:
         slippage_tolerance_bps: int = 10,
         generated_at: datetime | None = None,
     ) -> ExecutionCleanupPreview:
-        if pair_status.recommended_action != "close_open_leg":
+        if pair_status.recommended_action not in {
+            "close_open_leg",
+            "complete_or_unwind_missing_leg",
+        }:
             raise ValueError("Cleanup preview is only available when pair status recommends it")
 
         target_leg = _select_open_hyperliquid_leg(entry, pair_status)

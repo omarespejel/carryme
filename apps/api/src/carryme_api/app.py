@@ -2549,7 +2549,10 @@ async def _execute_guarded_pair_from_confirmation(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     cleanup_execution: ExecutionJournalEntry | None = None
-    if auto_cleanup and pair_status.recommended_action == "close_open_leg":
+    if auto_cleanup and pair_status.recommended_action in {
+        "close_open_leg",
+        "complete_or_unwind_missing_leg",
+    }:
         try:
             cleanup_preview = await cleanup_preview_service.preview_from_execution(
                 entry=primary_execution,
@@ -2767,7 +2770,10 @@ async def _execute_guarded_pair_close_from_confirmation(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     cleanup_execution: ExecutionJournalEntry | None = None
-    if auto_cleanup and pair_status.recommended_action == "close_open_leg":
+    if auto_cleanup and pair_status.recommended_action in {
+        "close_open_leg",
+        "complete_or_unwind_missing_leg",
+    }:
         try:
             cleanup_preview = await cleanup_preview_service.preview_from_execution(
                 entry=primary_execution,
@@ -5096,7 +5102,10 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         cleanup_execution: ExecutionJournalEntry | None = None
-        if auto_cleanup and pair_status.recommended_action == "close_open_leg":
+        if auto_cleanup and pair_status.recommended_action in {
+            "close_open_leg",
+            "complete_or_unwind_missing_leg",
+        }:
             try:
                 cleanup_preview = await cleanup_preview_service.preview_from_execution(
                     entry=primary_execution,
@@ -5375,7 +5384,10 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         cleanup_execution: ExecutionJournalEntry | None = None
-        if auto_cleanup and pair_status.recommended_action == "close_open_leg":
+        if auto_cleanup and pair_status.recommended_action in {
+            "close_open_leg",
+            "complete_or_unwind_missing_leg",
+        }:
             try:
                 cleanup_preview = await cleanup_preview_service.preview_from_execution(
                     entry=primary_execution,

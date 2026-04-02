@@ -10237,7 +10237,7 @@ def test_cleanup_preview_router_dispatches_to_paradex_when_paradex_leg_is_open()
         paper_trade_id=7,
         preview_hash="preview-hash",
         derived_state="cleanup_needed",
-        recommended_action="close_open_leg",
+        recommended_action="complete_or_unwind_missing_leg",
         order_state=ExecutionOrderState(
             execution_entry_id=12,
             paper_trade_id=7,
@@ -10308,6 +10308,7 @@ def test_cleanup_preview_router_dispatches_to_paradex_when_paradex_leg_is_open()
         preview = await router.preview_from_execution(entry=entry, pair_status=pair_status)
         assert preview.leg.venue == "paradex"
         assert preview.leg.side == "sell"
+        assert preview.reason == "complete_or_unwind_missing_leg"
 
     asyncio.run(run())
 

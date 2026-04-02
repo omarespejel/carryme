@@ -7,6 +7,11 @@ from typing import Protocol
 
 from carryme_models import ExecutionCleanupPreview, ExecutionJournalEntry, ExecutionPairStatus
 
+_CLEANUP_RECOMMENDED_ACTIONS = {
+    "close_open_leg",
+    "complete_or_unwind_missing_leg",
+}
+
 
 class VenueCleanupPreviewService(Protocol):
     """Build one reduce-only cleanup preview for a specific venue."""
@@ -50,7 +55,7 @@ def select_cleanup_preview_venue(
 ) -> str:
     """Return the single venue that still has an open leg requiring cleanup."""
 
-    if pair_status.recommended_action != "close_open_leg":
+    if pair_status.recommended_action not in _CLEANUP_RECOMMENDED_ACTIONS:
         raise ValueError("Cleanup preview is only available when pair status recommends it")
 
     position_symbols_by_venue = {
@@ -66,3 +71,9 @@ def select_cleanup_preview_venue(
     if len(candidate_venues) != 1:
         raise ValueError("Cleanup preview requires exactly one open leg across all venues")
     return candidate_venues[0]
+
+
+def cleanup_action_requires_unwind(pair_status: ExecutionPairStatus) -> bool:
+    """Return whether a pair-status action should trigger one-leg cleanup."""
+
+    return pair_status.recommended_action in _CLEANUP_RECOMMENDED_ACTIONS
