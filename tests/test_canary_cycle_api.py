@@ -1423,7 +1423,10 @@ def test_execute_guarded_canary_cycle_prefers_fresh_approved_snapshot(
         with pytest.raises(RuntimeError, match="reached lifecycle"):
             client.post(
                 "/v1/executions/live/canary-cycle",
-                params={"label": "arb_extended_paradex"},
+                params={
+                    "label": "arb_extended_paradex",
+                    "min_capacity_notional": 10.0,
+                },
             )
     finally:
         app.dependency_overrides.clear()
