@@ -119,6 +119,7 @@ from carryme_runtime import (
     require_confirmed_cleanup_preview,
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
+from carryme_runtime.route_approvals import scan_exact_canary_candidate_for_approval
 from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
@@ -1601,13 +1602,45 @@ async def _select_approved_canary_candidate(
         min_route_presence_ratio=min_route_presence_ratio,
         min_route_samples=min_route_samples,
     )
+    fee_profile_overrides = _build_fee_profile_overrides(
+        extended_fee_profile=extended_fee_profile,
+        paradex_fee_profile=paradex_fee_profile,
+        hyperliquid_fee_profile=hyperliquid_fee_profile,
+    )
+    if label is not None:
+        approvals = approval_service.list_recent(limit=1_000, label=label, approved=True)
+        for approved_route in approvals:
+            candidate, _ = await scan_exact_canary_candidate_for_approval(
+                scanner=universe_service,
+                approval_service=approval_service,
+                approval=approved_route,
+                venues=selected_venues,
+                fee_profile_overrides=fee_profile_overrides,
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+                limit=limit,
+            )
+            if candidate is not None:
+                return candidate, approved_route
+        raise HTTPException(
+            status_code=404,
+            detail="No approved canary candidate matched the requested filters",
+        )
     candidates = await universe_service.scan_canary_candidates(
         venues=selected_venues,
-        fee_profile_overrides=_build_fee_profile_overrides(
-            extended_fee_profile=extended_fee_profile,
-            paradex_fee_profile=paradex_fee_profile,
-            hyperliquid_fee_profile=hyperliquid_fee_profile,
-        ),
+        fee_profile_overrides=fee_profile_overrides,
         target_notional=target_notional,
         canary_max_notional=canary_max_notional,
         min_capacity_notional=min_capacity_notional,
@@ -1637,13 +1670,13 @@ async def _select_approved_canary_candidate(
             detail="No approved canary candidate matched the requested filters",
         )
     selected = approved_candidates[0]
-    approval = approval_service.get_for_candidate(selected)
-    if approval is None or not approval.approved:
+    matched_approval = approval_service.get_for_candidate(selected)
+    if matched_approval is None or not matched_approval.approved:
         raise HTTPException(
             status_code=409,
             detail="Selected canary route is no longer approved for live execution",
         )
-    return selected, approval
+    return selected, matched_approval
 
 
 async def _scan_approved_canary_basket_plan(

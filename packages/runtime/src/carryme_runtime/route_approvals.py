@@ -17,7 +17,10 @@ from carryme_models import (
 )
 from carryme_storage import RouteApprovalStore
 
-from carryme_runtime.universe import build_pair_spec_from_universe_opportunity
+from carryme_runtime.universe import (
+    OpportunityUniverseService,
+    build_pair_spec_from_universe_opportunity,
+)
 
 
 class _ScaledCandidatePnl(TypedDict):
@@ -226,6 +229,82 @@ class RouteApprovalService:
             ),
             entries=entries,
         )
+
+
+async def scan_exact_canary_candidate_for_approval(
+    *,
+    scanner: OpportunityUniverseService,
+    approval_service: RouteApprovalService,
+    approval: RouteApprovalEntry,
+    venues: list[str],
+    target_notional: float,
+    canary_max_notional: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+    include_symbols: list[str] | None,
+    exclude_symbols: list[str] | None,
+    exclude_tags: list[str] | None,
+    limit: int,
+    fee_profile_overrides: dict[str, str] | None = None,
+) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+    """Scan one exact approved route using the approval's configured fee profiles."""
+
+    selected_venues = {venue.lower() for venue in venues}
+    approval_venues = {approval.short_venue.lower(), approval.long_venue.lower()}
+    if not approval_venues.issubset(selected_venues):
+        return None, 0
+    if include_symbols is not None and approval.canonical_symbol not in include_symbols:
+        return None, 0
+    if exclude_symbols is not None and approval.canonical_symbol in exclude_symbols:
+        return None, 0
+
+    exact_fee_profiles = dict(fee_profile_overrides or {})
+    exact_fee_profiles[approval.short_venue] = approval.short_fee_profile
+    exact_fee_profiles[approval.long_venue] = approval.long_fee_profile
+
+    candidates = await scanner.scan_canary_candidates(
+        venues=[approval.short_venue, approval.long_venue],
+        fee_profile_overrides=exact_fee_profiles,
+        target_notional=target_notional,
+        canary_max_notional=canary_max_notional,
+        min_capacity_notional=min_capacity_notional,
+        min_daily_volume=min_daily_volume,
+        min_open_interest=min_open_interest,
+        min_roundtrip_edge=min_roundtrip_edge,
+        min_execution_quality_score=min_execution_quality_score,
+        min_execution_samples=min_execution_samples,
+        min_route_stability_weight=min_route_stability_weight,
+        min_route_presence_ratio=min_route_presence_ratio,
+        min_route_samples=min_route_samples,
+        include_symbols=[approval.canonical_symbol],
+        exclude_symbols=exclude_symbols,
+        exclude_tags=exclude_tags,
+        limit=max(1, limit),
+    )
+
+    for candidate in approval_service.filter_approved_canary_candidates(candidates):
+        matched = approval_service.get_for_candidate(candidate)
+        if matched is not None and _same_route_identity(matched, approval):
+            return candidate, len(candidates)
+    return None, len(candidates)
+
+
+def _same_route_identity(left: RouteApprovalEntry, right: RouteApprovalEntry) -> bool:
+    return (
+        left.label == right.label
+        and left.canonical_symbol == right.canonical_symbol
+        and left.short_venue == right.short_venue
+        and left.long_venue == right.long_venue
+        and left.short_fee_profile == right.short_fee_profile
+        and left.long_fee_profile == right.long_fee_profile
+    )
 
 
 def _scaled_candidate_pnl(

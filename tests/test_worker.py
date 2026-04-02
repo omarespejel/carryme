@@ -47,6 +47,7 @@ from carryme_models import (
 from carryme_runtime import (
     AccountPreflightService,
     ExecutionOrderStateService,
+    RouteApprovalService,
     SystemStateService,
 )
 from carryme_storage import (
@@ -1314,6 +1315,107 @@ def test_scan_approved_canary_once_saves_operator_approved_snapshots(tmp_path: P
     assert snapshots[0].approval.max_live_notional == 11.0
     assert len(alerts) == 1
     assert alerts[0].alert_type == "approved_canary_available"
+
+
+def test_scan_approved_canary_once_uses_exact_approved_fee_profiles(
+    tmp_path: Path,
+) -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="S-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="S-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="S-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+    calls: list[dict[str, object]] = []
+
+    class StubUniverseScanner:
+        async def scan_canary_candidates(
+            self,
+            **kwargs: object,
+        ) -> list[FundingUniverseCanaryCandidate]:
+            calls.append(dict(kwargs))
+            fee_profiles = cast(dict[str, str] | None, kwargs["fee_profile_overrides"])
+            include_symbols = cast(list[str] | None, kwargs["include_symbols"])
+            if fee_profiles == {"extended": "default", "paradex": "pro"}:
+                assert include_symbols == ["S-USD-PERP"]
+                return [candidate]
+            return []
+
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        approved_canary_scan_paradex_fee_profile="pro_fastfills",
+    )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 0, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            approved=True,
+            max_live_notional=11.0,
+            note="production canary",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, StubUniverseScanner()),
+            approval_service=RouteApprovalService(store=approval_store),
+            store=snapshot_store,
+            alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+            now=datetime(2026, 4, 2, 10, 5, tzinfo=UTC),
+        )
+    )
+
+    snapshots = snapshot_store.list_recent(limit=10, label="s_extended_paradex")
+
+    assert summary.scanned_candidates == 1
+    assert summary.approved_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].approval.long_fee_profile == "pro"
+    assert snapshots[0].candidate.opportunity.opportunity.long_fee_profile == "pro"
+    assert any(
+        call["fee_profile_overrides"] == {"extended": "default", "paradex": "pro"}
+        for call in calls
+    )
 
 
 def test_scan_approved_canary_once_emits_stale_alert_for_missing_route(tmp_path: Path) -> None:

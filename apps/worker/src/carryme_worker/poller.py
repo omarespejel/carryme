@@ -39,6 +39,7 @@ from carryme_models import (
     LaunchReadyCanaryStability,
     OpportunityRecord,
     PaperTradeSystemState,
+    RouteApprovalEntry,
     StableCanaryLaunchRecord,
     StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
@@ -70,6 +71,7 @@ from carryme_runtime import (
     reconcile_execution,
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
+from carryme_runtime.route_approvals import scan_exact_canary_candidate_for_approval
 from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
@@ -760,44 +762,55 @@ async def scan_approved_canary_once(
         ),
     )
 
-    candidates = await runtime.scan_canary_candidates(
-        venues=list(settings.approved_canary_scan_venues),
-        fee_profile_overrides=_build_approved_canary_fee_profile_overrides(settings),
-        target_notional=settings.approved_canary_scan_target_notional,
-        canary_max_notional=settings.approved_canary_scan_max_notional,
-        min_capacity_notional=settings.approved_canary_scan_min_capacity_notional,
-        min_daily_volume=settings.approved_canary_scan_min_daily_volume,
-        min_open_interest=settings.approved_canary_scan_min_open_interest,
-        min_roundtrip_edge=settings.approved_canary_scan_min_roundtrip_edge,
-        min_execution_quality_score=settings.approved_canary_scan_min_execution_quality_score,
-        min_execution_samples=settings.approved_canary_scan_min_execution_samples,
-        min_route_stability_weight=settings.approved_canary_scan_min_route_stability_weight,
-        min_route_presence_ratio=settings.approved_canary_scan_min_route_presence_ratio,
-        min_route_samples=settings.approved_canary_scan_min_route_samples,
-        include_symbols=list(settings.approved_canary_scan_include_symbols) or None,
-        exclude_symbols=list(settings.approved_canary_scan_exclude_symbols) or None,
-        exclude_tags=list(settings.approved_canary_scan_exclude_tags) or None,
-        limit=settings.approved_canary_scan_limit,
-    )
-    approved_candidates = route_approval_service.filter_approved_canary_candidates(candidates)
-    approved_labels = {
-        approval.label
-        for approval in route_approval_service.list_recent(limit=1_000, approved=True)
-    }
+    approvals = route_approval_service.list_recent(limit=1_000, approved=True)
+    approved_labels = {approval.label for approval in approvals}
+    approved_candidates: list[FundingUniverseCanaryCandidate] = []
+    approved_candidates_by_label: dict[str, RouteApprovalEntry] = {}
+    scanned_candidates = 0
+    for approved_route in approvals:
+        candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
+            scanner=runtime,
+            approval_service=route_approval_service,
+            approval=approved_route,
+            venues=list(settings.approved_canary_scan_venues),
+            fee_profile_overrides=_build_approved_canary_fee_profile_overrides(settings),
+            target_notional=settings.approved_canary_scan_target_notional,
+            canary_max_notional=settings.approved_canary_scan_max_notional,
+            min_capacity_notional=settings.approved_canary_scan_min_capacity_notional,
+            min_daily_volume=settings.approved_canary_scan_min_daily_volume,
+            min_open_interest=settings.approved_canary_scan_min_open_interest,
+            min_roundtrip_edge=settings.approved_canary_scan_min_roundtrip_edge,
+            min_execution_quality_score=settings.approved_canary_scan_min_execution_quality_score,
+            min_execution_samples=settings.approved_canary_scan_min_execution_samples,
+            min_route_stability_weight=settings.approved_canary_scan_min_route_stability_weight,
+            min_route_presence_ratio=settings.approved_canary_scan_min_route_presence_ratio,
+            min_route_samples=settings.approved_canary_scan_min_route_samples,
+            include_symbols=list(settings.approved_canary_scan_include_symbols) or None,
+            exclude_symbols=list(settings.approved_canary_scan_exclude_symbols) or None,
+            exclude_tags=list(settings.approved_canary_scan_exclude_tags) or None,
+            limit=settings.approved_canary_scan_limit,
+        )
+        scanned_candidates += candidate_count
+        if candidate is None:
+            continue
+        approved_candidates.append(candidate)
+        approved_candidates_by_label[approved_route.label] = approved_route
     previous_snapshots = {label: snapshot_store.latest(label=label) for label in approved_labels}
     snapshots: list[ApprovedCanarySnapshot] = []
     for candidate in approved_candidates:
-        approval = route_approval_service.get_for_candidate(candidate)
-        if approval is None or not approval.approved:
-            continue
         label = build_pair_spec_from_universe_opportunity(candidate.opportunity).label
+        matched_approval = approved_candidates_by_label.get(label or "")
+        if matched_approval is None:
+            matched_approval = route_approval_service.get_for_candidate(candidate)
+        if matched_approval is None or not matched_approval.approved:
+            continue
         snapshots.append(
             snapshot_store.append(
                 ApprovedCanarySnapshot(
                     captured_at=timestamp,
-                    label=label or approval.label,
+                    label=label or matched_approval.label,
                     candidate=candidate,
-                    approval=approval,
+                    approval=matched_approval,
                 )
             )
         )
@@ -833,7 +846,7 @@ async def scan_approved_canary_once(
                 )
 
     return ApprovedCanaryScanSummary(
-        scanned_candidates=len(candidates),
+        scanned_candidates=scanned_candidates,
         approved_candidates=len(approved_candidates),
         saved_snapshots=len(snapshots),
         alert_events=len(alerts),

@@ -60,7 +60,7 @@ from carryme_models import (
     VenueOrderPreview,
     VenueSystemState,
 )
-from carryme_runtime import BalanceAccountingService
+from carryme_runtime import BalanceAccountingService, RouteApprovalService
 from carryme_storage import (
     ApprovedCanaryStore,
     BalanceSnapshotStore,
@@ -72,6 +72,7 @@ from carryme_storage import (
     PairClosePreviewConfirmationStore,
     PaperTradeStore,
     PreviewConfirmationStore,
+    RouteApprovalStore,
 )
 from fastapi.testclient import TestClient
 
@@ -242,6 +243,23 @@ class _StubUniverseService:
 
 
 class _StubRouteApprovalService:
+    def list_recent(
+        self,
+        *,
+        limit: int = 50,
+        label: str | None = None,
+        canonical_symbol: str | None = None,
+        approved: bool | None = None,
+    ) -> list[RouteApprovalEntry]:
+        approval = _route_approval()
+        if label is not None and approval.label != label:
+            return []
+        if canonical_symbol is not None and approval.canonical_symbol != canonical_symbol:
+            return []
+        if approved is not None and approval.approved is not approved:
+            return []
+        return [approval][:limit]
+
     def filter_approved_canary_candidates(
         self,
         candidates: list[FundingUniverseCanaryCandidate],
@@ -954,6 +972,119 @@ def test_execute_guarded_canary_cycle_skips_unselected_live_credentials(
             )
     finally:
         app.dependency_overrides.clear()
+
+
+def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    approval_store = RouteApprovalStore(database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 11, 0, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            approved=True,
+            max_live_notional=25.0,
+            note="production route",
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self,
+            **kwargs: object,
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            fee_profiles = cast(dict[str, str] | None, kwargs["fee_profile_overrides"])
+            if fee_profiles != {"extended": "default", "paradex": "pro"}:
+                return []
+            return [
+                FundingUniverseCanaryCandidate(
+                    opportunity=FundingUniverseOpportunity(
+                        opportunity=FundingArbOpportunity(
+                            canonical_symbol="S-USD-PERP",
+                            long_venue="paradex",
+                            short_venue="extended",
+                            long_fee_profile="pro",
+                            short_fee_profile="default",
+                            gross_daily_edge=0.003,
+                            entry_cost_rate=0.00045,
+                            round_trip_cost_rate=0.0009,
+                            one_day_net_edge_after_entry=0.00255,
+                            one_day_net_edge_after_round_trip=0.0021,
+                            break_even_days_entry=0.2,
+                            break_even_days_round_trip=0.3,
+                            capacity=CapacityEstimate(
+                                short_bid_notional=1400.0,
+                                long_ask_notional=900.0,
+                                max_entry_notional=900.0,
+                                limiting_venue="paradex",
+                            ),
+                        ),
+                        venue_markets={
+                            "extended": FundingUniverseVenueMarket(
+                                venue="extended",
+                                symbol="S-USD",
+                            ),
+                            "paradex": FundingUniverseVenueMarket(
+                                venue="paradex",
+                                symbol="S-USD-PERP",
+                            ),
+                        },
+                        deployable_notional=900.0,
+                        estimated_one_day_pnl_after_round_trip=1.89,
+                    ),
+                    suggested_canary_notional=25.0,
+                )
+            ]
+
+    async def fake_run_guarded_canary_lifecycle(**kwargs: object) -> object:
+        candidate = cast(FundingUniverseCanaryCandidate, kwargs["candidate"])
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        assert approval.label == "s_extended_paradex"
+        assert approval.long_fee_profile == "pro"
+        assert candidate.opportunity.opportunity.long_fee_profile == "pro"
+        raise RuntimeError("reached lifecycle")
+
+    monkeypatch.setattr(
+        "carryme_api.app._run_guarded_canary_lifecycle",
+        fake_run_guarded_canary_lifecycle,
+    )
+
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(database_path),
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="0x123",
+    )
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = (
+        lambda: RouteApprovalService(store=approval_store)
+    )
+
+    client = TestClient(app)
+    try:
+        with pytest.raises(RuntimeError, match="reached lifecycle"):
+            client.post(
+                "/v1/executions/live/canary-cycle",
+                params={"label": "s_extended_paradex"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert captured["fee_profile_overrides"] == {"extended": "default", "paradex": "pro"}
+    assert captured["include_symbols"] == ["S-USD-PERP"]
+    assert captured["venues"] == ["extended", "paradex"]
 
 
 def test_execute_guarded_canary_cycle_skips_close_when_open_is_not_hedged(

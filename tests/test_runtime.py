@@ -9055,6 +9055,99 @@ def test_build_execution_pair_status_marks_single_leg_cleanup_as_cleanup_needed(
     assert status.recommended_action == "close_open_leg"
 
 
+def test_build_execution_pair_status_keeps_cleanup_retryable_when_order_state_is_unknown() -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=36,
+        executed_at=datetime(2026, 4, 2, 12, 0, tzinfo=UTC),
+        adapter="extended_cleanup_live",
+        mode="live",
+        status="submitted",
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-unknown",
+        confirmation_entry_id=14,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 4, 2, 11, 50, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="s_extended_paradex",
+                canonical_symbol="S-USD-PERP",
+                source_recorded_at=datetime(2026, 4, 2, 11, 45, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0012,
+                break_even_days_entry=0.35,
+                capacity_limit_notional=1000.0,
+                target_notional=11.0,
+                capacity_fraction=0.25,
+                max_target_notional=11.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="S-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="S-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="extended",
+                symbol="S-USD",
+                fee_profile="default",
+                side="buy",
+                target_notional=11.0,
+                status="submitted",
+                simulated=False,
+                external_reference="cleanup-order",
+                request_payload={"reduce_only": True},
+            )
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=36,
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-unknown",
+        legs=[
+            ExecutionLegOrderState(
+                venue="extended",
+                supported=True,
+                external_reference="cleanup-order",
+                derived_state="unknown",
+            )
+        ],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=36,
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-unknown",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=True,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="extended",
+                authenticated=True,
+                ready=True,
+                position_symbols=["S-USD"],
+                matched_leg_symbols=["S-USD"],
+                unmatched_leg_symbols=[],
+            )
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "cleanup_needed"
+    assert status.recommended_action == "close_open_leg"
+    assert any("cleanup" in note.lower() for note in status.notes)
+
+
 def test_build_execution_pair_status_marks_single_leg_cleanup_as_closed_when_positions_are_flat(
 ) -> None:
     entry = ExecutionJournalEntry(
