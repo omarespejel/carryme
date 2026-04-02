@@ -764,8 +764,7 @@ async def scan_approved_canary_once(
 
     approvals = route_approval_service.list_recent(limit=1_000, approved=True)
     approved_labels = {approval.label for approval in approvals}
-    approved_candidates: list[FundingUniverseCanaryCandidate] = []
-    approved_candidates_by_label: dict[str, RouteApprovalEntry] = {}
+    approved_matches: list[tuple[FundingUniverseCanaryCandidate, RouteApprovalEntry]] = []
     scanned_candidates = 0
     for approved_route in approvals:
         candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
@@ -793,16 +792,12 @@ async def scan_approved_canary_once(
         scanned_candidates += candidate_count
         if candidate is None:
             continue
-        approved_candidates.append(candidate)
-        approved_candidates_by_label[approved_route.label] = approved_route
+        approved_matches.append((candidate, approved_route))
     previous_snapshots = {label: snapshot_store.latest(label=label) for label in approved_labels}
     snapshots: list[ApprovedCanarySnapshot] = []
-    for candidate in approved_candidates:
+    for candidate, matched_approval in approved_matches:
         label = build_pair_spec_from_universe_opportunity(candidate.opportunity).label
-        matched_approval = approved_candidates_by_label.get(label or "")
-        if matched_approval is None:
-            matched_approval = route_approval_service.get_for_candidate(candidate)
-        if matched_approval is None or not matched_approval.approved:
+        if not matched_approval.approved:
             continue
         snapshots.append(
             snapshot_store.append(
@@ -847,7 +842,7 @@ async def scan_approved_canary_once(
 
     return ApprovedCanaryScanSummary(
         scanned_candidates=scanned_candidates,
-        approved_candidates=len(approved_candidates),
+        approved_candidates=len(approved_matches),
         saved_snapshots=len(snapshots),
         alert_events=len(alerts),
         sent_notifications=sent_notifications,
