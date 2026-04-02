@@ -1647,6 +1647,172 @@ def test_scan_approved_canary_once_preserves_exact_approval_when_labels_repeat(
     ] == ["pro_fastfills"]
 
 
+def test_scan_approved_canary_once_limit_counts_labels_not_duplicate_approvals(
+    tmp_path: Path,
+) -> None:
+    def _candidate(
+        canonical_symbol: str,
+        label_side: tuple[str, str],
+        fee_profiles: tuple[str, str],
+        *,
+        route_adjusted_quality_score: float,
+    ) -> FundingUniverseCanaryCandidate:
+        short_venue, long_venue = label_side
+        short_fee_profile, long_fee_profile = fee_profiles
+        venue_markets = {
+            short_venue: FundingUniverseVenueMarket(
+                venue=short_venue,
+                symbol=f"{canonical_symbol}-SHORT",
+            ),
+            long_venue: FundingUniverseVenueMarket(
+                venue=long_venue,
+                symbol=f"{canonical_symbol}-LONG",
+            ),
+        }
+        return FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol=canonical_symbol,
+                    long_venue=long_venue,
+                    short_venue=short_venue,
+                    long_fee_profile=long_fee_profile,
+                    short_fee_profile=short_fee_profile,
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue=long_venue,
+                    ),
+                ),
+                venue_markets=venue_markets,
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+                route_adjusted_quality_score=route_adjusted_quality_score,
+            ),
+            suggested_canary_notional=25.0,
+        )
+
+    class StubUniverseScanner:
+        async def scan_canary_candidates(
+            self,
+            **kwargs: object,
+        ) -> list[FundingUniverseCanaryCandidate]:
+            include_symbols = cast(list[str] | None, kwargs["include_symbols"])
+            fee_profiles = cast(dict[str, str] | None, kwargs["fee_profile_overrides"])
+            if include_symbols == ["S-USD-PERP"] and fee_profiles == {
+                "extended": "default",
+                "paradex": "pro",
+            }:
+                return [
+                    _candidate(
+                        "S-USD-PERP",
+                        ("extended", "paradex"),
+                        ("default", "pro"),
+                        route_adjusted_quality_score=0.4,
+                    )
+                ]
+            if include_symbols == ["S-USD-PERP"] and fee_profiles == {
+                "extended": "default",
+                "paradex": "pro_fastfills",
+            }:
+                return [
+                    _candidate(
+                        "S-USD-PERP",
+                        ("extended", "paradex"),
+                        ("default", "pro_fastfills"),
+                        route_adjusted_quality_score=0.9,
+                    )
+                ]
+            if include_symbols == ["JUP-USD-PERP"] and fee_profiles == {
+                "paradex": "pro_fastfills",
+                "extended": "default",
+            }:
+                return [
+                    _candidate(
+                        "JUP-USD-PERP",
+                        ("paradex", "extended"),
+                        ("pro_fastfills", "default"),
+                        route_adjusted_quality_score=0.7,
+                    )
+                ]
+            return []
+
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        approved_canary_scan_limit=2,
+    )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 2, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="s fastfills",
+        )
+    )
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 1, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            approved=True,
+            max_live_notional=11.0,
+            note="s pro",
+        )
+    )
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 0, tzinfo=UTC),
+            label="jup_paradex_extended",
+            canonical_symbol="JUP-USD-PERP",
+            short_venue="paradex",
+            long_venue="extended",
+            short_fee_profile="pro_fastfills",
+            long_fee_profile="default",
+            approved=True,
+            max_live_notional=11.0,
+            note="jup fastfills",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, StubUniverseScanner()),
+            approval_service=RouteApprovalService(store=approval_store),
+            store=snapshot_store,
+            alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+            now=datetime(2026, 4, 2, 10, 5, tzinfo=UTC),
+        )
+    )
+
+    snapshots = snapshot_store.list_recent(limit=10)
+    labels = {snapshot.label for snapshot in snapshots}
+
+    assert summary.scanned_candidates == 3
+    assert summary.approved_candidates == 2
+    assert summary.saved_snapshots == 2
+    assert labels == {"s_extended_paradex", "jup_paradex_extended"}
+
+
 def test_scan_approved_canary_once_continues_on_recoverable_exact_scan_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

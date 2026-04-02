@@ -803,73 +803,83 @@ async def scan_approved_canary_once(
             continue
         seen_route_keys.add(route_key)
         unique_approvals.append(approval)
+    approvals_by_label: dict[str, list[RouteApprovalEntry]] = {}
+    for approval in unique_approvals:
+        approvals_by_label.setdefault(approval.label, []).append(approval)
     approved_labels = {approval.label for approval in approvals}
     approved_matches_by_label: dict[
         str, tuple[FundingUniverseCanaryCandidate, RouteApprovalEntry]
     ] = {}
     scanned_candidates = 0
-    for scan_index, approved_route in enumerate(unique_approvals, start=1):
-        if scan_index > settings.approved_canary_scan_limit:
+    for label_index, label in enumerate(approvals_by_label, start=1):
+        if label_index > settings.approved_canary_scan_limit:
             loop_logger.info(
-                "approved canary exact scan limit reached at %s routes",
+                "approved canary exact scan limit reached at %s labels",
                 settings.approved_canary_scan_limit,
             )
             break
-        try:
-            async with asyncio.timeout(settings.universe_scan_timeout_seconds):
-                candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
-                    scanner=runtime,
-                    approval_service=route_approval_service,
-                    approval=approved_route,
-                    venues=list(settings.approved_canary_scan_venues),
-                    fee_profile_overrides=_build_approved_canary_fee_profile_overrides(settings),
-                    target_notional=settings.approved_canary_scan_target_notional,
-                    canary_max_notional=settings.approved_canary_scan_max_notional,
-                    min_capacity_notional=settings.approved_canary_scan_min_capacity_notional,
-                    min_daily_volume=settings.approved_canary_scan_min_daily_volume,
-                    min_open_interest=settings.approved_canary_scan_min_open_interest,
-                    min_roundtrip_edge=settings.approved_canary_scan_min_roundtrip_edge,
-                    min_execution_quality_score=settings.approved_canary_scan_min_execution_quality_score,
-                    min_execution_samples=settings.approved_canary_scan_min_execution_samples,
-                    min_route_stability_weight=settings.approved_canary_scan_min_route_stability_weight,
-                    min_route_presence_ratio=settings.approved_canary_scan_min_route_presence_ratio,
-                    min_route_samples=settings.approved_canary_scan_min_route_samples,
-                    include_symbols=list(settings.approved_canary_scan_include_symbols) or None,
-                    exclude_symbols=list(settings.approved_canary_scan_exclude_symbols) or None,
-                    exclude_tags=list(settings.approved_canary_scan_exclude_tags) or None,
-                    limit=settings.approved_canary_scan_limit,
+        for approved_route in approvals_by_label[label]:
+            try:
+                async with asyncio.timeout(settings.universe_scan_timeout_seconds):
+                    candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
+                        scanner=runtime,
+                        approval_service=route_approval_service,
+                        approval=approved_route,
+                        venues=list(settings.approved_canary_scan_venues),
+                        fee_profile_overrides=_build_approved_canary_fee_profile_overrides(
+                            settings
+                        ),
+                        target_notional=settings.approved_canary_scan_target_notional,
+                        canary_max_notional=settings.approved_canary_scan_max_notional,
+                        min_capacity_notional=settings.approved_canary_scan_min_capacity_notional,
+                        min_daily_volume=settings.approved_canary_scan_min_daily_volume,
+                        min_open_interest=settings.approved_canary_scan_min_open_interest,
+                        min_roundtrip_edge=settings.approved_canary_scan_min_roundtrip_edge,
+                        min_execution_quality_score=settings.approved_canary_scan_min_execution_quality_score,
+                        min_execution_samples=settings.approved_canary_scan_min_execution_samples,
+                        min_route_stability_weight=settings.approved_canary_scan_min_route_stability_weight,
+                        min_route_presence_ratio=settings.approved_canary_scan_min_route_presence_ratio,
+                        min_route_samples=settings.approved_canary_scan_min_route_samples,
+                        include_symbols=list(settings.approved_canary_scan_include_symbols)
+                        or None,
+                        exclude_symbols=list(settings.approved_canary_scan_exclude_symbols)
+                        or None,
+                        exclude_tags=list(settings.approved_canary_scan_exclude_tags) or None,
+                        limit=settings.approved_canary_scan_limit,
+                    )
+            except TimeoutError:
+                loop_logger.warning(
+                    "approved canary exact scan timed out for label=%s",
+                    approved_route.label,
                 )
-        except TimeoutError:
-            loop_logger.warning(
-                "approved canary exact scan timed out for label=%s",
-                approved_route.label,
-            )
-            continue
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError, ValueError) as exc:
-            loop_logger.warning(
-                "approved canary exact scan failed for label=%s: %s",
-                approved_route.label,
-                exc,
-            )
-            continue
-        scanned_candidates += candidate_count
-        if candidate is None:
-            continue
-        existing = approved_matches_by_label.get(approved_route.label)
-        if existing is None or _rank_approved_canary_candidate(
-            candidate
-        ) > _rank_approved_canary_candidate(existing[0]):
-            approved_matches_by_label[approved_route.label] = (candidate, approved_route)
+                continue
+            except (ConnectorError, UpstreamDataError, httpx.HTTPError, ValueError) as exc:
+                loop_logger.warning(
+                    "approved canary exact scan failed for label=%s: %s",
+                    approved_route.label,
+                    exc,
+                )
+                continue
+            scanned_candidates += candidate_count
+            if candidate is None:
+                continue
+            existing = approved_matches_by_label.get(approved_route.label)
+            if existing is None or _rank_approved_canary_candidate(
+                candidate
+            ) > _rank_approved_canary_candidate(existing[0]):
+                approved_matches_by_label[approved_route.label] = (candidate, approved_route)
     previous_snapshots = {label: snapshot_store.latest(label=label) for label in approved_labels}
     snapshots: list[ApprovedCanarySnapshot] = []
     approved_matches = list(approved_matches_by_label.values())
     for candidate, matched_approval in approved_matches:
-        label = build_pair_spec_from_universe_opportunity(candidate.opportunity).label
+        snapshot_label: str | None = build_pair_spec_from_universe_opportunity(
+            candidate.opportunity
+        ).label
         snapshots.append(
             snapshot_store.append(
                 ApprovedCanarySnapshot(
                     captured_at=timestamp,
-                    label=label or matched_approval.label,
+                    label=snapshot_label or matched_approval.label,
                     candidate=candidate,
                     approval=matched_approval,
                 )
