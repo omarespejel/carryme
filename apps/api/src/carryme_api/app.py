@@ -120,6 +120,7 @@ from carryme_runtime import (
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_runtime.route_approvals import scan_exact_canary_candidate_for_approval
+from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
@@ -1944,6 +1945,155 @@ def _select_latest_approved_canary_snapshot(
         snapshot.candidate.model_copy(update={"suggested_canary_notional": capped_notional}),
         approval,
     )
+
+
+def _validate_latest_approved_canary_snapshot_request(
+    *,
+    candidate: FundingUniverseCanaryCandidate,
+    approval: RouteApprovalEntry,
+    universe_service: OpportunityUniverseService,
+    venues: list[str] | None,
+    label: str,
+    target_notional: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+    include_symbols: list[str] | None,
+    exclude_symbols: list[str] | None,
+    exclude_tags: list[str] | None,
+) -> FundingUniverseCanaryCandidate:
+    """Reject cached snapshots that do not satisfy the current canary request."""
+
+    selected_venues = {venue.lower() for venue in (venues or list(SUPPORTED_UNIVERSE_VENUES))}
+    route = candidate.opportunity.opportunity
+    route_venues = {route.short_venue.lower(), route.long_venue.lower()}
+    if not route_venues.issubset(selected_venues):
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested venues",
+        )
+    if build_pair_spec_from_universe_opportunity(candidate.opportunity).label != label:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested label",
+        )
+    if (
+        route.canonical_symbol != approval.canonical_symbol
+        or route.short_venue != approval.short_venue
+        or route.long_venue != approval.long_venue
+        or route.short_fee_profile != approval.short_fee_profile
+        or route.long_fee_profile != approval.long_fee_profile
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot no longer matches the approved live route",
+        )
+    if not passes_symbol_policy(
+        route.canonical_symbol,
+        include_symbols=include_symbols,
+        exclude_symbols=exclude_symbols,
+        exclude_tags=exclude_tags or ["meme", "political"],
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested symbol policy",
+        )
+
+    deployable_notional = candidate.opportunity.deployable_notional
+    if route.capacity is not None and route.capacity.max_entry_notional is not None:
+        deployable_notional = min(target_notional, route.capacity.max_entry_notional)
+    elif deployable_notional is not None:
+        deployable_notional = min(target_notional, deployable_notional)
+    else:
+        deployable_notional = max(0.0, target_notional)
+    if deployable_notional < min_capacity_notional:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
+    if (candidate.opportunity.min_daily_volume or 0.0) < min_daily_volume:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
+    if (candidate.opportunity.min_open_interest or 0.0) < min_open_interest:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
+    modeled_roundtrip_edge = (
+        route.gross_daily_edge - candidate.opportunity.modeled_round_trip_cost_rate
+        if candidate.opportunity.modeled_round_trip_cost_rate is not None
+        else route.one_day_net_edge_after_round_trip
+    )
+    if modeled_roundtrip_edge < min_roundtrip_edge:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
+
+    execution_quality_service = getattr(universe_service, "execution_quality_service", None)
+    default_execution_quality_score = (
+        execution_quality_service.prior_score if execution_quality_service is not None else 1.0
+    )
+    execution_quality_score = (
+        candidate.opportunity.execution_quality.weighted_score
+        if candidate.opportunity.execution_quality is not None
+        else default_execution_quality_score
+    )
+    execution_sample_size = (
+        candidate.opportunity.execution_quality.sample_size
+        if candidate.opportunity.execution_quality is not None
+        else 0
+    )
+    if execution_quality_score < min_execution_quality_score:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
+    if execution_sample_size < min_execution_samples:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
+
+    if candidate.opportunity.route_stability is not None:
+        route_stability_weight = candidate.opportunity.route_stability.stability_weight
+        route_presence_ratio = candidate.opportunity.route_stability.presence_ratio
+        route_sample_size = candidate.opportunity.route_stability.sample_size
+        if route_stability_weight < min_route_stability_weight:
+            raise HTTPException(
+                status_code=409,
+                detail="Approved canary snapshot does not satisfy the requested filters",
+            )
+        if route_presence_ratio < min_route_presence_ratio:
+            raise HTTPException(
+                status_code=409,
+                detail="Approved canary snapshot does not satisfy the requested filters",
+            )
+        if route_sample_size < min_route_samples:
+            raise HTTPException(
+                status_code=409,
+                detail="Approved canary snapshot does not satisfy the requested filters",
+            )
+
+    adjusted_notional = min(
+        candidate.suggested_canary_notional,
+        approval.max_live_notional,
+        deployable_notional,
+    )
+    if adjusted_notional <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
+    return candidate.model_copy(update={"suggested_canary_notional": adjusted_notional})
 
 
 def _select_latest_launch_ready_canary_snapshot(
@@ -6034,6 +6184,11 @@ def create_app() -> FastAPI:
         normalized_label = label.strip() if label is not None else None
         if normalized_label == "":
             raise HTTPException(status_code=400, detail="label must be non-empty")
+        if max_snapshot_age_seconds < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="max_snapshot_age_seconds must be non-negative",
+            )
         if normalized_label is not None:
             try:
                 snapshot, selected, approval = await asyncio.to_thread(
@@ -6043,6 +6198,26 @@ def create_app() -> FastAPI:
                     label=normalized_label,
                     max_snapshot_age_seconds=max_snapshot_age_seconds,
                     canary_max_notional=canary_max_notional,
+                )
+                selected = _validate_latest_approved_canary_snapshot_request(
+                    candidate=selected,
+                    approval=approval,
+                    universe_service=universe_service,
+                    venues=venues,
+                    label=normalized_label,
+                    target_notional=target_notional,
+                    min_capacity_notional=min_capacity_notional,
+                    min_daily_volume=min_daily_volume,
+                    min_open_interest=min_open_interest,
+                    min_roundtrip_edge=min_roundtrip_edge,
+                    min_execution_quality_score=min_execution_quality_score,
+                    min_execution_samples=min_execution_samples,
+                    min_route_stability_weight=min_route_stability_weight,
+                    min_route_presence_ratio=min_route_presence_ratio,
+                    min_route_samples=min_route_samples,
+                    include_symbols=include_symbols,
+                    exclude_symbols=exclude_symbols,
+                    exclude_tags=exclude_tags,
                 )
             except HTTPException as exc:
                 if exc.status_code not in {404, 409}:
