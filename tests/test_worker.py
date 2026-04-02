@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ from carryme_models import (
 from carryme_runtime import (
     AccountPreflightService,
     ExecutionOrderStateService,
+    RouteApprovalService,
     SystemStateService,
 )
 from carryme_storage import (
@@ -1314,6 +1316,450 @@ def test_scan_approved_canary_once_saves_operator_approved_snapshots(tmp_path: P
     assert snapshots[0].approval.max_live_notional == 11.0
     assert len(alerts) == 1
     assert alerts[0].alert_type == "approved_canary_available"
+
+
+def test_scan_approved_canary_once_uses_exact_approved_fee_profiles(
+    tmp_path: Path,
+) -> None:
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="S-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="S-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="S-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+    calls: list[dict[str, object]] = []
+
+    class StubUniverseScanner:
+        async def scan_canary_candidates(
+            self,
+            **kwargs: object,
+        ) -> list[FundingUniverseCanaryCandidate]:
+            calls.append(dict(kwargs))
+            fee_profiles = cast(dict[str, str] | None, kwargs["fee_profile_overrides"])
+            include_symbols = cast(list[str] | None, kwargs["include_symbols"])
+            if fee_profiles == {"extended": "default", "paradex": "pro"}:
+                assert include_symbols == ["S-USD-PERP"]
+                return [candidate]
+            return []
+
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        approved_canary_scan_paradex_fee_profile="pro_fastfills",
+    )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 0, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            approved=True,
+            max_live_notional=11.0,
+            note="production canary",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, StubUniverseScanner()),
+            approval_service=RouteApprovalService(store=approval_store),
+            store=snapshot_store,
+            alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+            now=datetime(2026, 4, 2, 10, 5, tzinfo=UTC),
+        )
+    )
+
+    snapshots = snapshot_store.list_recent(limit=10, label="s_extended_paradex")
+
+    assert summary.scanned_candidates == 1
+    assert summary.approved_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].approval.long_fee_profile == "pro"
+    assert snapshots[0].candidate.opportunity.opportunity.long_fee_profile == "pro"
+    assert len(calls) == 1
+    assert calls[0]["fee_profile_overrides"] == {"extended": "default", "paradex": "pro"}
+    assert calls[0]["include_symbols"] == ["S-USD-PERP"]
+    assert calls[0]["venues"] == ["extended", "paradex"]
+
+
+def test_scan_approved_canary_once_skips_timed_out_exact_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        universe_scan_timeout_seconds=0.001,
+    )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 1, tzinfo=UTC),
+            label="slow_extended_paradex",
+            canonical_symbol="SLOW-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            approved=True,
+            max_live_notional=11.0,
+            note="slow exact route",
+        )
+    )
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 0, tzinfo=UTC),
+            label="fast_extended_paradex",
+            canonical_symbol="FAST-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="fast exact route",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    async def fake_scan_exact_canary_candidate_for_approval(
+        **kwargs: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        if approval.label == "slow_extended_paradex":
+            await asyncio.sleep(0.01)
+            return None, 0
+        return (
+            FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="FAST-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="FAST-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="FAST-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            1,
+        )
+
+    monkeypatch.setattr(
+        "carryme_worker.poller.scan_exact_canary_candidate_for_approval",
+        fake_scan_exact_canary_candidate_for_approval,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        summary = asyncio.run(
+            scan_approved_canary_once(
+                settings,
+                scanner=cast(Any, object()),
+                approval_service=RouteApprovalService(store=approval_store),
+                store=snapshot_store,
+                alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+                now=datetime(2026, 4, 2, 10, 5, tzinfo=UTC),
+            )
+        )
+
+    snapshots = snapshot_store.list_recent(limit=10)
+
+    assert summary.scanned_candidates == 1
+    assert summary.approved_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].label == "fast_extended_paradex"
+    assert "approved canary exact scan timed out for label=slow_extended_paradex" in caplog.text
+
+
+def test_scan_approved_canary_once_preserves_exact_approval_when_labels_repeat(
+    tmp_path: Path,
+) -> None:
+    def _candidate(
+        long_fee_profile: str,
+        *,
+        route_adjusted_quality_score: float,
+    ) -> FundingUniverseCanaryCandidate:
+        return FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="S-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile=long_fee_profile,
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="S-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="S-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+                route_adjusted_quality_score=route_adjusted_quality_score,
+            ),
+            suggested_canary_notional=25.0,
+        )
+
+    class StubUniverseScanner:
+        async def scan_canary_candidates(
+            self,
+            **kwargs: object,
+        ) -> list[FundingUniverseCanaryCandidate]:
+            fee_profiles = cast(dict[str, str] | None, kwargs["fee_profile_overrides"])
+            if fee_profiles == {"extended": "default", "paradex": "pro"}:
+                return [_candidate("pro", route_adjusted_quality_score=0.4)]
+            if fee_profiles == {"extended": "default", "paradex": "pro_fastfills"}:
+                return [_candidate("pro_fastfills", route_adjusted_quality_score=0.9)]
+            return []
+
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 0, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            approved=True,
+            max_live_notional=11.0,
+            note="tier a",
+        )
+    )
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 1, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="tier b",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, StubUniverseScanner()),
+            approval_service=RouteApprovalService(store=approval_store),
+            store=snapshot_store,
+            alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+            now=datetime(2026, 4, 2, 10, 5, tzinfo=UTC),
+        )
+    )
+
+    snapshots = snapshot_store.list_recent(limit=10, label="s_extended_paradex")
+
+    assert summary.scanned_candidates == 2
+    assert summary.approved_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert [snapshot.approval.long_fee_profile for snapshot in snapshots] == ["pro_fastfills"]
+    assert [
+        snapshot.candidate.opportunity.opportunity.long_fee_profile for snapshot in snapshots
+    ] == ["pro_fastfills"]
+
+
+def test_scan_approved_canary_once_continues_on_recoverable_exact_scan_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 1, tzinfo=UTC),
+            label="broken_extended_paradex",
+            canonical_symbol="BROKEN-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            approved=True,
+            max_live_notional=11.0,
+            note="broken exact route",
+        )
+    )
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 0, tzinfo=UTC),
+            label="healthy_extended_paradex",
+            canonical_symbol="HEALTHY-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="healthy exact route",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    async def fake_scan_exact_canary_candidate_for_approval(
+        **kwargs: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        if approval.label == "broken_extended_paradex":
+            raise ConnectorError("extended temporarily unavailable")
+        return (
+            FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="HEALTHY-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="HEALTHY-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="HEALTHY-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            1,
+        )
+
+    monkeypatch.setattr(
+        "carryme_worker.poller.scan_exact_canary_candidate_for_approval",
+        fake_scan_exact_canary_candidate_for_approval,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        summary = asyncio.run(
+            scan_approved_canary_once(
+                settings,
+                scanner=cast(Any, object()),
+                approval_service=RouteApprovalService(store=approval_store),
+                store=snapshot_store,
+                alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+                now=datetime(2026, 4, 2, 10, 5, tzinfo=UTC),
+            )
+        )
+
+    snapshots = snapshot_store.list_recent(limit=10)
+
+    assert summary.scanned_candidates == 1
+    assert summary.approved_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].label == "healthy_extended_paradex"
+    expected_warning = (
+        "approved canary exact scan failed for label=broken_extended_paradex: "
+        "extended temporarily unavailable"
+    )
+    assert expected_warning in caplog.text
 
 
 def test_scan_approved_canary_once_emits_stale_alert_for_missing_route(tmp_path: Path) -> None:
@@ -3704,9 +4150,12 @@ def test_run_supervised_universe_scan_loop_treats_connector_429_as_recoverable(
 
     from unittest.mock import patch
 
-    with caplog.at_level("WARNING"), patch(
-        "carryme_worker.poller.scan_funding_universe_once",
-        side_effect=fake_scan_funding_universe_once,
+    with (
+        caplog.at_level("WARNING"),
+        patch(
+            "carryme_worker.poller.scan_funding_universe_once",
+            side_effect=fake_scan_funding_universe_once,
+        ),
     ):
         summary = asyncio.run(
             run_supervised_universe_scan_loop(

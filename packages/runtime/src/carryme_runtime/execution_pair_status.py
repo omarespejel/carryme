@@ -64,7 +64,10 @@ def build_execution_pair_status(
         notes.append("Both legs are currently reflected in live position state.")
     elif any_position:
         derived_state = "cleanup_needed"
-        if any_unfilled and not any_filled:
+        if _is_cleanup_execution(entry):
+            recommended_action = "close_open_leg"
+            notes.append("A cleanup execution left one open leg in live position state.")
+        elif any_unfilled and not any_filled:
             recommended_action = "close_open_leg"
             notes.append("One leg is open while another was reported unfilled.")
         else:
