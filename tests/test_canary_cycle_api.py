@@ -1487,6 +1487,84 @@ def test_execute_guarded_canary_cycle_falls_back_to_exact_scan_when_snapshot_is_
     assert len(exact_scan_calls) == 1
 
 
+def test_execute_guarded_canary_cycle_falls_back_to_exact_scan_when_snapshot_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    approved_store = ApprovedCanaryStore(database_path)
+    approval_store = RouteApprovalStore(database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime.now(UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="missing snapshot approval",
+        )
+    )
+    paper_store = PaperTradeStore(database_path)
+    preview_confirmation_store = PreviewConfirmationStore(database_path)
+    pair_close_confirmation_store = PairClosePreviewConfirmationStore(database_path)
+    cleanup_confirmation_store = CleanupPreviewConfirmationStore(database_path)
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    snapshot_store = BalanceSnapshotStore(database_path)
+    exact_scan_calls: list[dict[str, object]] = []
+
+    _override_common_dependencies(
+        paper_store=paper_store,
+        preview_confirmation_store=preview_confirmation_store,
+        pair_close_confirmation_store=pair_close_confirmation_store,
+        cleanup_confirmation_store=cleanup_confirmation_store,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        snapshot_store=snapshot_store,
+    )
+    app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
+    app.dependency_overrides[get_route_approval_service] = lambda: RouteApprovalService(
+        store=approval_store
+    )
+
+    async def fake_scan_exact_canary_candidate_for_approval(
+        **kwargs: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        exact_scan_calls.append(dict(kwargs))
+        return _canary_candidate(), 1
+
+    async def fake_run_guarded_canary_lifecycle(**kwargs: object) -> object:
+        lifecycle_note = cast(str, kwargs["lifecycle_note"])
+        assert "fell back to exact live scan" in lifecycle_note
+        assert "No approved canary snapshot found" in lifecycle_note
+        raise RuntimeError("reached lifecycle")
+
+    monkeypatch.setattr(
+        "carryme_api.app.scan_exact_canary_candidate_for_approval",
+        fake_scan_exact_canary_candidate_for_approval,
+    )
+    monkeypatch.setattr(
+        "carryme_api.app._run_guarded_canary_lifecycle",
+        fake_run_guarded_canary_lifecycle,
+    )
+
+    client = TestClient(app)
+    try:
+        with pytest.raises(RuntimeError, match="reached lifecycle"):
+            client.post(
+                "/v1/executions/live/canary-cycle",
+                params={"label": "arb_extended_paradex"},
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert len(exact_scan_calls) == 1
+
+
 def test_execute_guarded_canary_cycle_rejects_blank_label(tmp_path: Path) -> None:
     database_path = tmp_path / "history.sqlite3"
     paper_store = PaperTradeStore(database_path)
