@@ -28,6 +28,26 @@ def build_execution_pair_status(
 ) -> ExecutionPairStatus:
     """Return a single pair-level state for a journaled execution attempt."""
 
+    if _has_duplicate_route_market(entry):
+        duplicate_route_notes = [
+            (
+                "Route legs are not uniquely identifiable by venue and symbol; "
+                "pair status requires manual review."
+            ),
+            *order_state.notes,
+            *reconciliation.notes,
+        ]
+        return ExecutionPairStatus(
+            execution_entry_id=entry.entry_id,
+            paper_trade_id=entry.paper_trade_id,
+            preview_hash=entry.preview_hash,
+            derived_state="review_required",
+            recommended_action="manual_review_required",
+            order_state=order_state,
+            reconciliation=reconciliation,
+            notes=duplicate_route_notes,
+        )
+
     position_presence = _position_presence_by_route(entry, reconciliation)
     order_leg_states = [item.derived_state for item in order_state.legs]
 
@@ -129,6 +149,17 @@ def _position_presence_by_route(
             leg.symbol in venue_state.position_symbols if venue_state is not None else False
         )
     return position_presence
+
+
+def _has_duplicate_route_market(entry: ExecutionJournalEntry) -> bool:
+    route_keys = {
+        f"{leg.venue}:{leg.symbol}"
+        for leg in (
+            entry.paper_trade.intent.long_leg,
+            entry.paper_trade.intent.short_leg,
+        )
+    }
+    return len(route_keys) != 2
 
 
 def _is_cleanup_execution(entry: ExecutionJournalEntry) -> bool:

@@ -9487,6 +9487,101 @@ def test_build_execution_pair_status_keeps_pending_when_same_venue_route_has_ope
     assert any("still reports the order as open" in note.lower() for note in status.notes)
 
 
+def test_build_execution_pair_status_fails_closed_on_duplicate_route_market() -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=39,
+        executed_at=datetime(2026, 4, 2, 16, 10, tzinfo=UTC),
+        adapter="paired_live:paradex_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=9,
+        preview_hash="duplicate-route-preview-hash",
+        confirmation_entry_id=17,
+        paper_trade=PaperTradeEntry(
+            entry_id=9,
+            created_at=datetime(2026, 4, 2, 16, 5, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="invalid_duplicate_route",
+                canonical_symbol="WLD-USD-PERP",
+                source_recorded_at=datetime(2026, 4, 2, 16, 0, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.001,
+                break_even_days_entry=0.5,
+                capacity_limit_notional=100.0,
+                target_notional=25.0,
+                capacity_fraction=1.0,
+                max_target_notional=25.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="WLD-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=25.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="WLD-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="sell",
+                    target_notional=25.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="WLD-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order-dup-1",
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="WLD-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="sell",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order-dup-2",
+            ),
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=39,
+        paper_trade_id=9,
+        preview_hash="duplicate-route-preview-hash",
+        legs=[],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=39,
+        paper_trade_id=9,
+        preview_hash="duplicate-route-preview-hash",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=["WLD-USD-PERP"],
+                matched_leg_symbols=["WLD-USD-PERP"],
+                unmatched_leg_symbols=[],
+            )
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "review_required"
+    assert status.recommended_action == "manual_review_required"
+    assert any("not uniquely identifiable" in note.lower() for note in status.notes)
+
+
 def test_build_execution_pair_status_keeps_cleanup_retryable_when_order_state_is_unknown() -> None:
     entry = ExecutionJournalEntry(
         entry_id=36,
