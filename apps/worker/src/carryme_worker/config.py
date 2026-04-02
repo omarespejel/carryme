@@ -93,6 +93,7 @@ class WorkerSettings(BaseSettings):
     approved_canary_scan_min_route_presence_ratio: float = 0.15
     approved_canary_scan_min_route_samples: int = 2
     approved_canary_scan_limit: int = 5
+    approved_canary_exact_scan_limit: int = 25
     approved_canary_scan_include_symbols: tuple[str, ...] = ()
     approved_canary_scan_exclude_symbols: tuple[str, ...] = ()
     approved_canary_scan_exclude_tags: tuple[str, ...] = ("meme", "political")
