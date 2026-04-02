@@ -29,16 +29,16 @@ def build_execution_pair_status(
     """Return a single pair-level state for a journaled execution attempt."""
 
     position_presence = _position_presence_by_route(entry, reconciliation)
-    order_states = {item.venue: item.derived_state for item in order_state.legs}
+    order_leg_states = [item.derived_state for item in order_state.legs]
 
     is_multi_leg_entry = len(entry.legs) >= 2
     any_position = any(position_presence.values())
     all_positions = bool(position_presence) and all(position_presence.values())
-    any_open = any(state == "open" for state in order_states.values())
-    any_partial_fill = any(state == "partial_fill" for state in order_states.values())
-    any_filled = any(state == "filled" for state in order_states.values())
-    any_unknown = any(state in {"unknown", "unsupported"} for state in order_states.values())
-    any_unfilled = any(state == "unfilled" for state in order_states.values())
+    any_open = any(state == "open" for state in order_leg_states)
+    any_partial_fill = any(state == "partial_fill" for state in order_leg_states)
+    any_filled = any(state == "filled" for state in order_leg_states)
+    any_unknown = any(state in {"unknown", "unsupported"} for state in order_leg_states)
+    any_unfilled = any(state == "unfilled" for state in order_leg_states)
     any_account_blocker = any(
         (not venue.authenticated) or (not venue.ready) for venue in reconciliation.venues
     )

@@ -9379,6 +9379,114 @@ def test_build_execution_pair_status_keeps_cleanup_needed_when_opposite_route_le
     assert any("cleanup execution left one open leg" in note.lower() for note in status.notes)
 
 
+def test_build_execution_pair_status_keeps_pending_when_same_venue_route_has_open_leg() -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=38,
+        executed_at=datetime(2026, 4, 2, 16, 5, tzinfo=UTC),
+        adapter="paired_live:paradex_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=8,
+        preview_hash="same-venue-preview-hash",
+        confirmation_entry_id=16,
+        paper_trade=PaperTradeEntry(
+            entry_id=8,
+            created_at=datetime(2026, 4, 2, 16, 0, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="wld_arb_paradex_pair",
+                canonical_symbol="WLD-USD-PERP",
+                source_recorded_at=datetime(2026, 4, 2, 15, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0021,
+                break_even_days_entry=0.20,
+                capacity_limit_notional=900.0,
+                target_notional=25.0,
+                capacity_fraction=1.0,
+                max_target_notional=25.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="WLD-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=25.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
+                    target_notional=25.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="WLD-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order-open",
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order-unfilled",
+            ),
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=38,
+        paper_trade_id=8,
+        preview_hash="same-venue-preview-hash",
+        legs=[
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="pdx-order-open",
+                derived_state="open",
+            ),
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="pdx-order-unfilled",
+                derived_state="unfilled",
+            ),
+        ],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=38,
+        paper_trade_id=8,
+        preview_hash="same-venue-preview-hash",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                matched_leg_symbols=[],
+                unmatched_leg_symbols=["WLD-USD-PERP", "ARB-USD-PERP"],
+            )
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "pending"
+    assert status.recommended_action == "wait_for_fill_or_timeout"
+    assert any("still reports the order as open" in note.lower() for note in status.notes)
+
+
 def test_build_execution_pair_status_keeps_cleanup_retryable_when_order_state_is_unknown() -> None:
     entry = ExecutionJournalEntry(
         entry_id=36,
