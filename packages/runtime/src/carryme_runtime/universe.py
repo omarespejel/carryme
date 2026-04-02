@@ -418,9 +418,7 @@ def _build_universe_opportunity(
     target_notional: float,
     execution_quality_index: dict[tuple[str, str, str], ExecutionQualitySummary],
     execution_prior_score: float,
-    route_stability_index: dict[
-        tuple[str, str, str, str, str], RouteStabilitySummary
-    ],
+    route_stability_index: dict[tuple[str, str, str, str, str], RouteStabilitySummary],
 ) -> FundingUniverseOpportunity:
     opportunity = score_funding_pair(
         left,
@@ -453,9 +451,7 @@ def _build_universe_opportunity(
         (opportunity.canonical_symbol, opportunity.short_venue, opportunity.long_venue)
     )
     execution_quality_score = (
-        execution_quality.weighted_score
-        if execution_quality is not None
-        else execution_prior_score
+        execution_quality.weighted_score if execution_quality is not None else execution_prior_score
     )
     route_stability = route_stability_index.get(
         (
@@ -472,9 +468,7 @@ def _build_universe_opportunity(
         else pnl_after_round_trip
     )
     execution_adjusted_quality_score = (
-        quality_score * execution_quality_score
-        if quality_score is not None
-        else quality_score
+        quality_score * execution_quality_score if quality_score is not None else quality_score
     )
     stability_adjusted_round_trip_pnl = (
         pnl_after_round_trip * route_stability.stability_weight
@@ -628,9 +622,7 @@ def _passes_filters(
         else 0.0
     )
     route_sample_size = (
-        opportunity.route_stability.sample_size
-        if opportunity.route_stability is not None
-        else 0
+        opportunity.route_stability.sample_size if opportunity.route_stability is not None else 0
     )
     if route_stability_weight < min_route_stability_weight:
         return False
@@ -829,25 +821,28 @@ def _modeled_net_edge_after_round_trip(opportunity: FundingUniverseOpportunity) 
 
 
 def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRanking) -> float:
+    def _rankable(value: float | None) -> float:
+        return value if value is not None else float("-inf")
+
     if ranking == "roundtrip_edge":
         return _modeled_net_edge_after_round_trip(opportunity)
     if ranking == "entry_edge":
         return _modeled_net_edge_after_entry(opportunity)
     if ranking == "roundtrip_pnl":
-        return opportunity.estimated_one_day_pnl_after_round_trip or float("-inf")
+        return _rankable(opportunity.estimated_one_day_pnl_after_round_trip)
     if ranking == "entry_pnl":
-        return opportunity.estimated_one_day_pnl_after_entry or float("-inf")
+        return _rankable(opportunity.estimated_one_day_pnl_after_entry)
     if ranking == "execution_adjusted_roundtrip_pnl":
-        return opportunity.execution_adjusted_one_day_pnl_after_round_trip or float("-inf")
+        return _rankable(opportunity.execution_adjusted_one_day_pnl_after_round_trip)
     if ranking == "execution_adjusted_quality_pnl":
-        return opportunity.execution_adjusted_quality_score or float("-inf")
+        return _rankable(opportunity.execution_adjusted_quality_score)
     if ranking == "stability_adjusted_roundtrip_pnl":
-        return opportunity.stability_adjusted_one_day_pnl_after_round_trip or float("-inf")
+        return _rankable(opportunity.stability_adjusted_one_day_pnl_after_round_trip)
     if ranking == "route_adjusted_quality_pnl":
-        return opportunity.route_adjusted_quality_score or float("-inf")
+        return _rankable(opportunity.route_adjusted_quality_score)
     if ranking == "stability_adjusted_quality_pnl":
-        return opportunity.stability_adjusted_quality_score or float("-inf")
-    return opportunity.quality_score or float("-inf")
+        return _rankable(opportunity.stability_adjusted_quality_score)
+    return _rankable(opportunity.quality_score)
 
 
 def _normalize_venues(venues: list[str]) -> list[str]:
@@ -982,9 +977,7 @@ def build_portfolio_plan(
         stability_adjusted_estimated_one_day_pnl_after_round_trip=(
             total_stability_adjusted_round_trip_pnl
         ),
-        route_adjusted_estimated_one_day_pnl_after_round_trip=(
-            total_route_adjusted_round_trip_pnl
-        ),
+        route_adjusted_estimated_one_day_pnl_after_round_trip=(total_route_adjusted_round_trip_pnl),
         entries=entries,
     )
 

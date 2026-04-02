@@ -171,9 +171,21 @@ def _rank_approved_canary_candidate(
 
     opportunity = candidate.opportunity
     return (
-        opportunity.route_adjusted_quality_score or float("-inf"),
-        opportunity.execution_adjusted_quality_score or float("-inf"),
-        opportunity.estimated_one_day_pnl_after_round_trip or float("-inf"),
+        (
+            opportunity.route_adjusted_quality_score
+            if opportunity.route_adjusted_quality_score is not None
+            else float("-inf")
+        ),
+        (
+            opportunity.execution_adjusted_quality_score
+            if opportunity.execution_adjusted_quality_score is not None
+            else float("-inf")
+        ),
+        (
+            opportunity.estimated_one_day_pnl_after_round_trip
+            if opportunity.estimated_one_day_pnl_after_round_trip is not None
+            else float("-inf")
+        ),
     )
 
 
@@ -1649,7 +1661,17 @@ async def _select_approved_canary_candidate(
             if candidate is not None:
                 exact_matches.append((candidate, approved_route))
         if exact_matches:
-            return max(exact_matches, key=lambda item: _rank_approved_canary_candidate(item[0]))
+            selected, _ = max(
+                exact_matches,
+                key=lambda item: _rank_approved_canary_candidate(item[0]),
+            )
+            matched_approval = approval_service.get_for_candidate(selected)
+            if matched_approval is None or not matched_approval.approved:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Selected canary route is no longer approved for live execution",
+                )
+            return selected, matched_approval
         raise HTTPException(
             status_code=404,
             detail="No approved canary candidate matched the requested filters",

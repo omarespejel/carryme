@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from carryme_api.app import (
@@ -60,7 +61,11 @@ from carryme_models import (
     VenueOrderPreview,
     VenueSystemState,
 )
-from carryme_runtime import BalanceAccountingService, RouteApprovalService
+from carryme_runtime import (
+    BalanceAccountingService,
+    RouteApprovalService,
+    build_pair_spec_from_universe_opportunity,
+)
 from carryme_storage import (
     ApprovedCanaryStore,
     BalanceSnapshotStore,
@@ -243,6 +248,16 @@ class _StubUniverseService:
 
 
 class _StubRouteApprovalService:
+    def __init__(self, approvals: list[RouteApprovalEntry] | None = None) -> None:
+        self._approvals = list(
+            approvals
+            or [
+                _route_approval(
+                    datetime(2026, 3, 29, 16, 0, tzinfo=UTC),
+                )
+            ]
+        )
+
     def list_recent(
         self,
         *,
@@ -251,30 +266,53 @@ class _StubRouteApprovalService:
         canonical_symbol: str | None = None,
         approved: bool | None = None,
     ) -> list[RouteApprovalEntry]:
-        approval = _route_approval()
-        if label is not None and approval.label != label:
-            return []
-        if canonical_symbol is not None and approval.canonical_symbol != canonical_symbol:
-            return []
-        if approved is not None and approval.approved is not approved:
-            return []
-        return [approval][:limit]
+        approvals = [
+            approval
+            for approval in self._approvals
+            if (label is None or approval.label == label)
+            and (canonical_symbol is None or approval.canonical_symbol == canonical_symbol)
+            and (approved is None or approval.approved is approved)
+        ]
+        approvals.sort(key=lambda item: item.updated_at, reverse=True)
+        return approvals[:limit]
 
     def filter_approved_canary_candidates(
         self,
         candidates: list[FundingUniverseCanaryCandidate],
     ) -> list[FundingUniverseCanaryCandidate]:
-        return candidates
+        approved_candidates: list[FundingUniverseCanaryCandidate] = []
+        for candidate in candidates:
+            approval = self.get_for_candidate(candidate)
+            if approval is not None and approval.approved:
+                approved_candidates.append(candidate)
+        return approved_candidates
 
     def get_for_candidate(
         self,
-        _candidate: FundingUniverseCanaryCandidate,
-    ) -> RouteApprovalEntry:
-        return _route_approval()
+        candidate: FundingUniverseCanaryCandidate,
+    ) -> RouteApprovalEntry | None:
+        opportunity = candidate.opportunity.opportunity
+        label = build_pair_spec_from_universe_opportunity(candidate.opportunity).label
+        for approval in self.list_recent(
+            limit=len(self._approvals) or 1,
+            label=label,
+            canonical_symbol=opportunity.canonical_symbol,
+            approved=None,
+        ):
+            if (
+                approval.short_venue == opportunity.short_venue
+                and approval.long_venue == opportunity.long_venue
+                and approval.short_fee_profile == opportunity.short_fee_profile
+                and approval.long_fee_profile == opportunity.long_fee_profile
+            ):
+                return approval
+        return None
 
     def require_live_approval(self, intent: FundingPairTradeIntent) -> RouteApprovalEntry:
         assert intent.label == "arb_extended_paradex"
-        return _route_approval()
+        approval = self.list_recent(limit=1, label=intent.label, approved=True)
+        assert approval
+        return approval[0]
 
 
 class _StubOrderPreviewService:
@@ -558,6 +596,26 @@ def _override_common_dependencies(
     app.dependency_overrides[get_paired_live_execution_coordinator] = (
         lambda: _StubPairedLiveExecutionCoordinator()
     )
+
+
+def test_exact_canary_ranking_preserves_zero_scores() -> None:
+    from carryme_api import app as app_module
+    from carryme_runtime import universe as universe_module
+
+    candidate = _canary_candidate()
+    opportunity = candidate.opportunity.model_copy(
+        update={
+            "route_adjusted_quality_score": 0.0,
+            "execution_adjusted_quality_score": 0.0,
+            "estimated_one_day_pnl_after_round_trip": 0.0,
+        }
+    )
+    candidate = candidate.model_copy(update={"opportunity": opportunity})
+
+    assert app_module._rank_approved_canary_candidate(candidate) == (0.0, 0.0, 0.0)
+    assert universe_module._ranking_value(opportunity, "roundtrip_pnl") == 0.0
+    assert universe_module._ranking_value(opportunity, "execution_adjusted_quality_pnl") == 0.0
+    assert universe_module._ranking_value(opportunity, "route_adjusted_quality_pnl") == 0.0
 
 
 def test_execute_guarded_approved_canary_basket_uses_shared_cap_plan(
@@ -924,9 +982,9 @@ def test_execute_guarded_canary_cycle_skips_unselected_live_credentials(
         note="approved canary",
     )
 
-    async def fake_select_approved_canary_candidate(**_: object) -> tuple[
-        FundingUniverseCanaryCandidate, RouteApprovalEntry
-    ]:
+    async def fake_select_approved_canary_candidate(
+        **_: object,
+    ) -> tuple[FundingUniverseCanaryCandidate, RouteApprovalEntry]:
         return candidate, approval
 
     async def fake_run_guarded_canary_lifecycle(**kwargs: object) -> None:
@@ -1006,6 +1064,20 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
             approved=True,
             max_live_notional=25.0,
             note="higher-ranked older route",
+        )
+    )
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 11, 2, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="vip",
+            approved=False,
+            max_live_notional=25.0,
+            note="unapproved negative control",
         )
     )
     calls: list[dict[str, object]] = []
@@ -1089,8 +1161,8 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
         paradex_private_key="0x123",
     )
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
-    app.dependency_overrides[get_route_approval_service] = (
-        lambda: RouteApprovalService(store=approval_store)
+    app.dependency_overrides[get_route_approval_service] = lambda: RouteApprovalService(
+        store=approval_store
     )
 
     client = TestClient(app)
@@ -1113,6 +1185,117 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
     }
     assert calls[1]["include_symbols"] == ["S-USD-PERP"]
     assert calls[1]["venues"] == ["extended", "paradex"]
+    assert all(
+        call["fee_profile_overrides"] != {"extended": "default", "paradex": "vip"} for call in calls
+    )
+
+
+def test_execute_guarded_canary_cycle_rechecks_selected_exact_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 4, 2, 12, 0, tzinfo=UTC),
+        label="s_extended_paradex",
+        canonical_symbol="S-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro",
+        approved=True,
+        max_live_notional=25.0,
+        note="stale exact approval",
+    )
+
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="S-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro",
+                short_fee_profile="default",
+                gross_daily_edge=0.003,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00255,
+                one_day_net_edge_after_round_trip=0.0021,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="S-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="S-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=1.89,
+            route_adjusted_quality_score=0.6,
+        ),
+        suggested_canary_notional=25.0,
+    )
+
+    async def fake_scan_exact_canary_candidate_for_approval(
+        **_: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        return candidate, 1
+
+    class StubRouteApprovalService(_StubRouteApprovalService):
+        def __init__(self) -> None:
+            super().__init__([approval])
+
+        def get_for_candidate(
+            self,
+            candidate: FundingUniverseCanaryCandidate,
+        ) -> RouteApprovalEntry | None:
+            _ = candidate
+            return None
+
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(database_path),
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-stark",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="0x123",
+    )
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    monkeypatch.setattr(
+        "carryme_api.app.scan_exact_canary_candidate_for_approval",
+        fake_scan_exact_canary_candidate_for_approval,
+    )
+    monkeypatch.setattr(
+        "carryme_api.app._run_guarded_canary_lifecycle",
+        AsyncMock(side_effect=RuntimeError("should not be reached")),
+    )
+
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/v1/executions/live/canary-cycle",
+            params={"label": "s_extended_paradex"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]
+        == "Selected canary route is no longer approved for live execution"
+    )
 
 
 def test_execute_guarded_canary_cycle_skips_close_when_open_is_not_hedged(
@@ -1862,9 +2045,7 @@ def test_execute_guarded_canary_cycle_from_latest_stable_launch_ready_skips_unse
     )
     launch_ready_store.append(snapshot)
     launch_ready_store.append(
-        snapshot.model_copy(
-            update={"captured_at": base_time + timedelta(minutes=1)}
-        )
+        snapshot.model_copy(update={"captured_at": base_time + timedelta(minutes=1)})
     )
 
     class StubRouteApprovalService:
