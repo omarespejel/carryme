@@ -8605,7 +8605,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
         ) -> PaperTradeAccountPreflight:
             self.probe_paper_trade_calls += 1
             if self.probe_paper_trade_calls <= 2:
-                positions = {"extended": ["ARB-USD"], "paradex": []}
+                positions = {"extended": [], "paradex": ["ARB-USD-PERP"]}
             else:
                 positions = {"extended": [], "paradex": []}
             return PaperTradeAccountPreflight(
@@ -8672,7 +8672,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
                         venue="paradex",
                         supported=True,
                         external_reference="paradex-1",
-                        derived_state="unfilled",
+                        derived_state="filled",
                     ),
                 ],
             )
@@ -8688,7 +8688,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
         ) -> ExecutionJournalEntry:
             return ExecutionJournalEntry(
                 executed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
-                adapter=f"paired_live:{first_venue}_then_paradex",
+                adapter="paired_live:paradex_then_extended",
                 mode="live",
                 status="submitted",
                 paper_trade_id=paper_trade.entry_id,
@@ -8696,16 +8696,6 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
                 confirmation_entry_id=confirmation.entry_id,
                 paper_trade=paper_trade,
                 legs=[
-                    ExecutionLegResult(
-                        venue="extended",
-                        symbol="ARB-USD",
-                        fee_profile="default",
-                        side="sell",
-                        target_notional=11.0,
-                        status="submitted",
-                        simulated=False,
-                        external_reference="extended-1",
-                    ),
                     ExecutionLegResult(
                         venue="paradex",
                         symbol="ARB-USD-PERP",
@@ -8715,6 +8705,16 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
                         status="submitted",
                         simulated=False,
                         external_reference="paradex-1",
+                    ),
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="extended-1",
                     ),
                 ],
             )
@@ -8727,30 +8727,30 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
             pair_status: ExecutionPairStatus,
             slippage_tolerance_bps: int = 10,
         ) -> ExecutionCleanupPreview:
-            assert pair_status.recommended_action == "close_open_leg"
+            assert pair_status.recommended_action == "complete_or_unwind_missing_leg"
             return ExecutionCleanupPreview(
                 execution_entry_id=entry.entry_id,
                 paper_trade_id=entry.paper_trade_id,
                 generated_at=datetime(2026, 3, 29, 13, 16, tzinfo=UTC),
                 preview_hash="cleanup-hash",
-                reason="close_open_leg",
+                reason="complete_or_unwind_missing_leg",
                 leg=VenueOrderPreview(
-                    venue="extended",
-                    symbol="ARB-USD",
-                    fee_profile="default",
-                    side="buy",
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
                     target_notional=11.0,
                     effective_notional=11.0,
-                    quantity=123.0,
-                    quantity_text="123",
-                    reference_price=0.0891,
-                    reference_price_source="best_ask",
-                    worst_acceptable_price=0.0892,
-                    worst_price_text="0.0892",
+                    quantity=123.1,
+                    quantity_text="123.10000000",
+                    reference_price=0.0892,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=0.0891,
+                    worst_price_text="0.08910000",
                     reduce_only=True,
-                    endpoint_path_hint="/api/v1/user/order",
-                    auth_scheme="api key + Stark signing key",
-                    payload={"symbol": "ARB-USD", "reduce_only": True},
+                    endpoint_path_hint="/v1/orders",
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ARB-USD-PERP", "reduce_only": True},
                     notes=[],
                 ),
                 notes=[],
@@ -8764,10 +8764,10 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
             confirmation: CleanupPreviewConfirmationEntry,
             executed_at: datetime | None = None,
         ) -> ExecutionJournalEntry:
-            assert confirmation.preview.leg.venue == "extended"
+            assert confirmation.preview.leg.venue == "paradex"
             return ExecutionJournalEntry(
                 executed_at=datetime(2026, 3, 29, 13, 16, tzinfo=UTC),
-                adapter="extended_cleanup_live",
+                adapter="paradex_cleanup_live",
                 mode="live",
                 status="submitted",
                 paper_trade_id=paper_trade.entry_id,
@@ -8776,10 +8776,10 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
                 paper_trade=paper_trade,
                 legs=[
                     ExecutionLegResult(
-                        venue="extended",
-                        symbol="ARB-USD",
-                        fee_profile="default",
-                        side="buy",
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="sell",
                         target_notional=11.0,
                         status="submitted",
                         simulated=False,
@@ -8835,7 +8835,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
         f"/v1/executions/live/pair/guarded/from-paper-trade/{paper_trade.entry_id}",
         params={
             "preview_hash": "preview-hash",
-            "first_venue": "extended",
+            "first_venue": "paradex",
             "poll_attempts": 2,
             "poll_interval_seconds": 0,
             "auto_cleanup": "true",
@@ -8846,26 +8846,25 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     assert response.status_code == 200
     payload = response.json()
     assert payload["paper_trade_id"] == paper_trade.entry_id
-    assert payload["primary_execution"]["adapter"] == "paired_live:extended_then_paradex"
-    assert payload["cleanup_execution"]["adapter"] == "extended_cleanup_live"
-    assert payload["pair_status"]["derived_state"] == "unfilled"
-    assert payload["pair_status"]["recommended_action"] == "no_action"
+    assert payload["primary_execution"]["adapter"] == "paired_live:paradex_then_extended"
+    assert payload["cleanup_execution"]["adapter"] == "paradex_cleanup_live"
     cleanup_confirmations = cleanup_confirmation_store.list_recent(limit=10)
     assert len(cleanup_confirmations) == 1
     assert cleanup_confirmations[0].preview_hash == "cleanup-hash"
     assert cleanup_confirmations[0].note == "guarded pair auto-cleanup"
-    assert cleanup_confirmations[0].preview.leg.venue == "extended"
+    assert cleanup_confirmations[0].preview.reason == "complete_or_unwind_missing_leg"
+    assert cleanup_confirmations[0].preview.leg.venue == "paradex"
     saved_executions = sorted(
         execution_store.list_recent(limit=10),
         key=lambda entry: entry.adapter,
     )
     assert [entry.adapter for entry in saved_executions] == [
-        "extended_cleanup_live",
-        "paired_live:extended_then_paradex",
+        "paired_live:paradex_then_extended",
+        "paradex_cleanup_live",
     ]
-    assert saved_executions[0].preview_hash == "cleanup-hash"
-    assert saved_executions[0].confirmation_entry_id == cleanup_confirmations[0].entry_id
-    assert saved_executions[1].preview_hash == "preview-hash"
+    assert saved_executions[1].preview_hash == "cleanup-hash"
+    assert saved_executions[1].confirmation_entry_id == cleanup_confirmations[0].entry_id
+    assert saved_executions[0].preview_hash == "preview-hash"
     assert paper_trade.entry_id is not None
     observations = [
         entry
@@ -8883,7 +8882,7 @@ def test_guarded_paired_live_execution_endpoint_auto_cleans_open_leg(tmp_path: P
     }
     latest_observation = observation_store.latest_for_paper_trade(paper_trade.entry_id)
     assert latest_observation is not None
-    assert latest_observation.execution_entry_id == saved_executions[0].entry_id
+    assert latest_observation.execution_entry_id == saved_executions[1].entry_id
     assert latest_observation.preview_hash == "cleanup-hash"
 
 
