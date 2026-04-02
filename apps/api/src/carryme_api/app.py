@@ -2082,6 +2082,15 @@ def _validate_latest_approved_canary_snapshot_request(
                 status_code=409,
                 detail="Approved canary snapshot does not satisfy the requested filters",
             )
+    elif (
+        min_route_stability_weight > 0.0
+        or min_route_presence_ratio > 0.0
+        or min_route_samples > 0
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
 
     adjusted_notional = min(
         candidate.suggested_canary_notional,
@@ -6189,6 +6198,11 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail="max_snapshot_age_seconds must be non-negative",
             )
+        _validate_route_stability_filters(
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+        )
         if normalized_label is not None:
             try:
                 snapshot, selected, approval = await asyncio.to_thread(
