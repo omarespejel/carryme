@@ -6,7 +6,7 @@ from pathlib import Path
 
 from carryme_runtime.preflight import LIVE_EXECUTION_VENUE_SPECS
 from carryme_storage.db import redact_database_url
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -16,6 +16,7 @@ class ApiSettings(BaseSettings):
     """Environment-backed API settings."""
 
     environment: str = "development"
+    operator_api_key: SecretStr | None = None
     database_path: str = Field(
         default="data/carryme.sqlite3",
         validation_alias=AliasChoices(
@@ -44,6 +45,17 @@ class ApiSettings(BaseSettings):
         env_prefix="CARRYME_API_",
         extra="ignore",
     )
+
+    @field_validator("operator_api_key")
+    @classmethod
+    def validate_operator_api_key(cls, value: SecretStr | None) -> SecretStr | None:
+        """Reject blank operator API keys so auth misconfiguration fails fast."""
+
+        if value is None:
+            return None
+        if not value.get_secret_value().strip():
+            raise ValueError("operator_api_key must be non-empty when configured")
+        return value
 
     @field_validator("watchlist_path")
     @classmethod
