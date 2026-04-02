@@ -1898,6 +1898,7 @@ def _select_latest_approved_canary_snapshot(
     approval_service: RouteApprovalService,
     label: str | None,
     max_snapshot_age_seconds: int,
+    canary_max_notional: float | None = None,
     now: datetime | None = None,
 ) -> tuple[ApprovedCanarySnapshot, FundingUniverseCanaryCandidate, RouteApprovalEntry]:
     snapshot = store.latest(label=label)
@@ -1925,11 +1926,18 @@ def _select_latest_approved_canary_snapshot(
     capped_notional = min(
         snapshot.candidate.suggested_canary_notional,
         approval.max_live_notional,
+        canary_max_notional
+        if canary_max_notional is not None
+        else snapshot.candidate.suggested_canary_notional,
     )
     if capped_notional <= 0:
         raise HTTPException(
             status_code=409,
-            detail="Approved canary snapshot no longer permits a positive live notional",
+            detail=(
+                "Approved canary snapshot does not satisfy the requested canary_max_notional"
+                if canary_max_notional is not None
+                else "Approved canary snapshot no longer permits a positive live notional"
+            ),
         )
     return (
         snapshot,
@@ -6034,6 +6042,7 @@ def create_app() -> FastAPI:
                     approval_service=approval_service,
                     label=normalized_label,
                     max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    canary_max_notional=canary_max_notional,
                 )
             except HTTPException as exc:
                 if exc.status_code not in {404, 409}:

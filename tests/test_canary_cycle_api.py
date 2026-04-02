@@ -1523,6 +1523,90 @@ def test_execute_guarded_canary_cycle_rejects_blank_label(tmp_path: Path) -> Non
     assert response.json()["detail"] == "label must be non-empty"
 
 
+def test_execute_guarded_canary_cycle_caps_fresh_snapshot_to_request_max(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    approved_store = ApprovedCanaryStore(database_path)
+    approved_store.append(
+        ApprovedCanarySnapshot(
+            captured_at=datetime.now(UTC),
+            label="arb_extended_paradex",
+            candidate=_canary_candidate(),
+            approval=_route_approval(),
+        )
+    )
+    approval_store = RouteApprovalStore(database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime.now(UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="fresh snapshot approval",
+        )
+    )
+    paper_store = PaperTradeStore(database_path)
+    preview_confirmation_store = PreviewConfirmationStore(database_path)
+    pair_close_confirmation_store = PairClosePreviewConfirmationStore(database_path)
+    cleanup_confirmation_store = CleanupPreviewConfirmationStore(database_path)
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    snapshot_store = BalanceSnapshotStore(database_path)
+
+    _override_common_dependencies(
+        paper_store=paper_store,
+        preview_confirmation_store=preview_confirmation_store,
+        pair_close_confirmation_store=pair_close_confirmation_store,
+        cleanup_confirmation_store=cleanup_confirmation_store,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        snapshot_store=snapshot_store,
+    )
+    app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
+    app.dependency_overrides[get_route_approval_service] = lambda: RouteApprovalService(
+        store=approval_store
+    )
+
+    async def fail_scan_exact_canary_candidate_for_approval(
+        **_: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        raise AssertionError("exact canary scan should not run for a fresh approved snapshot")
+
+    async def fake_run_guarded_canary_lifecycle(**kwargs: object) -> object:
+        candidate = cast(FundingUniverseCanaryCandidate, kwargs["candidate"])
+        assert candidate.suggested_canary_notional == 5.0
+        raise RuntimeError("reached lifecycle")
+
+    monkeypatch.setattr(
+        "carryme_api.app.scan_exact_canary_candidate_for_approval",
+        fail_scan_exact_canary_candidate_for_approval,
+    )
+    monkeypatch.setattr(
+        "carryme_api.app._run_guarded_canary_lifecycle",
+        fake_run_guarded_canary_lifecycle,
+    )
+
+    client = TestClient(app)
+    try:
+        with pytest.raises(RuntimeError, match="reached lifecycle"):
+            client.post(
+                "/v1/executions/live/canary-cycle",
+                params={
+                    "label": "arb_extended_paradex",
+                    "canary_max_notional": 5.0,
+                },
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_execute_guarded_canary_cycle_skips_close_when_open_is_not_hedged(
     tmp_path: Path,
 ) -> None:
