@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -1348,6 +1349,9 @@ def test_execute_guarded_canary_cycle_prefers_fresh_approved_snapshot(
     app.dependency_overrides[get_route_approval_service] = lambda: RouteApprovalService(
         store=approval_store
     )
+    to_thread_calls: list[
+        tuple[Callable[..., object], tuple[object, ...], dict[str, object]]
+    ] = []
 
     async def fail_scan_exact_canary_candidate_for_approval(
         **_: object,
@@ -1364,6 +1368,16 @@ def test_execute_guarded_canary_cycle_prefers_fresh_approved_snapshot(
         "carryme_api.app.scan_exact_canary_candidate_for_approval",
         fail_scan_exact_canary_candidate_for_approval,
     )
+    async def fake_to_thread(
+        func: Any,
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        to_thread_calls.append((cast(Callable[..., object], func), args, dict(kwargs)))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("carryme_api.app.asyncio.to_thread", fake_to_thread)
     monkeypatch.setattr(
         "carryme_api.app._run_guarded_canary_lifecycle",
         fake_run_guarded_canary_lifecycle,
@@ -1378,6 +1392,10 @@ def test_execute_guarded_canary_cycle_prefers_fresh_approved_snapshot(
             )
     finally:
         app.dependency_overrides.clear()
+
+    assert len(to_thread_calls) == 1
+    assert to_thread_calls[0][0].__name__ == "_select_latest_approved_canary_snapshot"
+    assert to_thread_calls[0][2]["label"] == "arb_extended_paradex"
 
 
 def test_execute_guarded_canary_cycle_falls_back_to_exact_scan_when_snapshot_is_stale(
@@ -1467,6 +1485,42 @@ def test_execute_guarded_canary_cycle_falls_back_to_exact_scan_when_snapshot_is_
         app.dependency_overrides.clear()
 
     assert len(exact_scan_calls) == 1
+
+
+def test_execute_guarded_canary_cycle_rejects_blank_label(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    paper_store = PaperTradeStore(database_path)
+    preview_confirmation_store = PreviewConfirmationStore(database_path)
+    pair_close_confirmation_store = PairClosePreviewConfirmationStore(database_path)
+    cleanup_confirmation_store = CleanupPreviewConfirmationStore(database_path)
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    snapshot_store = BalanceSnapshotStore(database_path)
+
+    _override_common_dependencies(
+        paper_store=paper_store,
+        preview_confirmation_store=preview_confirmation_store,
+        pair_close_confirmation_store=pair_close_confirmation_store,
+        cleanup_confirmation_store=cleanup_confirmation_store,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        snapshot_store=snapshot_store,
+    )
+    app.dependency_overrides[get_approved_canary_store] = lambda: ApprovedCanaryStore(
+        database_path
+    )
+
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/v1/executions/live/canary-cycle",
+            params={"label": "   "},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "label must be non-empty"
 
 
 def test_execute_guarded_canary_cycle_skips_close_when_open_is_not_hedged(

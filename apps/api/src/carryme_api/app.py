@@ -6023,12 +6023,16 @@ def create_app() -> FastAPI:
         close_position: bool = True,
     ) -> CanaryLifecycleResult:
         lifecycle_note: str | None = None
-        if label is not None:
+        normalized_label = label.strip() if label is not None else None
+        if normalized_label == "":
+            raise HTTPException(status_code=400, detail="label must be non-empty")
+        if normalized_label is not None:
             try:
-                snapshot, selected, approval = _select_latest_approved_canary_snapshot(
+                snapshot, selected, approval = await asyncio.to_thread(
+                    _select_latest_approved_canary_snapshot,
                     store=approved_store,
                     approval_service=approval_service,
-                    label=label,
+                    label=normalized_label,
                     max_snapshot_age_seconds=max_snapshot_age_seconds,
                 )
             except HTTPException as exc:
@@ -6038,7 +6042,7 @@ def create_app() -> FastAPI:
                     universe_service=universe_service,
                     approval_service=approval_service,
                     venues=venues,
-                    label=label,
+                    label=normalized_label,
                     extended_fee_profile=extended_fee_profile,
                     paradex_fee_profile=paradex_fee_profile,
                     hyperliquid_fee_profile=hyperliquid_fee_profile,
