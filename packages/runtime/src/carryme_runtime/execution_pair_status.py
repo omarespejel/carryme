@@ -28,7 +28,7 @@ def build_execution_pair_status(
 ) -> ExecutionPairStatus:
     """Return a single pair-level state for a journaled execution attempt."""
 
-    position_presence = _position_presence_by_leg(entry, reconciliation)
+    position_presence = _position_presence_by_route(entry, reconciliation)
     order_states = {item.venue: item.derived_state for item in order_state.legs}
 
     is_multi_leg_entry = len(entry.legs) >= 2
@@ -113,15 +113,19 @@ def build_execution_pair_status(
     )
 
 
-def _position_presence_by_leg(
+def _position_presence_by_route(
     entry: ExecutionJournalEntry,
     reconciliation: ExecutionReconciliation,
 ) -> dict[str, bool]:
     venues = {venue.venue: venue for venue in reconciliation.venues}
     position_presence: dict[str, bool] = {}
-    for leg in entry.legs:
+    route_legs = [
+        entry.paper_trade.intent.long_leg,
+        entry.paper_trade.intent.short_leg,
+    ]
+    for leg in route_legs:
         venue_state = venues.get(leg.venue)
-        position_presence[leg.venue] = (
+        position_presence[f"{leg.venue}:{leg.symbol}"] = (
             leg.symbol in venue_state.position_symbols if venue_state is not None else False
         )
     return position_presence

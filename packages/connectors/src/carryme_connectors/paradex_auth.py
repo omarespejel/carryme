@@ -260,13 +260,14 @@ def build_signed_paradex_order_payload(
         "side": side,
         "type": order_type,
         "size": _format_order_decimal(size),
-        "price": _format_order_decimal(price),
         "instruction": instruction,
         "client_id": client_id,
         "signature": signature,
         "signature_timestamp": signature_timestamp,
         "recv_window": recv_window_ms,
     }
+    if order_type != "MARKET":
+        signed_payload["price"] = _format_order_decimal(price)
     if reduce_only:
         signed_payload["flags"] = ["REDUCE_ONLY"]
     return signed_payload
