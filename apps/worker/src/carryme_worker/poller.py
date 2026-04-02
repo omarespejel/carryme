@@ -767,28 +767,36 @@ async def scan_approved_canary_once(
     approved_matches: list[tuple[FundingUniverseCanaryCandidate, RouteApprovalEntry]] = []
     scanned_candidates = 0
     for approved_route in approvals:
-        candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
-            scanner=runtime,
-            approval_service=route_approval_service,
-            approval=approved_route,
-            venues=list(settings.approved_canary_scan_venues),
-            fee_profile_overrides=_build_approved_canary_fee_profile_overrides(settings),
-            target_notional=settings.approved_canary_scan_target_notional,
-            canary_max_notional=settings.approved_canary_scan_max_notional,
-            min_capacity_notional=settings.approved_canary_scan_min_capacity_notional,
-            min_daily_volume=settings.approved_canary_scan_min_daily_volume,
-            min_open_interest=settings.approved_canary_scan_min_open_interest,
-            min_roundtrip_edge=settings.approved_canary_scan_min_roundtrip_edge,
-            min_execution_quality_score=settings.approved_canary_scan_min_execution_quality_score,
-            min_execution_samples=settings.approved_canary_scan_min_execution_samples,
-            min_route_stability_weight=settings.approved_canary_scan_min_route_stability_weight,
-            min_route_presence_ratio=settings.approved_canary_scan_min_route_presence_ratio,
-            min_route_samples=settings.approved_canary_scan_min_route_samples,
-            include_symbols=list(settings.approved_canary_scan_include_symbols) or None,
-            exclude_symbols=list(settings.approved_canary_scan_exclude_symbols) or None,
-            exclude_tags=list(settings.approved_canary_scan_exclude_tags) or None,
-            limit=settings.approved_canary_scan_limit,
-        )
+        try:
+            async with asyncio.timeout(settings.universe_scan_timeout_seconds):
+                candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
+                    scanner=runtime,
+                    approval_service=route_approval_service,
+                    approval=approved_route,
+                    venues=list(settings.approved_canary_scan_venues),
+                    fee_profile_overrides=_build_approved_canary_fee_profile_overrides(settings),
+                    target_notional=settings.approved_canary_scan_target_notional,
+                    canary_max_notional=settings.approved_canary_scan_max_notional,
+                    min_capacity_notional=settings.approved_canary_scan_min_capacity_notional,
+                    min_daily_volume=settings.approved_canary_scan_min_daily_volume,
+                    min_open_interest=settings.approved_canary_scan_min_open_interest,
+                    min_roundtrip_edge=settings.approved_canary_scan_min_roundtrip_edge,
+                    min_execution_quality_score=settings.approved_canary_scan_min_execution_quality_score,
+                    min_execution_samples=settings.approved_canary_scan_min_execution_samples,
+                    min_route_stability_weight=settings.approved_canary_scan_min_route_stability_weight,
+                    min_route_presence_ratio=settings.approved_canary_scan_min_route_presence_ratio,
+                    min_route_samples=settings.approved_canary_scan_min_route_samples,
+                    include_symbols=list(settings.approved_canary_scan_include_symbols) or None,
+                    exclude_symbols=list(settings.approved_canary_scan_exclude_symbols) or None,
+                    exclude_tags=list(settings.approved_canary_scan_exclude_tags) or None,
+                    limit=settings.approved_canary_scan_limit,
+                )
+        except TimeoutError:
+            loop_logger.warning(
+                "approved canary exact scan timed out for label=%s",
+                approved_route.label,
+            )
+            continue
         scanned_candidates += candidate_count
         if candidate is None:
             continue

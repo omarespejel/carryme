@@ -982,7 +982,7 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
     approval_store = RouteApprovalStore(database_path)
     approval_store.upsert(
         RouteApprovalEntry(
-            updated_at=datetime(2026, 4, 2, 11, 0, tzinfo=UTC),
+            updated_at=datetime(2026, 4, 2, 11, 1, tzinfo=UTC),
             label="s_extended_paradex",
             canonical_symbol="S-USD-PERP",
             short_venue="extended",
@@ -991,19 +991,39 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
             long_fee_profile="pro",
             approved=True,
             max_live_notional=25.0,
-            note="production route",
+            note="lower-ranked newer route",
         )
     )
-    captured: dict[str, object] = {}
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 11, 0, tzinfo=UTC),
+            label="s_extended_paradex",
+            canonical_symbol="S-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=25.0,
+            note="higher-ranked older route",
+        )
+    )
+    calls: list[dict[str, object]] = []
 
     class StubUniverseService:
         async def scan_canary_candidates(
             self,
             **kwargs: object,
         ) -> list[FundingUniverseCanaryCandidate]:
-            captured.update(kwargs)
+            calls.append(dict(kwargs))
             fee_profiles = cast(dict[str, str] | None, kwargs["fee_profile_overrides"])
-            if fee_profiles != {"extended": "default", "paradex": "pro"}:
+            if fee_profiles == {"extended": "default", "paradex": "pro"}:
+                route_adjusted_quality_score = 0.5
+                long_fee_profile = "pro"
+            elif fee_profiles == {"extended": "default", "paradex": "pro_fastfills"}:
+                route_adjusted_quality_score = 0.9
+                long_fee_profile = "pro_fastfills"
+            else:
                 return []
             return [
                 FundingUniverseCanaryCandidate(
@@ -1012,7 +1032,7 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
                             canonical_symbol="S-USD-PERP",
                             long_venue="paradex",
                             short_venue="extended",
-                            long_fee_profile="pro",
+                            long_fee_profile=long_fee_profile,
                             short_fee_profile="default",
                             gross_daily_edge=0.003,
                             entry_cost_rate=0.00045,
@@ -1040,6 +1060,7 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
                         },
                         deployable_notional=900.0,
                         estimated_one_day_pnl_after_round_trip=1.89,
+                        route_adjusted_quality_score=route_adjusted_quality_score,
                     ),
                     suggested_canary_notional=25.0,
                 )
@@ -1049,8 +1070,8 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
         candidate = cast(FundingUniverseCanaryCandidate, kwargs["candidate"])
         approval = cast(RouteApprovalEntry, kwargs["approval"])
         assert approval.label == "s_extended_paradex"
-        assert approval.long_fee_profile == "pro"
-        assert candidate.opportunity.opportunity.long_fee_profile == "pro"
+        assert approval.long_fee_profile == "pro_fastfills"
+        assert candidate.opportunity.opportunity.long_fee_profile == "pro_fastfills"
         raise RuntimeError("reached lifecycle")
 
     monkeypatch.setattr(
@@ -1082,9 +1103,16 @@ def test_execute_guarded_canary_cycle_uses_approved_fee_profiles_for_label_selec
     finally:
         app.dependency_overrides.clear()
 
-    assert captured["fee_profile_overrides"] == {"extended": "default", "paradex": "pro"}
-    assert captured["include_symbols"] == ["S-USD-PERP"]
-    assert captured["venues"] == ["extended", "paradex"]
+    assert len(calls) == 2
+    assert calls[0]["fee_profile_overrides"] == {"extended": "default", "paradex": "pro"}
+    assert calls[0]["include_symbols"] == ["S-USD-PERP"]
+    assert calls[0]["venues"] == ["extended", "paradex"]
+    assert calls[1]["fee_profile_overrides"] == {
+        "extended": "default",
+        "paradex": "pro_fastfills",
+    }
+    assert calls[1]["include_symbols"] == ["S-USD-PERP"]
+    assert calls[1]["venues"] == ["extended", "paradex"]
 
 
 def test_execute_guarded_canary_cycle_skips_close_when_open_is_not_hedged(

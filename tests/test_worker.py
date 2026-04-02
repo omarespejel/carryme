@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1412,10 +1413,125 @@ def test_scan_approved_canary_once_uses_exact_approved_fee_profiles(
     assert len(snapshots) == 1
     assert snapshots[0].approval.long_fee_profile == "pro"
     assert snapshots[0].candidate.opportunity.opportunity.long_fee_profile == "pro"
-    assert any(
-        call["fee_profile_overrides"] == {"extended": "default", "paradex": "pro"}
-        for call in calls
+    assert len(calls) == 1
+    assert calls[0]["fee_profile_overrides"] == {"extended": "default", "paradex": "pro"}
+    assert calls[0]["include_symbols"] == ["S-USD-PERP"]
+    assert calls[0]["venues"] == ["extended", "paradex"]
+
+
+def test_scan_approved_canary_once_skips_timed_out_exact_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        universe_scan_timeout_seconds=0.001,
     )
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 1, tzinfo=UTC),
+            label="slow_extended_paradex",
+            canonical_symbol="SLOW-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro",
+            approved=True,
+            max_live_notional=11.0,
+            note="slow exact route",
+        )
+    )
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 2, 10, 0, tzinfo=UTC),
+            label="fast_extended_paradex",
+            canonical_symbol="FAST-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="fast exact route",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    async def fake_scan_exact_canary_candidate_for_approval(
+        **kwargs: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        if approval.label == "slow_extended_paradex":
+            await asyncio.sleep(0.01)
+            return None, 0
+        return (
+            FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="FAST-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="FAST-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="FAST-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=11.0,
+            ),
+            1,
+        )
+
+    monkeypatch.setattr(
+        "carryme_worker.poller.scan_exact_canary_candidate_for_approval",
+        fake_scan_exact_canary_candidate_for_approval,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        summary = asyncio.run(
+            scan_approved_canary_once(
+                settings,
+                scanner=cast(Any, object()),
+                approval_service=RouteApprovalService(store=approval_store),
+                store=snapshot_store,
+                alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+                now=datetime(2026, 4, 2, 10, 5, tzinfo=UTC),
+            )
+        )
+
+    snapshots = snapshot_store.list_recent(limit=10)
+
+    assert summary.scanned_candidates == 1
+    assert summary.approved_candidates == 1
+    assert summary.saved_snapshots == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].label == "fast_extended_paradex"
+    assert "approved canary exact scan timed out for label=slow_extended_paradex" in caplog.text
 
 
 def test_scan_approved_canary_once_preserves_exact_approval_when_labels_repeat(

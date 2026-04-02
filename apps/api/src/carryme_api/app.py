@@ -164,6 +164,19 @@ MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 logger = logging.getLogger(__name__)
 
 
+def _rank_approved_canary_candidate(
+    candidate: FundingUniverseCanaryCandidate,
+) -> tuple[float, float, float]:
+    """Return the canary ranking tuple used for exact approval selection."""
+
+    opportunity = candidate.opportunity
+    return (
+        opportunity.route_adjusted_quality_score or float("-inf"),
+        opportunity.execution_adjusted_quality_score or float("-inf"),
+        opportunity.estimated_one_day_pnl_after_round_trip or float("-inf"),
+    )
+
+
 @dataclass(frozen=True)
 class _CanaryExecutionServices:
     """Candidate-scoped live execution services."""
@@ -1608,6 +1621,7 @@ async def _select_approved_canary_candidate(
         hyperliquid_fee_profile=hyperliquid_fee_profile,
     )
     if label is not None:
+        exact_matches: list[tuple[FundingUniverseCanaryCandidate, RouteApprovalEntry]] = []
         approvals = approval_service.list_recent(limit=1_000, label=label, approved=True)
         for approved_route in approvals:
             candidate, _ = await scan_exact_canary_candidate_for_approval(
@@ -1633,7 +1647,9 @@ async def _select_approved_canary_candidate(
                 limit=limit,
             )
             if candidate is not None:
-                return candidate, approved_route
+                exact_matches.append((candidate, approved_route))
+        if exact_matches:
+            return max(exact_matches, key=lambda item: _rank_approved_canary_candidate(item[0]))
         raise HTTPException(
             status_code=404,
             detail="No approved canary candidate matched the requested filters",
