@@ -7814,6 +7814,49 @@ def test_paradex_account_probe_counts_only_open_positions(
     asyncio.run(run())
 
 
+def test_paradex_account_probe_rejects_malformed_positions_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/account":
+            return httpx.Response(
+                200,
+                json={"account": "0xabc", "status": "ACTIVE", "free_collateral": "10.0"},
+            )
+        if request.url.path == "/v1/balance":
+            return httpx.Response(200, json=[{"asset": "USDC", "size": "10.0"}])
+        if request.url.path == "/v1/positions":
+            return httpx.Response(200, json={"positions": {"market": "STRK-USD-PERP"}})
+        if request.url.path == "/v1/auth/0xabc":
+            return httpx.Response(200, json={"jwt_token": "provided"})
+        raise AssertionError(f"Unexpected request path: {request.url.path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    async def run() -> None:
+        probe = ParadexAccountProbe()
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xabc",
+                    "private_key": None,
+                    "bearer_token": "provided",
+                },
+            }
+        )
+        assert status.authenticated is False
+        assert status.ready is False
+        assert any("malformed payload" in reason for reason in status.blocking_reasons)
+
+    asyncio.run(run())
+
+
 def test_reconcile_execution_marks_partial_and_missing_leg_symbols() -> None:
     entry = ExecutionJournalEntry(
         entry_id=21,
