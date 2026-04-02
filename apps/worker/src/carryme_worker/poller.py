@@ -763,10 +763,25 @@ async def scan_approved_canary_once(
     )
 
     approvals = route_approval_service.list_recent(limit=1_000, approved=True)
+    unique_approvals: list[RouteApprovalEntry] = []
+    seen_route_keys: set[tuple[str, str, str, str, str, str]] = set()
+    for approval in approvals:
+        route_key = (
+            approval.label,
+            approval.canonical_symbol,
+            approval.short_venue,
+            approval.long_venue,
+            approval.short_fee_profile,
+            approval.long_fee_profile,
+        )
+        if route_key in seen_route_keys:
+            continue
+        seen_route_keys.add(route_key)
+        unique_approvals.append(approval)
     approved_labels = {approval.label for approval in approvals}
     approved_matches: list[tuple[FundingUniverseCanaryCandidate, RouteApprovalEntry]] = []
     scanned_candidates = 0
-    for approved_route in approvals:
+    for approved_route in unique_approvals:
         try:
             async with asyncio.timeout(settings.universe_scan_timeout_seconds):
                 candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
@@ -805,8 +820,6 @@ async def scan_approved_canary_once(
     snapshots: list[ApprovedCanarySnapshot] = []
     for candidate, matched_approval in approved_matches:
         label = build_pair_spec_from_universe_opportunity(candidate.opportunity).label
-        if not matched_approval.approved:
-            continue
         snapshots.append(
             snapshot_store.append(
                 ApprovedCanarySnapshot(
