@@ -5945,6 +5945,7 @@ def create_app() -> FastAPI:
     async def execute_guarded_canary_cycle(
         request: Request,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        approved_store: Annotated[ApprovedCanaryStore, Depends(get_approved_canary_store)],
         universe_service: Annotated[
             OpportunityUniverseService, Depends(get_opportunity_universe_service)
         ],
@@ -5997,6 +5998,7 @@ def create_app() -> FastAPI:
         extended_fee_profile: str | None = None,
         paradex_fee_profile: str | None = "pro_fastfills",
         hyperliquid_fee_profile: str | None = None,
+        max_snapshot_age_seconds: int = 300,
         target_notional: float = 5_000.0,
         canary_max_notional: float = 25.0,
         min_capacity_notional: float = 25.0,
@@ -6020,30 +6022,77 @@ def create_app() -> FastAPI:
         auto_cleanup: bool = True,
         close_position: bool = True,
     ) -> CanaryLifecycleResult:
-        selected, approval = await _select_approved_canary_candidate(
-            universe_service=universe_service,
-            approval_service=approval_service,
-            venues=venues,
-            label=label,
-            extended_fee_profile=extended_fee_profile,
-            paradex_fee_profile=paradex_fee_profile,
-            hyperliquid_fee_profile=hyperliquid_fee_profile,
-            target_notional=target_notional,
-            canary_max_notional=canary_max_notional,
-            min_capacity_notional=min_capacity_notional,
-            min_daily_volume=min_daily_volume,
-            min_open_interest=min_open_interest,
-            min_roundtrip_edge=min_roundtrip_edge,
-            min_execution_quality_score=min_execution_quality_score,
-            min_execution_samples=min_execution_samples,
-            min_route_stability_weight=min_route_stability_weight,
-            min_route_presence_ratio=min_route_presence_ratio,
-            min_route_samples=min_route_samples,
-            include_symbols=include_symbols,
-            exclude_symbols=exclude_symbols,
-            exclude_tags=exclude_tags,
-            limit=limit,
-        )
+        lifecycle_note: str | None = None
+        if label is not None:
+            try:
+                snapshot, selected, approval = _select_latest_approved_canary_snapshot(
+                    store=approved_store,
+                    approval_service=approval_service,
+                    label=label,
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                )
+            except HTTPException as exc:
+                if exc.status_code not in {404, 409}:
+                    raise
+                selected, approval = await _select_approved_canary_candidate(
+                    universe_service=universe_service,
+                    approval_service=approval_service,
+                    venues=venues,
+                    label=label,
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                    target_notional=target_notional,
+                    canary_max_notional=canary_max_notional,
+                    min_capacity_notional=min_capacity_notional,
+                    min_daily_volume=min_daily_volume,
+                    min_open_interest=min_open_interest,
+                    min_roundtrip_edge=min_roundtrip_edge,
+                    min_execution_quality_score=min_execution_quality_score,
+                    min_execution_samples=min_execution_samples,
+                    min_route_stability_weight=min_route_stability_weight,
+                    min_route_presence_ratio=min_route_presence_ratio,
+                    min_route_samples=min_route_samples,
+                    include_symbols=include_symbols,
+                    exclude_symbols=exclude_symbols,
+                    exclude_tags=exclude_tags,
+                    limit=limit,
+                )
+                fallback_reason = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+                lifecycle_note = (
+                    "Approved canary snapshot unavailable; fell back to exact live scan "
+                    f"({fallback_reason})."
+                )
+            else:
+                lifecycle_note = (
+                    "Launched from approved canary snapshot "
+                    f"{snapshot.snapshot_id} captured at {snapshot.captured_at.isoformat()}."
+                )
+        else:
+            selected, approval = await _select_approved_canary_candidate(
+                universe_service=universe_service,
+                approval_service=approval_service,
+                venues=venues,
+                label=label,
+                extended_fee_profile=extended_fee_profile,
+                paradex_fee_profile=paradex_fee_profile,
+                hyperliquid_fee_profile=hyperliquid_fee_profile,
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+                limit=limit,
+            )
         cleanup_preview_service = _resolve_request_dependency(
             request,
             get_cleanup_preview_service,
@@ -6108,7 +6157,7 @@ def create_app() -> FastAPI:
             approval=approval,
             desired_notional=desired_notional,
             note=note,
-            lifecycle_note=None,
+            lifecycle_note=lifecycle_note,
             paper_store=paper_store,
             confirmation_store=confirmation_store,
             pair_close_confirmation_store=pair_close_confirmation_store,
