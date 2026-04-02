@@ -69,6 +69,7 @@ class ParadexLiveExecutionService:
     adaptive_retry_poll_attempts: int = 3
     adaptive_retry_poll_interval_seconds: float = 0.5
     adaptive_retry_book_slippage_bps: int = 5
+    forced_cleanup_market_fallback: bool = True
     base_url: str = PARADEX_API_BASE_URL
     token_provider: ParadexLiveTokenProvider = ParadexJwtTokenProvider()
     fetch_snapshot: SnapshotFetcher = fetch_live_snapshot
@@ -287,9 +288,61 @@ class ParadexLiveExecutionService:
             if observed_state.derived_state == "unfilled":
                 if attempt_index < self.adaptive_retry_attempts:
                     continue
+                if leg.reduce_only and self.forced_cleanup_market_fallback:
+                    return await self._submit_forced_market_cleanup(
+                        paper_trade=paper_trade,
+                        preview_hash=preview_hash,
+                        confirmation_entry_id=confirmation_entry_id,
+                        base_leg=leg,
+                        executed_at=executed_at,
+                        adapter_name=adapter_name,
+                        observer=observer,
+                        attempt_history=attempt_history,
+                    )
                 return entry
             return entry
         raise AssertionError("adaptive retry loop exited unexpectedly")
+
+    async def _submit_forced_market_cleanup(
+        self,
+        *,
+        paper_trade: PaperTradeEntry,
+        preview_hash: str,
+        confirmation_entry_id: int,
+        base_leg: VenueOrderPreview,
+        executed_at: datetime | None,
+        adapter_name: str,
+        observer: ParadexExecutionOrderObserver,
+        attempt_history: list[dict[str, Any]],
+    ) -> ExecutionJournalEntry:
+        market_leg = _build_forced_market_cleanup_leg(base_leg=base_leg)
+        entry = await self._submit_venue_order(
+            paper_trade=paper_trade,
+            preview_hash=preview_hash,
+            confirmation_entry_id=confirmation_entry_id,
+            adapter_name=adapter_name,
+            leg=market_leg,
+            executed_at=executed_at,
+        )
+        current_leg = entry.legs[0]
+        observed_state = None
+        if current_leg.status == "submitted":
+            observed_state = await self._observe_submitted_leg(
+                observer=observer,
+                leg=current_leg,
+            )
+        attempt_history.append(
+            _build_attempt_history_entry(
+                entry=entry,
+                attempt_index=len(attempt_history) + 1,
+                observed_state=observed_state,
+            )
+        )
+        return _entry_with_attempt_history(
+            entry=entry,
+            attempt_history=attempt_history,
+            observed_state=observed_state,
+        )
 
     async def _build_attempt_leg(
         self,
@@ -525,6 +578,30 @@ def _reprice_leg_within_confirmed_cap(
         update={
             "worst_acceptable_price": float(snapped),
             "worst_price_text": price_text,
+            "payload": payload,
+            "notes": notes,
+        }
+    )
+
+
+def _build_forced_market_cleanup_leg(*, base_leg: VenueOrderPreview) -> VenueOrderPreview:
+    payload = dict(base_leg.payload)
+    client_id = payload.get("client_id")
+    if isinstance(client_id, str) and client_id:
+        payload["client_id"] = f"{client_id}-mkt"
+    payload["type"] = "MARKET"
+    payload["price"] = "0"
+    payload["instruction"] = "IOC"
+    notes = [
+        *base_leg.notes,
+        (
+            "Cleanup IOC retries exhausted; escalating to a reduce-only MARKET order to "
+            "prioritize flattening remaining exposure."
+        ),
+    ]
+    return base_leg.model_copy(
+        update={
+            "order_type": "market",
             "payload": payload,
             "notes": notes,
         }

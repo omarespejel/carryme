@@ -6452,6 +6452,203 @@ def test_paradex_live_execution_service_submits_confirmed_cleanup_preview(
     asyncio.run(run())
 
 
+def test_paradex_live_execution_service_uses_market_fallback_for_unfilled_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_requests: list[dict[str, Any]] = []
+
+    class StubTokenProvider:
+        async def fetch_system_config(
+            self,
+            client: httpx.AsyncClient | None = None,
+        ) -> Any:
+            from carryme_connectors import ParadexSystemConfig
+
+            return ParadexSystemConfig(starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET")
+
+        async def issue_jwt_token(
+            self,
+            *,
+            account_address: str,
+            private_key: str,
+            client: httpx.AsyncClient | None = None,
+            now: int | None = None,
+        ) -> str:
+            return "jwt-token"
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        assert venue == "paradex"
+        assert symbol == "ARB-USD-PERP"
+        return _snapshot(
+            "paradex",
+            "ARB-USD-PERP",
+            -0.0002,
+            0.0890,
+            20_000,
+            0.0892,
+            20_000,
+            raw={
+                "order_size_increment": "0.1",
+                "min_notional": "10",
+                "price_tick_size": "0.0001",
+                "max_order_size": "12000000",
+            },
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer jwt-token"
+        if request.url.path == "/v1/orders":
+            payload = json.loads(request.content.decode("utf-8"))
+            seen_requests.append(payload)
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"order-{len(seen_requests)}",
+                    "status": "NEW",
+                    "client_id": payload["client_id"],
+                },
+            )
+        if request.url.path in {"/v1/orders/order-1", "/v1/orders/order-2"}:
+            return httpx.Response(
+                200,
+                json={
+                    "id": request.url.path.rsplit("/", 1)[-1],
+                    "status": "CLOSED",
+                    "avg_fill_price": "",
+                    "remaining_size": "123.1",
+                    "size": "123.1",
+                },
+            )
+        assert request.url.path == "/v1/orders/order-3"
+        return httpx.Response(
+            200,
+            json={
+                "id": "order-3",
+                "status": "CLOSED",
+                "avg_fill_price": "0.0894",
+                "remaining_size": "0",
+                "size": "123.1",
+            },
+        )
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    paper_trade = PaperTradeEntry(
+        entry_id=8,
+        created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=4500.0,
+            target_notional=1000.0,
+            capacity_fraction=0.25,
+            max_target_notional=1000.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=1000.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="ARB-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=1000.0,
+            ),
+        ),
+    )
+    confirmation = CleanupPreviewConfirmationEntry(
+        entry_id=11,
+        confirmed_at=datetime(2026, 3, 29, 13, 15, tzinfo=UTC),
+        paper_trade_id=8,
+        label="arb_extended_paradex",
+        preview_hash="cleanup-hash",
+        preview=ExecutionCleanupPreview(
+            execution_entry_id=5,
+            paper_trade_id=8,
+            generated_at=datetime(2026, 3, 29, 13, 12, tzinfo=UTC),
+            preview_hash="cleanup-hash",
+            reason="close_open_leg",
+            leg=VenueOrderPreview(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=11.0,
+                effective_notional=11.0,
+                quantity=123.1,
+                quantity_text="123.10000000",
+                quantity_increment=0.1,
+                minimum_order_size=0.1,
+                minimum_notional=10.0,
+                reference_price=0.0892,
+                reference_price_source="best_bid",
+                worst_acceptable_price=0.0890,
+                worst_price_text="0.08900000",
+                price_increment=0.0001,
+                max_order_value=1_000_000.0,
+                reduce_only=True,
+                endpoint_path_hint="/v1/orders",
+                required_auth_env_vars=[
+                    "CARRYME_API_PARADEX_ACCOUNT_ADDRESS",
+                    "CARRYME_API_PARADEX_PRIVATE_KEY",
+                ],
+                auth_scheme="main account address + subkey private key",
+                payload={
+                    "market": "ARB-USD-PERP",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "size": "123.10000000",
+                    "price": "0.08900000",
+                    "instruction": "IOC",
+                    "client_id": "carryme-cleanup-pt8-paradex-sell",
+                    "reduce_only": True,
+                },
+                notes=[],
+            ),
+            notes=[],
+        ),
+    )
+
+    async def run() -> None:
+        service = ParadexLiveExecutionService(
+            account_address="0xabc",
+            private_key="0x123",
+            token_provider=StubTokenProvider(),
+            fetch_snapshot=cast(Any, fetch_snapshot),
+            adaptive_retry_attempts=2,
+            adaptive_retry_poll_attempts=1,
+            adaptive_retry_poll_interval_seconds=0,
+            adaptive_retry_book_slippage_bps=5,
+        )
+        entry = await service.submit_confirmed_cleanup_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+        )
+        response_payload = entry.legs[0].response_payload
+        assert isinstance(response_payload, dict)
+        attempt_history = response_payload["attempt_history"]
+        assert isinstance(attempt_history, list)
+        assert len(attempt_history) == 3
+        assert [item["type"] for item in seen_requests] == ["LIMIT", "LIMIT", "MARKET"]
+        assert seen_requests[2]["price"] == "0"
+        assert seen_requests[2]["client_id"] == "carryme-cleanup-pt8-paradex-sell-mkt"
+        assert response_payload["observed_order_state"]["derived_state"] == "filled"
+
+    asyncio.run(run())
+
+
 def test_paradex_live_execution_service_labels_cleanup_network_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
