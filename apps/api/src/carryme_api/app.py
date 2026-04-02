@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -190,13 +191,14 @@ def get_app_environment() -> str:
     )
 
 
-def _resolve_api_settings_for_request(request: Request) -> ApiSettings:
+async def _resolve_api_settings_for_request(request: Request) -> ApiSettings:
     """Resolve API settings while honoring FastAPI dependency overrides in tests."""
 
-    override = request.app.dependency_overrides.get(get_api_settings)
-    if override is not None:
-        return cast(ApiSettings, override())
-    return get_api_settings()
+    resolver = request.app.dependency_overrides.get(get_api_settings) or get_api_settings
+    settings = resolver()
+    if inspect.isawaitable(settings):
+        settings = await cast(Awaitable[ApiSettings], settings)
+    return cast(ApiSettings, settings)
 
 
 def _operator_auth_error(status_code: int, detail: str) -> JSONResponse:
@@ -689,9 +691,7 @@ def _build_cleanup_preview_services_for_candidate(
     services: dict[str, Any] = {}
     for venue in _candidate_venues(candidate):
         if venue == "extended":
-            services[venue] = ExtendedCleanupPreviewService(
-                api_key=settings.extended_api_key or ""
-            )
+            services[venue] = ExtendedCleanupPreviewService(api_key=settings.extended_api_key or "")
         elif venue == "hyperliquid":
             services[venue] = HyperliquidCleanupPreviewService(
                 account_address=settings.hyperliquid_account_address or "",
@@ -1642,7 +1642,7 @@ async def _select_approved_canary_candidate(
         raise HTTPException(
             status_code=409,
             detail="Selected canary route is no longer approved for live execution",
-    )
+        )
     return selected, approval
 
 
@@ -1678,11 +1678,14 @@ async def _scan_approved_canary_basket_plan(
         min_route_presence_ratio=min_route_presence_ratio,
         min_route_samples=min_route_samples,
     )
-    fee_profile_overrides = _build_fee_profile_overrides(
-        extended_fee_profile=extended_fee_profile,
-        paradex_fee_profile=paradex_fee_profile,
-        hyperliquid_fee_profile=hyperliquid_fee_profile,
-    ) or {}
+    fee_profile_overrides = (
+        _build_fee_profile_overrides(
+            extended_fee_profile=extended_fee_profile,
+            paradex_fee_profile=paradex_fee_profile,
+            hyperliquid_fee_profile=hyperliquid_fee_profile,
+        )
+        or {}
+    )
     resolved_fee_profiles = universe_service.resolve_fee_profiles(
         venues=selected_venues,
         fee_profile_overrides=fee_profile_overrides,
@@ -2219,9 +2222,8 @@ async def _execute_approved_canary_basket_plan(
             settings=settings,
             candidate=candidate,
         )
-        route_note = (
-            f"approved canary basket route {index}/{len(basket_plan.entries)}"
-            + (f" :: {note}" if note else "")
+        route_note = f"approved canary basket route {index}/{len(basket_plan.entries)}" + (
+            f" :: {note}" if note else ""
         )
         try:
             result = await _run_guarded_canary_lifecycle(
@@ -2230,8 +2232,7 @@ async def _execute_approved_canary_basket_plan(
                 desired_notional=entry.selected_notional,
                 note=route_note,
                 lifecycle_note=(
-                    "Approved canary basket launch started at "
-                    f"{launched_at.isoformat()}."
+                    f"Approved canary basket launch started at {launched_at.isoformat()}."
                 ),
                 paper_store=paper_store,
                 confirmation_store=confirmation_store,
@@ -2833,7 +2834,7 @@ def create_app() -> FastAPI:
         if request.method not in MUTATING_HTTP_METHODS:
             return await call_next(request)
 
-        settings = _resolve_api_settings_for_request(request)
+        settings = await _resolve_api_settings_for_request(request)
         if settings.operator_api_key is None:
             return await call_next(request)
 
@@ -3116,9 +3117,7 @@ def create_app() -> FastAPI:
         response_model=ApprovedCanaryBasketPlan,
     )
     async def approved_canary_basket(
-        service: Annotated[
-            OpportunityUniverseService, Depends(get_opportunity_universe_service)
-        ],
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
         approval_service: Annotated[
             RouteApprovalService,
             Depends(get_route_approval_service),
@@ -5858,7 +5857,7 @@ def create_app() -> FastAPI:
         poll_interval_seconds: float = 2.0,
         auto_cleanup: bool = True,
         close_position: bool = True,
-        ) -> CanaryLifecycleResult:
+    ) -> CanaryLifecycleResult:
         selected, approval = await _select_approved_canary_candidate(
             universe_service=universe_service,
             approval_service=approval_service,

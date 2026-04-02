@@ -46,6 +46,17 @@ class ApiSettings(BaseSettings):
         extra="ignore",
     )
 
+    @field_validator("operator_api_key")
+    @classmethod
+    def validate_operator_api_key(cls, value: SecretStr | None) -> SecretStr | None:
+        """Reject blank operator API keys so auth misconfiguration fails fast."""
+
+        if value is None:
+            return None
+        if not value.get_secret_value().strip():
+            raise ValueError("operator_api_key must be non-empty when configured")
+        return value
+
     @field_validator("watchlist_path")
     @classmethod
     def validate_watchlist_path(cls, value: str) -> str:

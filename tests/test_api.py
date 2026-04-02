@@ -93,7 +93,7 @@ from carryme_storage import (
     WatchlistStore,
 )
 from fastapi.testclient import TestClient
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 
 def test_health_endpoint() -> None:
@@ -210,6 +210,108 @@ def test_operator_auth_allows_correct_bearer_on_mutating_requests(tmp_path: Path
     payload = response.json()
     assert payload["label"] == "s_extended_paradex"
     assert payload["long_fee_profile"] == "pro"
+
+
+def test_operator_auth_supports_async_settings_overrides(tmp_path: Path) -> None:
+    async def override_settings() -> ApiSettings:
+        return ApiSettings(
+            database_path=str(tmp_path / "history.sqlite3"),
+            operator_api_key=SecretStr("operator-secret"),
+        )
+
+    app.dependency_overrides[get_api_settings] = override_settings
+    client = TestClient(app)
+    try:
+        response = client.put(
+            "/v1/opportunities/route-approvals/s_extended_paradex",
+            headers={"Authorization": "Bearer operator-secret"},
+            json={
+                "canonical_symbol": "S-USD-PERP",
+                "short_venue": "extended",
+                "long_venue": "paradex",
+                "short_fee_profile": "default",
+                "long_fee_profile": "pro",
+                "approved": True,
+                "max_live_notional": 25.0,
+                "note": "production route",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["label"] == "s_extended_paradex"
+
+
+def test_operator_auth_rejects_missing_bearer_on_patch_requests(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        operator_api_key=SecretStr("operator-secret"),
+    )
+    client = TestClient(app)
+    try:
+        response = client.patch("/v1/opportunities/route-approvals/s_extended_paradex")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Missing operator authorization header"
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_operator_auth_allows_correct_bearer_to_reach_patch_route(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        operator_api_key=SecretStr("operator-secret"),
+    )
+    client = TestClient(app)
+    try:
+        response = client.patch(
+            "/v1/opportunities/route-approvals/s_extended_paradex",
+            headers={"Authorization": "Bearer operator-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 405
+
+
+def test_operator_auth_rejects_missing_bearer_on_delete_requests(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        operator_api_key=SecretStr("operator-secret"),
+    )
+    client = TestClient(app)
+    try:
+        response = client.delete("/v1/opportunities/route-approvals/s_extended_paradex")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Missing operator authorization header"
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_operator_auth_allows_correct_bearer_to_reach_delete_route(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        operator_api_key=SecretStr("operator-secret"),
+    )
+    client = TestClient(app)
+    try:
+        response = client.delete(
+            "/v1/opportunities/route-approvals/s_extended_paradex",
+            headers={"Authorization": "Bearer operator-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 405
+
+
+def test_operator_api_key_rejects_blank_values() -> None:
+    with pytest.raises(ValidationError, match="operator_api_key must be non-empty when configured"):
+        ApiSettings(operator_api_key=SecretStr("   "))
 
 
 def test_readiness_endpoint(tmp_path: Path) -> None:
