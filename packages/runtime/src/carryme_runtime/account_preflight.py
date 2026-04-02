@@ -708,14 +708,20 @@ def _unwrap_rows(value: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
 
 def _unwrap_rows_strict(value: dict[str, Any] | list[Any], *, context: str) -> list[dict[str, Any]]:
     if isinstance(value, list):
-        return [item for item in value if isinstance(item, dict)]
+        if not all(isinstance(item, dict) for item in value):
+            raise UpstreamDataError(f"{context} payload must be a list of objects")
+        return cast(list[dict[str, Any]], value)
     if isinstance(value, dict):
         for key in ("data", "results", "result", "rows", "positions", "balances"):
             if key not in value:
                 continue
             nested = value.get(key)
             if isinstance(nested, list):
-                return [item for item in nested if isinstance(item, dict)]
+                if not all(isinstance(item, dict) for item in nested):
+                    raise UpstreamDataError(
+                        f"{context} payload field {key!r} must be a list of objects"
+                    )
+                return cast(list[dict[str, Any]], nested)
             raise UpstreamDataError(f"{context} payload field {key!r} must be a list")
     raise UpstreamDataError(f"{context} payload did not contain a row list")
 
@@ -724,13 +730,9 @@ def _extract_balance_assets(value: dict[str, Any] | list[Any]) -> list[str]:
     return _extract_row_strings(value, "asset", "token", "currency", "symbol")
 
 
-def _count_open_positions(value: dict[str, Any] | list[Any], *, context: str | None = None) -> int:
-    rows = (
-        _unwrap_rows_strict(value, context=context)
-        if context is not None
-        else _unwrap_rows(value)
-    )
-    return len([row for row in rows if _row_represents_open_position(row)])
+def _count_open_positions(value: dict[str, Any] | list[Any], *, context: str) -> int:
+    rows = _unwrap_rows_strict(value, context=context)
+    return sum(1 for row in rows if _row_represents_open_position(row))
 
 
 def _extract_position_symbols(value: dict[str, Any] | list[Any]) -> list[str]:

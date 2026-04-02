@@ -7752,7 +7752,7 @@ def test_account_preflight_extracts_balance_assets_and_position_symbols() -> Non
 def test_account_preflight_ignores_closed_or_zero_size_positions() -> None:
     positions = {
         "results": [
-            {"market": "ARB-USD-PERP", "status": "CLOSED", "size": "0"},
+            {"market": "ARB-USD-PERP", "status": "CLOSED", "size": "3"},
             {"symbol": "STRK-USD", "status": "OPEN", "size": "25"},
             {"ticker": "ETH-USD-PERP", "size": "0"},
             {"market": "SOL-USD-PERP", "size": "-3"},
@@ -7760,7 +7760,7 @@ def test_account_preflight_ignores_closed_or_zero_size_positions() -> None:
     }
 
     assert _extract_position_symbols(positions) == ["STRK-USD", "SOL-USD-PERP"]
-    assert _count_open_positions(positions) == 2
+    assert _count_open_positions(positions, context="test positions") == 2
 
 
 def test_paradex_account_probe_counts_only_open_positions(
@@ -7778,7 +7778,7 @@ def test_paradex_account_probe_counts_only_open_positions(
             return httpx.Response(
                 200,
                 json=[
-                    {"market": "ARB-USD-PERP", "status": "CLOSED", "size": "0"},
+                    {"market": "ARB-USD-PERP", "status": "CLOSED", "size": "5"},
                     {"market": "STRK-USD-PERP", "status": "OPEN", "size": "2"},
                     {"market": "ETH-USD-PERP", "size": "0"},
                 ],
