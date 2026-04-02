@@ -1954,6 +1954,9 @@ def _validate_latest_approved_canary_snapshot_request(
     universe_service: OpportunityUniverseService,
     venues: list[str] | None,
     label: str,
+    extended_fee_profile: str | None,
+    paradex_fee_profile: str | None,
+    hyperliquid_fee_profile: str | None,
     target_notional: float,
     min_capacity_notional: float,
     min_daily_volume: float,
@@ -1994,6 +1997,21 @@ def _validate_latest_approved_canary_snapshot_request(
             status_code=409,
             detail="Approved canary snapshot no longer matches the approved live route",
         )
+    requested_fee_profiles = {
+        "extended": extended_fee_profile,
+        "paradex": paradex_fee_profile,
+        "hyperliquid": hyperliquid_fee_profile,
+    }
+    for venue_name, route_fee_profile in (
+        (route.short_venue.lower(), route.short_fee_profile),
+        (route.long_venue.lower(), route.long_fee_profile),
+    ):
+        requested_fee_profile = requested_fee_profiles.get(venue_name)
+        if requested_fee_profile is not None and route_fee_profile != requested_fee_profile:
+            raise HTTPException(
+                status_code=409,
+                detail="Approved canary snapshot does not satisfy the requested fee profiles",
+            )
     if not passes_symbol_policy(
         route.canonical_symbol,
         include_symbols=include_symbols,
@@ -2097,6 +2115,11 @@ def _validate_latest_approved_canary_snapshot_request(
         approval.max_live_notional,
         deployable_notional,
     )
+    if adjusted_notional < min_capacity_notional:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot does not satisfy the requested filters",
+        )
     if adjusted_notional <= 0:
         raise HTTPException(
             status_code=409,
@@ -6219,6 +6242,9 @@ def create_app() -> FastAPI:
                     universe_service=universe_service,
                     venues=venues,
                     label=normalized_label,
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
                     target_notional=target_notional,
                     min_capacity_notional=min_capacity_notional,
                     min_daily_volume=min_daily_volume,
