@@ -1407,6 +1407,109 @@ async def _ensure_cleanup_live_ready(
         )
 
 
+def _build_cleanup_confirmation_note(
+    *,
+    note: str | None,
+    requested_preview_hash: str,
+    current_preview_hash: str,
+) -> str | None:
+    if requested_preview_hash == current_preview_hash:
+        return note
+    refresh_note = (
+        "Refreshed cleanup preview from stale hash "
+        f"{requested_preview_hash} to current hash {current_preview_hash}"
+    )
+    if note is None or not note.strip():
+        return refresh_note
+    if refresh_note in note:
+        return note
+    return f"{note}; {refresh_note}"
+
+
+def _append_cleanup_confirmation_entry(
+    *,
+    paper_trade: PaperTradeEntry,
+    cleanup_preview: ExecutionCleanupPreview,
+    confirmation_store: CleanupPreviewConfirmationStore,
+    note: str | None,
+) -> CleanupPreviewConfirmationEntry:
+    effective_paper_trade_id = (
+        paper_trade.entry_id
+        if paper_trade.entry_id is not None
+        else cleanup_preview.paper_trade_id
+    )
+    if effective_paper_trade_id is None:
+        raise ValueError("paper_trade_id is required for cleanup confirmation entries")
+    return confirmation_store.append(
+        CleanupPreviewConfirmationEntry(
+            confirmed_at=datetime.now(UTC),
+            paper_trade_id=effective_paper_trade_id,
+            label=paper_trade.intent.label,
+            preview_hash=cleanup_preview.preview_hash,
+            preview=cleanup_preview,
+            note=note,
+        )
+    )
+
+
+def _resolve_cleanup_confirmation_for_live_submit(
+    *,
+    paper_trade: PaperTradeEntry,
+    cleanup_preview: ExecutionCleanupPreview,
+    confirmation_store: CleanupPreviewConfirmationStore,
+    requested_preview_hash: str,
+) -> CleanupPreviewConfirmationEntry:
+    current_preview_hash = cleanup_preview.preview_hash
+    effective_paper_trade_id = (
+        paper_trade.entry_id
+        if paper_trade.entry_id is not None
+        else cleanup_preview.paper_trade_id
+    )
+    if effective_paper_trade_id is None:
+        raise ValueError("paper_trade_id is required for cleanup confirmation entries")
+
+    if requested_preview_hash == current_preview_hash:
+        confirmations = confirmation_store.list_recent(
+            limit=50,
+            paper_trade_id=effective_paper_trade_id,
+        )
+        return require_confirmed_cleanup_preview(
+            paper_trade_id=effective_paper_trade_id,
+            preview_hash=current_preview_hash,
+            confirmations=confirmations,
+        )
+
+    current_confirmation = confirmation_store.find_latest_by_preview_hash(
+        paper_trade_id=effective_paper_trade_id,
+        preview_hash=current_preview_hash,
+    )
+    if current_confirmation is not None:
+        return current_confirmation
+
+    stale_confirmation = confirmation_store.find_latest_by_preview_hash(
+        paper_trade_id=effective_paper_trade_id,
+        preview_hash=requested_preview_hash,
+    )
+    if stale_confirmation is None:
+        raise ValueError(
+            "No cleanup preview confirmation matched "
+            f"paper_trade_id={effective_paper_trade_id} "
+            f"and preview_hash={requested_preview_hash}"
+        )
+
+    refreshed_note = _build_cleanup_confirmation_note(
+        note=stale_confirmation.note,
+        requested_preview_hash=requested_preview_hash,
+        current_preview_hash=current_preview_hash,
+    )
+    return _append_cleanup_confirmation_entry(
+        paper_trade=paper_trade,
+        cleanup_preview=cleanup_preview,
+        confirmation_store=confirmation_store,
+        note=refreshed_note,
+    )
+
+
 async def _observe_pair_status_for_execution(
     *,
     paper_trade: PaperTradeEntry,
@@ -3757,7 +3860,7 @@ def create_app() -> FastAPI:
         normalized_preview_hash = preview_hash.strip()
         if not normalized_preview_hash:
             raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
-        paper_trade, execution, _, cleanup_preview = await _build_cleanup_context_for_paper_trade(
+        paper_trade, _execution, _, cleanup_preview = await _build_cleanup_context_for_paper_trade(
             paper_trade_id=paper_trade_id,
             settings=settings,
             paper_store=paper_store,
@@ -3766,20 +3869,17 @@ def create_app() -> FastAPI:
             order_state_service=order_state_service,
             cleanup_service=cleanup_service,
         )
-        if cleanup_preview.preview_hash != normalized_preview_hash:
-            raise HTTPException(
-                status_code=409,
-                detail="Preview hash did not match the current cleanup preview",
-            )
-        confirmation = CleanupPreviewConfirmationEntry(
-            confirmed_at=datetime.now(UTC),
-            paper_trade_id=paper_trade.entry_id or paper_trade_id,
-            label=paper_trade.intent.label,
-            preview_hash=normalized_preview_hash,
-            preview=cleanup_preview,
+        refreshed_note = _build_cleanup_confirmation_note(
             note=note,
+            requested_preview_hash=normalized_preview_hash,
+            current_preview_hash=cleanup_preview.preview_hash,
         )
-        return confirmation_store.append(confirmation)
+        return _append_cleanup_confirmation_entry(
+            paper_trade=paper_trade,
+            cleanup_preview=cleanup_preview,
+            confirmation_store=confirmation_store,
+            note=refreshed_note,
+        )
 
     @app.post(
         "/v1/executions/pair-close-preview-confirmations/latest/from-paper-trade/{paper_trade_id}",
@@ -4495,20 +4595,12 @@ def create_app() -> FastAPI:
                 status_code=409,
                 detail="Current cleanup preview targets paradex, not extended",
             )
-        if cleanup_preview.preview_hash != normalized_preview_hash:
-            raise HTTPException(
-                status_code=409,
-                detail="Cleanup preview hash did not match the current cleanup preview",
-            )
-        confirmations = confirmation_store.list_recent(
-            limit=50,
-            paper_trade_id=paper_trade_id,
-        )
         try:
-            confirmation = require_confirmed_cleanup_preview(
-                paper_trade_id=paper_trade_id,
-                preview_hash=normalized_preview_hash,
-                confirmations=confirmations,
+            confirmation = _resolve_cleanup_confirmation_for_live_submit(
+                paper_trade=paper_trade,
+                cleanup_preview=cleanup_preview,
+                confirmation_store=confirmation_store,
+                requested_preview_hash=normalized_preview_hash,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -4609,20 +4701,12 @@ def create_app() -> FastAPI:
                 status_code=409,
                 detail="Current cleanup preview targets extended, not paradex",
             )
-        if cleanup_preview.preview_hash != normalized_preview_hash:
-            raise HTTPException(
-                status_code=409,
-                detail="Cleanup preview hash did not match the current cleanup preview",
-            )
-        confirmations = confirmation_store.list_recent(
-            limit=50,
-            paper_trade_id=paper_trade_id,
-        )
         try:
-            confirmation = require_confirmed_cleanup_preview(
-                paper_trade_id=paper_trade_id,
-                preview_hash=normalized_preview_hash,
-                confirmations=confirmations,
+            confirmation = _resolve_cleanup_confirmation_for_live_submit(
+                paper_trade=paper_trade,
+                cleanup_preview=cleanup_preview,
+                confirmation_store=confirmation_store,
+                requested_preview_hash=normalized_preview_hash,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -4701,6 +4785,9 @@ def create_app() -> FastAPI:
             Depends(get_hyperliquid_live_execution_service),
         ],
     ) -> ExecutionJournalEntry:
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
         await _ensure_cleanup_live_ready(
             venue="hyperliquid",
             settings=settings,
@@ -4720,20 +4807,12 @@ def create_app() -> FastAPI:
                 status_code=409,
                 detail="Current cleanup preview targets a different venue, not hyperliquid",
             )
-        if cleanup_preview.preview_hash != preview_hash:
-            raise HTTPException(
-                status_code=409,
-                detail="Cleanup preview hash did not match the current cleanup preview",
-            )
-        confirmations = confirmation_store.list_recent(
-            limit=50,
-            paper_trade_id=paper_trade_id,
-        )
         try:
-            confirmation = require_confirmed_cleanup_preview(
-                paper_trade_id=paper_trade_id,
-                preview_hash=preview_hash,
-                confirmations=confirmations,
+            confirmation = _resolve_cleanup_confirmation_for_live_submit(
+                paper_trade=paper_trade,
+                cleanup_preview=cleanup_preview,
+                confirmation_store=confirmation_store,
+                requested_preview_hash=normalized_preview_hash,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
