@@ -4821,6 +4821,31 @@ def test_build_signed_paradex_order_payload_adds_signature_fields() -> None:
     assert "flags" not in payload
 
 
+def test_build_signed_paradex_market_order_payload_omits_price() -> None:
+    payload = build_signed_paradex_order_payload(
+        account_address="0x123",
+        private_key="0x456",
+        starknet_chain_id="PRIVATE_SN_PARACLEAR_MAINNET",
+        order_payload={
+            "market": "WLD-USD-PERP",
+            "side": "BUY",
+            "type": "MARKET",
+            "size": "93.5",
+            "price": "0",
+            "instruction": "IOC",
+            "client_id": "carryme-cleanup-pt7-paradex-buy-mkt",
+            "reduce_only": True,
+        },
+        signature_timestamp_ms=1_700_000_000_000,
+        recv_window_ms=45_000,
+    )
+
+    assert payload["market"] == "WLD-USD-PERP"
+    assert payload["type"] == "MARKET"
+    assert payload["flags"] == ["REDUCE_ONLY"]
+    assert "price" not in payload
+
+
 def test_build_signed_extended_order_payload_uses_settlement_schema() -> None:
     payload = build_signed_extended_order_payload(
         api_key="extended-key",
@@ -6642,7 +6667,7 @@ def test_paradex_live_execution_service_uses_market_fallback_for_unfilled_cleanu
         assert isinstance(attempt_history, list)
         assert len(attempt_history) == 3
         assert [item["type"] for item in seen_requests] == ["LIMIT", "LIMIT", "MARKET"]
-        assert seen_requests[2]["price"] == "0"
+        assert "price" not in seen_requests[2]
         assert seen_requests[2]["client_id"] == "carryme-cleanup-pt8-paradex-sell-mkt"
         assert response_payload["observed_order_state"]["derived_state"] == "filled"
 
@@ -9250,6 +9275,311 @@ def test_build_execution_pair_status_marks_single_leg_cleanup_as_cleanup_needed(
 
     assert status.derived_state == "cleanup_needed"
     assert status.recommended_action == "close_open_leg"
+
+
+def test_build_execution_pair_status_keeps_cleanup_needed_when_opposite_route_leg_stays_open(
+) -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=37,
+        executed_at=datetime(2026, 4, 2, 16, 0, tzinfo=UTC),
+        adapter="paradex_cleanup_live",
+        mode="live",
+        status="rejected",
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-wld",
+        confirmation_entry_id=15,
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 4, 2, 15, 50, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="wld_paradex_extended",
+                canonical_symbol="WLD-USD-PERP",
+                source_recorded_at=datetime(2026, 4, 2, 15, 45, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0033,
+                break_even_days_entry=0.10,
+                capacity_limit_notional=995.0,
+                target_notional=25.0,
+                capacity_fraction=1.0,
+                max_target_notional=25.0,
+                long_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="WLD-USD",
+                    fee_profile="default",
+                    side="buy",
+                    target_notional=25.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="WLD-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="sell",
+                    target_notional=25.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="WLD-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+                status="rejected",
+                simulated=False,
+                external_reference="carryme-cleanup-pt7-paradex-buy-mkt",
+                request_payload={"type": "MARKET", "flags": ["REDUCE_ONLY"]},
+            )
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=37,
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-wld",
+        legs=[
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="carryme-cleanup-pt7-paradex-buy-mkt",
+                derived_state="unknown",
+            )
+        ],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=37,
+        paper_trade_id=7,
+        preview_hash="cleanup-preview-hash-wld",
+        status="rejected",
+        recommended_action="no_action",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="extended",
+                authenticated=True,
+                ready=True,
+                position_symbols=["WLD-USD"],
+                matched_leg_symbols=[],
+                unmatched_leg_symbols=[],
+            ),
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                matched_leg_symbols=[],
+                unmatched_leg_symbols=["WLD-USD-PERP"],
+            ),
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "cleanup_needed"
+    assert status.recommended_action == "close_open_leg"
+    assert any("cleanup execution left one open leg" in note.lower() for note in status.notes)
+
+
+def test_build_execution_pair_status_keeps_pending_when_same_venue_route_has_open_leg() -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=38,
+        executed_at=datetime(2026, 4, 2, 16, 5, tzinfo=UTC),
+        adapter="paired_live:paradex_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=8,
+        preview_hash="same-venue-preview-hash",
+        confirmation_entry_id=16,
+        paper_trade=PaperTradeEntry(
+            entry_id=8,
+            created_at=datetime(2026, 4, 2, 16, 0, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="wld_arb_paradex_pair",
+                canonical_symbol="WLD-USD-PERP",
+                source_recorded_at=datetime(2026, 4, 2, 15, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0021,
+                break_even_days_entry=0.20,
+                capacity_limit_notional=900.0,
+                target_notional=25.0,
+                capacity_fraction=1.0,
+                max_target_notional=25.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="WLD-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=25.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="sell",
+                    target_notional=25.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="WLD-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order-open",
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="ARB-USD-PERP",
+                fee_profile="pro",
+                side="sell",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order-unfilled",
+            ),
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=38,
+        paper_trade_id=8,
+        preview_hash="same-venue-preview-hash",
+        legs=[
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="pdx-order-open",
+                derived_state="open",
+            ),
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="pdx-order-unfilled",
+                derived_state="unfilled",
+            ),
+        ],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=38,
+        paper_trade_id=8,
+        preview_hash="same-venue-preview-hash",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                matched_leg_symbols=[],
+                unmatched_leg_symbols=["WLD-USD-PERP", "ARB-USD-PERP"],
+            )
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "pending"
+    assert status.recommended_action == "wait_for_fill_or_timeout"
+    assert any("still reports the order as open" in note.lower() for note in status.notes)
+
+
+def test_build_execution_pair_status_fails_closed_on_duplicate_route_market() -> None:
+    entry = ExecutionJournalEntry(
+        entry_id=39,
+        executed_at=datetime(2026, 4, 2, 16, 10, tzinfo=UTC),
+        adapter="paired_live:paradex_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=9,
+        preview_hash="duplicate-route-preview-hash",
+        confirmation_entry_id=17,
+        paper_trade=PaperTradeEntry(
+            entry_id=9,
+            created_at=datetime(2026, 4, 2, 16, 5, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label="invalid_duplicate_route",
+                canonical_symbol="WLD-USD-PERP",
+                source_recorded_at=datetime(2026, 4, 2, 16, 0, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.001,
+                break_even_days_entry=0.5,
+                capacity_limit_notional=100.0,
+                target_notional=25.0,
+                capacity_fraction=1.0,
+                max_target_notional=25.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="WLD-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=25.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="WLD-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="sell",
+                    target_notional=25.0,
+                ),
+            ),
+        ),
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="WLD-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order-dup-1",
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="WLD-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="sell",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="pdx-order-dup-2",
+            ),
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=39,
+        paper_trade_id=9,
+        preview_hash="duplicate-route-preview-hash",
+        legs=[],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=39,
+        paper_trade_id=9,
+        preview_hash="duplicate-route-preview-hash",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=["WLD-USD-PERP"],
+                matched_leg_symbols=["WLD-USD-PERP"],
+                unmatched_leg_symbols=[],
+            )
+        ],
+        notes=[],
+    )
+
+    status = build_execution_pair_status(entry, order_state, reconciliation)
+
+    assert status.derived_state == "review_required"
+    assert status.recommended_action == "manual_review_required"
+    assert any("not uniquely identifiable" in note.lower() for note in status.notes)
 
 
 def test_build_execution_pair_status_keeps_cleanup_retryable_when_order_state_is_unknown() -> None:

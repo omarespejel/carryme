@@ -28,17 +28,37 @@ def build_execution_pair_status(
 ) -> ExecutionPairStatus:
     """Return a single pair-level state for a journaled execution attempt."""
 
-    position_presence = _position_presence_by_leg(entry, reconciliation)
-    order_states = {item.venue: item.derived_state for item in order_state.legs}
+    if _has_duplicate_route_market(entry):
+        duplicate_route_notes = [
+            (
+                "Route legs are not uniquely identifiable by venue and symbol; "
+                "pair status requires manual review."
+            ),
+            *order_state.notes,
+            *reconciliation.notes,
+        ]
+        return ExecutionPairStatus(
+            execution_entry_id=entry.entry_id,
+            paper_trade_id=entry.paper_trade_id,
+            preview_hash=entry.preview_hash,
+            derived_state="review_required",
+            recommended_action="manual_review_required",
+            order_state=order_state,
+            reconciliation=reconciliation,
+            notes=duplicate_route_notes,
+        )
+
+    position_presence = _position_presence_by_route(entry, reconciliation)
+    order_leg_states = [item.derived_state for item in order_state.legs]
 
     is_multi_leg_entry = len(entry.legs) >= 2
     any_position = any(position_presence.values())
     all_positions = bool(position_presence) and all(position_presence.values())
-    any_open = any(state == "open" for state in order_states.values())
-    any_partial_fill = any(state == "partial_fill" for state in order_states.values())
-    any_filled = any(state == "filled" for state in order_states.values())
-    any_unknown = any(state in {"unknown", "unsupported"} for state in order_states.values())
-    any_unfilled = any(state == "unfilled" for state in order_states.values())
+    any_open = any(state == "open" for state in order_leg_states)
+    any_partial_fill = any(state == "partial_fill" for state in order_leg_states)
+    any_filled = any(state == "filled" for state in order_leg_states)
+    any_unknown = any(state in {"unknown", "unsupported"} for state in order_leg_states)
+    any_unfilled = any(state == "unfilled" for state in order_leg_states)
     any_account_blocker = any(
         (not venue.authenticated) or (not venue.ready) for venue in reconciliation.venues
     )
@@ -113,18 +133,33 @@ def build_execution_pair_status(
     )
 
 
-def _position_presence_by_leg(
+def _position_presence_by_route(
     entry: ExecutionJournalEntry,
     reconciliation: ExecutionReconciliation,
 ) -> dict[str, bool]:
     venues = {venue.venue: venue for venue in reconciliation.venues}
     position_presence: dict[str, bool] = {}
-    for leg in entry.legs:
+    route_legs = [
+        entry.paper_trade.intent.long_leg,
+        entry.paper_trade.intent.short_leg,
+    ]
+    for leg in route_legs:
         venue_state = venues.get(leg.venue)
-        position_presence[leg.venue] = (
+        position_presence[f"{leg.venue}:{leg.symbol}"] = (
             leg.symbol in venue_state.position_symbols if venue_state is not None else False
         )
     return position_presence
+
+
+def _has_duplicate_route_market(entry: ExecutionJournalEntry) -> bool:
+    route_keys = {
+        f"{leg.venue}:{leg.symbol}"
+        for leg in (
+            entry.paper_trade.intent.long_leg,
+            entry.paper_trade.intent.short_leg,
+        )
+    }
+    return len(route_keys) != 2
 
 
 def _is_cleanup_execution(entry: ExecutionJournalEntry) -> bool:
