@@ -818,9 +818,8 @@ async def scan_approved_canary_once(
                 settings.approved_canary_scan_limit,
             )
             break
-        label_evaluated = False
+        label_scanned = False
         for approved_route in approvals_by_label[label]:
-            label_evaluated = True
             try:
                 async with asyncio.timeout(settings.universe_scan_timeout_seconds):
                     candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
@@ -862,6 +861,7 @@ async def scan_approved_canary_once(
                     exc,
                 )
                 continue
+            label_scanned = True
             scanned_candidates += candidate_count
             if candidate is None:
                 continue
@@ -870,7 +870,7 @@ async def scan_approved_canary_once(
                 candidate
             ) > _rank_approved_canary_candidate(existing[0]):
                 approved_matches_by_label[approved_route.label] = (candidate, approved_route)
-        if label_evaluated:
+        if label_scanned:
             scanned_labels.add(label)
     previous_snapshots = {label: snapshot_store.latest(label=label) for label in scanned_labels}
     snapshots: list[ApprovedCanarySnapshot] = []
@@ -879,7 +879,7 @@ async def scan_approved_canary_once(
         snapshot_label = matched_approval.label
         try:
             derived_label = build_pair_spec_from_universe_opportunity(candidate.opportunity).label
-        except ValueError:
+        except Exception:
             loop_logger.warning(
                 "failed to derive approved canary snapshot label; using approval label=%s",
                 matched_approval.label,
