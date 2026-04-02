@@ -447,7 +447,7 @@ class ParadexAccountProbe:
                     context="Paradex account",
                 ),
                 balance_count=_count_rows(balances, context="Paradex balances"),
-                position_count=_count_rows(positions, context="Paradex positions"),
+                position_count=_count_open_positions(positions, context="Paradex positions"),
                 balance_assets=_extract_balance_assets(balances),
                 position_symbols=_extract_position_symbols(positions),
                 notes=[
@@ -706,8 +706,33 @@ def _unwrap_rows(value: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _unwrap_rows_strict(value: dict[str, Any] | list[Any], *, context: str) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        if not all(isinstance(item, dict) for item in value):
+            raise UpstreamDataError(f"{context} payload must be a list of objects")
+        return cast(list[dict[str, Any]], value)
+    if isinstance(value, dict):
+        for key in ("data", "results", "result", "rows", "positions", "balances"):
+            if key not in value:
+                continue
+            nested = value.get(key)
+            if isinstance(nested, list):
+                if not all(isinstance(item, dict) for item in nested):
+                    raise UpstreamDataError(
+                        f"{context} payload field {key!r} must be a list of objects"
+                    )
+                return cast(list[dict[str, Any]], nested)
+            raise UpstreamDataError(f"{context} payload field {key!r} must be a list")
+    raise UpstreamDataError(f"{context} payload did not contain a row list")
+
+
 def _extract_balance_assets(value: dict[str, Any] | list[Any]) -> list[str]:
     return _extract_row_strings(value, "asset", "token", "currency", "symbol")
+
+
+def _count_open_positions(value: dict[str, Any] | list[Any], *, context: str) -> int:
+    rows = _unwrap_rows_strict(value, context=context)
+    return sum(1 for row in rows if _row_represents_open_position(row))
 
 
 def _extract_position_symbols(value: dict[str, Any] | list[Any]) -> list[str]:
