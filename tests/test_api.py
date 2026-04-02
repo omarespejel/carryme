@@ -93,6 +93,7 @@ from carryme_storage import (
     WatchlistStore,
 )
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 
 def test_health_endpoint() -> None:
@@ -118,6 +119,97 @@ def test_versioned_health_endpoint() -> None:
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_operator_auth_does_not_gate_get_requests(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        operator_api_key=SecretStr("operator-secret"),
+    )
+    client = TestClient(app)
+    try:
+        response = client.get("/health")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+def test_operator_auth_rejects_missing_bearer_on_mutating_requests(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        operator_api_key=SecretStr("operator-secret"),
+    )
+    client = TestClient(app)
+    try:
+        response = client.put(
+            "/v1/opportunities/route-approvals/s_extended_paradex",
+            json={
+                "canonical_symbol": "S-USD-PERP",
+                "short_venue": "extended",
+                "long_venue": "paradex",
+                "short_fee_profile": "default",
+                "long_fee_profile": "pro",
+                "approved": True,
+                "max_live_notional": 25.0,
+                "note": "production route",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Missing operator authorization header"
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_operator_auth_rejects_wrong_bearer_on_mutating_requests(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        operator_api_key=SecretStr("operator-secret"),
+    )
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/v1/executions/live/canary-cycle",
+            headers={"Authorization": "Bearer wrong-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid operator authorization"
+
+
+def test_operator_auth_allows_correct_bearer_on_mutating_requests(tmp_path: Path) -> None:
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        operator_api_key=SecretStr("operator-secret"),
+    )
+    client = TestClient(app)
+    try:
+        response = client.put(
+            "/v1/opportunities/route-approvals/s_extended_paradex",
+            headers={"Authorization": "Bearer operator-secret"},
+            json={
+                "canonical_symbol": "S-USD-PERP",
+                "short_venue": "extended",
+                "long_venue": "paradex",
+                "short_fee_profile": "default",
+                "long_fee_profile": "pro",
+                "approved": True,
+                "max_live_notional": 25.0,
+                "note": "production route",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["label"] == "s_extended_paradex"
+    assert payload["long_fee_profile"] == "pro"
 
 
 def test_readiness_endpoint(tmp_path: Path) -> None:

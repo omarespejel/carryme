@@ -6,11 +6,12 @@ import asyncio
 import logging
 import math
 import os
-from collections.abc import Callable
+import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import httpx
 from carryme_models import (
@@ -139,7 +140,7 @@ from carryme_storage import (
 )
 from carryme_storage.db import DEFAULT_DATABASE_PING_TIMEOUT_SECONDS, Database
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from carryme_api.config import ApiSettings, get_api_settings
@@ -157,6 +158,7 @@ DEFAULT_APP_ENVIRONMENT = "development"
 APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
 MAX_HISTORY_LIMIT = 1000
 PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
+MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 logger = logging.getLogger(__name__)
 
 
@@ -186,6 +188,20 @@ def get_app_environment() -> str:
         os.getenv(APP_ENVIRONMENT_VARIABLE, DEFAULT_APP_ENVIRONMENT).strip()
         or DEFAULT_APP_ENVIRONMENT
     )
+
+
+def _resolve_api_settings_for_request(request: Request) -> ApiSettings:
+    """Resolve API settings while honoring FastAPI dependency overrides in tests."""
+
+    override = request.app.dependency_overrides.get(get_api_settings)
+    if override is not None:
+        return cast(ApiSettings, override())
+    return get_api_settings()
+
+
+def _operator_auth_error(status_code: int, detail: str) -> JSONResponse:
+    headers = {"WWW-Authenticate": "Bearer"} if status_code == 401 else None
+    return JSONResponse(status_code=status_code, content={"detail": detail}, headers=headers)
 
 
 @lru_cache
@@ -2808,6 +2824,34 @@ def create_app() -> FastAPI:
     """Create the FastAPI application."""
 
     app = FastAPI(title="carryme", version=APP_VERSION)
+
+    @app.middleware("http")
+    async def require_operator_auth_for_mutations(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if request.method not in MUTATING_HTTP_METHODS:
+            return await call_next(request)
+
+        settings = _resolve_api_settings_for_request(request)
+        if settings.operator_api_key is None:
+            return await call_next(request)
+
+        authorization = request.headers.get("Authorization")
+        if authorization is None:
+            return _operator_auth_error(401, "Missing operator authorization header")
+
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            return _operator_auth_error(401, "Malformed operator authorization header")
+
+        if not secrets.compare_digest(
+            token,
+            settings.operator_api_key.get_secret_value(),
+        ):
+            return _operator_auth_error(403, "Invalid operator authorization")
+
+        return await call_next(request)
 
     @app.get("/health", response_model=ServiceHealth)
     def health() -> ServiceHealth:
