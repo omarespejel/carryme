@@ -447,7 +447,7 @@ class ParadexAccountProbe:
                     context="Paradex account",
                 ),
                 balance_count=_count_rows(balances, context="Paradex balances"),
-                position_count=_count_rows(positions, context="Paradex positions"),
+                position_count=_count_open_positions(positions),
                 balance_assets=_extract_balance_assets(balances),
                 position_symbols=_extract_position_symbols(positions),
                 notes=[
@@ -708,6 +708,10 @@ def _unwrap_rows(value: dict[str, Any] | list[Any]) -> list[dict[str, Any]]:
 
 def _extract_balance_assets(value: dict[str, Any] | list[Any]) -> list[str]:
     return _extract_row_strings(value, "asset", "token", "currency", "symbol")
+
+
+def _count_open_positions(value: dict[str, Any] | list[Any]) -> int:
+    return len([row for row in _unwrap_rows(value) if _row_represents_open_position(row)])
 
 
 def _extract_position_symbols(value: dict[str, Any] | list[Any]) -> list[str]:
