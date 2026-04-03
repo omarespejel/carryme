@@ -1848,6 +1848,13 @@ async def run_supervised_approved_canary_scan_loop(
     approved_canary_alert_sink = alert_sink or ApprovedCanaryAlertStore(settings.database_path)
     loop_logger = logger or logging.getLogger("carryme.worker")
     approved_canary_notifier = alert_notifier
+    shared_scanner = scanner or _build_worker_universe_scanner(
+        settings,
+        history_store=OpportunityHistoryStore(settings.database_path),
+    )
+    shared_approval_service = approval_service or RouteApprovalService(
+        store=RouteApprovalStore(settings.database_path)
+    )
     supervised_stop_event = stop_event or asyncio.Event()
     if approved_canary_notifier is None:
         from carryme_worker.notifications import build_approved_canary_alert_notifier
@@ -1873,8 +1880,8 @@ async def run_supervised_approved_canary_scan_loop(
         try:
             summary = await scan_approved_canary_once(
                 settings,
-                scanner=scanner,
-                approval_service=approval_service,
+                scanner=shared_scanner,
+                approval_service=shared_approval_service,
                 store=snapshot_store,
                 alert_sink=approved_canary_alert_sink,
                 alert_notifier=approved_canary_notifier,
