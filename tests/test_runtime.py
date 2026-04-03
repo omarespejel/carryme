@@ -1575,12 +1575,26 @@ def test_execution_quality_service_pages_recent_observations() -> None:
             return self.entries[offset : offset + limit]
 
     class StubJournalStore:
+        def __init__(self) -> None:
+            self.paper_trade_batches: list[list[int]] = []
+
+        def list_latest_for_paper_trades(
+            self,
+            paper_trade_ids: list[int],
+        ) -> dict[int, ExecutionJournalEntry]:
+            self.paper_trade_batches.append(list(paper_trade_ids))
+            return {
+                paper_trade_id: make_entry(paper_trade_id)
+                for paper_trade_id in paper_trade_ids
+            }
+
         def latest_for_paper_trade(self, paper_trade_id: int) -> ExecutionJournalEntry | None:
             return make_entry(paper_trade_id)
 
     observation_store = StubObservationStore()
+    journal_store = StubJournalStore()
     service = ExecutionQualityService(
-        journal_store=StubJournalStore(),  # type: ignore[arg-type]
+        journal_store=journal_store,  # type: ignore[arg-type]
         observation_store=observation_store,  # type: ignore[arg-type]
         sample_limit=2,
         observation_scan_batch_size=2,
@@ -1592,6 +1606,7 @@ def test_execution_quality_service_pages_recent_observations() -> None:
     assert summary.hedged_count == 1
     assert summary.closed_count == 1
     assert observation_store.calls == [(2, 0), (2, 2)]
+    assert journal_store.paper_trade_batches == [[1, 2]]
 
 
 def test_execution_quality_service_reclassifies_stale_cleanup_review_required(

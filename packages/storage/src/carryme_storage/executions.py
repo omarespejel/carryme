@@ -416,6 +416,51 @@ class ExecutionJournalStore:
             }
         )
 
+    def list_latest_for_paper_trades(
+        self,
+        paper_trade_ids: list[int],
+    ) -> dict[int, ExecutionJournalEntry]:
+        """Return the newest execution journal entry for each requested paper trade."""
+
+        unique_ids = list(dict.fromkeys(paper_trade_ids))
+        if not unique_ids:
+            return {}
+        if any(paper_trade_id < 1 for paper_trade_id in unique_ids):
+            raise ValueError("paper_trade_ids must be positive")
+        self.initialize()
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.database.begin() as connection:
+            rows = connection.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT
+                        paper_trade_id,
+                        id,
+                        entry_json,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY paper_trade_id
+                            ORDER BY executed_at DESC, id DESC
+                        ) AS row_number
+                    FROM execution_journal_entries
+                    WHERE paper_trade_id IN ({placeholders})
+                )
+                SELECT paper_trade_id, id, entry_json
+                FROM ranked
+                WHERE row_number = 1
+                """,
+                tuple(unique_ids),
+            ).fetchall()
+
+        return {
+            int(paper_trade_id): ExecutionJournalEntry.model_validate(
+                {
+                    **json.loads(entry_json),
+                    "entry_id": stored_id,
+                }
+            )
+            for paper_trade_id, stored_id, entry_json in rows
+        }
+
     def list_for_paper_trade(
         self,
         paper_trade_id: int,

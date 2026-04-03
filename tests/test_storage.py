@@ -2,7 +2,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from carryme_models import (
@@ -707,6 +707,83 @@ def test_execution_journal_store_reserves_live_submission_once(tmp_path: Path) -
         confirmation_entry_id=11,
         preview_hash="preview-hash",
     )
+
+
+def test_execution_journal_store_lists_latest_for_multiple_paper_trades(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    def make_entry(
+        *,
+        paper_trade_id: int,
+        minute: int,
+        status: Literal["accepted", "submitted", "partial"],
+    ) -> ExecutionJournalEntry:
+        leg_status: Literal["accepted", "submitted"] = (
+            "submitted" if status == "partial" else status
+        )
+        return ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, minute, tzinfo=UTC),
+            adapter="mock",
+            mode="live",
+            status=status,
+            paper_trade_id=paper_trade_id,
+            paper_trade=PaperTradeEntry(
+                entry_id=paper_trade_id,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="batch lookup test",
+                intent=FundingPairTradeIntent(
+                    label=f"pair_{paper_trade_id}",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                    status=leg_status,
+                    simulated=True,
+                )
+            ],
+        )
+
+    older_trade_7 = store.append(make_entry(paper_trade_id=7, minute=5, status="submitted"))
+    latest_trade_7 = store.append(make_entry(paper_trade_id=7, minute=7, status="accepted"))
+    latest_trade_8 = store.append(make_entry(paper_trade_id=8, minute=6, status="partial"))
+
+    latest_entries = store.list_latest_for_paper_trades([7, 8, 7])
+
+    assert set(latest_entries) == {7, 8}
+    assert latest_entries[7].entry_id == latest_trade_7.entry_id
+    assert latest_entries[7].status == "accepted"
+    assert latest_entries[8].entry_id == latest_trade_8.entry_id
+    assert latest_entries[8].status == "partial"
+    assert latest_entries[7].entry_id != older_trade_7.entry_id
 
 
 def test_execution_journal_store_allows_same_confirmation_id_for_different_hashes(

@@ -82,6 +82,7 @@ class ExecutionQualityService:
         """Aggregate latest observed pair outcomes by symbol and venue direction."""
 
         unique_observations = self._list_recent_unique_observations()
+        entries_by_paper_trade = self._list_latest_entries_for_paper_trades(unique_observations)
 
         buckets: dict[tuple[str, str, str], _ExecutionQualityBucket] = {}
 
@@ -89,7 +90,7 @@ class ExecutionQualityService:
             paper_trade_id = observation.paper_trade_id
             if paper_trade_id is None:
                 continue
-            entry = self.journal_store.latest_for_paper_trade(paper_trade_id)
+            entry = entries_by_paper_trade.get(paper_trade_id)
             if entry is None:
                 continue
             pair_status = observation.pair_status
@@ -156,6 +157,26 @@ class ExecutionQualityService:
             offset += page_size
 
         return list(latest_by_paper_trade.values())
+
+    def _list_latest_entries_for_paper_trades(
+        self,
+        observations: list[ExecutionObservationEntry],
+    ) -> dict[int, ExecutionJournalEntry]:
+        paper_trade_ids = [
+            observation.paper_trade_id
+            for observation in observations
+            if observation.paper_trade_id is not None
+        ]
+        if hasattr(self.journal_store, "list_latest_for_paper_trades"):
+            return self.journal_store.list_latest_for_paper_trades(paper_trade_ids)
+        latest_by_paper_trade: dict[int, ExecutionJournalEntry] = {}
+        for paper_trade_id in paper_trade_ids:
+            if paper_trade_id in latest_by_paper_trade:
+                continue
+            entry = self.journal_store.latest_for_paper_trade(paper_trade_id)
+            if entry is not None:
+                latest_by_paper_trade[paper_trade_id] = entry
+        return latest_by_paper_trade
 
     def list_summaries(
         self,
