@@ -13011,6 +13011,184 @@ def test_execution_accounting_service_summarizes_filled_attempt_history(tmp_path
         summary.total_estimated_fee_paid
     )
 
+
+def test_execution_accounting_service_infers_held_hedge_fill_from_observation(
+    tmp_path: Path,
+) -> None:
+    journal_store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    observation_store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+    paper_trade = PaperTradeEntry(
+        entry_id=10,
+        created_at=datetime(2026, 4, 3, 22, 26, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="jup_extended_paradex",
+            canonical_symbol="JUP-USD-PERP",
+            source_recorded_at=datetime(2026, 4, 3, 22, 25, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0017,
+            break_even_days_entry=0.18,
+            capacity_limit_notional=294.9,
+            target_notional=25.0,
+            capacity_fraction=0.1,
+            max_target_notional=25.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="JUP-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="JUP-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=25.0,
+            ),
+        ),
+    )
+    saved = journal_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 4, 3, 22, 26, 34, tzinfo=UTC),
+            adapter="paired_live:paradex_then_extended",
+            mode="live",
+            status="submitted",
+            paper_trade_id=10,
+            preview_hash="preview-10",
+            paper_trade=paper_trade,
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="JUP-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=25.0,
+                    status="submitted",
+                    simulated=False,
+                    auth_usage="subkey_jwt",
+                    response_payload={
+                        "observed_order_state": {
+                            "derived_state": "filled",
+                            "size": "152",
+                            "remaining_size": "0",
+                            "avg_fill_price": "0.1639",
+                        }
+                    },
+                ),
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="JUP-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=25.0,
+                    status="submitted",
+                    simulated=False,
+                    auth_usage="api_key",
+                    response_payload={"orders": []},
+                ),
+            ],
+        )
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 4, 3, 22, 43, 27, tzinfo=UTC),
+            context="worker_execution_monitor",
+            execution_entry_id=saved.entry_id,
+            paper_trade_id=10,
+            preview_hash="preview-10",
+            order_state=ExecutionOrderState(
+                execution_entry_id=saved.entry_id,
+                paper_trade_id=10,
+                preview_hash="preview-10",
+                legs=[
+                    ExecutionLegOrderState(
+                        venue="paradex",
+                        supported=True,
+                        external_reference="paradex-order",
+                        client_id="carryme-pt10-paradex-buy",
+                        derived_state="filled",
+                        order_status="CLOSED",
+                        avg_fill_price="0.1639",
+                        remaining_size="0",
+                        size="152",
+                        notes=[],
+                        raw_response={},
+                    ),
+                    ExecutionLegOrderState(
+                        venue="extended",
+                        supported=True,
+                        external_reference="carryme-pt10-extended-sell",
+                        client_id="carryme-pt10-extended-sell",
+                        derived_state="unknown",
+                        notes=[
+                            "Extended private API currently exposes open orders only; "
+                            "absence here does not distinguish filled from closed."
+                        ],
+                        raw_response={"orders": []},
+                    ),
+                ],
+                notes=[],
+            ),
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=saved.entry_id,
+                paper_trade_id=10,
+                preview_hash="preview-10",
+                derived_state="hedged",
+                recommended_action="monitor_open_hedge",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=saved.entry_id,
+                    paper_trade_id=10,
+                    preview_hash="preview-10",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=saved.entry_id,
+                    paper_trade_id=10,
+                    preview_hash="preview-10",
+                    status="submitted",
+                    recommended_action="monitor_open_hedge",
+                    matched_all_leg_symbols=True,
+                    venues=[
+                        ExecutionVenueReconciliation(
+                            venue="paradex",
+                            authenticated=True,
+                            ready=True,
+                            position_symbols=["JUP-USD-PERP"],
+                            matched_leg_symbols=["JUP-USD-PERP"],
+                        ),
+                        ExecutionVenueReconciliation(
+                            venue="extended",
+                            authenticated=True,
+                            ready=True,
+                            position_symbols=["JUP-USD"],
+                            matched_leg_symbols=["JUP-USD"],
+                        ),
+                    ],
+                    notes=[],
+                ),
+                notes=["Both legs are currently reflected in live position state."],
+            ),
+        )
+    )
+
+    service = ExecutionAccountingService(
+        journal_store=journal_store,
+        observation_store=observation_store,
+    )
+
+    summary = service.latest_for_paper_trade(10)
+
+    assert summary is not None
+    assert summary.paper_trade_id == 10
+    assert summary.total_filled_notional == pytest.approx((152 * 0.1639) + 25.0)
+    assert summary.total_estimated_fee_paid == pytest.approx(
+        (152 * 0.1639 * 0.00014) + (25.0 * 0.00025)
+    )
+    assert summary.entries[0].filled_leg_count == 2
+    assert summary.entries[0].legs[1].derived_fill_state == "filled"
+    assert summary.entries[0].legs[1].filled_notional == pytest.approx(25.0)
+    assert "inferred from live hedge reconciliation" in summary.entries[0].legs[1].notes[-1]
+
 def test_extended_live_execution_service_rejects_cleanup_for_wrong_venue() -> None:
     confirmation = CleanupPreviewConfirmationEntry(
         entry_id=11,
