@@ -133,6 +133,11 @@ class ExecutionQualityService:
     def _list_recent_unique_observations(self) -> list[ExecutionObservationEntry]:
         """Return the latest observation per paper trade without scanning the full table."""
 
+        if hasattr(self.observation_store, "list_latest_for_recent_paper_trades"):
+            return self.observation_store.list_latest_for_recent_paper_trades(
+                limit=max(self.sample_limit, 1),
+            )
+
         page_size = max(self.observation_scan_batch_size, 1)
         latest_by_paper_trade: dict[int, ExecutionObservationEntry] = {}
         offset = 0

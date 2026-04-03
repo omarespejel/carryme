@@ -2334,6 +2334,45 @@ def test_execution_observation_store_orders_ties_deterministically(tmp_path: Pat
     assert [entry.context for entry in results] == ["second", "first"]
 
 
+def test_execution_observation_store_lists_latest_for_recent_paper_trades(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    def append(
+        *,
+        paper_trade_id: int,
+        minute: int,
+        context: str,
+    ) -> None:
+        store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 3, 29, 13, minute, tzinfo=UTC),
+                context=context,
+                execution_entry_id=paper_trade_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"preview-hash-{paper_trade_id}-{minute}",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=paper_trade_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-hash-{paper_trade_id}-{minute}",
+                    legs=[],
+                    notes=[],
+                ),
+            )
+        )
+
+    append(paper_trade_id=7, minute=5, context="older-7")
+    append(paper_trade_id=8, minute=6, context="only-8")
+    append(paper_trade_id=7, minute=7, context="latest-7")
+    append(paper_trade_id=9, minute=8, context="only-9")
+
+    results = store.list_latest_for_recent_paper_trades(limit=2)
+
+    assert [entry.paper_trade_id for entry in results] == [9, 7]
+    assert [entry.context for entry in results] == ["only-9", "latest-7"]
+
+
 def test_execution_observation_store_list_recent_without_limit(tmp_path: Path) -> None:
     store = ExecutionObservationStore(tmp_path / "history.sqlite3")
 

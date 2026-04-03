@@ -172,6 +172,55 @@ class ExecutionObservationStore:
             for stored_id, entry_json in rows
         ]
 
+    def list_latest_for_recent_paper_trades(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> list[ExecutionObservationEntry]:
+        """Return the newest observation for each recent paper trade."""
+
+        self.initialize()
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        if offset < 0:
+            raise ValueError("offset must be at least 0")
+
+        with self.database.begin() as connection:
+            rows = connection.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        id,
+                        entry_json,
+                        observed_at,
+                        paper_trade_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY paper_trade_id
+                            ORDER BY observed_at DESC, id DESC
+                        ) AS row_number
+                    FROM execution_observation_entries
+                    WHERE paper_trade_id IS NOT NULL
+                )
+                SELECT id, entry_json
+                FROM ranked
+                WHERE row_number = 1
+                ORDER BY observed_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+
+        return [
+            ExecutionObservationEntry.model_validate(
+                {
+                    **json.loads(entry_json),
+                    "entry_id": stored_id,
+                }
+            )
+            for stored_id, entry_json in rows
+        ]
+
     def _append_on_connection(
         self,
         connection: DatabaseConnection,
