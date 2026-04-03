@@ -41,6 +41,7 @@ class WorkerSettings(BaseSettings):
     system_state_alert_webhook_timeout_seconds: float = Field(default=10.0, gt=0)
     execution_observation_interval_seconds: int = Field(default=10, gt=0)
     execution_observation_max_backoff_seconds: int = Field(default=60, gt=0)
+    execution_observation_max_age_seconds: int = Field(default=1800, gt=0)
     execution_alert_webhook_url: str | None = None
     execution_alert_webhook_timeout_seconds: float = Field(default=10.0, gt=0)
     score_timeout_seconds: float = Field(default=30.0, gt=0)
