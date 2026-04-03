@@ -2342,6 +2342,8 @@ async def observe_live_executions_once(
     recent_live_executions = _list_recent_live_executions(
         journal_store,
         limit=settings.execution_observation_limit,
+        now=timestamp,
+        max_age_seconds=settings.execution_observation_max_age_seconds,
     )
 
     scanned_executions = 0
@@ -2890,6 +2892,8 @@ def _list_recent_live_executions(
     journal_store: ExecutionJournalStore,
     *,
     limit: int,
+    now: datetime,
+    max_age_seconds: int,
 ) -> list[ExecutionJournalEntry]:
     """Return recent unique live executions after filtering irrelevant journal rows."""
 
@@ -2906,6 +2910,9 @@ def _list_recent_live_executions(
 
         for execution in batch:
             if execution.mode != "live" or execution.status not in {"submitted", "partial"}:
+                continue
+            age_seconds = max(0.0, (now - execution.executed_at).total_seconds())
+            if age_seconds > max_age_seconds:
                 continue
             if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
                 continue
