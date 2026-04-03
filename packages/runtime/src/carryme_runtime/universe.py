@@ -212,7 +212,17 @@ class OpportunityUniverseService:
             fee_profile_overrides,
         )
         overlaps = await self.discover_overlaps(normalized_venues)
-        snapshots = await self._fetch_overlapping_snapshots(overlaps)
+        filtered_overlaps = [
+            overlap
+            for overlap in overlaps
+            if passes_symbol_policy(
+                overlap.canonical_symbol,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+            )
+        ]
+        snapshots = await self._fetch_overlapping_snapshots(filtered_overlaps)
         execution_quality_index = (
             self.execution_quality_service.build_index()
             if self.execution_quality_service is not None
@@ -230,14 +240,7 @@ class OpportunityUniverseService:
         )
 
         opportunities: list[FundingUniverseOpportunity] = []
-        for overlap in overlaps:
-            if not passes_symbol_policy(
-                overlap.canonical_symbol,
-                include_symbols=include_symbols,
-                exclude_symbols=exclude_symbols,
-                exclude_tags=exclude_tags,
-            ):
-                continue
+        for overlap in filtered_overlaps:
             entries = [
                 (venue, symbol, snapshots[(venue, symbol)])
                 for venue, symbol in overlap.venue_symbols.items()
@@ -287,8 +290,8 @@ class OpportunityUniverseService:
             fee_profiles=fee_profiles,
             ranking=normalized_ranking,
             target_notional=target_notional,
-            overlap_count=len(overlaps),
-            overlaps=overlaps,
+            overlap_count=len(filtered_overlaps),
+            overlaps=filtered_overlaps,
             opportunities=ranked,
         )
 

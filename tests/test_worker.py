@@ -174,6 +174,10 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.max_backoff_seconds == 300
     assert settings.universe_scan_interval_seconds == 60
     assert settings.universe_scan_max_backoff_seconds == 300
+    assert settings.universe_scan_snapshot_batch_size == 6
+    assert settings.universe_scan_extended_snapshot_concurrency == 2
+    assert settings.universe_scan_paradex_snapshot_concurrency == 2
+    assert settings.universe_scan_hyperliquid_snapshot_concurrency == 2
     assert settings.execution_observation_interval_seconds == 10
     assert settings.execution_observation_max_backoff_seconds == 60
     assert settings.score_timeout_seconds == 30.0
@@ -254,6 +258,17 @@ def test_worker_rejects_non_positive_execution_observation_interval(tmp_path: Pa
         WorkerSettings(
             watchlist_path=str(watchlist),
             execution_observation_interval_seconds=0,
+        )
+
+
+def test_worker_rejects_non_positive_universe_scan_snapshot_batch_size(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text('{"pairs": []}')
+
+    with pytest.raises(ValidationError, match="universe_scan_snapshot_batch_size"):
+        WorkerSettings(
+            watchlist_path=str(watchlist),
+            universe_scan_snapshot_batch_size=0,
         )
 
 

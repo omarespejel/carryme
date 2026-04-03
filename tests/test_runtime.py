@@ -1025,6 +1025,52 @@ def test_opportunity_universe_service_batches_snapshot_tasks() -> None:
     asyncio.run(run())
 
 
+def test_opportunity_universe_service_filters_overlaps_before_snapshot_fetch() -> None:
+    symbol_lists = {
+        "extended": ["ARB-USD", "JUP-USD"],
+        "paradex": ["ARB-USD-PERP", "JUP-USD-PERP"],
+    }
+    fetched: list[tuple[str, str]] = []
+    snapshots = {
+        ("extended", "JUP-USD"): _snapshot(
+            "extended", "JUP-USD", 0.0001, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("paradex", "JUP-USD-PERP"): _snapshot(
+            "paradex", "JUP-USD-PERP", -0.0004, 1.0, 10_000, 1.001, 10_000
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        fetched.append((venue, symbol))
+        try:
+            return snapshots[(venue, symbol)]
+        except KeyError as exc:
+            raise AssertionError(
+                f"unexpected fetch for filtered-out symbol: {(venue, symbol)}"
+            ) from exc
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            ranking="roundtrip_pnl",
+            include_symbols=["JUP-USD-PERP"],
+            limit=20,
+        )
+
+        assert scan.overlap_count == 1
+        assert [item.canonical_symbol for item in scan.overlaps] == ["JUP-USD-PERP"]
+        assert fetched == [("extended", "JUP-USD"), ("paradex", "JUP-USD-PERP")]
+
+    asyncio.run(run())
+
+
 def test_opportunity_universe_service_excludes_policy_tags() -> None:
     symbol_lists = {
         "extended": ["TRUMP-USD", "LIT-USD"],

@@ -521,13 +521,7 @@ async def scan_funding_universe_once(
     history_store = store or OpportunityHistoryStore(settings.database_path)
     candidate_alert_sink = alert_sink or CandidateAlertStore(settings.database_path)
     timestamp = now or datetime.now(UTC)
-    runtime = scanner or OpportunityUniverseService(
-        execution_quality_service=ExecutionQualityService(
-            journal_store=ExecutionJournalStore(settings.database_path),
-            observation_store=ExecutionObservationStore(settings.database_path),
-        ),
-        route_stability_service=RouteStabilityService(history_store=history_store),
-    )
+    runtime = scanner or _build_worker_universe_scanner(settings, history_store=history_store)
 
     async with asyncio.timeout(settings.universe_scan_timeout_seconds):
         scan = await runtime.scan(
@@ -602,6 +596,26 @@ def _build_universe_fee_profile_overrides(
         if (profile := getattr(settings, f"universe_scan_{venue}_fee_profile", None))
     }
     return overrides or None
+
+
+def _build_worker_universe_scanner(
+    settings: WorkerSettings,
+    *,
+    history_store: OpportunityHistoryStore,
+) -> OpportunityUniverseService:
+    return OpportunityUniverseService(
+        execution_quality_service=ExecutionQualityService(
+            journal_store=ExecutionJournalStore(settings.database_path),
+            observation_store=ExecutionObservationStore(settings.database_path),
+        ),
+        route_stability_service=RouteStabilityService(history_store=history_store),
+        snapshot_batch_size=settings.universe_scan_snapshot_batch_size,
+        snapshot_concurrency_by_venue={
+            "extended": settings.universe_scan_extended_snapshot_concurrency,
+            "paradex": settings.universe_scan_paradex_snapshot_concurrency,
+            "hyperliquid": settings.universe_scan_hyperliquid_snapshot_concurrency,
+        },
+    )
 
 
 def _build_approved_canary_fee_profile_overrides(
@@ -777,14 +791,9 @@ async def scan_approved_canary_once(
     route_approval_service = approval_service or RouteApprovalService(
         store=RouteApprovalStore(settings.database_path)
     )
-    runtime = scanner or OpportunityUniverseService(
-        execution_quality_service=ExecutionQualityService(
-            journal_store=ExecutionJournalStore(settings.database_path),
-            observation_store=ExecutionObservationStore(settings.database_path),
-        ),
-        route_stability_service=RouteStabilityService(
-            history_store=OpportunityHistoryStore(settings.database_path)
-        ),
+    runtime = scanner or _build_worker_universe_scanner(
+        settings,
+        history_store=OpportunityHistoryStore(settings.database_path),
     )
 
     approvals = route_approval_service.list_recent(limit=1_000, approved=True)
