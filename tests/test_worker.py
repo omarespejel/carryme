@@ -211,10 +211,10 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.universe_scan_min_route_samples == 0
     assert settings.universe_scan_min_execution_samples == 0
     assert settings.universe_scan_limit == 10
-    assert settings.approved_canary_scan_min_execution_quality_score == 0.5
-    assert settings.approved_canary_scan_min_route_stability_weight == 0.10
-    assert settings.approved_canary_scan_min_route_presence_ratio == 0.15
-    assert settings.approved_canary_scan_min_route_samples == 2
+    assert settings.approved_canary_scan_min_execution_quality_score == 0.45
+    assert settings.approved_canary_scan_min_route_stability_weight == 0.0
+    assert settings.approved_canary_scan_min_route_presence_ratio == 0.0
+    assert settings.approved_canary_scan_min_route_samples == 0
     assert settings.approved_canary_exact_scan_limit == 25
     assert settings.paradex_recv_window_ms == 300000
     assert settings.execution_observation_max_age_seconds == 1800
@@ -2318,6 +2318,99 @@ def test_scan_approved_canary_once_does_not_emit_stale_alert_when_label_scan_fai
     assert summary.saved_snapshots == 0
     assert summary.alert_events == 0
     assert alert_store.list_recent(limit=10, label=approval.label) == []
+
+
+def test_scan_approved_canary_once_uses_relaxed_worker_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            label="jup_extended_paradex",
+            canonical_symbol="JUP-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=25.0,
+            note="approved canary",
+        )
+    )
+    snapshot_store = ApprovedCanaryStore(settings.database_path)
+
+    async def fake_scan_exact_canary_candidate_for_approval(
+        **kwargs: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        assert kwargs["min_execution_quality_score"] == 0.45
+        assert kwargs["min_route_stability_weight"] == 0.0
+        assert kwargs["min_route_presence_ratio"] == 0.0
+        assert kwargs["min_route_samples"] == 0
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        return (
+            FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol=approval.canonical_symbol,
+                        long_venue=approval.long_venue,
+                        short_venue=approval.short_venue,
+                        long_fee_profile=approval.long_fee_profile,
+                        short_fee_profile=approval.short_fee_profile,
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue=approval.long_venue,
+                        ),
+                    ),
+                    venue_markets={
+                        approval.short_venue: FundingUniverseVenueMarket(
+                            venue=approval.short_venue,
+                            symbol="JUP-USD",
+                        ),
+                        approval.long_venue: FundingUniverseVenueMarket(
+                            venue=approval.long_venue,
+                            symbol="JUP-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=25.0,
+            ),
+            1,
+        )
+
+    monkeypatch.setattr(
+        "carryme_worker.poller.scan_exact_canary_candidate_for_approval",
+        fake_scan_exact_canary_candidate_for_approval,
+    )
+
+    summary = asyncio.run(
+        scan_approved_canary_once(
+            settings,
+            scanner=cast(Any, object()),
+            approval_service=RouteApprovalService(store=approval_store),
+            store=snapshot_store,
+            alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+            now=datetime(2026, 4, 4, 10, 5, tzinfo=UTC),
+        )
+    )
+
+    snapshots = snapshot_store.list_recent(limit=10)
+    assert summary.saved_snapshots == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].label == "jup_extended_paradex"
 
 
 def test_scan_approved_canary_once_emits_stale_alert_for_missing_route(tmp_path: Path) -> None:
