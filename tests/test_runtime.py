@@ -1066,7 +1066,7 @@ def test_opportunity_universe_service_filters_overlaps_before_snapshot_fetch() -
 
         assert scan.overlap_count == 1
         assert [item.canonical_symbol for item in scan.overlaps] == ["JUP-USD-PERP"]
-        assert fetched == [("extended", "JUP-USD"), ("paradex", "JUP-USD-PERP")]
+        assert set(fetched) == {("extended", "JUP-USD"), ("paradex", "JUP-USD-PERP")}
 
     asyncio.run(run())
 

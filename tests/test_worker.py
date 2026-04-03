@@ -157,7 +157,21 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_MIN_EXECUTION_QUALITY_SCORE", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_MIN_EXECUTION_SAMPLES", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_LIMIT", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_UNIVERSE_SCAN_SNAPSHOT_BATCH_SIZE", raising=False)
+    monkeypatch.delenv(
+        "CARRYME_WORKER_UNIVERSE_SCAN_EXTENDED_SNAPSHOT_CONCURRENCY",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_UNIVERSE_SCAN_PARADEX_SNAPSHOT_CONCURRENCY",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_UNIVERSE_SCAN_HYPERLIQUID_SNAPSHOT_CONCURRENCY",
+        raising=False,
+    )
     monkeypatch.delenv("CARRYME_WORKER_EXTENDED_STARK_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_EXECUTION_OBSERVATION_MAX_AGE_SECONDS", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_RECV_WINDOW_MS", raising=False)
     monkeypatch.delenv("CARRYME_API_EXTENDED_STARK_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("CARRYME_API_PARADEX_RECV_WINDOW_MS", raising=False)
@@ -269,6 +283,29 @@ def test_worker_rejects_non_positive_universe_scan_snapshot_batch_size(tmp_path:
         WorkerSettings(
             watchlist_path=str(watchlist),
             universe_scan_snapshot_batch_size=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("universe_scan_extended_snapshot_concurrency", 0),
+        ("universe_scan_paradex_snapshot_concurrency", 0),
+        ("universe_scan_hyperliquid_snapshot_concurrency", 0),
+    ),
+)
+def test_worker_rejects_non_positive_snapshot_concurrency(
+    tmp_path: Path,
+    field_name: str,
+    value: int,
+) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text('{"pairs": []}')
+
+    with pytest.raises(ValidationError, match=field_name):
+        WorkerSettings(
+            watchlist_path=str(watchlist),
+            **cast(Any, {field_name: value}),
         )
 
 
