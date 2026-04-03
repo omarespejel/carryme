@@ -111,6 +111,32 @@ class OpportunityUniverseService:
     snapshot_retry_backoff_seconds: float = 0.25
     execution_quality_service: ExecutionQualityService | None = None
     route_stability_service: RouteStabilityService | None = None
+    _overlap_cache: dict[tuple[str, ...], list[FundingUniverseOverlap]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _overlap_cache_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _execution_quality_index_cache: (
+        tuple[dict[tuple[str, str, str], ExecutionQualitySummary], float] | None
+    ) = field(default=None, init=False, repr=False)
+    _execution_quality_index_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _route_stability_index_cache: (
+        dict[tuple[str, str, str, str, str], RouteStabilitySummary] | None
+    ) = field(default=None, init=False, repr=False)
+    _route_stability_index_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
 
     def resolve_fee_profiles(
         self,
@@ -211,7 +237,7 @@ class OpportunityUniverseService:
             self.default_fee_profiles,
             fee_profile_overrides,
         )
-        overlaps = await self.discover_overlaps(normalized_venues)
+        overlaps = await self._discover_overlaps_cached(normalized_venues)
         filtered_overlaps = [
             overlap
             for overlap in overlaps
@@ -223,21 +249,11 @@ class OpportunityUniverseService:
             )
         ]
         snapshots = await self._fetch_overlapping_snapshots(filtered_overlaps)
-        execution_quality_index = (
-            self.execution_quality_service.build_index()
-            if self.execution_quality_service is not None
-            else {}
-        )
-        execution_prior_score = (
-            self.execution_quality_service.prior_score
-            if self.execution_quality_service is not None
-            else 1.0
-        )
-        route_stability_index = (
-            self.route_stability_service.build_index()
-            if self.route_stability_service is not None
-            else {}
-        )
+        (
+            execution_quality_index,
+            execution_prior_score,
+        ) = await self._build_execution_quality_index_cached()
+        route_stability_index = await self._build_route_stability_index_cached()
 
         opportunities: list[FundingUniverseOpportunity] = []
         for overlap in filtered_overlaps:
@@ -317,6 +333,54 @@ class OpportunityUniverseService:
         ]
         overlaps.sort(key=lambda item: item.canonical_symbol)
         return overlaps
+
+    async def _discover_overlaps_cached(
+        self,
+        venues: list[str],
+    ) -> list[FundingUniverseOverlap]:
+        key = tuple(venues)
+        cached = self._overlap_cache.get(key)
+        if cached is not None:
+            return cached
+        async with self._overlap_cache_lock:
+            cached = self._overlap_cache.get(key)
+            if cached is None:
+                cached = await self.discover_overlaps(list(key))
+                self._overlap_cache[key] = cached
+        return cached
+
+    async def _build_execution_quality_index_cached(
+        self,
+    ) -> tuple[dict[tuple[str, str, str], ExecutionQualitySummary], float]:
+        if self.execution_quality_service is None:
+            return {}, 1.0
+        cached = self._execution_quality_index_cache
+        if cached is not None:
+            return cached
+        async with self._execution_quality_index_lock:
+            cached = self._execution_quality_index_cache
+            if cached is None:
+                cached = (
+                    self.execution_quality_service.build_index(),
+                    self.execution_quality_service.prior_score,
+                )
+                self._execution_quality_index_cache = cached
+        return cached
+
+    async def _build_route_stability_index_cached(
+        self,
+    ) -> dict[tuple[str, str, str, str, str], RouteStabilitySummary]:
+        if self.route_stability_service is None:
+            return {}
+        cached = self._route_stability_index_cache
+        if cached is not None:
+            return cached
+        async with self._route_stability_index_lock:
+            cached = self._route_stability_index_cache
+            if cached is None:
+                cached = self.route_stability_service.build_index()
+                self._route_stability_index_cache = cached
+        return cached
 
     async def _fetch_overlapping_snapshots(
         self,
