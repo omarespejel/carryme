@@ -4532,6 +4532,90 @@ def test_run_supervised_approved_canary_scan_loop_honors_max_iterations(
     assert sleeps == [3.0]
 
 
+def test_run_supervised_approved_canary_scan_loop_reuses_shared_scanner_across_cycles(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        approved_canary_scan_interval_seconds=1,
+    )
+
+    class StubScanner:
+        pass
+
+    shared_scanner = StubScanner()
+    build_calls: list[int] = []
+    seen_scanners: list[object] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        _ = seconds
+
+    async def fake_scan_approved_canary_once(
+        settings_arg: WorkerSettings,
+        *,
+        scanner: object | None = None,
+        approval_service: object | None = None,
+        store: object | None = None,
+        alert_sink: object | None = None,
+        alert_notifier: object | None = None,
+        logger: object | None = None,
+        now: datetime | None = None,
+    ) -> ApprovedCanaryScanSummary:
+        assert settings_arg is settings
+        assert approval_service is not None
+        assert store is not None
+        assert alert_sink is not None
+        _ = alert_notifier
+        _ = logger
+        assert now is None
+        assert scanner is not None
+        seen_scanners.append(scanner)
+        return ApprovedCanaryScanSummary(
+            scanned_candidates=0,
+            approved_candidates=0,
+            saved_snapshots=0,
+            alert_events=0,
+            sent_notifications=0,
+            database_path=settings.database_path,
+        )
+
+    def fake_build_worker_universe_scanner(
+        settings_arg: WorkerSettings,
+        *,
+        history_store: object | None = None,
+    ) -> StubScanner:
+        assert settings_arg is settings
+        assert history_store is not None
+        build_calls.append(1)
+        return shared_scanner
+
+    from unittest.mock import patch
+
+    with (
+        patch(
+            "carryme_worker.poller.scan_approved_canary_once",
+            side_effect=fake_scan_approved_canary_once,
+        ),
+        patch(
+            "carryme_worker.poller._build_worker_universe_scanner",
+            side_effect=fake_build_worker_universe_scanner,
+        ),
+    ):
+        summary = asyncio.run(
+            run_supervised_approved_canary_scan_loop(
+                settings,
+                store=ApprovedCanaryStore(settings.database_path),
+                alert_sink=ApprovedCanaryAlertStore(settings.database_path),
+                sleep=fake_sleep,
+                max_iterations=2,
+            )
+        )
+
+    assert summary.attempts == 2
+    assert build_calls == [1]
+    assert seen_scanners == [shared_scanner, shared_scanner]
+
+
 def test_observe_system_state_once_emits_and_notifies_alerts(tmp_path: Path) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
