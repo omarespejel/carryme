@@ -246,7 +246,7 @@ class ExecutionAccountingService:
             return observation.execution_entry_id == entry.entry_id
         if observation.preview_hash is not None and entry.preview_hash is not None:
             return observation.preview_hash == entry.preview_hash
-        return observation.paper_trade_id == entry.paper_trade_id
+        return False
 
     def _apply_observation_inference(
         self,
