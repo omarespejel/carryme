@@ -132,6 +132,7 @@ class ExecutionObservationStore:
         self,
         *,
         limit: int | None = 50,
+        offset: int = 0,
         paper_trade_id: int | None = None,
     ) -> list[ExecutionObservationEntry]:
         """Return recent execution observation rows."""
@@ -139,6 +140,10 @@ class ExecutionObservationStore:
         self.initialize()
         if limit is not None and limit < 1:
             raise ValueError("limit must be at least 1")
+        if offset < 0:
+            raise ValueError("offset must be at least 0")
+        if limit is None and offset > 0:
+            raise ValueError("offset requires a finite limit")
         query = """
             SELECT id, entry_json
             FROM execution_observation_entries
@@ -151,8 +156,8 @@ class ExecutionObservationStore:
             params = ()
         query += " ORDER BY observed_at DESC, id DESC"
         if limit is not None:
-            query += " LIMIT ?"
-            params = (*params, limit)
+            query += " LIMIT ? OFFSET ?"
+            params = (*params, limit, offset)
 
         with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()

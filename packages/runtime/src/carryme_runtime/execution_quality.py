@@ -76,28 +76,12 @@ class ExecutionQualityService:
     prior_weight: float = 2.0
     prior_score: float = 0.65
     sample_limit: int = 500
+    observation_scan_batch_size: int = 200
 
     def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
         """Aggregate latest observed pair outcomes by symbol and venue direction."""
 
-        observations = self.observation_store.list_recent(limit=None)
-        latest_by_paper_trade: dict[int, ExecutionObservationEntry] = {}
-        for observation in observations:
-            if observation.paper_trade_id is None or observation.pair_status is None:
-                continue
-            existing = latest_by_paper_trade.get(observation.paper_trade_id)
-            if existing is None or _observation_sort_key(observation) > _observation_sort_key(
-                existing
-            ):
-                latest_by_paper_trade[observation.paper_trade_id] = observation
-
-        unique_observations = sorted(
-            latest_by_paper_trade.values(),
-            key=_observation_sort_key,
-            reverse=True,
-        )
-        if self.sample_limit > 0:
-            unique_observations = unique_observations[: self.sample_limit]
+        unique_observations = self._list_recent_unique_observations()
 
         buckets: dict[tuple[str, str, str], _ExecutionQualityBucket] = {}
 
@@ -144,6 +128,34 @@ class ExecutionQualityService:
                 pending_count=bucket.pending_count,
             )
         return result
+
+    def _list_recent_unique_observations(self) -> list[ExecutionObservationEntry]:
+        """Return the latest observation per paper trade without scanning the full table."""
+
+        page_size = max(self.observation_scan_batch_size, 1)
+        latest_by_paper_trade: dict[int, ExecutionObservationEntry] = {}
+        offset = 0
+
+        while True:
+            observations = self.observation_store.list_recent(limit=page_size, offset=offset)
+            if not observations:
+                break
+
+            for observation in observations:
+                paper_trade_id = observation.paper_trade_id
+                if paper_trade_id is None or observation.pair_status is None:
+                    continue
+                if paper_trade_id in latest_by_paper_trade:
+                    continue
+                latest_by_paper_trade[paper_trade_id] = observation
+                if self.sample_limit > 0 and len(latest_by_paper_trade) >= self.sample_limit:
+                    return list(latest_by_paper_trade.values())
+
+            if len(observations) < page_size:
+                break
+            offset += page_size
+
+        return list(latest_by_paper_trade.values())
 
     def list_summaries(
         self,
