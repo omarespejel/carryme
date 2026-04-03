@@ -159,6 +159,7 @@ APP_NAME = "carryme-api"
 APP_VERSION = "0.1.0"
 DEFAULT_APP_ENVIRONMENT = "development"
 APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
+MAX_GUARDED_AUTO_CLEANUP_STEPS = 3
 MAX_HISTORY_LIMIT = 1000
 PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -1611,6 +1612,171 @@ async def _observe_pair_status_for_execution(
     return last_status
 
 
+async def _run_guarded_auto_cleanup_sequence(
+    *,
+    paper_trade: PaperTradeEntry,
+    preview_hash: str,
+    initial_execution: ExecutionJournalEntry,
+    initial_pair_status: ExecutionPairStatus,
+    settings: ApiSettings,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    cleanup_confirmation_store: CleanupPreviewConfirmationStore,
+    account_preflight_service: AccountPreflightService,
+    order_state_service: ExecutionOrderStateService,
+    cleanup_preview_service: CleanupPreviewRouter,
+    cleanup_live_router: CleanupLiveExecutionRouter,
+    poll_attempts: int,
+    poll_interval_seconds: float,
+    confirmation_note: str,
+    observation_context_prefix: str,
+) -> tuple[ExecutionJournalEntry | None, ExecutionPairStatus]:
+    paper_trade_id = paper_trade.entry_id or 0
+    current_execution = initial_execution
+    pair_status = initial_pair_status
+    latest_cleanup_execution: ExecutionJournalEntry | None = None
+
+    for step in range(1, MAX_GUARDED_AUTO_CLEANUP_STEPS + 1):
+        reused_existing_cleanup = False
+        if pair_status.recommended_action not in {
+            "close_open_leg",
+            "complete_or_unwind_missing_leg",
+        }:
+            return latest_cleanup_execution, pair_status
+
+        try:
+            cleanup_preview = await cleanup_preview_service.preview_from_execution(
+                entry=current_execution,
+                pair_status=pair_status,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        try:
+            await _ensure_cleanup_live_ready(
+                venue=cleanup_preview.leg.venue,
+                settings=settings,
+                account_service=account_preflight_service,
+            )
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        cleanup_confirmation = cleanup_confirmation_store.find_latest_by_preview_hash(
+            paper_trade_id=paper_trade_id,
+            preview_hash=cleanup_preview.preview_hash,
+        )
+        if cleanup_confirmation is None:
+            cleanup_confirmation = cleanup_confirmation_store.append(
+                CleanupPreviewConfirmationEntry(
+                    confirmed_at=datetime.now(UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=paper_trade.intent.label,
+                    preview_hash=cleanup_preview.preview_hash,
+                    preview=cleanup_preview,
+                    note=confirmation_note,
+                )
+            )
+        if cleanup_confirmation.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Cleanup preview confirmation entry_id is required before live submission",
+            )
+
+        if not execution_store.reserve_live_submission(
+            confirmation_entry_id=cleanup_confirmation.entry_id,
+            preview_hash=cleanup_confirmation.preview_hash,
+        ):
+            existing_entry = execution_store.find_by_confirmation(
+                confirmation_entry_id=cleanup_confirmation.entry_id,
+                preview_hash=cleanup_confirmation.preview_hash,
+            )
+            if existing_entry is None:
+                pair_status = pair_status.model_copy(
+                    update={
+                        "notes": [
+                            *pair_status.notes,
+                            (
+                                "Cleanup live submission was already reserved; "
+                                "manual reconciliation is required before retrying"
+                            ),
+                        ]
+                    }
+                )
+                return latest_cleanup_execution, pair_status
+            latest_cleanup_execution = existing_entry
+            reused_existing_cleanup = True
+        else:
+            try:
+                latest_cleanup_execution = (
+                    await cleanup_live_router.submit_confirmed_cleanup_preview(
+                        paper_trade=paper_trade,
+                        confirmation=cleanup_confirmation,
+                    )
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+            latest_cleanup_execution = execution_store.append(latest_cleanup_execution)
+            if latest_cleanup_execution.entry_id is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Execution journal append did not return an id",
+                )
+            execution_store.mark_live_submission_completed(
+                confirmation_entry_id=cleanup_confirmation.entry_id,
+                preview_hash=cleanup_confirmation.preview_hash,
+                execution_entry_id=latest_cleanup_execution.entry_id,
+            )
+
+        try:
+            pair_status = await _observe_pair_status_for_execution(
+                paper_trade=paper_trade,
+                execution=latest_cleanup_execution,
+                settings=settings,
+                account_service=account_preflight_service,
+                order_state_service=order_state_service,
+                observation_store=observation_store,
+                observation_context=f"{observation_context_prefix}_cleanup_step_{step}",
+                poll_attempts=poll_attempts,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if reused_existing_cleanup:
+            pair_status = pair_status.model_copy(
+                update={
+                    "notes": [
+                        *pair_status.notes,
+                        "Existing cleanup execution reused for this confirmation",
+                    ]
+                }
+            )
+            return latest_cleanup_execution, pair_status
+
+        current_execution = latest_cleanup_execution
+
+    if pair_status.recommended_action in {"close_open_leg", "complete_or_unwind_missing_leg"}:
+        pair_status = pair_status.model_copy(
+            update={
+                "notes": [
+                    *pair_status.notes,
+                    (
+                        "Automatic cleanup stopped after reaching the maximum chained cleanup "
+                        f"steps ({MAX_GUARDED_AUTO_CLEANUP_STEPS})."
+                    ),
+                ]
+            }
+        )
+    return latest_cleanup_execution, pair_status
+
+
 def _select_trade_intent_records(
     records: list[OpportunityRecord],
     *,
@@ -2842,123 +3008,25 @@ async def _execute_guarded_pair_from_confirmation(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     cleanup_execution: ExecutionJournalEntry | None = None
-    if auto_cleanup and pair_status.recommended_action in {
-        "close_open_leg",
-        "complete_or_unwind_missing_leg",
-    }:
-        try:
-            cleanup_preview = await cleanup_preview_service.preview_from_execution(
-                entry=primary_execution,
-                pair_status=pair_status,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        try:
-            await _ensure_cleanup_live_ready(
-                venue=cleanup_preview.leg.venue,
-                settings=settings,
-                account_service=account_preflight_service,
-            )
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        cleanup_confirmation = cleanup_confirmation_store.find_latest_by_preview_hash(
-            paper_trade_id=paper_trade_id,
-            preview_hash=cleanup_preview.preview_hash,
+    if auto_cleanup:
+        cleanup_execution, pair_status = await _run_guarded_auto_cleanup_sequence(
+            paper_trade=paper_trade,
+            preview_hash=confirmation.preview_hash,
+            initial_execution=primary_execution,
+            initial_pair_status=pair_status,
+            settings=settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            account_preflight_service=account_preflight_service,
+            order_state_service=order_state_service,
+            cleanup_preview_service=cleanup_preview_service,
+            cleanup_live_router=cleanup_live_router,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            confirmation_note="guarded pair auto-cleanup",
+            observation_context_prefix="guarded_pair",
         )
-        if cleanup_confirmation is None:
-            cleanup_confirmation = cleanup_confirmation_store.append(
-                CleanupPreviewConfirmationEntry(
-                    confirmed_at=datetime.now(UTC),
-                    paper_trade_id=paper_trade_id,
-                    label=paper_trade.intent.label,
-                    preview_hash=cleanup_preview.preview_hash,
-                    preview=cleanup_preview,
-                    note="guarded pair auto-cleanup",
-                )
-            )
-        if cleanup_confirmation.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Cleanup preview confirmation entry_id is required before live submission",
-            )
-        if not execution_store.reserve_live_submission(
-            confirmation_entry_id=cleanup_confirmation.entry_id,
-            preview_hash=cleanup_confirmation.preview_hash,
-        ):
-            existing_entry = execution_store.find_by_confirmation(
-                confirmation_entry_id=cleanup_confirmation.entry_id,
-                preview_hash=cleanup_confirmation.preview_hash,
-            )
-            if existing_entry is not None:
-                return GuardedPairExecutionResult(
-                    paper_trade_id=paper_trade_id,
-                    preview_hash=confirmation.preview_hash,
-                    primary_execution=primary_execution,
-                    cleanup_execution=existing_entry,
-                    pair_status=pair_status.model_copy(
-                        update={
-                            "notes": [
-                                *pair_status.notes,
-                                "Existing cleanup execution reused for this confirmation",
-                            ]
-                        }
-                    ),
-                )
-            return GuardedPairExecutionResult(
-                paper_trade_id=paper_trade_id,
-                preview_hash=confirmation.preview_hash,
-                primary_execution=primary_execution,
-                cleanup_execution=None,
-                pair_status=pair_status.model_copy(
-                    update={
-                        "notes": [
-                            *pair_status.notes,
-                            (
-                                "Cleanup live submission was already reserved; "
-                                "manual reconciliation is required before retrying"
-                            ),
-                        ]
-                    }
-                ),
-            )
-        try:
-            cleanup_execution = await cleanup_live_router.submit_confirmed_cleanup_preview(
-                paper_trade=paper_trade,
-                confirmation=cleanup_confirmation,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        cleanup_execution = execution_store.append(cleanup_execution)
-        if cleanup_execution.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Execution journal append did not return an id",
-            )
-        execution_store.mark_live_submission_completed(
-            confirmation_entry_id=cleanup_confirmation.entry_id,
-            preview_hash=cleanup_confirmation.preview_hash,
-            execution_entry_id=cleanup_execution.entry_id,
-        )
-        try:
-            pair_status = await _observe_pair_status_for_execution(
-                paper_trade=paper_trade,
-                execution=cleanup_execution,
-                settings=settings,
-                account_service=account_preflight_service,
-                order_state_service=order_state_service,
-                observation_store=observation_store,
-                poll_attempts=poll_attempts,
-                poll_interval_seconds=poll_interval_seconds,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return GuardedPairExecutionResult(
         paper_trade_id=paper_trade_id,
@@ -3063,124 +3131,25 @@ async def _execute_guarded_pair_close_from_confirmation(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     cleanup_execution: ExecutionJournalEntry | None = None
-    if auto_cleanup and pair_status.recommended_action in {
-        "close_open_leg",
-        "complete_or_unwind_missing_leg",
-    }:
-        try:
-            cleanup_preview = await cleanup_preview_service.preview_from_execution(
-                entry=primary_execution,
-                pair_status=pair_status,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        try:
-            await _ensure_cleanup_live_ready(
-                venue=cleanup_preview.leg.venue,
-                settings=settings,
-                account_service=account_preflight_service,
-            )
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        cleanup_confirmation = cleanup_confirmation_store.find_latest_by_preview_hash(
-            paper_trade_id=paper_trade_id,
-            preview_hash=cleanup_preview.preview_hash,
+    if auto_cleanup:
+        cleanup_execution, pair_status = await _run_guarded_auto_cleanup_sequence(
+            paper_trade=paper_trade,
+            preview_hash=confirmation.preview_hash,
+            initial_execution=primary_execution,
+            initial_pair_status=pair_status,
+            settings=settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            account_preflight_service=account_preflight_service,
+            order_state_service=order_state_service,
+            cleanup_preview_service=cleanup_preview_service,
+            cleanup_live_router=cleanup_live_router,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            confirmation_note="guarded pair close auto-cleanup",
+            observation_context_prefix="guarded_pair_close",
         )
-        if cleanup_confirmation is None:
-            cleanup_confirmation = cleanup_confirmation_store.append(
-                CleanupPreviewConfirmationEntry(
-                    confirmed_at=datetime.now(UTC),
-                    paper_trade_id=paper_trade_id,
-                    label=paper_trade.intent.label,
-                    preview_hash=cleanup_preview.preview_hash,
-                    preview=cleanup_preview,
-                    note="guarded pair close auto-cleanup",
-                )
-            )
-        if cleanup_confirmation.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Cleanup preview confirmation entry_id is required before live submission",
-            )
-        if not execution_store.reserve_live_submission(
-            confirmation_entry_id=cleanup_confirmation.entry_id,
-            preview_hash=cleanup_confirmation.preview_hash,
-        ):
-            existing_entry = execution_store.find_by_confirmation(
-                confirmation_entry_id=cleanup_confirmation.entry_id,
-                preview_hash=cleanup_confirmation.preview_hash,
-            )
-            if existing_entry is not None:
-                return GuardedPairExecutionResult(
-                    paper_trade_id=paper_trade_id,
-                    preview_hash=confirmation.preview_hash,
-                    primary_execution=primary_execution,
-                    cleanup_execution=existing_entry,
-                    pair_status=pair_status.model_copy(
-                        update={
-                            "notes": [
-                                *pair_status.notes,
-                                "Existing cleanup execution reused for this confirmation",
-                            ]
-                        }
-                    ),
-                )
-            return GuardedPairExecutionResult(
-                paper_trade_id=paper_trade_id,
-                preview_hash=confirmation.preview_hash,
-                primary_execution=primary_execution,
-                cleanup_execution=None,
-                pair_status=pair_status.model_copy(
-                    update={
-                        "notes": [
-                            *pair_status.notes,
-                            (
-                                "Cleanup live submission was already reserved; "
-                                "manual reconciliation is required before retrying"
-                            ),
-                        ]
-                    }
-                ),
-            )
-        try:
-            cleanup_execution = await cleanup_live_router.submit_confirmed_cleanup_preview(
-                paper_trade=paper_trade,
-                confirmation=cleanup_confirmation,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        cleanup_execution = execution_store.append(cleanup_execution)
-        if cleanup_execution.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Execution journal append did not return an id",
-            )
-        execution_store.mark_live_submission_completed(
-            confirmation_entry_id=cleanup_confirmation.entry_id,
-            preview_hash=cleanup_confirmation.preview_hash,
-            execution_entry_id=cleanup_execution.entry_id,
-        )
-        try:
-            pair_status = await _observe_pair_status_for_execution(
-                paper_trade=paper_trade,
-                execution=cleanup_execution,
-                settings=settings,
-                account_service=account_preflight_service,
-                order_state_service=order_state_service,
-                observation_store=observation_store,
-                observation_context="guarded_pair_close_cleanup_poll",
-                poll_attempts=poll_attempts,
-                poll_interval_seconds=poll_interval_seconds,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return GuardedPairExecutionResult(
         paper_trade_id=paper_trade_id,
@@ -5311,193 +5280,22 @@ def create_app() -> FastAPI:
                 status_code=500,
                 detail="Preview confirmation entry_id is required before live submission",
             )
-        if not execution_store.reserve_live_submission(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
-        ):
-            existing_entry = execution_store.find_by_confirmation(
-                confirmation_entry_id=confirmation.entry_id,
-                preview_hash=confirmation.preview_hash,
-            )
-            if existing_entry is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=existing_entry.model_dump(mode="json"),
-                )
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "A live submission is already reserved for this confirmed preview; "
-                    "manual reconciliation is required before retrying"
-                ),
-            )
-
-        try:
-            primary_execution = await service.submit_confirmed_preview(
-                paper_trade=paper_trade,
-                confirmation=confirmation,
-                first_venue=first_venue,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        primary_execution = execution_store.append(primary_execution)
-        if primary_execution.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Execution journal append did not return an id",
-            )
-        execution_store.mark_live_submission_completed(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
-            execution_entry_id=primary_execution.entry_id,
-        )
-        try:
-            pair_status = await _observe_pair_status_for_execution(
-                paper_trade=paper_trade,
-                execution=primary_execution,
-                settings=settings,
-                account_service=account_preflight_service,
-                order_state_service=order_state_service,
-                observation_store=observation_store,
-                poll_attempts=poll_attempts,
-                poll_interval_seconds=poll_interval_seconds,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        cleanup_execution: ExecutionJournalEntry | None = None
-        if auto_cleanup and pair_status.recommended_action in {
-            "close_open_leg",
-            "complete_or_unwind_missing_leg",
-        }:
-            try:
-                cleanup_preview = await cleanup_preview_service.preview_from_execution(
-                    entry=primary_execution,
-                    pair_status=pair_status,
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-            try:
-                await _ensure_cleanup_live_ready(
-                    venue=cleanup_preview.leg.venue,
-                    settings=settings,
-                    account_service=account_preflight_service,
-                )
-            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-            cleanup_confirmation = cleanup_confirmation_store.find_latest_by_preview_hash(
-                paper_trade_id=paper_trade_id,
-                preview_hash=cleanup_preview.preview_hash,
-            )
-            if cleanup_confirmation is None:
-                cleanup_confirmation = cleanup_confirmation_store.append(
-                    CleanupPreviewConfirmationEntry(
-                        confirmed_at=datetime.now(UTC),
-                        paper_trade_id=paper_trade_id,
-                        label=paper_trade.intent.label,
-                        preview_hash=cleanup_preview.preview_hash,
-                        preview=cleanup_preview,
-                        note="guarded pair auto-cleanup",
-                    )
-                )
-            if cleanup_confirmation.entry_id is None:
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        "Cleanup preview confirmation entry_id is required before live submission"
-                    ),
-                )
-            if not execution_store.reserve_live_submission(
-                confirmation_entry_id=cleanup_confirmation.entry_id,
-                preview_hash=cleanup_confirmation.preview_hash,
-            ):
-                existing_entry = execution_store.find_by_confirmation(
-                    confirmation_entry_id=cleanup_confirmation.entry_id,
-                    preview_hash=cleanup_confirmation.preview_hash,
-                )
-                if existing_entry is not None:
-                    return GuardedPairExecutionResult(
-                        paper_trade_id=paper_trade_id,
-                        preview_hash=normalized_preview_hash,
-                        primary_execution=primary_execution,
-                        cleanup_execution=existing_entry,
-                        pair_status=pair_status.model_copy(
-                            update={
-                                "notes": [
-                                    *pair_status.notes,
-                                    "Existing cleanup execution reused for this confirmation",
-                                ]
-                            }
-                        ),
-                    )
-                return GuardedPairExecutionResult(
-                    paper_trade_id=paper_trade_id,
-                    preview_hash=normalized_preview_hash,
-                    primary_execution=primary_execution,
-                    cleanup_execution=None,
-                    pair_status=pair_status.model_copy(
-                        update={
-                            "notes": [
-                                *pair_status.notes,
-                                (
-                                    "Cleanup live submission was already reserved; "
-                                    "manual reconciliation is required before retrying"
-                                ),
-                            ]
-                        }
-                    ),
-                )
-            try:
-                cleanup_execution = await cleanup_live_router.submit_confirmed_cleanup_preview(
-                    paper_trade=paper_trade,
-                    confirmation=cleanup_confirmation,
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-            cleanup_execution = execution_store.append(cleanup_execution)
-            if cleanup_execution.entry_id is None:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Execution journal append did not return an id",
-                )
-            execution_store.mark_live_submission_completed(
-                confirmation_entry_id=cleanup_confirmation.entry_id,
-                preview_hash=cleanup_confirmation.preview_hash,
-                execution_entry_id=cleanup_execution.entry_id,
-            )
-            try:
-                pair_status = await _observe_pair_status_for_execution(
-                    paper_trade=paper_trade,
-                    execution=cleanup_execution,
-                    settings=settings,
-                    account_service=account_preflight_service,
-                    order_state_service=order_state_service,
-                    observation_store=observation_store,
-                    poll_attempts=poll_attempts,
-                    poll_interval_seconds=poll_interval_seconds,
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        return GuardedPairExecutionResult(
-            paper_trade_id=paper_trade_id,
-            preview_hash=normalized_preview_hash,
-            primary_execution=primary_execution,
-            cleanup_execution=cleanup_execution,
-            pair_status=pair_status,
+        return await _execute_guarded_pair_from_confirmation(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            settings=settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            account_preflight_service=account_preflight_service,
+            order_state_service=order_state_service,
+            cleanup_preview_service=cleanup_preview_service,
+            cleanup_live_router=cleanup_live_router,
+            service=service,
+            first_venue=first_venue,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            auto_cleanup=auto_cleanup,
         )
 
     @app.post(
@@ -5592,194 +5390,22 @@ def create_app() -> FastAPI:
             except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-        if not execution_store.reserve_live_submission(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
-        ):
-            existing_entry = execution_store.find_by_confirmation(
-                confirmation_entry_id=confirmation.entry_id,
-                preview_hash=confirmation.preview_hash,
-            )
-            if existing_entry is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=existing_entry.model_dump(mode="json"),
-                )
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "A live submission is already reserved for this confirmed preview; "
-                    "manual reconciliation is required before retrying"
-                ),
-            )
-
-        try:
-            primary_execution = await service.submit_confirmed_preview(
-                paper_trade=paper_trade,
-                confirmation=confirmation,
-                first_venue=first_venue,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        primary_execution = execution_store.append(primary_execution)
-        if primary_execution.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Execution journal append did not return an id",
-            )
-        execution_store.mark_live_submission_completed(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
-            execution_entry_id=primary_execution.entry_id,
-        )
-        try:
-            pair_status = await _observe_pair_status_for_execution(
-                paper_trade=paper_trade,
-                execution=primary_execution,
-                settings=settings,
-                account_service=account_preflight_service,
-                order_state_service=order_state_service,
-                observation_store=observation_store,
-                observation_context="guarded_pair_close_poll",
-                poll_attempts=poll_attempts,
-                poll_interval_seconds=poll_interval_seconds,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        cleanup_execution: ExecutionJournalEntry | None = None
-        if auto_cleanup and pair_status.recommended_action in {
-            "close_open_leg",
-            "complete_or_unwind_missing_leg",
-        }:
-            try:
-                cleanup_preview = await cleanup_preview_service.preview_from_execution(
-                    entry=primary_execution,
-                    pair_status=pair_status,
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-            try:
-                await _ensure_cleanup_live_ready(
-                    venue=cleanup_preview.leg.venue,
-                    settings=settings,
-                    account_service=account_preflight_service,
-                )
-            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-            cleanup_confirmation = cleanup_confirmation_store.find_latest_by_preview_hash(
-                paper_trade_id=paper_trade_id,
-                preview_hash=cleanup_preview.preview_hash,
-            )
-            if cleanup_confirmation is None:
-                cleanup_confirmation = cleanup_confirmation_store.append(
-                    CleanupPreviewConfirmationEntry(
-                        confirmed_at=datetime.now(UTC),
-                        paper_trade_id=paper_trade_id,
-                        label=paper_trade.intent.label,
-                        preview_hash=cleanup_preview.preview_hash,
-                        preview=cleanup_preview,
-                        note="guarded pair close auto-cleanup",
-                    )
-                )
-            if cleanup_confirmation.entry_id is None:
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        "Cleanup preview confirmation entry_id is required before live submission"
-                    ),
-                )
-            if not execution_store.reserve_live_submission(
-                confirmation_entry_id=cleanup_confirmation.entry_id,
-                preview_hash=cleanup_confirmation.preview_hash,
-            ):
-                existing_entry = execution_store.find_by_confirmation(
-                    confirmation_entry_id=cleanup_confirmation.entry_id,
-                    preview_hash=cleanup_confirmation.preview_hash,
-                )
-                if existing_entry is not None:
-                    return GuardedPairExecutionResult(
-                        paper_trade_id=paper_trade_id,
-                        preview_hash=normalized_preview_hash,
-                        primary_execution=primary_execution,
-                        cleanup_execution=existing_entry,
-                        pair_status=pair_status.model_copy(
-                            update={
-                                "notes": [
-                                    *pair_status.notes,
-                                    "Existing cleanup execution reused for this confirmation",
-                                ]
-                            }
-                        ),
-                    )
-                return GuardedPairExecutionResult(
-                    paper_trade_id=paper_trade_id,
-                    preview_hash=normalized_preview_hash,
-                    primary_execution=primary_execution,
-                    cleanup_execution=None,
-                    pair_status=pair_status.model_copy(
-                        update={
-                            "notes": [
-                                *pair_status.notes,
-                                (
-                                    "Cleanup live submission was already reserved; "
-                                    "manual reconciliation is required before retrying"
-                                ),
-                            ]
-                        }
-                    ),
-                )
-            try:
-                cleanup_execution = await cleanup_live_router.submit_confirmed_cleanup_preview(
-                    paper_trade=paper_trade,
-                    confirmation=cleanup_confirmation,
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-            cleanup_execution = execution_store.append(cleanup_execution)
-            if cleanup_execution.entry_id is None:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Execution journal append did not return an id",
-                )
-            execution_store.mark_live_submission_completed(
-                confirmation_entry_id=cleanup_confirmation.entry_id,
-                preview_hash=cleanup_confirmation.preview_hash,
-                execution_entry_id=cleanup_execution.entry_id,
-            )
-            try:
-                pair_status = await _observe_pair_status_for_execution(
-                    paper_trade=paper_trade,
-                    execution=cleanup_execution,
-                    settings=settings,
-                    account_service=account_preflight_service,
-                    order_state_service=order_state_service,
-                    observation_store=observation_store,
-                    observation_context="guarded_pair_close_cleanup_poll",
-                    poll_attempts=poll_attempts,
-                    poll_interval_seconds=poll_interval_seconds,
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        return GuardedPairExecutionResult(
-            paper_trade_id=paper_trade_id,
-            preview_hash=normalized_preview_hash,
-            primary_execution=primary_execution,
-            cleanup_execution=cleanup_execution,
-            pair_status=pair_status,
+        return await _execute_guarded_pair_close_from_confirmation(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            settings=settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            cleanup_confirmation_store=cleanup_confirmation_store,
+            account_preflight_service=account_preflight_service,
+            order_state_service=order_state_service,
+            cleanup_preview_service=cleanup_preview_service,
+            cleanup_live_router=cleanup_live_router,
+            service=service,
+            first_venue=first_venue,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            auto_cleanup=auto_cleanup,
         )
 
     @app.get("/dashboard", response_class=HTMLResponse)
