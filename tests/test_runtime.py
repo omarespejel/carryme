@@ -7755,6 +7755,63 @@ def test_extended_account_probe_uses_balance_payload_for_collateral(
     asyncio.run(run())
 
 
+def test_extended_account_probe_retries_transient_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        attempts[path] = attempts.get(path, 0) + 1
+        if path == "/api/v1/user/account/info" and attempts[path] == 1:
+            return httpx.Response(429, json={"error": "RATE_LIMITED"})
+        if path == "/api/v1/user/account/info":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "subAccountId": "extended-subaccount",
+                        "status": "ACTIVE",
+                        "equity": "10",
+                        "availableForTrade": "10",
+                    }
+                },
+            )
+        if path == "/api/v1/user/balance":
+            return httpx.Response(200, json={"data": []})
+        if path == "/api/v1/user/positions":
+            return httpx.Response(200, json={"data": []})
+        raise AssertionError(f"Unexpected request path: {path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    async def fast_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    async def run() -> None:
+        probe = ExtendedAccountProbe()
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "api_key": "extended-key",
+                },
+            }
+        )
+        assert status.authenticated is True
+        assert status.ready is True
+        assert status.total_collateral == pytest.approx(10.0)
+        assert attempts["/api/v1/user/account/info"] == 2
+
+    asyncio.run(run())
+
+
 def test_paradex_account_probe_requires_private_key_or_bearer_override() -> None:
     async def run() -> None:
         probe = ParadexAccountProbe()
@@ -7825,6 +7882,68 @@ def test_paradex_account_probe_uses_subkey_jwt_when_bearer_is_missing(
         assert status.ready is True
         assert status.credential_mode == "subkey_jwt"
         assert status.account_identifier == "0xabc"
+
+    asyncio.run(run())
+
+
+def test_paradex_account_probe_retries_transient_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubTokenProvider:
+        async def issue_jwt_token(
+            self,
+            *,
+            account_address: str,
+            private_key: str,
+            client: httpx.AsyncClient | None = None,
+            now: int | None = None,
+        ) -> str:
+            assert account_address == "0xabc"
+            assert private_key == "0x123"
+            return "derived-token"
+
+    attempts: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        attempts[path] = attempts.get(path, 0) + 1
+        assert request.headers["Authorization"] == "Bearer derived-token"
+        if path == "/v1/account" and attempts[path] == 1:
+            return httpx.Response(429, json={"error": "RATE_LIMITED"})
+        if path == "/v1/account":
+            return httpx.Response(200, json={"account": "0xabc", "status": "ACTIVE"})
+        if path == "/v1/balance":
+            return httpx.Response(200, json=[])
+        if path == "/v1/positions":
+            return httpx.Response(200, json=[])
+        raise AssertionError(f"Unexpected request path: {path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    async def fast_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    async def run() -> None:
+        probe = ParadexAccountProbe(token_provider=StubTokenProvider())
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xabc",
+                    "private_key": "0x123",
+                    "bearer_token": None,
+                },
+            }
+        )
+        assert status.authenticated is True
+        assert status.ready is True
+        assert attempts["/v1/account"] == 2
 
     asyncio.run(run())
 
