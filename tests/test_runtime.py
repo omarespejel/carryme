@@ -1020,7 +1020,7 @@ def test_opportunity_universe_service_batches_snapshot_tasks() -> None:
         )
 
         assert len(scan.opportunities) == 6
-        assert max_inflight <= 3
+        assert 1 < max_inflight <= 3
 
     asyncio.run(run())
 
