@@ -106,6 +106,7 @@ class OpportunityUniverseService:
     snapshot_concurrency_by_venue: dict[str, int] = field(
         default_factory=lambda: dict(DEFAULT_SNAPSHOT_CONCURRENCY_BY_VENUE)
     )
+    snapshot_batch_size: int | None = None
     snapshot_retry_attempts: int = 3
     snapshot_retry_backoff_seconds: float = 0.25
     execution_quality_service: ExecutionQualityService | None = None
@@ -322,24 +323,42 @@ class OpportunityUniverseService:
             venue: asyncio.Semaphore(max(self.snapshot_concurrency_by_venue.get(venue, 1), 1))
             for venue in VENUE_REGISTRY
         }
-        tasks = {
-            (venue, symbol): asyncio.create_task(
-                self._fetch_snapshot_with_controls(
-                    venue,
-                    symbol,
-                    semaphore=semaphores[venue],
-                )
-            )
+        snapshots: dict[tuple[str, str], NormalizedMarketSnapshot] = {}
+        items = [
+            (venue, symbol)
             for overlap in overlaps
             for venue, symbol in overlap.venue_symbols.items()
-        }
-        snapshots: dict[tuple[str, str], NormalizedMarketSnapshot] = {}
-        for key, task in tasks.items():
-            try:
-                snapshots[key] = await task
-            except (ValueError, UpstreamDataError, ConnectorError, httpx.HTTPError):
-                continue
+        ]
+        batch_size = self._effective_snapshot_batch_size()
+        for start in range(0, len(items), batch_size):
+            batch = items[start : start + batch_size]
+            tasks = {
+                (venue, symbol): asyncio.create_task(
+                    self._fetch_snapshot_with_controls(
+                        venue,
+                        symbol,
+                        semaphore=semaphores[venue],
+                    )
+                )
+                for venue, symbol in batch
+            }
+            for key, task in tasks.items():
+                try:
+                    snapshots[key] = await task
+                except (ValueError, UpstreamDataError, ConnectorError, httpx.HTTPError):
+                    continue
         return snapshots
+
+    def _effective_snapshot_batch_size(self) -> int:
+        if self.snapshot_batch_size is not None:
+            return max(self.snapshot_batch_size, 1)
+        return max(
+            sum(
+                max(self.snapshot_concurrency_by_venue.get(venue, 1), 1)
+                for venue in VENUE_REGISTRY
+            ),
+            1,
+        )
 
     async def _fetch_snapshot_with_controls(
         self,

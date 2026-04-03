@@ -971,6 +971,60 @@ def test_opportunity_universe_service_limits_snapshot_concurrency_by_venue() -> 
     asyncio.run(run())
 
 
+def test_opportunity_universe_service_batches_snapshot_tasks() -> None:
+    symbol_lists = {
+        "extended": [f"S{i}-USD" for i in range(6)],
+        "paradex": [f"S{i}-USD-PERP" for i in range(6)],
+    }
+    snapshots = {
+        ("extended", f"S{i}-USD"): _snapshot(
+            "extended", f"S{i}-USD", 0.0001, 1.0, 10_000, 1.001, 10_000
+        )
+        for i in range(6)
+    }
+    snapshots.update(
+        {
+            ("paradex", f"S{i}-USD-PERP"): _snapshot(
+                "paradex", f"S{i}-USD-PERP", -0.0004, 1.0, 10_000, 1.001, 10_000
+            )
+            for i in range(6)
+        }
+    )
+    inflight = 0
+    max_inflight = 0
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        try:
+            await asyncio.sleep(0.01)
+            return snapshots[(venue, symbol)]
+        finally:
+            inflight -= 1
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+            snapshot_concurrency_by_venue={"extended": 8, "hyperliquid": 8, "paradex": 8},
+            snapshot_batch_size=3,
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            ranking="roundtrip_pnl",
+            limit=20,
+        )
+
+        assert len(scan.opportunities) == 6
+        assert 1 < max_inflight <= 3
+
+    asyncio.run(run())
+
+
 def test_opportunity_universe_service_excludes_policy_tags() -> None:
     symbol_lists = {
         "extended": ["TRUMP-USD", "LIT-USD"],
