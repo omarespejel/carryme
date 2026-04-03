@@ -14,8 +14,18 @@ class ExtendedPrivateConnector(BaseHttpConnector):
 
     venue = "extended"
 
-    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
-        super().__init__(client)
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        max_attempts: int = 3,
+        base_backoff_seconds: float = 0.1,
+    ) -> None:
+        super().__init__(
+            client,
+            max_attempts=max_attempts,
+            base_backoff_seconds=base_backoff_seconds,
+        )
 
     async def fetch_account(self) -> dict[str, Any]:
         payload = await self._request_json("GET", "/api/v1/user/account/info")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict, cast
@@ -25,6 +26,10 @@ from carryme_models import (
 from pydantic import ValidationError
 
 from carryme_runtime.opportunities import UpstreamDataError
+
+AUTH_READ_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+AUTH_READ_RETRY_ATTEMPTS = 3
+AUTH_READ_RETRY_BACKOFF_SECONDS = 0.25
 
 
 class VenueAccountConfig(TypedDict):
@@ -206,9 +211,9 @@ class ExtendedAccountProbe:
             headers=headers,
             timeout=15.0,
         ) as client:
-            connector = ExtendedPrivateConnector(client)
+            connector = ExtendedPrivateConnector(client, max_attempts=1)
             try:
-                account = await connector.fetch_account()
+                account = await _run_authenticated_read_with_retry(connector.fetch_account)
                 balances = await _fetch_extended_optional_rows(
                     connector.fetch_balances,
                     resource_label="balance",
@@ -392,12 +397,12 @@ class ParadexAccountProbe:
             headers=headers,
             timeout=15.0,
         ) as client:
-            connector = ParadexPrivateConnector(client)
+            connector = ParadexPrivateConnector(client, max_attempts=1)
             try:
                 account, balances, positions = await asyncio.gather(
-                    connector.fetch_account(),
-                    connector.fetch_balances(),
-                    connector.fetch_positions(),
+                    _run_authenticated_read_with_retry(connector.fetch_account),
+                    _run_authenticated_read_with_retry(connector.fetch_balances),
+                    _run_authenticated_read_with_retry(connector.fetch_positions),
                 )
             except (ConnectorError, httpx.HTTPError) as exc:
                 return VenueAccountPreflight(
@@ -611,7 +616,7 @@ async def _fetch_extended_optional_rows(
     resource_label: str,
 ) -> dict[str, Any] | list[Any]:
     try:
-        return await fetcher()
+        return await _run_authenticated_read_with_retry(fetcher)
     except ConnectorError as exc:
         cause = exc.__cause__
         if not (isinstance(cause, httpx.HTTPStatusError) and cause.response.status_code == 404):
@@ -620,6 +625,35 @@ async def _fetch_extended_optional_rows(
             "data": [],
             "notes": [f"Extended {resource_label} endpoint returned 404; treated as empty"],
         }
+
+
+async def _run_authenticated_read_with_retry(
+    fetcher: Callable[[], Awaitable[dict[str, Any] | list[Any]]],
+) -> dict[str, Any] | list[Any]:
+    for attempt in range(1, AUTH_READ_RETRY_ATTEMPTS + 1):
+        try:
+            return await fetcher()
+        except (ConnectorError, httpx.HTTPError) as exc:
+            if attempt >= AUTH_READ_RETRY_ATTEMPTS or not _is_retryable_authenticated_read_error(
+                exc
+            ):
+                raise
+            await asyncio.sleep(
+                AUTH_READ_RETRY_BACKOFF_SECONDS
+                * (2 ** (attempt - 1))
+                * random.uniform(0.75, 1.25)
+            )
+    raise RuntimeError("authenticated read retry loop exited unexpectedly")
+
+
+def _is_retryable_authenticated_read_error(exc: ConnectorError | httpx.HTTPError) -> bool:
+    if isinstance(exc, ConnectorError):
+        if exc.status_code is None:
+            return True
+        return exc.status_code in AUTH_READ_RETRYABLE_STATUS_CODES
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in AUTH_READ_RETRYABLE_STATUS_CODES
+    return isinstance(exc, httpx.TransportError)
 
 
 def _blocking_reasons(enabled: bool, missing_env_vars: list[str], venue: str) -> list[str]:
