@@ -1655,11 +1655,22 @@ async def _run_guarded_auto_cleanup_sequence(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         try:
-            await _ensure_cleanup_live_ready(
-                venue=cleanup_preview.leg.venue,
-                settings=settings,
-                account_service=account_preflight_service,
+            await asyncio.wait_for(
+                _ensure_cleanup_live_ready(
+                    venue=cleanup_preview.leg.venue,
+                    settings=settings,
+                    account_service=account_preflight_service,
+                ),
+                timeout=PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS,
             )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "Timed out probing cleanup live readiness for "
+                    f"{cleanup_preview.leg.venue}"
+                ),
+            ) from exc
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -1693,18 +1704,14 @@ async def _run_guarded_auto_cleanup_sequence(
                 preview_hash=cleanup_confirmation.preview_hash,
             )
             if existing_entry is None:
-                pair_status = pair_status.model_copy(
-                    update={
-                        "notes": [
-                            *pair_status.notes,
-                            (
-                                "Cleanup live submission was already reserved; "
-                                "manual reconciliation is required before retrying"
-                            ),
-                        ]
-                    }
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Cleanup live submission was already reserved without a matching "
+                        "journaled execution; manual reconciliation is required before "
+                        "retrying"
+                    ),
                 )
-                return latest_cleanup_execution, pair_status
             latest_cleanup_execution = existing_entry
             reused_existing_cleanup = True
         else:
@@ -3063,11 +3070,19 @@ async def _execute_guarded_pair_close_from_confirmation(
         )
     for venue in {leg.venue for leg in confirmation.preview.legs}:
         try:
-            await _ensure_cleanup_live_ready(
-                venue=venue,
-                settings=settings,
-                account_service=account_preflight_service,
+            await asyncio.wait_for(
+                _ensure_cleanup_live_ready(
+                    venue=venue,
+                    settings=settings,
+                    account_service=account_preflight_service,
+                ),
+                timeout=PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS,
             )
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Timed out probing cleanup live readiness for {venue}",
+            ) from exc
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
