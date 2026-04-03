@@ -97,6 +97,7 @@ from carryme_runtime import (
     require_confirmed_preview,
 )
 from carryme_runtime.account_preflight import (
+    AUTH_READ_RETRY_ATTEMPTS,
     ExtendedAccountProbe,
     HyperliquidAccountProbe,
     ParadexAccountProbe,
@@ -7812,6 +7813,106 @@ def test_extended_account_probe_retries_transient_429(
     asyncio.run(run())
 
 
+def test_extended_account_probe_retries_transient_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        attempts[path] = attempts.get(path, 0) + 1
+        if path == "/api/v1/user/account/info" and attempts[path] == 1:
+            return httpx.Response(500, json={"error": "SERVER_ERROR"})
+        if path == "/api/v1/user/account/info":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "subAccountId": "extended-subaccount",
+                        "status": "ACTIVE",
+                        "equity": "10",
+                        "availableForTrade": "10",
+                    }
+                },
+            )
+        if path == "/api/v1/user/balance":
+            return httpx.Response(200, json={"data": []})
+        if path == "/api/v1/user/positions":
+            return httpx.Response(200, json={"data": []})
+        raise AssertionError(f"Unexpected request path: {path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    async def fast_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    async def run() -> None:
+        probe = ExtendedAccountProbe()
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "api_key": "extended-key",
+                },
+            }
+        )
+        assert status.authenticated is True
+        assert status.ready is True
+        assert status.total_collateral == pytest.approx(10.0)
+        assert attempts["/api/v1/user/account/info"] == 2
+
+    asyncio.run(run())
+
+
+def test_extended_account_probe_fails_after_retry_budget_on_repeated_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        attempts[path] = attempts.get(path, 0) + 1
+        if path == "/api/v1/user/account/info":
+            return httpx.Response(429, json={"error": "RATE_LIMITED"})
+        raise AssertionError(f"Unexpected request path: {path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    async def fast_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    async def run() -> None:
+        probe = ExtendedAccountProbe()
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "api_key": "extended-key",
+                },
+            }
+        )
+        assert status.authenticated is False
+        assert status.ready is False
+        assert attempts["/api/v1/user/account/info"] == AUTH_READ_RETRY_ATTEMPTS
+        assert status.blocking_reasons == [
+            "Extended authenticated read failed: extended request failed with status 429"
+        ]
+
+    asyncio.run(run())
+
+
 def test_paradex_account_probe_requires_private_key_or_bearer_override() -> None:
     async def run() -> None:
         probe = ParadexAccountProbe()
@@ -7948,6 +8049,65 @@ def test_paradex_account_probe_retries_transient_429(
     asyncio.run(run())
 
 
+def test_paradex_account_probe_fails_after_retry_budget_on_repeated_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubTokenProvider:
+        async def issue_jwt_token(
+            self,
+            *,
+            account_address: str,
+            private_key: str,
+            client: httpx.AsyncClient | None = None,
+            now: int | None = None,
+        ) -> str:
+            assert account_address == "0xabc"
+            assert private_key == "0x123"
+            return "derived-token"
+
+    attempts: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        attempts[path] = attempts.get(path, 0) + 1
+        assert request.headers["Authorization"] == "Bearer derived-token"
+        if path == "/v1/account":
+            return httpx.Response(429, json={"error": "RATE_LIMITED"})
+        raise AssertionError(f"Unexpected request path: {path}")
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    async def fast_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    async def run() -> None:
+        probe = ParadexAccountProbe(token_provider=StubTokenProvider())
+        status = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xabc",
+                    "private_key": "0x123",
+                    "bearer_token": None,
+                },
+            }
+        )
+        assert status.authenticated is False
+        assert status.ready is False
+        assert attempts["/v1/account"] == AUTH_READ_RETRY_ATTEMPTS
+        assert status.blocking_reasons == [
+            "Paradex authenticated read failed: paradex request failed with status 429"
+        ]
+
+    asyncio.run(run())
+
+
 def test_account_preflight_extracts_balance_assets_and_position_symbols() -> None:
     balances = {
         "results": [
@@ -8002,8 +8162,8 @@ def test_paradex_account_probe_counts_only_open_positions(
                     {"market": "ETH-USD-PERP", "size": "0"},
                 ],
             )
-        if request.url.path == "/v1/auth/0xabc":
-            return httpx.Response(200, json={"jwt_token": "provided"})
+        if request.url.path.startswith("/v1/auth/"):
+            raise AssertionError("unexpected auth call when bearer_token is provided")
         raise AssertionError(f"Unexpected request path: {request.url.path}")
 
     real_async_client = httpx.AsyncClient
@@ -8046,8 +8206,8 @@ def test_paradex_account_probe_rejects_malformed_positions_payload(
             return httpx.Response(200, json=[{"asset": "USDC", "size": "10.0"}])
         if request.url.path == "/v1/positions":
             return httpx.Response(200, json={"positions": {"market": "STRK-USD-PERP"}})
-        if request.url.path == "/v1/auth/0xabc":
-            return httpx.Response(200, json={"jwt_token": "provided"})
+        if request.url.path.startswith("/v1/auth/"):
+            raise AssertionError("unexpected auth call when bearer_token is provided")
         raise AssertionError(f"Unexpected request path: {request.url.path}")
 
     real_async_client = httpx.AsyncClient

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict, cast
@@ -210,7 +211,7 @@ class ExtendedAccountProbe:
             headers=headers,
             timeout=15.0,
         ) as client:
-            connector = ExtendedPrivateConnector(client)
+            connector = ExtendedPrivateConnector(client, max_attempts=1)
             try:
                 account = await _run_authenticated_read_with_retry(connector.fetch_account)
                 balances = await _fetch_extended_optional_rows(
@@ -396,7 +397,7 @@ class ParadexAccountProbe:
             headers=headers,
             timeout=15.0,
         ) as client:
-            connector = ParadexPrivateConnector(client)
+            connector = ParadexPrivateConnector(client, max_attempts=1)
             try:
                 account, balances, positions = await asyncio.gather(
                     _run_authenticated_read_with_retry(connector.fetch_account),
@@ -629,19 +630,20 @@ async def _fetch_extended_optional_rows(
 async def _run_authenticated_read_with_retry(
     fetcher: Callable[[], Awaitable[dict[str, Any] | list[Any]]],
 ) -> dict[str, Any] | list[Any]:
-    last_exc: ConnectorError | httpx.HTTPError | None = None
     for attempt in range(1, AUTH_READ_RETRY_ATTEMPTS + 1):
         try:
             return await fetcher()
         except (ConnectorError, httpx.HTTPError) as exc:
-            last_exc = exc
             if attempt >= AUTH_READ_RETRY_ATTEMPTS or not _is_retryable_authenticated_read_error(
                 exc
             ):
                 raise
-            await asyncio.sleep(AUTH_READ_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
-    assert last_exc is not None
-    raise last_exc
+            await asyncio.sleep(
+                AUTH_READ_RETRY_BACKOFF_SECONDS
+                * (2 ** (attempt - 1))
+                * random.uniform(0.75, 1.25)
+            )
+    raise RuntimeError("authenticated read retry loop exited unexpectedly")
 
 
 def _is_retryable_authenticated_read_error(exc: ConnectorError | httpx.HTTPError) -> bool:
