@@ -1450,6 +1450,150 @@ def test_execution_quality_service_caps_after_latest_per_trade(tmp_path: Path) -
     assert summary.review_required_count == 0
 
 
+def test_execution_quality_service_pages_recent_observations() -> None:
+    def make_entry(paper_trade_id: int) -> ExecutionJournalEntry:
+        return ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 12, paper_trade_id, tzinfo=UTC),
+            adapter="paired_live:auto",
+            mode="live",
+            status="submitted",
+            paper_trade_id=paper_trade_id,
+            preview_hash=f"hash-{paper_trade_id}",
+            confirmation_entry_id=paper_trade_id,
+            paper_trade=PaperTradeEntry(
+                entry_id=paper_trade_id,
+                created_at=datetime(2026, 3, 29, 11, paper_trade_id, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label=f"arb_extended_paradex_{paper_trade_id}",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 11, paper_trade_id, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.001,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.1,
+                    max_target_notional=100.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                )
+            ],
+        )
+
+    def make_observation(
+        *,
+        paper_trade_id: int,
+        minute: int,
+        outcome: Literal[
+            "hedged",
+            "pending",
+            "unfilled",
+            "closed",
+            "cleanup_needed",
+            "review_required",
+        ],
+    ) -> ExecutionObservationEntry:
+        order_state = ExecutionOrderState(
+            execution_entry_id=paper_trade_id,
+            paper_trade_id=paper_trade_id,
+            preview_hash=f"hash-{paper_trade_id}",
+            legs=[],
+            notes=[],
+        )
+        return ExecutionObservationEntry(
+            entry_id=minute,
+            observed_at=datetime(2026, 3, 29, 13, minute, tzinfo=UTC),
+            context="guarded_pair_poll",
+            execution_entry_id=paper_trade_id,
+            paper_trade_id=paper_trade_id,
+            preview_hash=f"hash-{paper_trade_id}",
+            order_state=order_state,
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=paper_trade_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"hash-{paper_trade_id}",
+                derived_state=outcome,
+                recommended_action="observe",
+                order_state=order_state,
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=paper_trade_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"hash-{paper_trade_id}",
+                    status="submitted",
+                    recommended_action="observe",
+                    matched_all_leg_symbols=outcome in {"hedged", "closed"},
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            ),
+        )
+
+    class StubObservationStore:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int | None, int]] = []
+            self.entries = [
+                make_observation(paper_trade_id=1, minute=14, outcome="hedged"),
+                make_observation(paper_trade_id=1, minute=13, outcome="cleanup_needed"),
+                make_observation(paper_trade_id=2, minute=12, outcome="closed"),
+                make_observation(paper_trade_id=3, minute=11, outcome="review_required"),
+            ]
+
+        def list_recent(
+            self,
+            *,
+            limit: int | None = 50,
+            offset: int = 0,
+            paper_trade_id: int | None = None,
+        ) -> list[ExecutionObservationEntry]:
+            assert paper_trade_id is None
+            self.calls.append((limit, offset))
+            if limit is None:
+                return self.entries[offset:]
+            return self.entries[offset : offset + limit]
+
+    class StubJournalStore:
+        def latest_for_paper_trade(self, paper_trade_id: int) -> ExecutionJournalEntry | None:
+            return make_entry(paper_trade_id)
+
+    observation_store = StubObservationStore()
+    service = ExecutionQualityService(
+        journal_store=StubJournalStore(),  # type: ignore[arg-type]
+        observation_store=observation_store,  # type: ignore[arg-type]
+        sample_limit=2,
+        observation_scan_batch_size=2,
+    )
+
+    summary = service.build_index()[("ARB-USD-PERP", "extended", "paradex")]
+
+    assert summary.sample_size == 2
+    assert summary.hedged_count == 1
+    assert summary.closed_count == 1
+    assert observation_store.calls == [(2, 0), (2, 2)]
+
+
 def test_execution_quality_service_reclassifies_stale_cleanup_review_required(
     tmp_path: Path,
 ) -> None:

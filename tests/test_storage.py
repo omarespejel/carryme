@@ -2283,6 +2283,32 @@ def test_execution_observation_store_list_recent_without_limit(tmp_path: Path) -
     assert [entry.context for entry in results] == ["third", "second", "first"]
 
 
+def test_execution_observation_store_list_recent_with_offset(tmp_path: Path) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    for index, context in enumerate(["first", "second", "third"], start=12):
+        store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 3, 29, 13, index, tzinfo=UTC),
+                context=context,
+                execution_entry_id=index,
+                paper_trade_id=7,
+                preview_hash=f"preview-hash-{context}",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=index,
+                    paper_trade_id=7,
+                    preview_hash=f"preview-hash-{context}",
+                    legs=[],
+                    notes=[],
+                ),
+            )
+        )
+
+    results = store.list_recent(limit=1, offset=1)
+
+    assert [entry.context for entry in results] == ["second"]
+
+
 @pytest.mark.parametrize("invalid_limit", [0, -1])
 def test_execution_observation_store_rejects_non_positive_limits(
     tmp_path: Path,
@@ -2292,6 +2318,25 @@ def test_execution_observation_store_rejects_non_positive_limits(
 
     with pytest.raises(ValueError, match="limit must be at least 1"):
         store.list_recent(limit=invalid_limit)
+
+
+@pytest.mark.parametrize(
+    ("limit", "offset", "message"),
+    [
+        (None, 1, "offset requires a finite limit"),
+        (1, -1, "offset must be at least 0"),
+    ],
+)
+def test_execution_observation_store_rejects_invalid_offsets(
+    tmp_path: Path,
+    limit: int | None,
+    offset: int,
+    message: str,
+) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    with pytest.raises(ValueError, match=message):
+        store.list_recent(limit=limit, offset=offset)
 
 
 def test_execution_journal_store_lists_entries_for_paper_trade(tmp_path: Path) -> None:
