@@ -275,14 +275,18 @@ def test_worker_rejects_non_positive_execution_observation_interval(tmp_path: Pa
         )
 
 
-def test_worker_rejects_non_positive_universe_scan_snapshot_batch_size(tmp_path: Path) -> None:
+@pytest.mark.parametrize("value", (0, -1))
+def test_worker_rejects_non_positive_universe_scan_snapshot_batch_size(
+    tmp_path: Path,
+    value: int,
+) -> None:
     watchlist = tmp_path / "watchlist.json"
     watchlist.write_text('{"pairs": []}')
 
     with pytest.raises(ValidationError, match="universe_scan_snapshot_batch_size"):
         WorkerSettings(
             watchlist_path=str(watchlist),
-            universe_scan_snapshot_batch_size=0,
+            universe_scan_snapshot_batch_size=value,
         )
 
 
@@ -290,8 +294,11 @@ def test_worker_rejects_non_positive_universe_scan_snapshot_batch_size(tmp_path:
     ("field_name", "value"),
     (
         ("universe_scan_extended_snapshot_concurrency", 0),
+        ("universe_scan_extended_snapshot_concurrency", -1),
         ("universe_scan_paradex_snapshot_concurrency", 0),
+        ("universe_scan_paradex_snapshot_concurrency", -1),
         ("universe_scan_hyperliquid_snapshot_concurrency", 0),
+        ("universe_scan_hyperliquid_snapshot_concurrency", -1),
     ),
 )
 def test_worker_rejects_non_positive_snapshot_concurrency(
