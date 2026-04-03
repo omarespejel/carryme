@@ -2901,8 +2901,9 @@ def _list_recent_live_executions(
     offset = 0
     seen_paper_trade_ids: set[int] = set()
     selected: list[ExecutionJournalEntry] = []
+    reached_stale_cutoff = False
 
-    while len(selected) < limit:
+    while len(selected) < limit and not reached_stale_cutoff:
         batch = journal_store.list_recent(limit=page_size, offset=offset)
         if not batch:
             break
@@ -2913,7 +2914,8 @@ def _list_recent_live_executions(
                 continue
             age_seconds = max(0.0, (now - execution.executed_at).total_seconds())
             if age_seconds > max_age_seconds:
-                continue
+                reached_stale_cutoff = True
+                break
             if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
                 continue
             seen_paper_trade_ids.add(execution.paper_trade_id)
