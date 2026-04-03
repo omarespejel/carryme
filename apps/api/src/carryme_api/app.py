@@ -608,10 +608,17 @@ def get_execution_adapter() -> ExecutionAdapter:
 
 def get_execution_accounting_service(
     store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+    observation_store: Annotated[
+        ExecutionObservationStore,
+        Depends(get_execution_observation_store),
+    ],
 ) -> ExecutionAccountingService:
     """Return the derived execution accounting service."""
 
-    return ExecutionAccountingService(journal_store=store)
+    return ExecutionAccountingService(
+        journal_store=store,
+        observation_store=observation_store,
+    )
 
 
 def get_route_approval_store(
