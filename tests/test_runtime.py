@@ -2468,6 +2468,99 @@ def test_opportunity_universe_service_reuses_overlaps_and_indexes_across_concurr
     assert route_stability_calls == 1
 
 
+def test_opportunity_universe_service_rebuilds_inputs_for_later_scans() -> None:
+    symbol_lists = {
+        "extended": ["S-USD"],
+        "paradex": ["S-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "S-USD"): _snapshot(
+            "extended",
+            "S-USD",
+            0.00010,
+            0.4920,
+            80_000,
+            0.4922,
+            75_000,
+            daily_volume=900_000,
+            open_interest=1_400_000,
+        ),
+        ("paradex", "S-USD-PERP"): _snapshot(
+            "paradex",
+            "S-USD-PERP",
+            -0.00120,
+            0.4918,
+            85_000,
+            0.4921,
+            82_000,
+            daily_volume=950_000,
+            open_interest=1_500_000,
+        ),
+    }
+    symbol_calls: dict[str, int] = {"extended": 0, "paradex": 0}
+    execution_quality_calls = 0
+    route_stability_calls = 0
+
+    async def list_symbols(venue: str) -> list[str]:
+        symbol_calls[venue] += 1
+        await asyncio.sleep(0)
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    class StubExecutionQualityService:
+        prior_score = 0.55
+
+        def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
+            nonlocal execution_quality_calls
+            execution_quality_calls += 1
+            return {}
+
+    class StubRouteStabilityService:
+        def build_index(
+            self,
+        ) -> dict[tuple[str, str, str, str, str], RouteStabilitySummary]:
+            nonlocal route_stability_calls
+            route_stability_calls += 1
+            return {}
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+            execution_quality_service=cast(
+                ExecutionQualityService,
+                StubExecutionQualityService(),
+            ),
+            route_stability_service=cast(
+                RouteStabilityService,
+                StubRouteStabilityService(),
+            ),
+        )
+        first = await service.scan(
+            venues=["extended", "paradex"],
+            ranking="route_adjusted_quality_pnl",
+            include_symbols=["S-USD-PERP"],
+            limit=1,
+        )
+        second = await service.scan(
+            venues=["extended", "paradex"],
+            ranking="route_adjusted_quality_pnl",
+            include_symbols=["S-USD-PERP"],
+            limit=1,
+        )
+
+        assert len(first.opportunities) == 1
+        assert len(second.opportunities) == 1
+
+    asyncio.run(run())
+
+    assert symbol_calls == {"extended": 2, "paradex": 2}
+    assert execution_quality_calls == 2
+    assert route_stability_calls == 2
+
+
 def test_opportunity_universe_service_filters_by_min_execution_samples(
     tmp_path: Path,
 ) -> None:
