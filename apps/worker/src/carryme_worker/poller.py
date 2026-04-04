@@ -2251,15 +2251,36 @@ async def launch_latest_stable_canary_once(
                     ),
                 )
 
+    risk_budget_scan_limit = settings.stable_canary_launch_active_execution_limit
+    active_executions_for_budget = _list_recent_live_executions(
+        execution_store,
+        observation_store,
+        limit=risk_budget_scan_limit + 1,
+        now=timestamp,
+        max_age_seconds=settings.execution_observation_max_age_seconds,
+    )
+    if (
+        (
+            settings.stable_canary_launch_max_total_live_notional is not None
+            or settings.stable_canary_launch_max_live_notional_per_venue is not None
+        )
+        and len(active_executions_for_budget) > risk_budget_scan_limit
+    ):
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=(
+                "Stable launch risk-budget check truncated by "
+                "stable_canary_launch_active_execution_limit; increase limit"
+            ),
+        )
+
     risk_budget_reason = _build_stable_launch_risk_budget_reason(
         settings=settings,
-        active_executions=_list_recent_live_executions(
-            execution_store,
-            observation_store,
-            limit=settings.stable_canary_launch_active_execution_limit,
-            now=timestamp,
-            max_age_seconds=settings.execution_observation_max_age_seconds,
-        ),
+        active_executions=active_executions_for_budget,
         candidate=selected,
     )
     if risk_budget_reason is not None:
