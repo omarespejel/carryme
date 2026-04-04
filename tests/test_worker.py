@@ -266,6 +266,8 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_recent_closed_trade_limit == 10
     assert settings.stable_canary_launch_max_recent_negative_total_collateral is None
     assert settings.stable_canary_launch_max_consecutive_losing_trades is None
+    assert settings.stable_canary_launch_global_cooldown_seconds is None
+    assert settings.stable_canary_launch_label_cooldown_seconds is None
     assert settings.execution_auto_pair_close_enabled is False
     assert settings.execution_auto_pair_close_shadow_mode is False
     assert settings.execution_auto_pair_close_max_snapshot_age_seconds == 300
@@ -3510,6 +3512,109 @@ def test_cache_launch_ready_canaries_once_emits_stable_launch_ready_available_al
     assert notifier.events == ["stable_launch_ready_available"]
 
 
+def _build_stable_launch_test_snapshot(
+    *,
+    label: str,
+    launch_ready_snapshot_id: int = 19,
+    approved_snapshot_id: int = 18,
+    suggested_canary_notional: float = 20.0,
+) -> tuple[
+    RouteApprovalEntry,
+    FundingUniverseCanaryCandidate,
+    LaunchReadyCanarySnapshot,
+    LaunchReadyCanaryStability,
+]:
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        label=label,
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=suggested_canary_notional,
+        note="approved canary",
+    )
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(venue="extended", symbol="ARB-USD"),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=suggested_canary_notional,
+    )
+    snapshot = LaunchReadyCanarySnapshot(
+        launch_ready_snapshot_id=launch_ready_snapshot_id,
+        captured_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+        label=label,
+        max_snapshot_age_seconds=300,
+        approved_snapshot=ApprovedCanarySnapshot(
+            snapshot_id=approved_snapshot_id,
+            captured_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            label=label,
+            candidate=candidate,
+            approval=approval,
+        ),
+        system_state=PaperTradeSystemState(
+            paper_trade_id=0,
+            label=label,
+            ready=True,
+            venues=[
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+    stability = LaunchReadyCanaryStability(
+        snapshot=snapshot,
+        consecutive_snapshots=3,
+        stable_seconds=45.0,
+        min_snapshot_count=2,
+        min_stable_seconds=30.0,
+    )
+    return approval, candidate, snapshot, stability
+
+
 def test_launch_latest_stable_canary_once_skips_when_no_stable_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -3527,6 +3632,185 @@ def test_launch_latest_stable_canary_once_skips_when_no_stable_snapshot(
     assert summary.status == "skipped"
     assert summary.detail == "No launch-ready canary snapshot found"
     assert summary.paper_trade_id is None
+
+
+def test_launch_latest_stable_canary_once_skips_when_global_cooldown_active(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_global_cooldown_seconds=300,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            status="launched",
+            label="near_extended_paradex",
+            launch_ready_snapshot_id=11,
+            approved_snapshot_id=10,
+            paper_trade_id=91,
+            final_pair_state="closed",
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("global cooldown must block before launch selection")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 4, 4, 10, 3, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch global cooldown active: "
+        "last_label=near_extended_paradex remaining_seconds=120"
+    )
+
+
+def test_launch_latest_stable_canary_once_skips_when_label_cooldown_active(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_label_cooldown_seconds=180,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            status="launched",
+            label="arb_extended_paradex",
+            launch_ready_snapshot_id=12,
+            approved_snapshot_id=11,
+            paper_trade_id=92,
+            final_pair_state="closed",
+        )
+    )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        launch_ready_snapshot_id=13,
+        approved_snapshot_id=12,
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("label cooldown must block before lifecycle launch")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch label cooldown active: "
+        "label=arb_extended_paradex remaining_seconds=60"
+    )
+
+
+def test_launch_latest_stable_canary_once_ignores_shadow_cooldowns_in_live_mode(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_global_cooldown_seconds=300,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            status="shadowed",
+            label="near_extended_paradex",
+            launch_ready_snapshot_id=14,
+            approved_snapshot_id=13,
+            paper_trade_id=0,
+            final_pair_state="shadowed",
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                HTTPException(status_code=404, detail="No launch-ready canary snapshot found")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == "No launch-ready canary snapshot found"
+
+
+def test_launch_latest_stable_canary_once_respects_shadow_cooldowns_in_shadow_mode(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_shadow_mode=True,
+        stable_canary_launch_global_cooldown_seconds=300,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            status="shadowed",
+            label="near_extended_paradex",
+            launch_ready_snapshot_id=15,
+            approved_snapshot_id=14,
+            paper_trade_id=0,
+            final_pair_state="shadowed",
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("shadow cooldown must block before launch selection")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch global cooldown active: "
+        "last_label=near_extended_paradex remaining_seconds=180"
+    )
 
 
 def test_launch_latest_stable_canary_once_skips_when_active_live_hedge_exists(
