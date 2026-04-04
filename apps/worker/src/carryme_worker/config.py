@@ -60,6 +60,18 @@ class WorkerSettings(BaseSettings):
         default=None,
         ge=0,
     )
+    stable_canary_launch_recent_launch_window_seconds: int | None = Field(
+        default=None,
+        gt=0,
+    )
+    stable_canary_launch_max_launches_per_window: int | None = Field(
+        default=None,
+        ge=1,
+    )
+    stable_canary_launch_max_label_launches_per_window: int | None = Field(
+        default=None,
+        ge=1,
+    )
     stable_canary_launch_min_execution_quality_score: float | None = Field(
         default=None,
         ge=0,
@@ -359,6 +371,23 @@ class WorkerSettings(BaseSettings):
         if missing:
             raise ValueError(
                 "Missing required live credentials for enabled venues: " + ", ".join(missing)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_stable_launch_rate_caps(self) -> "WorkerSettings":
+        """Require a launch window whenever stable launch rate caps are configured."""
+
+        if (
+            self.stable_canary_launch_recent_launch_window_seconds is None
+            and (
+                self.stable_canary_launch_max_launches_per_window is not None
+                or self.stable_canary_launch_max_label_launches_per_window is not None
+            )
+        ):
+            raise ValueError(
+                "stable_canary_launch_recent_launch_window_seconds is required when "
+                "stable launch rate caps are configured"
             )
         return self
 
