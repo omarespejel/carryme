@@ -909,6 +909,8 @@ def _summarize_open_hedge_profit_totals(
         grouped_by_capture.setdefault(snapshot.captured_at, {})[snapshot.venue] = snapshot
 
     required_venues = set(baseline_by_venue)
+    if any(snapshot.total_collateral is None for snapshot in baseline_by_venue.values()):
+        return None, None
     latest_total: float | None = None
     peak_total: float | None = None
     for captured_at in sorted(grouped_by_capture):
@@ -916,20 +918,15 @@ def _summarize_open_hedge_profit_totals(
         if not required_venues.issubset(snapshots):
             continue
         total = 0.0
-        have_total = False
         for venue, baseline in baseline_by_venue.items():
             current = snapshots[venue]
-            if (
-                baseline.total_collateral is None
-                or current.total_collateral is None
-            ):
-                continue
-            total += current.total_collateral - baseline.total_collateral
-            have_total = True
-        if not have_total:
+            if current.total_collateral is None:
+                break
+            total += current.total_collateral - cast(float, baseline.total_collateral)
+        else:
+            latest_total = total
+            peak_total = total if peak_total is None else max(peak_total, total)
             continue
-        latest_total = total
-        peak_total = total if peak_total is None else max(peak_total, total)
 
     return latest_total, peak_total
 
@@ -948,13 +945,11 @@ def _build_open_hedge_profit_protection_reason(
     if min_profit is None or giveback_ratio is None:
         return None
 
-    current_total = attribution.total_collateral_delta if attribution is not None else None
     latest_total, peak_total = _summarize_open_hedge_profit_totals(
         balance_service,
         paper_trade_id=paper_trade_id,
     )
-    if current_total is None:
-        current_total = latest_total
+    current_total = latest_total
     if current_total is None or peak_total is None or peak_total < min_profit:
         return None
 

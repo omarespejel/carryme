@@ -5434,6 +5434,79 @@ def test_build_open_hedge_profit_protection_reason_ignores_small_giveback(
     assert reason is None
 
 
+def test_build_open_hedge_profit_protection_reason_requires_complete_totals(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=True,
+        execution_auto_pair_close_min_profit_total_collateral=0.05,
+        execution_auto_pair_close_max_profit_giveback_ratio=0.4,
+    )
+    balance_service = BalanceAccountingService(store=BalanceSnapshotStore(settings.database_path))
+    store = BalanceSnapshotStore(settings.database_path)
+    for snapshot in [
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+            paper_trade_id=24,
+            label="near_extended_paradex",
+            stage="pre_open",
+            venue="extended",
+            total_collateral=500.0,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+            paper_trade_id=24,
+            label="near_extended_paradex",
+            stage="pre_open",
+            venue="paradex",
+            total_collateral=500.0,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            paper_trade_id=24,
+            label="near_extended_paradex",
+            stage="funding_window_checkpoint",
+            venue="extended",
+            total_collateral=500.05,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            paper_trade_id=24,
+            label="near_extended_paradex",
+            stage="funding_window_checkpoint",
+            venue="paradex",
+            total_collateral=500.10,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 4, 4, 11, 0, tzinfo=UTC),
+            paper_trade_id=24,
+            label="near_extended_paradex",
+            stage="funding_window_checkpoint",
+            venue="extended",
+            total_collateral=500.01,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 4, 4, 11, 0, tzinfo=UTC),
+            paper_trade_id=24,
+            label="near_extended_paradex",
+            stage="funding_window_checkpoint",
+            venue="paradex",
+            total_collateral=None,
+        ),
+    ]:
+        store.append(snapshot)
+
+    reason = _build_open_hedge_profit_protection_reason(
+        paper_trade_id=24,
+        balance_service=balance_service,
+        settings=settings,
+        attribution=balance_service.summarize_paper_trade_attribution(24),
+    )
+
+    assert reason is None
+
+
 def test_maybe_auto_close_open_hedged_execution_shadow_mode_logs_profit_giveback(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
