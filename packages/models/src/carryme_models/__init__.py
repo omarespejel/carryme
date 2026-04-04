@@ -14,6 +14,8 @@ from carryme_models.approval import RouteApprovalEntry, RouteApprovalUpsert
 from carryme_models.approved_canary import ApprovedCanarySnapshot
 from carryme_models.approved_canary_alert import ApprovedCanaryAlertEvent
 from carryme_models.balance_accounting import (
+    BalanceAttributionPhase,
+    PaperTradeBalanceAttribution,
     PaperTradeBalanceDelta,
     VenueBalanceDelta,
     VenueBalanceSnapshot,
@@ -110,7 +112,9 @@ __all__ = [
     "CanaryBasketLaunchResult",
     "CanaryBasketRouteOutcome",
     "CanaryLifecycleResult",
+    "BalanceAttributionPhase",
     "ExecutionAlertEvent",
+    "PaperTradeBalanceAttribution",
     "PaperTradeBalanceDelta",
     "CleanupPreviewConfirmationEntry",
     "CredentialRequirementStatus",

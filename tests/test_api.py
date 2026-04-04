@@ -29,6 +29,7 @@ from carryme_models import (
     ApprovedCanaryBasketEntry,
     ApprovedCanaryBasketPlan,
     ApprovedCanarySnapshot,
+    BalanceAttributionPhase,
     CandidateAlertEvent,
     CapacityEstimate,
     CleanupPreviewConfirmationEntry,
@@ -58,6 +59,7 @@ from carryme_models import (
     OpportunityRecord,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceAttribution,
     PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeOrderPreview,
@@ -1914,6 +1916,56 @@ def test_balance_delta_endpoint_uses_service_dependency() -> None:
     payload = response.json()
     assert payload["paper_trade_id"] == 7
     assert payload["total_collateral_delta"] == -0.23
+
+
+def test_balance_attribution_endpoint_uses_service_dependency() -> None:
+    class StubBalanceAccountingService:
+        def summarize_paper_trade_attribution(
+            self,
+            paper_trade_id: int,
+        ) -> PaperTradeBalanceAttribution:
+            assert paper_trade_id == 7
+            return PaperTradeBalanceAttribution(
+                paper_trade_id=7,
+                label="near_extended_paradex",
+                snapshot_count=8,
+                venue_count=2,
+                funding_checkpoint_count=1,
+                first_captured_at=datetime(2026, 3, 29, 17, 0, tzinfo=UTC),
+                latest_captured_at=datetime(2026, 3, 29, 18, 5, tzinfo=UTC),
+                total_collateral_delta=0.05,
+                total_available_to_trade_delta=0.05,
+                total_free_collateral_delta=0.05,
+                entry=BalanceAttributionPhase(
+                    phase="entry",
+                    snapshot_count=4,
+                    venue_count=2,
+                    start_captured_at=datetime(2026, 3, 29, 17, 0, tzinfo=UTC),
+                    end_captured_at=datetime(2026, 3, 29, 17, 2, tzinfo=UTC),
+                    start_stage="pre_open",
+                    end_stage="post_open",
+                    duration_seconds=120.0,
+                    total_collateral_delta=-0.08,
+                    total_available_to_trade_delta=-0.08,
+                    total_free_collateral_delta=-0.08,
+                    venues=[],
+                ),
+                hold=None,
+                exit=None,
+            )
+
+    app.dependency_overrides[get_balance_accounting_service] = (
+        lambda: StubBalanceAccountingService()
+    )
+    client = TestClient(app)
+    response = client.get("/v1/accounting/balance-attribution/from-paper-trade/7")
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["paper_trade_id"] == 7
+    assert payload["funding_checkpoint_count"] == 1
+    assert payload["entry"]["total_collateral_delta"] == -0.08
 
 
 def test_execution_quality_endpoint_uses_service_dependency() -> None:

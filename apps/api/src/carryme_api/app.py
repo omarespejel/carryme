@@ -50,6 +50,7 @@ from carryme_models import (
     PairClosePreviewConfirmationEntry,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceAttribution,
     PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
@@ -3983,6 +3984,22 @@ def create_app() -> FastAPI:
         ],
     ) -> PaperTradeBalanceDelta:
         summary = service.summarize_paper_trade(paper_trade_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="No balance snapshots found")
+        return summary
+
+    @app.get(
+        "/v1/accounting/balance-attribution/from-paper-trade/{paper_trade_id}",
+        response_model=PaperTradeBalanceAttribution,
+    )
+    def balance_attribution_for_paper_trade(
+        paper_trade_id: int,
+        service: Annotated[
+            BalanceAccountingService,
+            Depends(get_balance_accounting_service),
+        ],
+    ) -> PaperTradeBalanceAttribution:
+        summary = service.summarize_paper_trade_attribution(paper_trade_id)
         if summary is None:
             raise HTTPException(status_code=404, detail="No balance snapshots found")
         return summary

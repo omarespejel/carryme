@@ -44,6 +44,7 @@ from carryme_models import (
     PairClosePreviewConfirmationEntry,
     PaperTradeAccountingSummary,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceAttribution,
     PaperTradeBalanceDelta,
     PaperTradeEntry,
     PaperTradeExecutionPreflight,
@@ -13937,3 +13938,182 @@ def test_balance_accounting_service_summarizes_snapshots(tmp_path: Path) -> None
     assert summary.venue_count == 2
     assert summary.total_collateral_delta == pytest.approx(-0.23)
     assert summary.venues[0].snapshot_count == 2
+
+
+def test_balance_accounting_service_builds_funding_attribution(tmp_path: Path) -> None:
+    store = BalanceSnapshotStore(tmp_path / "history.sqlite3")
+    service = BalanceAccountingService(store=store)
+    snapshots = [
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            stage="pre_open",
+            venue="extended",
+            total_collateral=100.0,
+            available_to_trade=100.0,
+            free_collateral=100.0,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            stage="pre_open",
+            venue="paradex",
+            total_collateral=200.0,
+            available_to_trade=200.0,
+            free_collateral=200.0,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 2, tzinfo=UTC),
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            stage="post_open",
+            venue="extended",
+            total_collateral=99.95,
+            available_to_trade=99.95,
+            free_collateral=99.95,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 15, 2, tzinfo=UTC),
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            stage="post_open",
+            venue="paradex",
+            total_collateral=199.97,
+            available_to_trade=199.97,
+            free_collateral=199.97,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            stage="funding_window_checkpoint",
+            venue="extended",
+            total_collateral=100.10,
+            available_to_trade=100.10,
+            free_collateral=100.10,
+            note="worker funding checkpoint window_index=1 hold_window_hours=1.000000",
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 0, tzinfo=UTC),
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            stage="funding_window_checkpoint",
+            venue="paradex",
+            total_collateral=200.05,
+            available_to_trade=200.05,
+            free_collateral=200.05,
+            note="worker funding checkpoint window_index=1 hold_window_hours=1.000000",
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            stage="post_close",
+            venue="extended",
+            total_collateral=100.04,
+            available_to_trade=100.04,
+            free_collateral=100.04,
+        ),
+        VenueBalanceSnapshot(
+            captured_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            stage="post_close",
+            venue="paradex",
+            total_collateral=200.01,
+            available_to_trade=200.01,
+            free_collateral=200.01,
+        ),
+    ]
+    for snapshot in snapshots:
+        store.append(snapshot)
+
+    summary = service.summarize_paper_trade_attribution(7)
+
+    assert summary is not None
+    assert isinstance(summary, PaperTradeBalanceAttribution)
+    assert summary.funding_checkpoint_count == 1
+    assert summary.total_collateral_delta == pytest.approx(0.05)
+    assert summary.entry is not None
+    assert summary.entry.total_collateral_delta == pytest.approx(-0.08)
+    assert summary.entry.start_stage == "pre_open"
+    assert summary.entry.end_stage == "post_open"
+    assert summary.hold is not None
+    assert summary.hold.total_collateral_delta == pytest.approx(0.23)
+    assert summary.hold.start_stage == "post_open"
+    assert summary.hold.end_stage == "funding_window_checkpoint"
+    assert summary.exit is not None
+    assert summary.exit.total_collateral_delta == pytest.approx(-0.10)
+    assert summary.exit.start_stage == "funding_window_checkpoint"
+    assert summary.exit.end_stage == "post_close"
+
+
+def test_balance_accounting_service_capture_uses_one_timestamp_per_stage(tmp_path: Path) -> None:
+    store = BalanceSnapshotStore(tmp_path / "history.sqlite3")
+    service = BalanceAccountingService(store=store)
+    snapshots = service.capture_paper_trade(
+        paper_trade=PaperTradeEntry(
+            entry_id=7,
+            created_at=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+            note="test",
+            intent=FundingPairTradeIntent(
+                label="near_extended_paradex",
+                canonical_symbol="NEAR-USD-PERP",
+                source_recorded_at=datetime(2026, 3, 29, 14, 55, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.0005,
+                break_even_days_entry=0.25,
+                capacity_limit_notional=500.0,
+                target_notional=25.0,
+                capacity_fraction=0.05,
+                max_target_notional=25.0,
+                long_leg=TradeLegIntent(
+                    venue="paradex",
+                    symbol="NEAR-USD-PERP",
+                    fee_profile="pro_fastfills",
+                    side="buy",
+                    target_notional=25.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue="extended",
+                    symbol="NEAR-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=25.0,
+                ),
+            ),
+        ),
+        preflight=PaperTradeAccountPreflight(
+            paper_trade_id=7,
+            label="near_extended_paradex",
+            ready=True,
+            venues=[
+                VenueAccountPreflight(
+                    venue="extended",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="api_key",
+                    total_collateral=100.0,
+                    available_to_trade=100.0,
+                    free_collateral=100.0,
+                ),
+                VenueAccountPreflight(
+                    venue="paradex",
+                    enabled=True,
+                    authenticated=True,
+                    ready=True,
+                    credential_mode="bearer_token",
+                    total_collateral=200.0,
+                    available_to_trade=200.0,
+                    free_collateral=200.0,
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+        stage="funding_window_checkpoint",
+        note="worker funding checkpoint window_index=1 hold_window_hours=1.000000",
+    )
+
+    assert len({snapshot.captured_at for snapshot in snapshots}) == 1

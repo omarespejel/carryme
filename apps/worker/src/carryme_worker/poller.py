@@ -41,6 +41,7 @@ from carryme_models import (
     LaunchReadyCanarySnapshot,
     LaunchReadyCanaryStability,
     OpportunityRecord,
+    PaperTradeAccountPreflight,
     PaperTradeEntry,
     PaperTradeSystemState,
     RouteApprovalEntry,
@@ -74,6 +75,7 @@ from carryme_runtime import (
     filter_candidate_records,
     reconcile_execution,
 )
+from carryme_runtime.balance_accounting import FUNDING_WINDOW_CHECKPOINT_STAGE
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_runtime.route_approvals import scan_exact_canary_candidate_for_approval
 from carryme_storage import (
@@ -938,6 +940,151 @@ def _build_open_hedge_auto_close_reason(
         )
 
     return None
+
+
+def _build_execution_hold_window_hours(paper_trade: PaperTradeEntry) -> float:
+    """Return the effective hold window for one open hedged route."""
+
+    venues = {
+        paper_trade.intent.long_leg.venue.lower(),
+        paper_trade.intent.short_leg.venue.lower(),
+    }
+    hours = [
+        FUNDING_WINDOW_HOURS_BY_VENUE[venue]
+        for venue in venues
+        if venue in FUNDING_WINDOW_HOURS_BY_VENUE
+    ]
+    if not hours:
+        return 1.0
+    return min(hours)
+
+
+def _build_funding_checkpoint_note(*, window_index: int, hold_window_hours: float) -> str:
+    """Return the persisted metadata note for one funding-window checkpoint."""
+
+    return (
+        "worker funding checkpoint "
+        f"window_index={window_index} hold_window_hours={hold_window_hours:.6f}"
+    )
+
+
+def _parse_funding_checkpoint_index(note: str | None) -> int | None:
+    """Extract the checkpoint window index from a persisted note."""
+
+    if note is None:
+        return None
+    marker = "window_index="
+    start = note.find(marker)
+    if start < 0:
+        return None
+    value = note[start + len(marker) :].split(" ", 1)[0].strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _latest_funding_checkpoint_index(
+    balance_service: BalanceAccountingService,
+    *,
+    paper_trade_id: int,
+) -> int | None:
+    """Return the latest persisted funding checkpoint window index for one paper trade."""
+
+    snapshots = balance_service.list_snapshots(
+        limit=1,
+        paper_trade_id=paper_trade_id,
+        stage=FUNDING_WINDOW_CHECKPOINT_STAGE,
+    )
+    if not snapshots:
+        return None
+    snapshot = snapshots[0]
+    parsed = _parse_funding_checkpoint_index(snapshot.note)
+    if parsed is not None:
+        return parsed
+    return 1
+
+
+def _build_funding_checkpoint_window_index(
+    *,
+    paper_trade: PaperTradeEntry,
+    now: datetime,
+) -> tuple[int, float]:
+    """Return the effective crossed funding-window count for one paper trade."""
+
+    hold_window_hours = _build_execution_hold_window_hours(paper_trade)
+    window_seconds = hold_window_hours * 3600.0
+    if window_seconds <= 0:
+        return 0, hold_window_hours
+    entry_bucket = int(paper_trade.created_at.timestamp() // window_seconds)
+    current_bucket = int(now.timestamp() // window_seconds)
+    return max(0, current_bucket - entry_bucket), hold_window_hours
+
+
+def _maybe_capture_open_hedge_funding_checkpoint(
+    *,
+    settings: WorkerSettings,
+    execution: ExecutionJournalEntry,
+    pair_status: ExecutionPairStatus,
+    preflight: PaperTradeAccountPreflight,
+    balance_service: BalanceAccountingService,
+    logger: logging.Logger,
+    now: datetime,
+) -> list[Any]:
+    """Persist one periodic balance checkpoint while a hedge remains open."""
+
+    if not settings.execution_balance_checkpoint_enabled:
+        return []
+    if pair_status.derived_state != "hedged":
+        return []
+    if pair_status.recommended_action != "monitor_open_hedge":
+        return []
+
+    paper_trade = execution.paper_trade
+    paper_trade_id = execution.paper_trade_id
+    if paper_trade is None or paper_trade_id is None:
+        return []
+    if any(not venue.authenticated for venue in preflight.venues):
+        logger.debug(
+            (
+                "skipping funding checkpoint for paper_trade_id=%s because "
+                "account reads are unauthenticated"
+            ),
+            paper_trade_id,
+        )
+        return []
+
+    window_index, hold_window_hours = _build_funding_checkpoint_window_index(
+        paper_trade=paper_trade,
+        now=now,
+    )
+    if window_index < 1:
+        return []
+
+    latest_index = _latest_funding_checkpoint_index(
+        balance_service,
+        paper_trade_id=paper_trade_id,
+    )
+    if latest_index is not None and latest_index >= window_index:
+        return []
+
+    logger.info(
+        "capturing funding checkpoint for paper_trade_id=%s at window_index=%s",
+        paper_trade_id,
+        window_index,
+    )
+    return balance_service.capture_paper_trade(
+        paper_trade=paper_trade,
+        preflight=preflight,
+        stage=FUNDING_WINDOW_CHECKPOINT_STAGE,
+        note=_build_funding_checkpoint_note(
+            window_index=window_index,
+            hold_window_hours=hold_window_hours,
+        ),
+    )
 
 
 async def _maybe_auto_close_open_hedged_execution(
@@ -2826,6 +2973,7 @@ async def observe_live_executions_once(
     approved_store: ApprovedCanaryStore | None = None,
     alert_sink: ExecutionAlertSink | None = None,
     alert_notifier: ExecutionAlertNotifier | None = None,
+    balance_service: BalanceAccountingService | None = None,
     account_service: AccountPreflightService | None = None,
     order_state_service: ExecutionOrderStateService | None = None,
     logger: logging.Logger | None = None,
@@ -2837,6 +2985,9 @@ async def observe_live_executions_once(
     history_store = observation_store or ExecutionObservationStore(settings.database_path)
     approved_snapshot_store = approved_store or ApprovedCanaryStore(settings.database_path)
     execution_alert_sink = alert_sink or ExecutionAlertStore(settings.database_path)
+    balance_snapshot_service = balance_service or BalanceAccountingService(
+        store=BalanceSnapshotStore(settings.database_path)
+    )
     account_probe_service = account_service or AccountPreflightService()
     state_service = order_state_service or ExecutionOrderStateService(
         observers=_build_order_state_observers(settings)
@@ -2952,6 +3103,23 @@ async def observe_live_executions_once(
             continue
         observed_executions += 1
         saved_observations += 1
+        try:
+            _maybe_capture_open_hedge_funding_checkpoint(
+                settings=settings,
+                execution=execution,
+                pair_status=pair_status,
+                preflight=account_preflight,
+                balance_service=balance_snapshot_service,
+                logger=loop_logger,
+                now=timestamp,
+            )
+        except Exception:
+            loop_logger.warning(
+                "Failed to capture funding checkpoint for execution entry_id=%s paper_trade_id=%s",
+                execution.entry_id,
+                execution.paper_trade_id,
+                exc_info=True,
+            )
         try:
             await _maybe_auto_close_open_hedged_execution(
                 settings=settings,
