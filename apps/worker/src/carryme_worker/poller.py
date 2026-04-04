@@ -1757,6 +1757,7 @@ async def launch_latest_stable_canary_once(
                             "worker"
                         ),
                     )
+                # Shadow mode is off but was previously on: allow a real launch now.
             else:
                 return StableCanaryLaunchSummary(
                     status="skipped",
