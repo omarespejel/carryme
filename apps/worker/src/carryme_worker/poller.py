@@ -887,6 +887,7 @@ def _approved_snapshot_matches_paper_trade(
 def _build_open_hedge_auto_close_reason(
     *,
     paper_trade: PaperTradeEntry,
+    opened_at: datetime,
     snapshot: ApprovedCanarySnapshot,
     settings: WorkerSettings,
     now: datetime,
@@ -930,7 +931,7 @@ def _build_open_hedge_auto_close_reason(
                 f"{settings.execution_auto_pair_close_max_round_trip_break_even_hold_windows:.2f}"
             )
 
-    hold_age_seconds = max(0.0, (now - paper_trade.created_at).total_seconds())
+    hold_age_seconds = max(0.0, (now - opened_at).total_seconds())
     hold_age_windows = hold_age_seconds / (hold_window_hours * 3600.0)
     if hold_age_windows >= settings.execution_auto_pair_close_max_hold_windows:
         return (
@@ -1010,18 +1011,18 @@ def _latest_funding_checkpoint_index(
 
 def _build_funding_checkpoint_window_index(
     *,
-    paper_trade: PaperTradeEntry,
+    opened_at: datetime,
+    hold_window_hours: float,
     now: datetime,
-) -> tuple[int, float]:
+) -> int:
     """Return the effective crossed funding-window count for one paper trade."""
 
-    hold_window_hours = _build_execution_hold_window_hours(paper_trade)
     window_seconds = hold_window_hours * 3600.0
     if window_seconds <= 0:
-        return 0, hold_window_hours
-    entry_bucket = int(paper_trade.created_at.timestamp() // window_seconds)
+        return 0
+    entry_bucket = int(opened_at.timestamp() // window_seconds)
     current_bucket = int(now.timestamp() // window_seconds)
-    return max(0, current_bucket - entry_bucket), hold_window_hours
+    return max(0, current_bucket - entry_bucket)
 
 
 def _maybe_capture_open_hedge_funding_checkpoint(
@@ -1057,8 +1058,10 @@ def _maybe_capture_open_hedge_funding_checkpoint(
         )
         return []
 
-    window_index, hold_window_hours = _build_funding_checkpoint_window_index(
-        paper_trade=paper_trade,
+    hold_window_hours = _build_execution_hold_window_hours(paper_trade)
+    window_index = _build_funding_checkpoint_window_index(
+        opened_at=execution.executed_at,
+        hold_window_hours=hold_window_hours,
         now=now,
     )
     if window_index < 1:
@@ -1138,6 +1141,7 @@ async def _maybe_auto_close_open_hedged_execution(
 
     close_reason = _build_open_hedge_auto_close_reason(
         paper_trade=paper_trade,
+        opened_at=execution.executed_at,
         snapshot=latest_snapshot,
         settings=settings,
         now=now,
