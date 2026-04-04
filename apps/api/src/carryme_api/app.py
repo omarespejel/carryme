@@ -119,6 +119,7 @@ from carryme_runtime import (
     require_confirmed_cleanup_preview,
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
+from carryme_runtime.pair_close_preview import _pair_close_hash
 from carryme_runtime.route_approvals import scan_exact_canary_candidate_for_approval
 from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import (
@@ -1385,6 +1386,18 @@ def _validate_client_pair_close_preview_for_confirmation(
         raise HTTPException(
             status_code=409,
             detail="Provided pair close preview hash did not match the requested preview hash",
+        )
+    expected_preview_hash = _pair_close_hash(
+        execution_entry_id=preview.execution_entry_id,
+        paper_trade_id=preview.paper_trade_id,
+        legs=preview.legs,
+    )
+    if preview.preview_hash != expected_preview_hash:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Provided pair close preview hash did not match the preview body"
+            ),
         )
     if preview.paper_trade_id != paper_trade.entry_id:
         raise HTTPException(
