@@ -81,11 +81,19 @@ class WorkerSettings(BaseSettings):
     execution_auto_pair_close_min_profit_total_collateral: float | None = Field(
         default=None,
         ge=0,
+        description=(
+            "Minimum absolute profit in summed total-collateral units across the live trade's "
+            "tracked venues before profit-giveback auto-close can trigger."
+        ),
     )
     execution_auto_pair_close_max_profit_giveback_ratio: float | None = Field(
         default=None,
         gt=0,
         le=1,
+        description=(
+            "Maximum allowed fraction of peak summed total-collateral profit that can be given "
+            "back before profit-protection auto-close triggers."
+        ),
     )
     execution_auto_pair_close_timeout_seconds: float = Field(default=30.0, gt=0)
     execution_alert_webhook_url: str | None = None
