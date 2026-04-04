@@ -612,10 +612,11 @@ def _list_recent_effective_stable_launch_records(
 ) -> list[StableCanaryLaunchRecord]:
     """Return recent launch records relevant to the current worker mode."""
 
-    records = launch_store.list_recent(limit=limit, label=label)
-    if include_shadowed:
-        return records
-    return [record for record in records if record.status == "launched"]
+    return launch_store.list_recent(
+        limit=limit,
+        label=label,
+        status=None if include_shadowed else "launched",
+    )
 
 
 def _build_stable_launch_cooldown_reason(

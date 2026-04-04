@@ -2766,6 +2766,38 @@ def test_stable_canary_launch_store_appends_and_filters(tmp_path: Path) -> None:
     assert latest.launch_ready_snapshot_id == 9
 
 
+def test_stable_canary_launch_store_filters_by_status(tmp_path: Path) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 3, 30, 12, 0, tzinfo=UTC),
+            status="launched",
+            label="arb_extended_paradex",
+            launch_ready_snapshot_id=9,
+            approved_snapshot_id=8,
+            paper_trade_id=17,
+            final_pair_state="closed",
+        )
+    )
+    store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 3, 30, 12, 5, tzinfo=UTC),
+            status="shadowed",
+            label="arb_extended_paradex",
+            launch_ready_snapshot_id=10,
+            approved_snapshot_id=9,
+            paper_trade_id=0,
+            final_pair_state="shadowed",
+        )
+    )
+
+    results = store.list_recent(limit=10, label="arb_extended_paradex", status="launched")
+
+    assert len(results) == 1
+    assert results[0].status == "launched"
+    assert results[0].launch_ready_snapshot_id == 9
+
+
 def test_approved_canary_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:
     store = ApprovedCanaryAlertStore(tmp_path / "history.sqlite3")
     previous_snapshot = ApprovedCanarySnapshot(

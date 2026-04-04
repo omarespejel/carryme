@@ -90,6 +90,7 @@ class StableCanaryLaunchStore:
         *,
         limit: int = 50,
         label: str | None = None,
+        status: str | None = None,
         launch_ready_snapshot_id: int | None = None,
     ) -> list[StableCanaryLaunchRecord]:
         """Return recent stable canary launch records."""
@@ -104,6 +105,9 @@ class StableCanaryLaunchStore:
         if label is not None:
             clauses.append("label = ?")
             params.append(label)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
         if launch_ready_snapshot_id is not None:
             clauses.append("launch_ready_snapshot_id = ?")
             params.append(launch_ready_snapshot_id)

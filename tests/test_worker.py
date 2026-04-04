@@ -3918,6 +3918,66 @@ def test_launch_latest_stable_canary_once_skips_when_global_launch_rate_cap_reac
     )
 
 
+def test_launch_latest_stable_canary_once_rate_cap_ignores_shadowed_rows_beyond_limit(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_recent_launch_window_seconds=3600,
+        stable_canary_launch_max_launches_per_window=2,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    now = datetime(2026, 4, 4, 10, 20, tzinfo=UTC)
+    for launch_id, launched_at in (
+        (201, datetime(2026, 4, 4, 10, 10, tzinfo=UTC)),
+        (202, datetime(2026, 4, 4, 10, 5, tzinfo=UTC)),
+    ):
+        launch_store.append(
+            StableCanaryLaunchRecord(
+                launched_at=launched_at,
+                status="launched",
+                label=f"route_{launch_id}",
+                launch_ready_snapshot_id=launch_id,
+                approved_snapshot_id=launch_id,
+                paper_trade_id=launch_id,
+                final_pair_state="closed",
+            )
+        )
+    for launch_id in range(203, 228):
+        launch_store.append(
+            StableCanaryLaunchRecord(
+                launched_at=now - timedelta(minutes=launch_id - 202),
+                status="shadowed",
+                label=f"shadow_{launch_id}",
+                launch_ready_snapshot_id=launch_id,
+                approved_snapshot_id=launch_id,
+                paper_trade_id=0,
+                final_pair_state="shadowed",
+            )
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("shadowed rows must not hide live launch rate caps")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=now,
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch rate cap reached: "
+        "launches_in_window=2 >= max=2 window_seconds=3600"
+    )
+
+
 def test_launch_latest_stable_canary_once_skips_when_label_launch_rate_cap_reached(
     tmp_path: Path,
 ) -> None:
