@@ -1752,6 +1752,11 @@ async def launch_latest_stable_canary_once(
             )
 
     if settings.stable_canary_launch_shadow_mode:
+        logging.getLogger("carryme.worker").info(
+            "shadow launch for label=%s from launch_ready_snapshot_id=%s",
+            snapshot.label,
+            snapshot.launch_ready_snapshot_id,
+        )
         return StableCanaryLaunchSummary(
             status="skipped",
             database_path=settings.database_target,

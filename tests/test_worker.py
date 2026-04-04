@@ -4587,6 +4587,7 @@ def _build_auto_close_execution_leg() -> ExecutionLegResult:
 
 def test_launch_latest_stable_canary_once_shadow_mode_skips_live_submission(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
@@ -4692,6 +4693,7 @@ def test_launch_latest_stable_canary_once_shadow_mode_skips_live_submission(
         raise AssertionError("shadow mode should not submit live executions")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
+        caplog.set_level(logging.INFO, logger="carryme.worker")
         monkeypatch.setattr(
             "carryme_worker.poller._build_launch_ready_canary_stability",
             lambda **_: stability,
@@ -4715,6 +4717,7 @@ def test_launch_latest_stable_canary_once_shadow_mode_skips_live_submission(
     assert summary.status == "skipped"
     assert summary.launch_ready_snapshot_id == 9
     assert summary.detail == "Shadow mode: would launch stable canary from launch-ready snapshot 9"
+    assert "shadow launch for label=arb_extended_paradex" in caplog.text
 
 
 def test_build_open_hedge_auto_close_reason_flags_entry_edge_decay() -> None:
