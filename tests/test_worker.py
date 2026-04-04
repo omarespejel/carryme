@@ -117,6 +117,7 @@ from carryme_worker.poller import (
     UniverseScanSummary,
     _build_open_hedge_auto_close_reason,
     _build_order_state_observers,
+    _execution_requires_continued_monitoring,
     _maybe_auto_close_open_hedged_execution,
     cache_launch_ready_canaries_once,
     install_signal_handlers,
@@ -8021,6 +8022,227 @@ def test_observe_live_executions_once_keeps_monitoring_stale_open_hedges(
     assert summary.scanned_executions == 1
     assert summary.observed_executions == 1
     assert summary.saved_observations == 1
+
+
+def test_execution_requires_continued_monitoring_uses_latest_non_null_pair_status(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="stale-open-preview",
+            confirmation_entry_id=9,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+                note="stale open hedge",
+                intent=FundingPairTradeIntent(
+                    label="stale_open_pair",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 11, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order-stale-open",
+                )
+            ],
+        )
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            context="worker_execution_monitor",
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=7,
+            preview_hash="stale-open-preview",
+            order_state=ExecutionOrderState(
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=7,
+                preview_hash="stale-open-preview",
+                legs=[],
+                notes=[],
+            ),
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=7,
+                preview_hash="stale-open-preview",
+                derived_state="hedged",
+                recommended_action="monitor_open_hedge",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=7,
+                    preview_hash="stale-open-preview",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=7,
+                    preview_hash="stale-open-preview",
+                    status="submitted",
+                    recommended_action="monitor_open_hedge",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            ),
+        )
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 1, tzinfo=UTC),
+            context="worker_execution_monitor",
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=7,
+            preview_hash="stale-open-preview",
+            order_state=ExecutionOrderState(
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=7,
+                preview_hash="stale-open-preview",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+
+    assert _execution_requires_continued_monitoring(
+        observation_store,
+        execution=execution,
+    )
+
+
+def test_execution_requires_continued_monitoring_keeps_unknown_pair_status_history(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="stale-open-preview",
+            confirmation_entry_id=9,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+                note="stale open hedge",
+                intent=FundingPairTradeIntent(
+                    label="stale_open_pair",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 11, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=11.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order-stale-open",
+                )
+            ],
+        )
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+            context="worker_execution_monitor",
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=7,
+            preview_hash="stale-open-preview",
+            order_state=ExecutionOrderState(
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=7,
+                preview_hash="stale-open-preview",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 1, tzinfo=UTC),
+            context="worker_execution_monitor",
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=7,
+            preview_hash="stale-open-preview",
+            order_state=ExecutionOrderState(
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=7,
+                preview_hash="stale-open-preview",
+                legs=[],
+                notes=[],
+            ),
+        )
+    )
+
+    assert _execution_requires_continued_monitoring(
+        observation_store,
+        execution=execution,
+    )
 
 
 def test_observe_live_executions_once_includes_exact_max_age_cutoff(tmp_path: Path) -> None:

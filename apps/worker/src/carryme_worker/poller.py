@@ -3638,9 +3638,16 @@ def _execution_requires_continued_monitoring(
     if paper_trade_id is None:
         return False
     latest = observation_store.latest_for_paper_trade(paper_trade_id)
-    if latest is None or latest.pair_status is None:
+    if latest is None:
         return False
     pair_status = latest.pair_status
+    if pair_status is None:
+        for observation in observation_store.list_recent(limit=None, paper_trade_id=paper_trade_id):
+            if observation.pair_status is not None:
+                pair_status = observation.pair_status
+                break
+        else:
+            return True
     return pair_status.derived_state in {
         "hedged",
         "cleanup_needed",
