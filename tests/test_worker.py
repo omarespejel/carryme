@@ -3952,6 +3952,60 @@ def test_launch_latest_stable_canary_once_skips_when_execution_sample_requiremen
     )
 
 
+def test_launch_latest_stable_canary_once_skips_when_samples_required_but_maturity_missing(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_min_execution_samples=2,
+    )
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        execution_quality=None,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
+    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
+    stability = stability.model_copy(update={"snapshot": snapshot})
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("missing maturity must block before lifecycle launch")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == "Stable launch execution maturity is missing for the selected route"
+
+
 def test_launch_latest_stable_canary_once_skips_when_execution_quality_requirement_not_met(
     tmp_path: Path,
 ) -> None:
@@ -4151,6 +4205,7 @@ def test_launch_latest_stable_canary_once_allows_launch_at_exact_maturity_thresh
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_min_execution_quality_score=0.55,
         stable_canary_launch_min_execution_samples=2,
+        stable_canary_launch_max_active_live_executions=1,
     )
     approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
         label="arb_extended_paradex",
