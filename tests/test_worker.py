@@ -22,6 +22,7 @@ from carryme_models import (
     ExecutionObservationEntry,
     ExecutionOrderState,
     ExecutionPairStatus,
+    ExecutionQualitySummary,
     ExecutionReconciliation,
     ExecutionVenueReconciliation,
     FundingArbOpportunity,
@@ -237,6 +238,22 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_LIVE_NOTIONAL_PER_VENUE",
         raising=False,
     )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_GLOBAL_COOLDOWN_SECONDS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_LABEL_COOLDOWN_SECONDS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MIN_EXECUTION_QUALITY_SCORE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MIN_EXECUTION_SAMPLES",
+        raising=False,
+    )
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_RECV_WINDOW_MS", raising=False)
     monkeypatch.delenv("CARRYME_API_EXTENDED_STARK_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("CARRYME_API_PARADEX_RECV_WINDOW_MS", raising=False)
@@ -268,6 +285,8 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_max_consecutive_losing_trades is None
     assert settings.stable_canary_launch_global_cooldown_seconds is None
     assert settings.stable_canary_launch_label_cooldown_seconds is None
+    assert settings.stable_canary_launch_min_execution_quality_score is None
+    assert settings.stable_canary_launch_min_execution_samples is None
     assert settings.execution_auto_pair_close_enabled is False
     assert settings.execution_auto_pair_close_shadow_mode is False
     assert settings.execution_auto_pair_close_max_snapshot_age_seconds == 300
@@ -3518,6 +3537,7 @@ def _build_stable_launch_test_snapshot(
     launch_ready_snapshot_id: int = 19,
     approved_snapshot_id: int = 18,
     suggested_canary_notional: float = 20.0,
+    execution_quality: ExecutionQualitySummary | None = None,
 ) -> tuple[
     RouteApprovalEntry,
     FundingUniverseCanaryCandidate,
@@ -3567,6 +3587,7 @@ def _build_stable_launch_test_snapshot(
             },
             deployable_notional=900.0,
             estimated_one_day_pnl_after_round_trip=2.79,
+            execution_quality=execution_quality,
         ),
         suggested_canary_notional=suggested_canary_notional,
     )
@@ -3811,6 +3832,280 @@ def test_launch_latest_stable_canary_once_respects_shadow_cooldowns_in_shadow_mo
         "Stable launch global cooldown active: "
         "last_label=near_extended_paradex remaining_seconds=180"
     )
+
+
+def test_launch_latest_stable_canary_once_skips_when_execution_maturity_missing(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_min_execution_quality_score=0.55,
+    )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        execution_quality=None,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
+    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
+    stability = stability.model_copy(update={"snapshot": snapshot})
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("maturity gate must block before lifecycle launch")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == "Stable launch execution maturity is missing for the selected route"
+
+
+def test_launch_latest_stable_canary_once_skips_when_execution_sample_requirement_not_met(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_min_execution_samples=2,
+    )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        execution_quality=ExecutionQualitySummary(
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            sample_size=1,
+            weighted_score=0.8,
+            latest_outcome="closed",
+            closed_count=1,
+        ),
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
+    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
+    stability = stability.model_copy(update={"snapshot": snapshot})
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("sample gate must block before lifecycle launch")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch execution sample requirement not met: samples=1 < min=2"
+    )
+
+
+def test_launch_latest_stable_canary_once_skips_when_execution_quality_requirement_not_met(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_min_execution_quality_score=0.6,
+    )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        execution_quality=ExecutionQualitySummary(
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            sample_size=3,
+            weighted_score=0.55,
+            latest_outcome="closed",
+            closed_count=2,
+            hedged_count=1,
+        ),
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
+    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
+    stability = stability.model_copy(update={"snapshot": snapshot})
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("quality gate must block before lifecycle launch")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch execution quality requirement not met: score=0.5500 < min=0.6000"
+    )
+
+
+def test_launch_latest_stable_canary_once_allows_launch_when_execution_maturity_requirements_met(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_min_execution_quality_score=0.55,
+        stable_canary_launch_min_execution_samples=2,
+    )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        execution_quality=ExecutionQualitySummary(
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            sample_size=3,
+            weighted_score=0.65,
+            latest_outcome="closed",
+            closed_count=2,
+            hedged_count=1,
+        ),
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
+    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
+    stability = stability.model_copy(update={"snapshot": snapshot})
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+
+    class StubLifecycleResult:
+        def __init__(self) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=117,
+                created_at=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00355,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=900.0,
+                    target_notional=20.0,
+                    capacity_fraction=20.0 / 900.0,
+                    max_target_notional=20.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=20.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=20.0,
+                    ),
+                ),
+            )
+            self.execution = ExecutionJournalEntry(
+                entry_id=171,
+                executed_at=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+                adapter="paired_live:extended_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=117,
+                preview_hash="launch-preview-maturity",
+                confirmation_entry_id=271,
+                paper_trade=self.paper_trade,
+                legs=[_build_auto_close_execution_leg()],
+            )
+            self.final_pair_status = _build_auto_close_pair_status(
+                execution=self.execution,
+                derived_state="closed",
+                recommended_action="no_action",
+            )
+            self.observation = ExecutionObservationEntry(
+                observed_at=datetime(2026, 4, 4, 10, 3, tzinfo=UTC),
+                context="worker_execution_monitor",
+                execution_entry_id=171,
+                paper_trade_id=117,
+                preview_hash="launch-preview-maturity",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=171,
+                    paper_trade_id=117,
+                    preview_hash="launch-preview-maturity",
+                    legs=[],
+                    notes=[],
+                ),
+            )
+
+    async def run_stub_lifecycle(**_: object) -> StubLifecycleResult:
+        return StubLifecycleResult()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "launched"
 
 
 def test_launch_latest_stable_canary_once_skips_when_active_live_hedge_exists(
