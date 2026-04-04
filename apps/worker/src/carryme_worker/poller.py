@@ -955,7 +955,10 @@ async def _maybe_auto_close_open_hedged_execution(
 ) -> ExecutionJournalEntry | None:
     """Close one monitored hedged pair when the automated exit rules trigger."""
 
-    if not settings.execution_auto_pair_close_enabled:
+    if (
+        not settings.execution_auto_pair_close_enabled
+        and not settings.execution_auto_pair_close_shadow_mode
+    ):
         return None
     if pair_status.derived_state != "hedged":
         return None
@@ -993,6 +996,14 @@ async def _maybe_auto_close_open_hedged_execution(
         now=now,
     )
     if close_reason is None:
+        return None
+
+    if settings.execution_auto_pair_close_shadow_mode:
+        logger.info(
+            "shadow auto-close for paper_trade_id=%s because %s",
+            paper_trade.entry_id,
+            close_reason,
+        )
         return None
 
     api_settings = _build_api_settings_from_worker_settings(settings)
@@ -1418,11 +1429,18 @@ async def cache_launch_ready_canaries_once(
             settings=settings,
         )
         if automation_gate_reason is not None:
-            loop_logger.debug(
-                "skipping launch-ready snapshot label=%s because %s",
-                label,
-                automation_gate_reason,
-            )
+            if settings.stable_canary_launch_shadow_mode:
+                loop_logger.info(
+                    "shadow launch gate blocked label=%s because %s",
+                    label,
+                    automation_gate_reason,
+                )
+            else:
+                loop_logger.debug(
+                    "skipping launch-ready snapshot label=%s because %s",
+                    label,
+                    automation_gate_reason,
+                )
             continue
         system_state = await _probe_candidate_system_state(
             settings=settings,
@@ -1732,6 +1750,19 @@ async def launch_latest_stable_canary_once(
                     f"paper trade {previous_launch.paper_trade_id}"
                 ),
             )
+
+    if settings.stable_canary_launch_shadow_mode:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=(
+                "Shadow mode: would launch stable canary from launch-ready snapshot "
+                f"{snapshot.launch_ready_snapshot_id}"
+            ),
+        )
 
     try:
         lifecycle = await _run_guarded_canary_lifecycle(
