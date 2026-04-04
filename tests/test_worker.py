@@ -114,6 +114,7 @@ from carryme_worker.poller import (
     SystemStateObservationSummary,
     UniverseScanLoopSummary,
     UniverseScanSummary,
+    _build_open_hedge_auto_close_reason,
     _build_order_state_observers,
     cache_launch_ready_canaries_once,
     install_signal_handlers,
@@ -172,6 +173,19 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.delenv("CARRYME_WORKER_EXTENDED_STARK_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_EXECUTION_OBSERVATION_MAX_AGE_SECONDS", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_ENABLED", raising=False)
+    monkeypatch.delenv(
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MIN_ENTRY_EDGE_RETENTION_RATIO",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_ROUND_TRIP_BREAK_EVEN_HOLD_WINDOWS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_HOLD_WINDOWS",
+        raising=False,
+    )
     monkeypatch.delenv(
         "CARRYME_WORKER_STABLE_LAUNCH_READY_MIN_EDGE_RETENTION_RATIO",
         raising=False,
@@ -206,6 +220,10 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.universe_scan_hyperliquid_snapshot_concurrency == 2
     assert settings.execution_observation_interval_seconds == 10
     assert settings.execution_observation_max_backoff_seconds == 60
+    assert settings.execution_auto_pair_close_enabled is False
+    assert settings.execution_auto_pair_close_min_entry_edge_retention_ratio == 0.35
+    assert settings.execution_auto_pair_close_max_round_trip_break_even_hold_windows == 2.5
+    assert settings.execution_auto_pair_close_max_hold_windows == 2.0
     assert settings.stable_launch_ready_min_edge_retention_ratio == 0.7
     assert settings.stable_launch_ready_max_entry_break_even_funding_windows == 6.0
     assert settings.stable_launch_ready_max_round_trip_break_even_funding_windows == 12.0
@@ -4398,6 +4416,200 @@ def test_launch_latest_stable_canary_once_ignores_unselected_live_credentials(
     assert summary.paper_trade_id == 17
 
 
+def test_build_open_hedge_auto_close_reason_flags_entry_edge_decay() -> None:
+    settings = WorkerSettings(
+        execution_auto_pair_close_enabled=True,
+        execution_auto_pair_close_min_entry_edge_retention_ratio=0.35,
+    )
+    paper_trade = PaperTradeEntry(
+        entry_id=11,
+        created_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="near_extended_paradex",
+            canonical_symbol="NEAR-USD-PERP",
+            source_recorded_at=datetime(2026, 4, 4, 8, 59, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0016,
+            break_even_days_entry=0.2,
+            capacity_limit_notional=300.0,
+            target_notional=25.0,
+            capacity_fraction=25.0 / 300.0,
+            max_target_notional=25.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="NEAR-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="NEAR-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=25.0,
+            ),
+        ),
+    )
+    snapshot = ApprovedCanarySnapshot(
+        captured_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        label="near_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="NEAR-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.0010,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=0.0004,
+                    one_day_net_edge_after_round_trip=0.0002,
+                    break_even_days_entry=0.3,
+                    break_even_days_round_trip=0.6,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=500.0,
+                        long_ask_notional=400.0,
+                        max_entry_notional=400.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(venue="extended", symbol="NEAR-USD"),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="NEAR-USD-PERP",
+                    ),
+                },
+                deployable_notional=400.0,
+                estimated_one_day_pnl_after_round_trip=0.08,
+            ),
+            suggested_canary_notional=25.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 4, 8, 58, tzinfo=UTC),
+            label="near_extended_paradex",
+            canonical_symbol="NEAR-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=25.0,
+            note="approved canary",
+        ),
+    )
+
+    reason = _build_open_hedge_auto_close_reason(
+        paper_trade=paper_trade,
+        snapshot=snapshot,
+        settings=settings,
+        now=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+    )
+
+    assert reason is not None
+    assert reason.startswith("entry edge retention")
+
+
+def test_build_open_hedge_auto_close_reason_flags_max_hold_windows() -> None:
+    settings = WorkerSettings(
+        execution_auto_pair_close_enabled=True,
+        execution_auto_pair_close_max_hold_windows=2.0,
+        execution_auto_pair_close_min_entry_edge_retention_ratio=0.2,
+        execution_auto_pair_close_max_round_trip_break_even_hold_windows=4.0,
+    )
+    paper_trade = PaperTradeEntry(
+        entry_id=12,
+        created_at=datetime(2026, 4, 3, 0, 0, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="jup_extended_paradex",
+            canonical_symbol="JUP-USD-PERP",
+            source_recorded_at=datetime(2026, 4, 2, 23, 59, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0012,
+            break_even_days_entry=0.2,
+            capacity_limit_notional=300.0,
+            target_notional=25.0,
+            capacity_fraction=25.0 / 300.0,
+            max_target_notional=25.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="JUP-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="JUP-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=25.0,
+            ),
+        ),
+    )
+    snapshot = ApprovedCanarySnapshot(
+        captured_at=datetime(2026, 4, 4, 0, 30, tzinfo=UTC),
+        label="jup_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="JUP-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.0014,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=0.0010,
+                    one_day_net_edge_after_round_trip=0.0008,
+                    break_even_days_entry=0.1,
+                    break_even_days_round_trip=0.4,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=500.0,
+                        long_ask_notional=400.0,
+                        max_entry_notional=400.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(venue="extended", symbol="JUP-USD"),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="JUP-USD-PERP",
+                    ),
+                },
+                deployable_notional=400.0,
+                estimated_one_day_pnl_after_round_trip=0.3,
+            ),
+            suggested_canary_notional=25.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 3, 23, 59, tzinfo=UTC),
+            label="jup_extended_paradex",
+            canonical_symbol="JUP-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=25.0,
+            note="approved canary",
+        ),
+    )
+
+    reason = _build_open_hedge_auto_close_reason(
+        paper_trade=paper_trade,
+        snapshot=snapshot,
+        settings=settings,
+        now=datetime(2026, 4, 4, 17, 0, tzinfo=UTC),
+    )
+
+    assert reason is not None
+    assert reason.startswith("hold age windows")
+
+
 def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
     tmp_path: Path,
 ) -> None:
@@ -4605,6 +4817,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         *,
         execution_store: object | None = None,
         observation_store: object | None = None,
+        approved_store: object | None = None,
         alert_sink: object | None = None,
         alert_notifier: object | None = None,
         account_service: object | None = None,
@@ -4615,6 +4828,7 @@ def test_run_production_supervisor_cycle_once_orders_stages(
         assert settings_arg is settings
         _ = execution_store
         _ = observation_store
+        _ = approved_store
         _ = alert_sink
         assert alert_notifier is execution_notifier
         _ = account_service
@@ -5954,6 +6168,173 @@ def test_observe_live_executions_once_persists_latest_live_snapshots(tmp_path: P
     assert latest.order_state.legs[0].observation_source == "rest_poll"
 
 
+def test_observe_live_executions_once_triggers_auto_close_for_hedged_pairs(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=True,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=9,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="jup_extended_paradex",
+                    canonical_symbol="JUP-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=25.0,
+                    capacity_fraction=25.0 / 4500.0,
+                    max_target_notional=25.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="JUP-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=25.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="JUP-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=25.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="JUP-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=25.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order-1",
+                )
+            ],
+        )
+    )
+
+    class StubAccountService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            config_map: object,
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id == 7
+            _ = config_map
+            return PaperTradeAccountPreflight(
+                paper_trade_id=7,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        position_symbols=["JUP-USD"],
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="bearer_token",
+                        position_symbols=["JUP-USD-PERP"],
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[],
+                notes=[],
+            )
+
+    auto_close_calls: list[int] = []
+
+    async def fake_auto_close(**kwargs: object) -> None:
+        execution = cast(ExecutionJournalEntry, kwargs["execution"])
+        auto_close_calls.append(execution.paper_trade_id or 0)
+        return None
+
+    hedged_pair_status = ExecutionPairStatus(
+        execution_entry_id=1,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        derived_state="hedged",
+        recommended_action="monitor_open_hedge",
+        order_state=ExecutionOrderState(
+            execution_entry_id=1,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            legs=[],
+            notes=[],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=1,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            status="accepted",
+            recommended_action="no_action",
+            matched_all_leg_symbols=True,
+            venues=[],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.build_execution_pair_status",
+            lambda *args, **kwargs: hedged_pair_status,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._maybe_auto_close_open_hedged_execution",
+            fake_auto_close,
+        )
+        summary = asyncio.run(
+            observe_live_executions_once(
+                settings,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                approved_store=ApprovedCanaryStore(settings.database_path),
+                account_service=cast(AccountPreflightService, StubAccountService()),
+                order_state_service=cast(ExecutionOrderStateService, StubOrderStateService()),
+                now=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+            )
+        )
+
+    assert summary.observed_executions == 1
+    assert auto_close_calls == [7]
+
+
 def test_observe_live_executions_once_skips_failed_observations(tmp_path: Path) -> None:
     watchlist_path = tmp_path / "watchlist.json"
     watchlist_path.write_text('{"pairs": []}')
@@ -7271,6 +7652,7 @@ def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_pat
         *,
         execution_store: object | None = None,
         observation_store: object | None = None,
+        approved_store: object | None = None,
         alert_sink: object | None = None,
         alert_notifier: object | None = None,
         account_service: object | None = None,
@@ -7281,6 +7663,7 @@ def test_run_supervised_execution_observation_loop_honors_max_iterations(tmp_pat
         assert settings_arg is settings
         assert execution_store is stub_execution_store
         assert observation_store is stub_observation_store
+        _ = approved_store
         assert alert_sink is stub_alert_sink
         assert alert_notifier is not None
         assert account_service is stable_account_service
@@ -7391,6 +7774,7 @@ def test_run_supervised_execution_observation_loop_applies_backoff(tmp_path: Pat
         *,
         execution_store: object | None = None,
         observation_store: object | None = None,
+        approved_store: object | None = None,
         alert_sink: object | None = None,
         alert_notifier: object | None = None,
         account_service: object | None = None,
@@ -7401,6 +7785,7 @@ def test_run_supervised_execution_observation_loop_applies_backoff(tmp_path: Pat
         assert settings_arg is settings
         _ = execution_store
         _ = observation_store
+        _ = approved_store
         _ = alert_sink
         assert alert_notifier is not None
         assert account_service is stable_account_service
@@ -7484,6 +7869,7 @@ def test_run_supervised_execution_observation_loop_clamps_exponential_backoff(
         *,
         execution_store: object | None = None,
         observation_store: object | None = None,
+        approved_store: object | None = None,
         alert_sink: object | None = None,
         alert_notifier: object | None = None,
         account_service: object | None = None,
@@ -7494,6 +7880,7 @@ def test_run_supervised_execution_observation_loop_clamps_exponential_backoff(
         assert settings_arg is settings
         _ = execution_store
         _ = observation_store
+        _ = approved_store
         _ = alert_sink
         assert alert_notifier is not None
         assert account_service is stable_account_service
