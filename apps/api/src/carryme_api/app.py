@@ -1360,6 +1360,95 @@ def _pair_close_preview_matches_canonical(
     )
 
 
+def _opposite_trade_side(side: str) -> str:
+    normalized = side.strip().lower()
+    if normalized == "buy":
+        return "sell"
+    if normalized == "sell":
+        return "buy"
+    raise ValueError(f"Unsupported trade side {side!r}")
+
+
+def _validate_client_pair_close_preview_for_confirmation(
+    *,
+    preview: ExecutionPairClosePreview,
+    preview_hash: str,
+    paper_trade: PaperTradeEntry,
+    execution: ExecutionJournalEntry,
+) -> None:
+    if paper_trade.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Paper trade entry_id is required before pair-close confirmation",
+        )
+    if preview.preview_hash != preview_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="Provided pair close preview hash did not match the requested preview hash",
+        )
+    if preview.paper_trade_id != paper_trade.entry_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Provided pair close preview did not belong to this paper trade",
+        )
+    if execution.entry_id is not None and preview.execution_entry_id != execution.entry_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Provided pair close preview must target the latest execution entry",
+        )
+    if preview.label != paper_trade.intent.label:
+        raise HTTPException(
+            status_code=409,
+            detail="Provided pair close preview label did not match the paper trade",
+        )
+    if preview.reason != "close_pair":
+        raise HTTPException(
+            status_code=409,
+            detail="Provided pair close preview must have reason 'close_pair'",
+        )
+    if len(preview.legs) != 2 or len({leg.venue.strip().lower() for leg in preview.legs}) != 2:
+        raise HTTPException(
+            status_code=409,
+            detail="Provided pair close preview must contain exactly two legs on distinct venues",
+        )
+
+    expected_legs = {
+        paper_trade.intent.long_leg.venue.strip().lower(): (
+            paper_trade.intent.long_leg.symbol,
+            paper_trade.intent.long_leg.fee_profile,
+            _opposite_trade_side(paper_trade.intent.long_leg.side),
+        ),
+        paper_trade.intent.short_leg.venue.strip().lower(): (
+            paper_trade.intent.short_leg.symbol,
+            paper_trade.intent.short_leg.fee_profile,
+            _opposite_trade_side(paper_trade.intent.short_leg.side),
+        ),
+    }
+    if {leg.venue.strip().lower() for leg in preview.legs} != set(expected_legs):
+        raise HTTPException(
+            status_code=409,
+            detail="Provided pair close preview venues did not match the paper trade",
+        )
+    for leg in preview.legs:
+        if leg.reduce_only is not True:
+            raise HTTPException(
+                status_code=409,
+                detail="Provided pair close preview legs must be reduce-only",
+            )
+        expected_symbol, expected_fee_profile, expected_side = expected_legs[
+            leg.venue.strip().lower()
+        ]
+        if (
+            leg.symbol != expected_symbol
+            or leg.fee_profile != expected_fee_profile
+            or leg.side != expected_side
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Provided pair close preview leg did not match the paper trade intent",
+            )
+
+
 async def _ensure_cleanup_live_ready(
     *,
     venue: str,
@@ -4157,7 +4246,41 @@ def create_app() -> FastAPI:
         normalized_preview_hash = preview_hash.strip()
         if not normalized_preview_hash:
             raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
-        paper_trade, _, _, canonical_preview = await _build_pair_close_context_for_paper_trade(
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        execution = execution_store.latest_for_paper_trade(paper_trade_id)
+        if execution is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No execution journal entry matched paper trade {paper_trade_id}",
+            )
+        if paper_trade.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Paper trade entry_id is required before pair-close confirmation",
+            )
+        resolved_paper_trade_id = paper_trade.entry_id
+        if preview is not None:
+            _validate_client_pair_close_preview_for_confirmation(
+                preview=preview,
+                preview_hash=normalized_preview_hash,
+                paper_trade=paper_trade,
+                execution=execution,
+            )
+            confirmation = PairClosePreviewConfirmationEntry(
+                confirmed_at=datetime.now(UTC),
+                paper_trade_id=resolved_paper_trade_id,
+                label=paper_trade.intent.label,
+                preview_hash=normalized_preview_hash,
+                preview=preview,
+                note=note,
+            )
+            return confirmation_store.append(confirmation)
+        _, _, _, canonical_preview = await _build_pair_close_context_for_paper_trade(
             paper_trade_id=paper_trade_id,
             settings=settings,
             paper_store=paper_store,
@@ -4166,14 +4289,6 @@ def create_app() -> FastAPI:
             order_state_service=order_state_service,
             pair_close_service=pair_close_service,
         )
-        if preview is not None and not _pair_close_preview_matches_canonical(
-            provided=preview,
-            canonical=canonical_preview,
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="Provided pair close preview did not match the current server preview",
-            )
         if canonical_preview.preview_hash != normalized_preview_hash:
             raise HTTPException(
                 status_code=409,
@@ -4181,7 +4296,7 @@ def create_app() -> FastAPI:
             )
         confirmation = PairClosePreviewConfirmationEntry(
             confirmed_at=datetime.now(UTC),
-            paper_trade_id=paper_trade.entry_id or paper_trade_id,
+            paper_trade_id=resolved_paper_trade_id,
             label=paper_trade.intent.label,
             preview_hash=canonical_preview.preview_hash,
             preview=canonical_preview,
