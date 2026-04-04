@@ -4593,6 +4593,7 @@ def test_launch_latest_stable_canary_once_shadow_mode_skips_live_submission(
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_shadow_mode=True,
     )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
     approval = RouteApprovalEntry(
         updated_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
         label="arb_extended_paradex",
@@ -4709,15 +4710,226 @@ def test_launch_latest_stable_canary_once_shadow_mode_skips_live_submission(
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                launch_store=launch_store,
                 approved_store=approved_store,
                 now=datetime(2026, 3, 30, 10, 2, tzinfo=UTC),
             )
         )
 
+    launch_records = launch_store.list_recent(limit=10)
     assert summary.status == "skipped"
     assert summary.launch_ready_snapshot_id == 9
     assert summary.detail == "Shadow mode: would launch stable canary from launch-ready snapshot 9"
     assert "shadow launch for label=arb_extended_paradex" in caplog.text
+    assert len(launch_records) == 1
+    assert launch_records[0].status == "shadowed"
+    assert launch_records[0].launch_ready_snapshot_id == 9
+    assert launch_records[0].paper_trade_id == 0
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        repeat_summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                approved_store=approved_store,
+                now=datetime(2026, 3, 30, 10, 3, tzinfo=UTC),
+            )
+        )
+
+    assert repeat_summary.status == "skipped"
+    assert (
+        repeat_summary.detail
+        == "Launch-ready canary snapshot already evaluated in shadow mode by worker"
+    )
+    assert len(launch_store.list_recent(limit=10)) == 1
+
+
+def test_launch_latest_stable_canary_once_shadow_gate_block_logs_revalidation_skip(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_shadow_mode=True,
+        stable_launch_ready_min_edge_retention_ratio=0.9,
+    )
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 3, 30, 10, 1, tzinfo=UTC),
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=11.0,
+        note="approved canary",
+    )
+    older_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=7,
+        captured_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.0045,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.004,
+                    one_day_net_edge_after_round_trip=0.0036,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=3.24,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=approval,
+    )
+    latest_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=8,
+        captured_at=datetime(2026, 3, 30, 10, 1, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.0015,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.0012,
+                    one_day_net_edge_after_round_trip=0.001,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1200.0,
+                        long_ask_notional=850.0,
+                        max_entry_notional=850.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=850.0,
+                estimated_one_day_pnl_after_round_trip=0.85,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=approval,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    older_snapshot = approved_store.append(older_snapshot)
+    latest_snapshot = approved_store.append(latest_snapshot)
+    snapshot = LaunchReadyCanarySnapshot(
+        launch_ready_snapshot_id=9,
+        captured_at=datetime(2026, 3, 30, 10, 2, tzinfo=UTC),
+        label="arb_extended_paradex",
+        max_snapshot_age_seconds=300,
+        approved_snapshot=latest_snapshot,
+        system_state=PaperTradeSystemState(
+            paper_trade_id=0,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+    stability = LaunchReadyCanaryStability(
+        snapshot=snapshot,
+        consecutive_snapshots=3,
+        stable_seconds=45.0,
+        min_snapshot_count=2,
+        min_stable_seconds=30.0,
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        caplog.set_level(logging.INFO, logger="carryme.worker")
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (
+                snapshot,
+                latest_snapshot.candidate,
+                latest_snapshot.approval,
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                approved_store=approved_store,
+                now=datetime(2026, 3, 30, 10, 3, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Latest approved snapshot no longer satisfies automated launch gates: "
+        "entry edge retention 0.30 below minimum 0.90"
+    )
+    assert (
+        "shadow launch gate blocked label=arb_extended_paradex because entry edge retention "
+        "0.30 below minimum 0.90" in caplog.text
+    )
 
 
 def test_build_open_hedge_auto_close_reason_flags_entry_edge_decay() -> None:

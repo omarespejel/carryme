@@ -1722,6 +1722,12 @@ async def launch_latest_stable_canary_once(
         settings=settings,
     )
     if automation_gate_reason is not None:
+        if settings.stable_canary_launch_shadow_mode:
+            logging.getLogger("carryme.worker").info(
+                "shadow launch gate blocked label=%s because %s",
+                snapshot.label,
+                automation_gate_reason,
+            )
         return StableCanaryLaunchSummary(
             status="skipped",
             database_path=settings.database_target,
@@ -1737,25 +1743,52 @@ async def launch_latest_stable_canary_once(
     if snapshot.launch_ready_snapshot_id is not None:
         previous_launch = stable_launch_store.latest_for_snapshot(snapshot.launch_ready_snapshot_id)
         if previous_launch is not None:
-            return StableCanaryLaunchSummary(
-                status="skipped",
-                database_path=settings.database_target,
-                label=snapshot.label,
-                launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-                approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-                paper_trade_id=previous_launch.paper_trade_id,
-                final_pair_state=previous_launch.final_pair_state,
-                detail=(
-                    "Launch-ready canary snapshot already launched by worker as "
-                    f"paper trade {previous_launch.paper_trade_id}"
-                ),
-            )
+            if previous_launch.status == "shadowed":
+                if settings.stable_canary_launch_shadow_mode:
+                    return StableCanaryLaunchSummary(
+                        status="skipped",
+                        database_path=settings.database_target,
+                        label=snapshot.label,
+                        launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+                        approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+                        final_pair_state=previous_launch.final_pair_state,
+                        detail=(
+                            "Launch-ready canary snapshot already evaluated in shadow mode by "
+                            "worker"
+                        ),
+                    )
+            else:
+                return StableCanaryLaunchSummary(
+                    status="skipped",
+                    database_path=settings.database_target,
+                    label=snapshot.label,
+                    launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+                    approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+                    paper_trade_id=previous_launch.paper_trade_id,
+                    final_pair_state=previous_launch.final_pair_state,
+                    detail=(
+                        "Launch-ready canary snapshot already launched by worker as "
+                        f"paper trade {previous_launch.paper_trade_id}"
+                    ),
+                )
 
     if settings.stable_canary_launch_shadow_mode:
         logging.getLogger("carryme.worker").info(
             "shadow launch for label=%s from launch_ready_snapshot_id=%s",
             snapshot.label,
             snapshot.launch_ready_snapshot_id,
+        )
+        stable_launch_store.append(
+            StableCanaryLaunchRecord(
+                launched_at=timestamp,
+                status="shadowed",
+                label=snapshot.label,
+                launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id or 0,
+                approved_snapshot_id=snapshot.approved_snapshot.snapshot_id or 0,
+                paper_trade_id=0,
+                final_pair_state="shadowed",
+                detail="Shadow mode launch marker",
+            )
         )
         return StableCanaryLaunchSummary(
             status="skipped",

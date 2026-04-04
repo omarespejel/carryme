@@ -11,7 +11,7 @@ class StableCanaryLaunchRecord(BaseModel):
 
     launch_id: int | None = None
     launched_at: datetime
-    status: Literal["launched"]
+    status: Literal["launched", "shadowed"]
     label: str = Field(min_length=1)
     launch_ready_snapshot_id: int
     approved_snapshot_id: int
