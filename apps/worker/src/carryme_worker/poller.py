@@ -712,6 +712,30 @@ def _build_stable_launch_execution_maturity_reason(
     return None
 
 
+def _build_stable_launch_latest_outcome_reason(
+    *,
+    settings: WorkerSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> str | None:
+    """Return the deterministic reason unattended launch is blocked by a bad latest outcome."""
+
+    if not settings.stable_canary_launch_block_adverse_latest_outcome:
+        return None
+
+    execution_quality = candidate.opportunity.execution_quality
+    if execution_quality is None:
+        return None
+
+    latest_outcome = execution_quality.latest_outcome
+    if latest_outcome not in {"cleanup_needed", "review_required"}:
+        return None
+
+    return (
+        "Stable launch blocked by adverse latest execution outcome: "
+        f"latest_outcome={latest_outcome}"
+    )
+
+
 @dataclass
 class ProductionSupervisorCycleSummary:
     """Summary emitted after one end-to-end production supervisor cycle."""
@@ -2553,6 +2577,26 @@ async def launch_latest_stable_canary_once(
             launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
             approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
             detail=execution_maturity_reason,
+        )
+
+    latest_outcome_reason = _build_stable_launch_latest_outcome_reason(
+        settings=settings,
+        candidate=latest_approved_snapshot.candidate,
+    )
+    if latest_outcome_reason is not None:
+        if settings.stable_canary_launch_shadow_mode:
+            logging.getLogger("carryme.worker").info(
+                "shadow launch latest-outcome blocked label=%s because %s",
+                snapshot.label,
+                latest_outcome_reason,
+            )
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=latest_outcome_reason,
         )
 
     recent_approved_chain = _list_recent_approved_snapshot_chain(
