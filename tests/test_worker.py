@@ -3843,6 +3843,28 @@ def test_launch_latest_stable_canary_once_skips_when_total_live_notional_budget_
     persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
     snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
     stability = stability.model_copy(update={"snapshot": snapshot})
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
@@ -3862,6 +3884,7 @@ def test_launch_latest_stable_canary_once_skips_when_total_live_notional_budget_
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
             )
         )
@@ -4020,6 +4043,17 @@ def test_launch_latest_stable_canary_once_skips_when_risk_budget_scan_truncates(
     persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
     snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
     stability = stability.model_copy(update={"snapshot": snapshot})
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
@@ -4039,6 +4073,7 @@ def test_launch_latest_stable_canary_once_skips_when_risk_budget_scan_truncates(
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
             )
         )
@@ -4055,6 +4090,7 @@ def test_launch_latest_stable_canary_once_allows_total_live_notional_budget_at_e
 ) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_active_live_executions=5,
         stable_canary_launch_max_total_live_notional=45.0,
     )
     execution_store = ExecutionJournalStore(settings.database_path)
@@ -4191,6 +4227,17 @@ def test_launch_latest_stable_canary_once_allows_total_live_notional_budget_at_e
     persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
     snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
     stability = stability.model_copy(update={"snapshot": snapshot})
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
 
     class StubLifecycleResult:
         def __init__(self) -> None:
@@ -4235,6 +4282,11 @@ def test_launch_latest_stable_canary_once_allows_total_live_notional_budget_at_e
                 paper_trade=self.paper_trade,
                 legs=[_build_auto_close_execution_leg()],
             )
+            self.final_pair_status = _build_auto_close_pair_status(
+                execution=self.execution,
+                derived_state="closed",
+                recommended_action="no_action",
+            )
             self.observation = ExecutionObservationEntry(
                 observed_at=datetime(2026, 4, 4, 10, 3, tzinfo=UTC),
                 context="worker_execution_monitor",
@@ -4269,6 +4321,7 @@ def test_launch_latest_stable_canary_once_allows_total_live_notional_budget_at_e
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
             )
         )
@@ -4418,6 +4471,17 @@ def test_launch_latest_stable_canary_once_skips_when_venue_live_notional_budget_
     persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
     snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
     stability = stability.model_copy(update={"snapshot": snapshot})
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
@@ -4437,6 +4501,7 @@ def test_launch_latest_stable_canary_once_skips_when_venue_live_notional_budget_
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
             )
         )
@@ -4453,6 +4518,7 @@ def test_launch_latest_stable_canary_once_allows_venue_live_notional_budget_at_e
 ) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_active_live_executions=5,
         stable_canary_launch_max_live_notional_per_venue=45.0,
     )
     execution_store = ExecutionJournalStore(settings.database_path)
@@ -4589,6 +4655,17 @@ def test_launch_latest_stable_canary_once_allows_venue_live_notional_budget_at_e
     persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
     snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
     stability = stability.model_copy(update={"snapshot": snapshot})
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
 
     class StubLifecycleResult:
         def __init__(self) -> None:
@@ -4633,6 +4710,11 @@ def test_launch_latest_stable_canary_once_allows_venue_live_notional_budget_at_e
                 paper_trade=self.paper_trade,
                 legs=[_build_auto_close_execution_leg()],
             )
+            self.final_pair_status = _build_auto_close_pair_status(
+                execution=self.execution,
+                derived_state="closed",
+                recommended_action="no_action",
+            )
             self.observation = ExecutionObservationEntry(
                 observed_at=datetime(2026, 4, 4, 10, 3, tzinfo=UTC),
                 context="worker_execution_monitor",
@@ -4667,6 +4749,7 @@ def test_launch_latest_stable_canary_once_allows_venue_live_notional_budget_at_e
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
             )
         )
