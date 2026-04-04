@@ -70,6 +70,7 @@ class WorkerSettings(BaseSettings):
         gt=0,
     )
     execution_auto_pair_close_max_hold_windows: float = Field(default=2.0, gt=0)
+    execution_auto_pair_close_timeout_seconds: float = Field(default=30.0, gt=0)
     execution_alert_webhook_url: str | None = None
     execution_alert_webhook_timeout_seconds: float = Field(default=10.0, gt=0)
     score_timeout_seconds: float = Field(default=30.0, gt=0)

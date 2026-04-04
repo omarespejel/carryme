@@ -1013,40 +1013,55 @@ async def _maybe_auto_close_open_hedged_execution(
         latest_snapshot.candidate,
     )
 
-    paper_trade_entry, latest_execution, _, pair_close_preview = (
-        await _build_pair_close_context_for_paper_trade(
-            paper_trade_id=paper_trade.entry_id,
-            settings=api_settings,
-            paper_store=PaperTradeStore(api_settings.database_path),
-            execution_store=execution_store,
-            account_service=account_service,
-            order_state_service=order_state_service,
-            pair_close_service=pair_close_preview_service,
+    try:
+        async with asyncio.timeout(settings.execution_auto_pair_close_timeout_seconds):
+            paper_trade_entry, latest_execution, _, pair_close_preview = (
+                await _build_pair_close_context_for_paper_trade(
+                    paper_trade_id=paper_trade.entry_id,
+                    settings=api_settings,
+                    paper_store=PaperTradeStore(api_settings.database_path),
+                    execution_store=execution_store,
+                    account_service=account_service,
+                    order_state_service=order_state_service,
+                    pair_close_service=pair_close_preview_service,
+                )
+            )
+            confirmation = _append_pair_close_confirmation_for_preview(
+                paper_trade=paper_trade_entry,
+                confirmation_store=PairClosePreviewConfirmationStore(api_settings.database_path),
+                preview=pair_close_preview,
+                note=f"worker auto-close: {close_reason}",
+            )
+            result = await _execute_guarded_pair_close_from_confirmation(
+                paper_trade=paper_trade_entry,
+                confirmation=confirmation,
+                settings=api_settings,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                cleanup_confirmation_store=CleanupPreviewConfirmationStore(
+                    api_settings.database_path
+                ),
+                account_preflight_service=account_service,
+                order_state_service=order_state_service,
+                cleanup_preview_service=cleanup_preview_service,
+                cleanup_live_router=cleanup_live_router,
+                service=pair_close_live_service,
+                first_venue="auto",
+                poll_attempts=5,
+                poll_interval_seconds=2.0,
+                auto_cleanup=True,
+            )
+    except TimeoutError:
+        logger.warning(
+            (
+                "timed out auto-closing paper_trade_id=%s from execution_entry_id=%s "
+                "after %.1f seconds"
+            ),
+            paper_trade.entry_id,
+            execution.entry_id,
+            settings.execution_auto_pair_close_timeout_seconds,
         )
-    )
-    confirmation = _append_pair_close_confirmation_for_preview(
-        paper_trade=paper_trade_entry,
-        confirmation_store=PairClosePreviewConfirmationStore(api_settings.database_path),
-        preview=pair_close_preview,
-        note=f"worker auto-close: {close_reason}",
-    )
-    result = await _execute_guarded_pair_close_from_confirmation(
-        paper_trade=paper_trade_entry,
-        confirmation=confirmation,
-        settings=api_settings,
-        execution_store=execution_store,
-        observation_store=observation_store,
-        cleanup_confirmation_store=CleanupPreviewConfirmationStore(api_settings.database_path),
-        account_preflight_service=account_service,
-        order_state_service=order_state_service,
-        cleanup_preview_service=cleanup_preview_service,
-        cleanup_live_router=cleanup_live_router,
-        service=pair_close_live_service,
-        first_venue="auto",
-        poll_attempts=5,
-        poll_interval_seconds=2.0,
-        auto_cleanup=True,
-    )
+        return None
     logger.info(
         "auto-closed paper_trade_id=%s from execution_entry_id=%s because %s",
         paper_trade.entry_id,

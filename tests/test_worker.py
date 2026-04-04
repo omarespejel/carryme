@@ -4,7 +4,7 @@ import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 import pytest
@@ -116,6 +116,7 @@ from carryme_worker.poller import (
     UniverseScanSummary,
     _build_open_hedge_auto_close_reason,
     _build_order_state_observers,
+    _maybe_auto_close_open_hedged_execution,
     cache_launch_ready_canaries_once,
     install_signal_handlers,
     launch_latest_stable_canary_once,
@@ -187,6 +188,10 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
         raising=False,
     )
     monkeypatch.delenv(
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_TIMEOUT_SECONDS",
+        raising=False,
+    )
+    monkeypatch.delenv(
         "CARRYME_WORKER_STABLE_LAUNCH_READY_MIN_EDGE_RETENTION_RATIO",
         raising=False,
     )
@@ -224,6 +229,7 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.execution_auto_pair_close_min_entry_edge_retention_ratio == 0.35
     assert settings.execution_auto_pair_close_max_round_trip_break_even_hold_windows == 2.5
     assert settings.execution_auto_pair_close_max_hold_windows == 2.0
+    assert settings.execution_auto_pair_close_timeout_seconds == 30.0
     assert settings.stable_launch_ready_min_edge_retention_ratio == 0.7
     assert settings.stable_launch_ready_max_entry_break_even_funding_windows == 6.0
     assert settings.stable_launch_ready_max_round_trip_break_even_funding_windows == 12.0
@@ -4416,6 +4422,162 @@ def test_launch_latest_stable_canary_once_ignores_unselected_live_credentials(
     assert summary.paper_trade_id == 17
 
 
+def _build_auto_close_paper_trade(
+    *,
+    entry_id: int,
+    created_at: datetime,
+    label: str = "jup_extended_paradex",
+    canonical_symbol: str = "JUP-USD-PERP",
+    entry_edge: float = 0.0012,
+) -> PaperTradeEntry:
+    return PaperTradeEntry(
+        entry_id=entry_id,
+        created_at=created_at,
+        intent=FundingPairTradeIntent(
+            label=label,
+            canonical_symbol=canonical_symbol,
+            source_recorded_at=created_at,
+            one_day_net_edge_after_entry=entry_edge,
+            break_even_days_entry=0.2,
+            capacity_limit_notional=300.0,
+            target_notional=25.0,
+            capacity_fraction=25.0 / 300.0,
+            max_target_notional=25.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol=f"{canonical_symbol}",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol=canonical_symbol.replace("-PERP", ""),
+                fee_profile="default",
+                side="sell",
+                target_notional=25.0,
+            ),
+        ),
+    )
+
+
+def _build_auto_close_snapshot(
+    *,
+    captured_at: datetime,
+    label: str = "jup_extended_paradex",
+    canonical_symbol: str = "JUP-USD-PERP",
+    entry_edge: float = 0.0010,
+    round_trip_edge: float = 0.0008,
+    break_even_days_round_trip: float | None = 0.4,
+) -> ApprovedCanarySnapshot:
+    return ApprovedCanarySnapshot(
+        captured_at=captured_at,
+        label=label,
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol=canonical_symbol,
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.0014,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=entry_edge,
+                    one_day_net_edge_after_round_trip=round_trip_edge,
+                    break_even_days_entry=0.1,
+                    break_even_days_round_trip=break_even_days_round_trip,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=500.0,
+                        long_ask_notional=400.0,
+                        max_entry_notional=400.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol=canonical_symbol.replace("-PERP", ""),
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol=canonical_symbol,
+                    ),
+                },
+                deployable_notional=400.0,
+                estimated_one_day_pnl_after_round_trip=0.3,
+            ),
+            suggested_canary_notional=25.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=captured_at,
+            label=label,
+            canonical_symbol=canonical_symbol,
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=25.0,
+            note="approved canary",
+        ),
+    )
+
+
+def _build_auto_close_pair_status(
+    *,
+    execution: ExecutionJournalEntry,
+    derived_state: Literal[
+        "hedged",
+        "pending",
+        "unfilled",
+        "closed",
+        "cleanup_needed",
+        "review_required",
+    ] = "hedged",
+    recommended_action: str = "monitor_open_hedge",
+) -> ExecutionPairStatus:
+    return ExecutionPairStatus(
+        execution_entry_id=execution.entry_id or 1,
+        paper_trade_id=execution.paper_trade_id,
+        preview_hash=execution.preview_hash,
+        derived_state=derived_state,
+        recommended_action=recommended_action,
+        order_state=ExecutionOrderState(
+            execution_entry_id=execution.entry_id or 1,
+            paper_trade_id=execution.paper_trade_id,
+            preview_hash=execution.preview_hash,
+            legs=[],
+            notes=[],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=execution.entry_id or 1,
+            paper_trade_id=execution.paper_trade_id,
+            preview_hash=execution.preview_hash,
+            status="accepted",
+            recommended_action="no_action",
+            matched_all_leg_symbols=True,
+            venues=[],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+
+def _build_auto_close_execution_leg() -> ExecutionLegResult:
+    return ExecutionLegResult(
+        venue="extended",
+        symbol="JUP-USD",
+        fee_profile="default",
+        side="sell",
+        target_notional=25.0,
+        status="submitted",
+        simulated=False,
+        external_reference="ext-order-auto-close",
+    )
+
+
 def test_build_open_hedge_auto_close_reason_flags_entry_edge_decay() -> None:
     settings = WorkerSettings(
         execution_auto_pair_close_enabled=True,
@@ -4608,6 +4770,54 @@ def test_build_open_hedge_auto_close_reason_flags_max_hold_windows() -> None:
 
     assert reason is not None
     assert reason.startswith("hold age windows")
+
+
+def test_build_open_hedge_auto_close_reason_flags_non_positive_round_trip_edge() -> None:
+    settings = WorkerSettings(execution_auto_pair_close_enabled=True)
+    paper_trade = _build_auto_close_paper_trade(
+        entry_id=13,
+        created_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+    )
+    snapshot = _build_auto_close_snapshot(
+        captured_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        round_trip_edge=0.0,
+    )
+
+    reason = _build_open_hedge_auto_close_reason(
+        paper_trade=paper_trade,
+        snapshot=snapshot,
+        settings=settings,
+        now=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+    )
+
+    assert reason is not None
+    assert reason.startswith("latest approved round-trip edge is non-positive")
+
+
+def test_build_open_hedge_auto_close_reason_flags_round_trip_break_even_hold_windows() -> None:
+    settings = WorkerSettings(
+        execution_auto_pair_close_enabled=True,
+        execution_auto_pair_close_max_hold_windows=10.0,
+        execution_auto_pair_close_max_round_trip_break_even_hold_windows=1.0,
+    )
+    paper_trade = _build_auto_close_paper_trade(
+        entry_id=14,
+        created_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+    )
+    snapshot = _build_auto_close_snapshot(
+        captured_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        break_even_days_round_trip=0.7,
+    )
+
+    reason = _build_open_hedge_auto_close_reason(
+        paper_trade=paper_trade,
+        snapshot=snapshot,
+        settings=settings,
+        now=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+    )
+
+    assert reason is not None
+    assert reason.startswith("round-trip break-even hold windows")
 
 
 def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
@@ -6333,6 +6543,217 @@ def test_observe_live_executions_once_triggers_auto_close_for_hedged_pairs(
 
     assert summary.observed_executions == 1
     assert auto_close_calls == [7]
+
+
+def test_maybe_auto_close_open_hedged_execution_skips_when_policy_disabled(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=False,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=15,
+            preview_hash="auto-close-preview",
+            confirmation_entry_id=20,
+            paper_trade=_build_auto_close_paper_trade(
+                entry_id=15,
+                created_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+            ),
+            legs=[_build_auto_close_execution_leg()],
+        )
+    )
+
+    class UnexpectedApprovedStore:
+        def latest(self, label: str) -> ApprovedCanarySnapshot | None:
+            _ = label
+            raise AssertionError("policy-disabled auto-close must not query approved snapshots")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("policy-disabled auto-close must not build pair-close context")
+            ),
+        )
+        result = asyncio.run(
+            _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=_build_auto_close_pair_status(execution=execution),
+                approved_store=cast(ApprovedCanaryStore, UnexpectedApprovedStore()),
+                execution_store=execution_store,
+                observation_store=observation_store,
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                logger=logging.getLogger("test"),
+                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result is None
+
+
+def test_maybe_auto_close_open_hedged_execution_skips_non_hedged_pair_status(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=True,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=16,
+            preview_hash="non-hedged-preview",
+            confirmation_entry_id=21,
+            paper_trade=_build_auto_close_paper_trade(
+                entry_id=16,
+                created_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+            ),
+            legs=[_build_auto_close_execution_leg()],
+        )
+    )
+
+    class UnexpectedApprovedStore:
+        def latest(self, label: str) -> ApprovedCanarySnapshot | None:
+            _ = label
+            raise AssertionError("non-hedged auto-close must not query approved snapshots")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("non-hedged auto-close must not build pair-close context")
+            ),
+        )
+        result = asyncio.run(
+            _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=_build_auto_close_pair_status(
+                    execution=execution,
+                    derived_state="cleanup_needed",
+                    recommended_action="no_action",
+                ),
+                approved_store=cast(ApprovedCanaryStore, UnexpectedApprovedStore()),
+                execution_store=execution_store,
+                observation_store=observation_store,
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                logger=logging.getLogger("test"),
+                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result is None
+
+
+def test_maybe_auto_close_open_hedged_execution_times_out(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=True,
+        execution_auto_pair_close_timeout_seconds=0.01,
+        execution_auto_pair_close_max_hold_windows=10.0,
+        execution_auto_pair_close_max_round_trip_break_even_hold_windows=10.0,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=17,
+            preview_hash="timeout-preview",
+            confirmation_entry_id=22,
+            paper_trade=_build_auto_close_paper_trade(
+                entry_id=17,
+                created_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
+            ),
+            legs=[_build_auto_close_execution_leg()],
+        )
+    )
+    approved_store.append(
+        _build_auto_close_snapshot(
+            captured_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            break_even_days_round_trip=0.2,
+        )
+    )
+
+    async def slow_pair_close_context(**kwargs: object) -> tuple[object, object, object, object]:
+        _ = kwargs
+        await asyncio.sleep(0.05)
+        raise AssertionError("timeout should fire before pair-close context completes")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_preview_service_for_candidate",
+            lambda *args, **kwargs: object(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_preview_router_for_candidate",
+            lambda *args, **kwargs: object(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_live_execution_coordinator_for_candidate",
+            lambda *args, **kwargs: object(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_live_execution_router_for_candidate",
+            lambda *args, **kwargs: object(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
+            slow_pair_close_context,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._execute_guarded_pair_close_from_confirmation",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("timed-out auto-close must not execute downstream close")
+            ),
+        )
+        result = asyncio.run(
+            _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=_build_auto_close_pair_status(execution=execution),
+                approved_store=approved_store,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                logger=logging.getLogger("test"),
+                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result is None
 
 
 def test_observe_live_executions_once_skips_failed_observations(tmp_path: Path) -> None:
