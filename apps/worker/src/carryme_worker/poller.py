@@ -356,6 +356,83 @@ class StableCanaryLaunchLoopSummary:
     database_path: str
 
 
+def _list_blocking_live_executions_for_stable_launch(
+    *,
+    settings: WorkerSettings,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    now: datetime,
+) -> list[tuple[int, str, str]]:
+    """Return live executions that should block unattended launch."""
+
+    blocking: list[tuple[int, str, str]] = []
+    recent_live_executions = _list_recent_live_executions(
+        execution_store,
+        observation_store,
+        limit=settings.stable_canary_launch_active_execution_limit,
+        now=now,
+        max_age_seconds=settings.execution_observation_max_age_seconds,
+    )
+    for execution in recent_live_executions:
+        paper_trade_id = execution.paper_trade_id
+        paper_trade = execution.paper_trade
+        if paper_trade_id is None or paper_trade is None:
+            continue
+        latest = observation_store.latest_for_paper_trade(paper_trade_id)
+        if latest is None:
+            blocking.append(
+                (
+                    paper_trade_id,
+                    paper_trade.intent.label,
+                    "pending_initial_monitoring",
+                )
+            )
+            continue
+        pair_status = latest.pair_status
+        if pair_status is None:
+            if _execution_requires_continued_monitoring(
+                observation_store,
+                execution=execution,
+            ):
+                blocking.append(
+                    (
+                        paper_trade_id,
+                        paper_trade.intent.label,
+                        "pending_pair_status",
+                    )
+                )
+            continue
+        if (
+            pair_status.derived_state in {"hedged", "cleanup_needed", "review_required"}
+            or pair_status.recommended_action != "no_action"
+        ):
+            blocking.append(
+                (
+                    paper_trade_id,
+                    paper_trade.intent.label,
+                    f"{pair_status.derived_state}/{pair_status.recommended_action}",
+                )
+            )
+    return blocking
+
+
+def _build_blocking_live_execution_detail(
+    *,
+    blocking: list[tuple[int, str, str]],
+    max_active_live_executions: int,
+) -> str:
+    summary = ", ".join(
+        f"paper_trade_id={paper_trade_id} label={label} state={state}"
+        for paper_trade_id, label, state in blocking[:3]
+    )
+    if len(blocking) > 3:
+        summary += f", +{len(blocking) - 3} more"
+    return (
+        "Active live executions still require monitoring before unattended launch "
+        f"(max_allowed={max_active_live_executions}, current={len(blocking)}): {summary}"
+    )
+
+
 @dataclass
 class ProductionSupervisorCycleSummary:
     """Summary emitted after one end-to-end production supervisor cycle."""
@@ -1969,10 +2046,31 @@ async def launch_latest_stable_canary_once(
     launch_ready_store = LaunchReadyCanaryStore(runtime_settings.database_path)
     stable_launch_store = launch_store or StableCanaryLaunchStore(runtime_settings.database_path)
     source_approved_store = approved_store or ApprovedCanaryStore(runtime_settings.database_path)
+    execution_store = ExecutionJournalStore(runtime_settings.database_path)
+    observation_store = ExecutionObservationStore(runtime_settings.database_path)
     route_approval_service = RouteApprovalService(
         store=RouteApprovalStore(runtime_settings.database_path)
     )
     timestamp = now or datetime.now(UTC)
+
+    blocking_live_executions = _list_blocking_live_executions_for_stable_launch(
+        settings=settings,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        now=timestamp,
+    )
+    if (
+        len(blocking_live_executions)
+        > settings.stable_canary_launch_max_active_live_executions
+    ):
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            detail=_build_blocking_live_execution_detail(
+                blocking=blocking_live_executions,
+                max_active_live_executions=settings.stable_canary_launch_max_active_live_executions,
+            ),
+        )
 
     try:
         stability = _build_launch_ready_canary_stability(
