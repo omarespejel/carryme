@@ -105,6 +105,11 @@ from carryme_worker.notifications import (
 
 logger = logging.getLogger(__name__)
 OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
+FUNDING_WINDOW_HOURS_BY_VENUE: dict[str, float] = {
+    "extended": 1.0,
+    "paradex": 8.0,
+    "hyperliquid": 8.0,
+}
 
 
 def _rank_approved_canary_candidate(
@@ -720,6 +725,129 @@ def _normalized_launch_ready_snapshot_payload(
     return payload
 
 
+def _approved_snapshot_route_key(
+    snapshot: ApprovedCanarySnapshot,
+) -> tuple[str, str, str, str, str, str]:
+    """Return the normalized identity key for one approved snapshot route."""
+
+    opportunity = snapshot.candidate.opportunity.opportunity
+    return (
+        snapshot.label,
+        opportunity.canonical_symbol,
+        opportunity.short_venue,
+        opportunity.long_venue,
+        opportunity.short_fee_profile,
+        opportunity.long_fee_profile,
+    )
+
+
+def _effective_funding_window_hours(snapshot: ApprovedCanarySnapshot) -> float:
+    """Return the fastest relevant funding interval across the route venues."""
+
+    opportunity = snapshot.candidate.opportunity.opportunity
+    hours = [
+        FUNDING_WINDOW_HOURS_BY_VENUE.get(opportunity.short_venue, 8.0),
+        FUNDING_WINDOW_HOURS_BY_VENUE.get(opportunity.long_venue, 8.0),
+    ]
+    return min(hours)
+
+
+def _list_recent_approved_snapshot_chain(
+    *,
+    store: ApprovedCanaryStore,
+    snapshot: ApprovedCanarySnapshot,
+    max_snapshot_age_seconds: int,
+    limit: int = 20,
+) -> list[ApprovedCanarySnapshot]:
+    """Return the recent same-route approved snapshot chain for one label."""
+
+    route_key = _approved_snapshot_route_key(snapshot)
+    recent_snapshots = store.list_recent(limit=limit, label=snapshot.label)
+    chain: list[ApprovedCanarySnapshot] = []
+    for recent_snapshot in recent_snapshots:
+        if _approved_snapshot_route_key(recent_snapshot) != route_key:
+            break
+        age_seconds = max(
+            0.0,
+            (snapshot.captured_at - recent_snapshot.captured_at).total_seconds(),
+        )
+        if age_seconds > max_snapshot_age_seconds:
+            break
+        chain.append(recent_snapshot)
+    return chain
+
+
+def _build_approved_snapshot_automation_gate_reason(
+    *,
+    snapshot: ApprovedCanarySnapshot,
+    recent_chain: list[ApprovedCanarySnapshot],
+    settings: WorkerSettings,
+) -> str | None:
+    """Return the blocking reason for unattended launch-readiness, if any."""
+
+    opportunity = snapshot.candidate.opportunity.opportunity
+    current_entry_edge = opportunity.one_day_net_edge_after_entry
+    current_round_trip_edge = opportunity.one_day_net_edge_after_round_trip
+
+    max_entry_edge = max(
+        item.candidate.opportunity.opportunity.one_day_net_edge_after_entry
+        for item in recent_chain
+    )
+    max_round_trip_edge = max(
+        item.candidate.opportunity.opportunity.one_day_net_edge_after_round_trip
+        for item in recent_chain
+    )
+    if max_entry_edge <= 0 or max_round_trip_edge <= 0:
+        return "recent approved snapshot chain has non-positive net edge"
+
+    min_retention_ratio = settings.stable_launch_ready_min_edge_retention_ratio
+    entry_retention_ratio = current_entry_edge / max_entry_edge
+    if entry_retention_ratio < min_retention_ratio:
+        return (
+            "entry edge retention "
+            f"{entry_retention_ratio:.2f} below minimum {min_retention_ratio:.2f}"
+        )
+
+    round_trip_retention_ratio = current_round_trip_edge / max_round_trip_edge
+    if round_trip_retention_ratio < min_retention_ratio:
+        return (
+            "round-trip edge retention "
+            f"{round_trip_retention_ratio:.2f} below minimum {min_retention_ratio:.2f}"
+        )
+
+    break_even_days_entry = opportunity.break_even_days_entry
+    break_even_days_round_trip = opportunity.break_even_days_round_trip
+    if break_even_days_entry is None or break_even_days_round_trip is None:
+        return "approved canary snapshot is missing break-even timing"
+
+    funding_window_hours = _effective_funding_window_hours(snapshot)
+    entry_break_even_windows = break_even_days_entry * 24.0 / funding_window_hours
+    if (
+        entry_break_even_windows
+        > settings.stable_launch_ready_max_entry_break_even_funding_windows
+    ):
+        return (
+            "entry break-even funding windows "
+            f"{entry_break_even_windows:.2f} exceeds maximum "
+            f"{settings.stable_launch_ready_max_entry_break_even_funding_windows:.2f}"
+        )
+
+    round_trip_break_even_windows = (
+        break_even_days_round_trip * 24.0 / funding_window_hours
+    )
+    if (
+        round_trip_break_even_windows
+        > settings.stable_launch_ready_max_round_trip_break_even_funding_windows
+    ):
+        return (
+            "round-trip break-even funding windows "
+            f"{round_trip_break_even_windows:.2f} exceeds maximum "
+            f"{settings.stable_launch_ready_max_round_trip_break_even_funding_windows:.2f}"
+        )
+
+    return None
+
+
 def _build_latest_launch_ready_stability(
     *,
     store: LaunchReadyCanaryStore,
@@ -1056,6 +1184,23 @@ async def cache_launch_ready_canaries_once(
                 "approval": refreshed_approval,
             }
         )
+        recent_approved_chain = _list_recent_approved_snapshot_chain(
+            store=source_store,
+            snapshot=refreshed_snapshot,
+            max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+        )
+        automation_gate_reason = _build_approved_snapshot_automation_gate_reason(
+            snapshot=refreshed_snapshot,
+            recent_chain=recent_approved_chain or [refreshed_snapshot],
+            settings=settings,
+        )
+        if automation_gate_reason is not None:
+            loop_logger.debug(
+                "skipping launch-ready snapshot label=%s because %s",
+                label,
+                automation_gate_reason,
+            )
+            continue
         system_state = await _probe_candidate_system_state(
             settings=settings,
             service=runtime,
@@ -1263,6 +1408,7 @@ async def launch_latest_stable_canary_once(
     *,
     api_settings: ApiSettings | None = None,
     launch_store: StableCanaryLaunchStore | None = None,
+    approved_store: ApprovedCanaryStore | None = None,
     now: datetime | None = None,
 ) -> StableCanaryLaunchSummary:
     """Launch the latest stable cached canary once, or skip deterministically."""
@@ -1270,6 +1416,7 @@ async def launch_latest_stable_canary_once(
     runtime_settings = api_settings or _build_api_settings_from_worker_settings(settings)
     launch_ready_store = LaunchReadyCanaryStore(runtime_settings.database_path)
     stable_launch_store = launch_store or StableCanaryLaunchStore(runtime_settings.database_path)
+    source_approved_store = approved_store or ApprovedCanaryStore(runtime_settings.database_path)
     route_approval_service = RouteApprovalService(
         store=RouteApprovalStore(runtime_settings.database_path)
     )
@@ -1299,6 +1446,52 @@ async def launch_latest_stable_canary_once(
                 detail=exc.detail,
             )
         raise
+
+    latest_approved_snapshot = source_approved_store.latest(label=snapshot.label)
+    if latest_approved_snapshot is None:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail="Latest approved canary snapshot is missing for the selected label",
+        )
+    if latest_approved_snapshot.snapshot_id != snapshot.approved_snapshot.snapshot_id:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=(
+                "Launch-ready canary snapshot is stale relative to the latest "
+                "approved snapshot"
+            ),
+        )
+
+    recent_approved_chain = _list_recent_approved_snapshot_chain(
+        store=source_approved_store,
+        snapshot=latest_approved_snapshot,
+        max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+    )
+    automation_gate_reason = _build_approved_snapshot_automation_gate_reason(
+        snapshot=latest_approved_snapshot,
+        recent_chain=recent_approved_chain or [latest_approved_snapshot],
+        settings=settings,
+    )
+    if automation_gate_reason is not None:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=(
+                "Latest approved snapshot no longer satisfies automated launch "
+                f"gates: {automation_gate_reason}"
+            ),
+        )
 
     if snapshot.launch_ready_snapshot_id is not None:
         previous_launch = stable_launch_store.latest_for_snapshot(snapshot.launch_ready_snapshot_id)
