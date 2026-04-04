@@ -60,6 +60,7 @@ class WorkerSettings(BaseSettings):
     execution_observation_interval_seconds: int = Field(default=10, gt=0)
     execution_observation_max_backoff_seconds: int = Field(default=60, gt=0)
     execution_observation_max_age_seconds: int = Field(default=1800, gt=0)
+    execution_balance_checkpoint_enabled: bool = True
     execution_auto_pair_close_enabled: bool = False
     execution_auto_pair_close_shadow_mode: bool = False
     execution_auto_pair_close_min_entry_edge_retention_ratio: float = Field(

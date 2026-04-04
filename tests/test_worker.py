@@ -54,6 +54,7 @@ from carryme_runtime import (
 from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
+    BalanceSnapshotStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
@@ -7065,6 +7066,197 @@ def test_observe_live_executions_once_triggers_auto_close_for_hedged_pairs(
 
     assert summary.observed_executions == 1
     assert auto_close_calls == [7]
+
+
+def test_observe_live_executions_once_captures_funding_checkpoint_for_open_hedge(
+    tmp_path: Path,
+) -> None:
+    watchlist_path = tmp_path / "watchlist.json"
+    watchlist_path.write_text('{"pairs": []}')
+    settings = WorkerSettings(
+        watchlist_path=str(watchlist_path),
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=False,
+        execution_observation_max_age_seconds=7_200,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    snapshot_store = BalanceSnapshotStore(settings.database_path)
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, 5, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=9,
+            paper_trade=PaperTradeEntry(
+                entry_id=7,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="operator accepted candidate",
+                intent=FundingPairTradeIntent(
+                    label="near_extended_paradex",
+                    canonical_symbol="NEAR-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=25.0,
+                    capacity_fraction=25.0 / 4500.0,
+                    max_target_notional=25.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="NEAR-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=25.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="NEAR-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=25.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="NEAR-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=25.0,
+                    status="submitted",
+                    simulated=False,
+                    external_reference="ext-order-1",
+                )
+            ],
+        )
+    )
+
+    class StubAccountService:
+        async def probe_paper_trade(
+            self,
+            paper_trade: PaperTradeEntry,
+            config_map: object,
+        ) -> PaperTradeAccountPreflight:
+            assert paper_trade.entry_id == 7
+            _ = config_map
+            return PaperTradeAccountPreflight(
+                paper_trade_id=7,
+                label=paper_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        total_collateral=99.9,
+                        available_to_trade=99.9,
+                        free_collateral=99.9,
+                        position_symbols=["NEAR-USD"],
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="bearer_token",
+                        total_collateral=199.8,
+                        available_to_trade=199.8,
+                        free_collateral=199.8,
+                        position_symbols=["NEAR-USD-PERP"],
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    class StubOrderStateService:
+        async def observe_execution(self, entry: ExecutionJournalEntry) -> ExecutionOrderState:
+            return ExecutionOrderState(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                preview_hash=entry.preview_hash,
+                legs=[],
+                notes=[],
+            )
+
+    hedged_pair_status = ExecutionPairStatus(
+        execution_entry_id=1,
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        derived_state="hedged",
+        recommended_action="monitor_open_hedge",
+        order_state=ExecutionOrderState(
+            execution_entry_id=1,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            legs=[],
+            notes=[],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=1,
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            status="accepted",
+            recommended_action="no_action",
+            matched_all_leg_symbols=True,
+            venues=[],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    async def fake_auto_close(**kwargs: object) -> None:
+        _ = kwargs
+        return None
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller.build_execution_pair_status",
+            lambda *args, **kwargs: hedged_pair_status,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._maybe_auto_close_open_hedged_execution",
+            fake_auto_close,
+        )
+        asyncio.run(
+            observe_live_executions_once(
+                settings,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                approved_store=ApprovedCanaryStore(settings.database_path),
+                account_service=cast(AccountPreflightService, StubAccountService()),
+                order_state_service=cast(ExecutionOrderStateService, StubOrderStateService()),
+                now=datetime(2026, 3, 29, 14, 5, tzinfo=UTC),
+            )
+        )
+        asyncio.run(
+            observe_live_executions_once(
+                settings,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                approved_store=ApprovedCanaryStore(settings.database_path),
+                account_service=cast(AccountPreflightService, StubAccountService()),
+                order_state_service=cast(ExecutionOrderStateService, StubOrderStateService()),
+                now=datetime(2026, 3, 29, 14, 6, tzinfo=UTC),
+            )
+        )
+
+    checkpoints = snapshot_store.list_recent(
+        limit=10,
+        paper_trade_id=7,
+        stage="funding_window_checkpoint",
+    )
+
+    assert len(checkpoints) == 2
+    assert {snapshot.venue for snapshot in checkpoints} == {"extended", "paradex"}
+    assert all(snapshot.note is not None for snapshot in checkpoints)
+    assert all("window_index=1" in cast(str, snapshot.note) for snapshot in checkpoints)
 
 
 def test_maybe_auto_close_open_hedged_execution_skips_when_policy_disabled(
