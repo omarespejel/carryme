@@ -3848,7 +3848,7 @@ def test_launch_latest_stable_canary_once_respects_shadow_cooldowns_in_shadow_mo
 )
 def test_launch_latest_stable_canary_once_skips_when_latest_outcome_is_adverse(
     tmp_path: Path,
-    latest_outcome: str,
+    latest_outcome: Literal["review_required", "cleanup_needed"],
     cleanup_needed_count: int,
     review_required_count: int,
 ) -> None:
