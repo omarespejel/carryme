@@ -42,6 +42,7 @@ from carryme_models import (
     LaunchReadyCanaryStability,
     OpportunityRecord,
     PaperTradeAccountPreflight,
+    PaperTradeBalanceAttribution,
     PaperTradeEntry,
     PaperTradeSystemState,
     RouteApprovalEntry,
@@ -887,6 +888,88 @@ def _approved_snapshot_matches_paper_trade(
     )
 
 
+def _summarize_open_hedge_profit_totals(
+    balance_service: BalanceAccountingService,
+    *,
+    paper_trade_id: int,
+) -> tuple[float | None, float | None]:
+    """Return the latest and peak total collateral deltas for one open hedge."""
+
+    ordered = sorted(
+        balance_service.list_snapshots(limit=500, paper_trade_id=paper_trade_id),
+        key=lambda snapshot: snapshot.captured_at,
+    )
+    if not ordered:
+        return None, None
+
+    baseline_by_venue: dict[str, Any] = {}
+    grouped_by_capture: dict[datetime, dict[str, Any]] = {}
+    for snapshot in ordered:
+        baseline_by_venue.setdefault(snapshot.venue, snapshot)
+        grouped_by_capture.setdefault(snapshot.captured_at, {})[snapshot.venue] = snapshot
+
+    required_venues = set(baseline_by_venue)
+    latest_total: float | None = None
+    peak_total: float | None = None
+    for captured_at in sorted(grouped_by_capture):
+        snapshots = grouped_by_capture[captured_at]
+        if not required_venues.issubset(snapshots):
+            continue
+        total = 0.0
+        have_total = False
+        for venue, baseline in baseline_by_venue.items():
+            current = snapshots[venue]
+            if (
+                baseline.total_collateral is None
+                or current.total_collateral is None
+            ):
+                continue
+            total += current.total_collateral - baseline.total_collateral
+            have_total = True
+        if not have_total:
+            continue
+        latest_total = total
+        peak_total = total if peak_total is None else max(peak_total, total)
+
+    return latest_total, peak_total
+
+
+def _build_open_hedge_profit_protection_reason(
+    *,
+    paper_trade_id: int,
+    balance_service: BalanceAccountingService,
+    settings: WorkerSettings,
+    attribution: PaperTradeBalanceAttribution | None = None,
+) -> str | None:
+    """Return the deterministic reason to close one profitable hedge after giveback."""
+
+    min_profit = settings.execution_auto_pair_close_min_profit_total_collateral
+    giveback_ratio = settings.execution_auto_pair_close_max_profit_giveback_ratio
+    if min_profit is None or giveback_ratio is None:
+        return None
+
+    current_total = attribution.total_collateral_delta if attribution is not None else None
+    latest_total, peak_total = _summarize_open_hedge_profit_totals(
+        balance_service,
+        paper_trade_id=paper_trade_id,
+    )
+    if current_total is None:
+        current_total = latest_total
+    if current_total is None or peak_total is None or peak_total < min_profit:
+        return None
+
+    minimum_allowed_total = peak_total * (1.0 - giveback_ratio)
+    if current_total > minimum_allowed_total:
+        return None
+
+    giveback_total = peak_total - current_total
+    return (
+        "profit giveback "
+        f"{giveback_total:.6f} from peak {peak_total:.6f} exceeded allowed ratio "
+        f"{giveback_ratio:.2f} (current {current_total:.6f})"
+    )
+
+
 def _build_open_hedge_auto_close_reason(
     *,
     paper_trade: PaperTradeEntry,
@@ -1263,6 +1346,7 @@ async def _maybe_auto_close_open_hedged_execution(
     approved_store: ApprovedCanaryStore,
     execution_store: ExecutionJournalStore,
     observation_store: ExecutionObservationStore,
+    balance_service: BalanceAccountingService | None = None,
     account_service: AccountPreflightService,
     order_state_service: ExecutionOrderStateService,
     approval_service: RouteApprovalService | None = None,
@@ -1298,13 +1382,26 @@ async def _maybe_auto_close_open_hedged_execution(
     if latest_snapshot is None:
         return None
 
-    close_reason = _build_open_hedge_auto_close_reason(
-        paper_trade=paper_trade,
-        opened_at=execution.executed_at,
-        snapshot=latest_snapshot,
-        settings=settings,
-        now=now,
+    balance_snapshot_service = balance_service or BalanceAccountingService(
+        store=BalanceSnapshotStore(settings.database_path)
     )
+    latest_attribution = balance_snapshot_service.summarize_paper_trade_attribution(
+        paper_trade.entry_id
+    )
+    close_reason = _build_open_hedge_profit_protection_reason(
+        paper_trade_id=paper_trade.entry_id,
+        balance_service=balance_snapshot_service,
+        settings=settings,
+        attribution=latest_attribution,
+    )
+    if close_reason is None:
+        close_reason = _build_open_hedge_auto_close_reason(
+            paper_trade=paper_trade,
+            opened_at=execution.executed_at,
+            snapshot=latest_snapshot,
+            settings=settings,
+            now=now,
+        )
     if close_reason is None:
         return None
 
@@ -3306,6 +3403,7 @@ async def observe_live_executions_once(
                 approved_store=approved_snapshot_store,
                 execution_store=journal_store,
                 observation_store=history_store,
+                balance_service=balance_snapshot_service,
                 account_service=account_probe_service,
                 order_state_service=state_service,
                 approval_service=auto_close_approval_service,
