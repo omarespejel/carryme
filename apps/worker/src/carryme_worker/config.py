@@ -374,6 +374,23 @@ class WorkerSettings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_stable_launch_rate_caps(self) -> "WorkerSettings":
+        """Require a launch window whenever stable launch rate caps are configured."""
+
+        if (
+            self.stable_canary_launch_recent_launch_window_seconds is None
+            and (
+                self.stable_canary_launch_max_launches_per_window is not None
+                or self.stable_canary_launch_max_label_launches_per_window is not None
+            )
+        ):
+            raise ValueError(
+                "stable_canary_launch_recent_launch_window_seconds is required when "
+                "stable launch rate caps are configured"
+            )
+        return self
+
     @property
     def database_target(self) -> str:
         """Return a log-safe identifier for the configured database."""

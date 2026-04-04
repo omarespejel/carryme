@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -456,6 +456,20 @@ def test_worker_rejects_enabled_live_mode_without_required_credentials(tmp_path:
         WorkerSettings(
             watchlist_path=str(watchlist),
             extended_live_enabled=True,
+        )
+
+
+def test_worker_rejects_stable_launch_rate_caps_without_window(tmp_path: Path) -> None:
+    watchlist = tmp_path / "watchlist.json"
+    watchlist.write_text('{"pairs": []}')
+
+    with pytest.raises(
+        ValidationError,
+        match="stable_canary_launch_recent_launch_window_seconds",
+    ):
+        WorkerSettings(
+            watchlist_path=str(watchlist),
+            stable_canary_launch_max_launches_per_window=1,
         )
 
 
@@ -3862,9 +3876,13 @@ def test_launch_latest_stable_canary_once_skips_when_global_launch_rate_cap_reac
         stable_canary_launch_max_launches_per_window=2,
     )
     launch_store = StableCanaryLaunchStore(settings.database_path)
+    now = datetime(2026, 4, 4, 10, 20, tzinfo=UTC)
+    window_seconds = settings.stable_canary_launch_recent_launch_window_seconds
+    assert window_seconds is not None
     for launch_id, launched_at in (
-        (101, datetime(2026, 4, 4, 10, 0, tzinfo=UTC)),
-        (102, datetime(2026, 4, 4, 10, 10, tzinfo=UTC)),
+        (101, datetime(2026, 4, 4, 10, 10, tzinfo=UTC)),
+        (103, now - timedelta(seconds=window_seconds)),
+        (104, now - timedelta(seconds=window_seconds + 1)),
     ):
         launch_store.append(
             StableCanaryLaunchRecord(
@@ -3889,7 +3907,7 @@ def test_launch_latest_stable_canary_once_skips_when_global_launch_rate_cap_reac
             launch_latest_stable_canary_once(
                 settings,
                 launch_store=launch_store,
-                now=datetime(2026, 4, 4, 10, 20, tzinfo=UTC),
+                now=now,
             )
         )
 
@@ -3909,9 +3927,13 @@ def test_launch_latest_stable_canary_once_skips_when_label_launch_rate_cap_reach
         stable_canary_launch_max_label_launches_per_window=2,
     )
     launch_store = StableCanaryLaunchStore(settings.database_path)
+    now = datetime(2026, 4, 4, 10, 20, tzinfo=UTC)
+    window_seconds = settings.stable_canary_launch_recent_launch_window_seconds
+    assert window_seconds is not None
     for launch_id, launched_at in (
-        (111, datetime(2026, 4, 4, 10, 0, tzinfo=UTC)),
-        (112, datetime(2026, 4, 4, 10, 10, tzinfo=UTC)),
+        (111, datetime(2026, 4, 4, 10, 10, tzinfo=UTC)),
+        (113, now - timedelta(seconds=window_seconds)),
+        (114, now - timedelta(seconds=window_seconds + 1)),
     ):
         launch_store.append(
             StableCanaryLaunchRecord(
@@ -3947,7 +3969,7 @@ def test_launch_latest_stable_canary_once_skips_when_label_launch_rate_cap_reach
             launch_latest_stable_canary_once(
                 settings,
                 launch_store=launch_store,
-                now=datetime(2026, 4, 4, 10, 20, tzinfo=UTC),
+                now=now,
             )
         )
 
