@@ -3841,6 +3841,17 @@ def test_launch_latest_stable_canary_once_skips_when_execution_maturity_missing(
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_min_execution_quality_score=0.55,
     )
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
     approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
         label="arb_extended_paradex",
         execution_quality=None,
@@ -3868,6 +3879,7 @@ def test_launch_latest_stable_canary_once_skips_when_execution_maturity_missing(
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
             )
         )
@@ -3882,6 +3894,17 @@ def test_launch_latest_stable_canary_once_skips_when_execution_sample_requiremen
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_min_execution_samples=2,
+    )
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
     )
     approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
         label="arb_extended_paradex",
@@ -3918,6 +3941,7 @@ def test_launch_latest_stable_canary_once_skips_when_execution_sample_requiremen
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
             )
         )
@@ -3934,6 +3958,17 @@ def test_launch_latest_stable_canary_once_skips_when_execution_quality_requireme
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_min_execution_quality_score=0.6,
+    )
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
     )
     approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
         label="arb_extended_paradex",
@@ -3971,6 +4006,7 @@ def test_launch_latest_stable_canary_once_skips_when_execution_quality_requireme
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
             )
         )

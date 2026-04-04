@@ -2535,6 +2535,26 @@ async def launch_latest_stable_canary_once(
             ),
         )
 
+    execution_maturity_reason = _build_stable_launch_execution_maturity_reason(
+        settings=settings,
+        candidate=latest_approved_snapshot.candidate,
+    )
+    if execution_maturity_reason is not None:
+        if settings.stable_canary_launch_shadow_mode:
+            logging.getLogger("carryme.worker").info(
+                "shadow launch maturity blocked label=%s because %s",
+                snapshot.label,
+                execution_maturity_reason,
+            )
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=execution_maturity_reason,
+        )
+
     recent_approved_chain = _list_recent_approved_snapshot_chain(
         store=source_approved_store,
         snapshot=latest_approved_snapshot,
