@@ -366,10 +366,14 @@ def _list_blocking_live_executions_for_stable_launch(
     """Return live executions that should block unattended launch."""
 
     blocking: list[tuple[int, str, str]] = []
+    scan_limit = max(
+        settings.stable_canary_launch_active_execution_limit,
+        settings.stable_canary_launch_max_active_live_executions + 1,
+    )
     recent_live_executions = _list_recent_live_executions(
         execution_store,
         observation_store,
-        limit=settings.stable_canary_launch_active_execution_limit,
+        limit=scan_limit,
         now=now,
         max_age_seconds=settings.execution_observation_max_age_seconds,
     )

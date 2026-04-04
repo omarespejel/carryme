@@ -3611,6 +3611,78 @@ def test_launch_latest_stable_canary_once_skips_when_recent_live_trade_is_unobse
     )
 
 
+def test_launch_latest_stable_canary_once_counts_beyond_active_execution_scan_limit(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_active_live_executions=1,
+        stable_canary_launch_active_execution_limit=1,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+
+    for paper_trade_id, label, preview_hash in (
+        (41, "near_extended_paradex", "blocking-live-preview-1"),
+        (42, "jup_extended_paradex", "blocking-live-preview-2"),
+    ):
+        execution = execution_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+                adapter="paired_live:extended_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=preview_hash,
+                confirmation_entry_id=paper_trade_id + 100,
+                paper_trade=_build_auto_close_paper_trade(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
+                    label=label,
+                ),
+                legs=[_build_auto_close_execution_leg()],
+            )
+        )
+        observation_store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                context="worker_execution_monitor",
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=execution.preview_hash,
+                order_state=ExecutionOrderState(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=execution.preview_hash,
+                    legs=[],
+                    notes=[],
+                ),
+                pair_status=_build_auto_close_pair_status(
+                    execution=execution,
+                    derived_state="hedged",
+                    recommended_action="monitor_open_hedge",
+                ),
+            )
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("blocking live executions must short-circuit launch selection")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert "max_allowed=1, current=2" in cast(str, summary.detail)
+
+
 def test_launch_latest_stable_canary_once_skips_stale_latest_approved_snapshot(
     tmp_path: Path,
 ) -> None:
