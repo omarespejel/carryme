@@ -296,6 +296,87 @@ async def scan_exact_canary_candidate_for_approval(
     return None, len(candidates)
 
 
+async def scan_live_route_candidate_for_approval(
+    *,
+    scanner: OpportunityUniverseService,
+    approval: RouteApprovalEntry,
+    venues: list[str],
+    target_notional: float,
+    canary_max_notional: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+    include_symbols: list[str] | None,
+    exclude_symbols: list[str] | None,
+    exclude_tags: list[str] | None,
+    limit: int,
+    fee_profile_overrides: dict[str, str] | None = None,
+) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+    """Revalidate one exact live route even after its canary edge has decayed."""
+
+    selected_venues = {venue.lower() for venue in venues}
+    approval_venues = {approval.short_venue.lower(), approval.long_venue.lower()}
+    if not approval_venues.issubset(selected_venues):
+        return None, 0
+    if include_symbols is not None and approval.canonical_symbol not in include_symbols:
+        return None, 0
+    if exclude_symbols is not None and approval.canonical_symbol in exclude_symbols:
+        return None, 0
+
+    exact_fee_profiles = dict(fee_profile_overrides or {})
+    exact_fee_profiles[approval.short_venue] = approval.short_fee_profile
+    exact_fee_profiles[approval.long_venue] = approval.long_fee_profile
+
+    scan = await scanner.scan(
+        venues=[approval.short_venue, approval.long_venue],
+        ranking="route_adjusted_quality_pnl",
+        fee_profile_overrides=exact_fee_profiles,
+        target_notional=target_notional,
+        min_capacity_notional=min_capacity_notional,
+        min_daily_volume=min_daily_volume,
+        min_open_interest=min_open_interest,
+        min_roundtrip_edge=min_roundtrip_edge,
+        min_execution_quality_score=min_execution_quality_score,
+        min_execution_samples=min_execution_samples,
+        min_route_stability_weight=min_route_stability_weight,
+        min_route_presence_ratio=min_route_presence_ratio,
+        min_route_samples=min_route_samples,
+        include_symbols=[approval.canonical_symbol],
+        exclude_symbols=exclude_symbols,
+        exclude_tags=exclude_tags,
+        limit=max(2, limit),
+    )
+
+    for opportunity in scan.opportunities:
+        modeled = opportunity.opportunity
+        if (
+            modeled.canonical_symbol != approval.canonical_symbol
+            or modeled.short_venue != approval.short_venue
+            or modeled.long_venue != approval.long_venue
+            or modeled.short_fee_profile != approval.short_fee_profile
+            or modeled.long_fee_profile != approval.long_fee_profile
+        ):
+            continue
+        deployable_notional = opportunity.deployable_notional
+        suggested_canary_notional = canary_max_notional
+        if deployable_notional is not None and deployable_notional > 0:
+            suggested_canary_notional = min(canary_max_notional, deployable_notional)
+        return (
+            FundingUniverseCanaryCandidate(
+                opportunity=opportunity,
+                suggested_canary_notional=max(suggested_canary_notional, 0.0),
+            ),
+            len(scan.opportunities),
+        )
+    return None, len(scan.opportunities)
+
+
 def _same_route_identity(left: RouteApprovalEntry, right: RouteApprovalEntry) -> bool:
     return (
         left.label == right.label

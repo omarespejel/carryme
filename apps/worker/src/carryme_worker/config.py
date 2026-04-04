@@ -63,6 +63,11 @@ class WorkerSettings(BaseSettings):
     execution_balance_checkpoint_enabled: bool = True
     execution_auto_pair_close_enabled: bool = False
     execution_auto_pair_close_shadow_mode: bool = False
+    execution_auto_pair_close_max_snapshot_age_seconds: int = Field(default=300, gt=0)
+    execution_auto_pair_close_live_revalidation_timeout_seconds: float = Field(
+        default=20.0,
+        gt=0,
+    )
     execution_auto_pair_close_min_entry_edge_retention_ratio: float = Field(
         default=0.35,
         ge=0,

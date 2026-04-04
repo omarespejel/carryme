@@ -234,6 +234,8 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.execution_observation_max_backoff_seconds == 60
     assert settings.execution_auto_pair_close_enabled is False
     assert settings.execution_auto_pair_close_shadow_mode is False
+    assert settings.execution_auto_pair_close_max_snapshot_age_seconds == 300
+    assert settings.execution_auto_pair_close_live_revalidation_timeout_seconds == 20.0
     assert settings.execution_auto_pair_close_min_entry_edge_retention_ratio == 0.35
     assert settings.execution_auto_pair_close_max_round_trip_break_even_hold_windows == 2.5
     assert settings.execution_auto_pair_close_max_hold_windows == 2.0
@@ -5421,6 +5423,13 @@ def test_maybe_auto_close_open_hedged_execution_shadow_mode_logs_without_closing
     )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
+        async def unexpected_live_revalidation(**_: object) -> tuple[object, int]:
+            raise AssertionError("fresh approved snapshots must not trigger live revalidation")
+
+        monkeypatch.setattr(
+            "carryme_worker.poller.scan_live_route_candidate_for_approval",
+            unexpected_live_revalidation,
+        )
         monkeypatch.setattr(
             "carryme_worker.poller._build_pair_close_context_for_paper_trade",
             lambda **_: (_ for _ in ()).throw(
@@ -5445,6 +5454,258 @@ def test_maybe_auto_close_open_hedged_execution_shadow_mode_logs_without_closing
 
     assert result is None
     assert "shadow auto-close for paper_trade_id=11" in caplog.text
+    assert "source=approved_snapshot" in caplog.text
+
+
+def test_maybe_auto_close_open_hedged_execution_shadow_mode_revalidates_stale_snapshot(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_shadow_mode=True,
+        execution_auto_pair_close_max_snapshot_age_seconds=300,
+    )
+    approval_store = ApprovedCanaryStore(settings.database_path)
+    approval_store.append(
+        _build_auto_close_snapshot(
+            captured_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+        )
+    )
+    route_approval_service = RouteApprovalService(store=RouteApprovalStore(settings.database_path))
+    route_approval_service.store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+            label="jup_extended_paradex",
+            canonical_symbol="JUP-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=25.0,
+            note="approved canary",
+        )
+    )
+    execution = ExecutionJournalEntry(
+        executed_at=datetime(2026, 4, 4, 9, 30, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=18,
+        preview_hash="stale-preview-hash",
+        confirmation_entry_id=10,
+        paper_trade=_build_auto_close_paper_trade(
+            entry_id=18,
+            created_at=datetime(2026, 4, 4, 9, 26, tzinfo=UTC),
+        ),
+        legs=[_build_auto_close_execution_leg()],
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        async def fake_live_revalidation(
+            **_: object,
+        ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+            return (
+                _build_auto_close_snapshot(
+                    captured_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                    round_trip_edge=-0.0001,
+                ).candidate,
+                1,
+            )
+
+        monkeypatch.setattr(
+            "carryme_worker.poller.scan_live_route_candidate_for_approval",
+            fake_live_revalidation,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("shadow mode should not build a close context")
+            ),
+        )
+        caplog.set_level(logging.INFO)
+        result = asyncio.run(
+            _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=_build_auto_close_pair_status(execution=execution),
+                approved_store=approval_store,
+                execution_store=ExecutionJournalStore(settings.database_path),
+                observation_store=ExecutionObservationStore(settings.database_path),
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                approval_service=route_approval_service,
+                scanner=cast(Any, object()),
+                logger=logging.getLogger("carryme.worker"),
+                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result is None
+    assert "shadow auto-close for paper_trade_id=18" in caplog.text
+    assert "source=live_revalidation" in caplog.text
+
+
+def test_maybe_auto_close_open_hedged_execution_skips_when_stale_snapshot_cannot_revalidate(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=True,
+        execution_auto_pair_close_max_snapshot_age_seconds=300,
+    )
+    approval_store = ApprovedCanaryStore(settings.database_path)
+    approval_store.append(
+        _build_auto_close_snapshot(
+            captured_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+        )
+    )
+    route_approval_service = RouteApprovalService(store=RouteApprovalStore(settings.database_path))
+    route_approval_service.store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+            label="jup_extended_paradex",
+            canonical_symbol="JUP-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=25.0,
+            note="approved canary",
+        )
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=19,
+            preview_hash="missing-route-preview",
+            confirmation_entry_id=22,
+            paper_trade=_build_auto_close_paper_trade(
+                entry_id=19,
+                created_at=datetime(2026, 4, 4, 7, 0, tzinfo=UTC),
+            ),
+            legs=[_build_auto_close_execution_leg()],
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        async def missing_live_revalidation(
+            **_: object,
+        ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+            return None, 0
+
+        monkeypatch.setattr(
+            "carryme_worker.poller.scan_live_route_candidate_for_approval",
+            missing_live_revalidation,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("failed revalidation must not build pair-close context")
+            ),
+        )
+        result = asyncio.run(
+            _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=_build_auto_close_pair_status(execution=execution),
+                approved_store=approval_store,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                approval_service=route_approval_service,
+                scanner=cast(Any, object()),
+                logger=logging.getLogger("test"),
+                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result is None
+
+
+def test_maybe_auto_close_open_hedged_execution_revalidates_without_active_approval(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_shadow_mode=True,
+        execution_auto_pair_close_max_snapshot_age_seconds=300,
+    )
+    approval_store = ApprovedCanaryStore(settings.database_path)
+    approval_store.append(
+        _build_auto_close_snapshot(
+            captured_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+        )
+    )
+    execution = ExecutionJournalEntry(
+        executed_at=datetime(2026, 4, 4, 9, 30, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=20,
+        preview_hash="synthetic-approval-preview",
+        confirmation_entry_id=23,
+        paper_trade=_build_auto_close_paper_trade(
+            entry_id=20,
+            created_at=datetime(2026, 4, 4, 9, 26, tzinfo=UTC),
+        ),
+        legs=[_build_auto_close_execution_leg()],
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        async def fake_live_revalidation(
+            **_: object,
+        ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+            return (
+                _build_auto_close_snapshot(
+                    captured_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                    round_trip_edge=-0.0001,
+                ).candidate,
+                1,
+            )
+
+        monkeypatch.setattr(
+            "carryme_worker.poller.scan_live_route_candidate_for_approval",
+            fake_live_revalidation,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("shadow mode should not build a close context")
+            ),
+        )
+        caplog.set_level(logging.INFO)
+        result = asyncio.run(
+            _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=_build_auto_close_pair_status(execution=execution),
+                approved_store=approval_store,
+                execution_store=ExecutionJournalStore(settings.database_path),
+                observation_store=ExecutionObservationStore(settings.database_path),
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                approval_service=RouteApprovalService(
+                    store=RouteApprovalStore(settings.database_path)
+                ),
+                scanner=cast(Any, object()),
+                logger=logging.getLogger("carryme.worker"),
+                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result is None
+    assert "shadow auto-close for paper_trade_id=20" in caplog.text
+    assert "source=live_revalidation" in caplog.text
 
 
 def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
