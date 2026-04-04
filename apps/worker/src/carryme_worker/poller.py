@@ -678,6 +678,40 @@ def _build_stable_launch_cooldown_reason(
     )
 
 
+def _build_stable_launch_execution_maturity_reason(
+    *,
+    settings: WorkerSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> str | None:
+    """Return the deterministic reason unattended launch is blocked by thin route history."""
+
+    min_quality_score = settings.stable_canary_launch_min_execution_quality_score
+    min_samples = settings.stable_canary_launch_min_execution_samples
+    if min_quality_score is None and min_samples is None:
+        return None
+
+    execution_quality = candidate.opportunity.execution_quality
+    if execution_quality is None:
+        return "Stable launch execution maturity is missing for the selected route"
+
+    if min_samples is not None and execution_quality.sample_size < min_samples:
+        return (
+            "Stable launch execution sample requirement not met: "
+            f"samples={execution_quality.sample_size} < min={min_samples}"
+        )
+
+    if (
+        min_quality_score is not None
+        and execution_quality.weighted_score + 1e-9 < min_quality_score
+    ):
+        return (
+            "Stable launch execution quality requirement not met: "
+            f"score={execution_quality.weighted_score:.4f} < min={min_quality_score:.4f}"
+        )
+
+    return None
+
+
 @dataclass
 class ProductionSupervisorCycleSummary:
     """Summary emitted after one end-to-end production supervisor cycle."""
@@ -2499,6 +2533,26 @@ async def launch_latest_stable_canary_once(
                 "Launch-ready canary snapshot is stale relative to the latest "
                 "approved snapshot"
             ),
+        )
+
+    execution_maturity_reason = _build_stable_launch_execution_maturity_reason(
+        settings=settings,
+        candidate=latest_approved_snapshot.candidate,
+    )
+    if execution_maturity_reason is not None:
+        if settings.stable_canary_launch_shadow_mode:
+            logging.getLogger("carryme.worker").info(
+                "shadow launch maturity blocked label=%s because %s",
+                snapshot.label,
+                execution_maturity_reason,
+            )
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=execution_maturity_reason,
         )
 
     recent_approved_chain = _list_recent_approved_snapshot_chain(
