@@ -397,6 +397,7 @@ def _list_blocking_live_executions_for_stable_launch(
             if _execution_requires_continued_monitoring(
                 observation_store,
                 execution=execution,
+                latest_observation=latest,
             ):
                 blocking.append(
                     (
@@ -3912,13 +3913,16 @@ def _execution_requires_continued_monitoring(
     observation_store: ExecutionObservationStore,
     *,
     execution: ExecutionJournalEntry,
+    latest_observation: ExecutionObservationEntry | None = None,
 ) -> bool:
     """Return whether an older live execution still has an active monitoring state."""
 
     paper_trade_id = execution.paper_trade_id
     if paper_trade_id is None:
         return False
-    latest = observation_store.latest_for_paper_trade(paper_trade_id)
+    latest = latest_observation
+    if latest is None:
+        latest = observation_store.latest_for_paper_trade(paper_trade_id)
     if latest is None:
         return False
     pair_status = latest.pair_status

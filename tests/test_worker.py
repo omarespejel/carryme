@@ -210,6 +210,14 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "CARRYME_WORKER_STABLE_LAUNCH_READY_MAX_ROUND_TRIP_BREAK_EVEN_FUNDING_WINDOWS",
         raising=False,
     )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_ACTIVE_LIVE_EXECUTIONS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_ACTIVE_EXECUTION_LIMIT",
+        raising=False,
+    )
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_RECV_WINDOW_MS", raising=False)
     monkeypatch.delenv("CARRYME_API_EXTENDED_STARK_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("CARRYME_API_PARADEX_RECV_WINDOW_MS", raising=False)
