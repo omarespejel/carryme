@@ -13,12 +13,15 @@ from typing import Any, Literal, Protocol, cast
 
 import httpx
 from carryme_api.app import (
+    _append_pair_close_confirmation_for_preview,
     _build_cleanup_live_execution_router_for_candidate,
     _build_cleanup_preview_router_for_candidate,
     _build_launch_ready_canary_stability,
+    _build_pair_close_context_for_paper_trade,
     _build_pair_close_live_execution_coordinator_for_candidate,
     _build_pair_close_preview_service_for_candidate,
     _build_paired_live_execution_coordinator_for_candidate,
+    _execute_guarded_pair_close_from_confirmation,
     _run_guarded_canary_lifecycle,
     _select_latest_launch_ready_canary_snapshot,
 )
@@ -38,6 +41,7 @@ from carryme_models import (
     LaunchReadyCanarySnapshot,
     LaunchReadyCanaryStability,
     OpportunityRecord,
+    PaperTradeEntry,
     PaperTradeSystemState,
     RouteApprovalEntry,
     StableCanaryLaunchRecord,
@@ -752,6 +756,17 @@ def _effective_funding_window_hours(snapshot: ApprovedCanarySnapshot) -> float:
     return min(hours)
 
 
+def _hold_window_hours(snapshot: ApprovedCanarySnapshot) -> float:
+    """Return the slowest relevant funding interval across the route venues."""
+
+    opportunity = snapshot.candidate.opportunity.opportunity
+    hours = [
+        FUNDING_WINDOW_HOURS_BY_VENUE.get(opportunity.short_venue, 8.0),
+        FUNDING_WINDOW_HOURS_BY_VENUE.get(opportunity.long_venue, 8.0),
+    ]
+    return max(hours)
+
+
 def _list_recent_approved_snapshot_chain(
     *,
     store: ApprovedCanaryStore,
@@ -846,6 +861,214 @@ def _build_approved_snapshot_automation_gate_reason(
         )
 
     return None
+
+
+def _approved_snapshot_matches_paper_trade(
+    *,
+    snapshot: ApprovedCanarySnapshot,
+    paper_trade: PaperTradeEntry,
+) -> bool:
+    """Return whether an approved snapshot still matches the live paper trade route."""
+
+    opportunity = snapshot.candidate.opportunity.opportunity
+    intent = paper_trade.intent
+    return (
+        snapshot.label == intent.label
+        and opportunity.canonical_symbol == intent.canonical_symbol
+        and opportunity.long_venue == intent.long_leg.venue
+        and opportunity.short_venue == intent.short_leg.venue
+        and opportunity.long_fee_profile == intent.long_leg.fee_profile
+        and opportunity.short_fee_profile == intent.short_leg.fee_profile
+    )
+
+
+def _build_open_hedge_auto_close_reason(
+    *,
+    paper_trade: PaperTradeEntry,
+    snapshot: ApprovedCanarySnapshot,
+    settings: WorkerSettings,
+    now: datetime,
+) -> str | None:
+    """Return the deterministic reason to close one open hedged pair, if any."""
+
+    opportunity = snapshot.candidate.opportunity.opportunity
+    current_round_trip_edge = opportunity.one_day_net_edge_after_round_trip
+    if current_round_trip_edge <= 0:
+        return (
+            "latest approved round-trip edge is non-positive "
+            f"({current_round_trip_edge:.6f})"
+        )
+
+    entry_edge = paper_trade.intent.one_day_net_edge_after_entry
+    if entry_edge > 0:
+        entry_retention_ratio = opportunity.one_day_net_edge_after_entry / entry_edge
+        if (
+            entry_retention_ratio
+            < settings.execution_auto_pair_close_min_entry_edge_retention_ratio
+        ):
+            return (
+                "entry edge retention "
+                f"{entry_retention_ratio:.2f} fell below "
+                f"{settings.execution_auto_pair_close_min_entry_edge_retention_ratio:.2f}"
+            )
+
+    hold_window_hours = _hold_window_hours(snapshot)
+    break_even_days_round_trip = opportunity.break_even_days_round_trip
+    if break_even_days_round_trip is not None:
+        round_trip_break_even_hold_windows = (
+            break_even_days_round_trip * 24.0 / hold_window_hours
+        )
+        if (
+            round_trip_break_even_hold_windows
+            > settings.execution_auto_pair_close_max_round_trip_break_even_hold_windows
+        ):
+            return (
+                "round-trip break-even hold windows "
+                f"{round_trip_break_even_hold_windows:.2f} exceeds maximum "
+                f"{settings.execution_auto_pair_close_max_round_trip_break_even_hold_windows:.2f}"
+            )
+
+    hold_age_seconds = max(0.0, (now - paper_trade.created_at).total_seconds())
+    hold_age_windows = hold_age_seconds / (hold_window_hours * 3600.0)
+    if hold_age_windows >= settings.execution_auto_pair_close_max_hold_windows:
+        return (
+            "hold age windows "
+            f"{hold_age_windows:.2f} reached maximum "
+            f"{settings.execution_auto_pair_close_max_hold_windows:.2f}"
+        )
+
+    return None
+
+
+async def _maybe_auto_close_open_hedged_execution(
+    *,
+    settings: WorkerSettings,
+    execution: ExecutionJournalEntry,
+    pair_status: ExecutionPairStatus,
+    approved_store: ApprovedCanaryStore,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    account_service: AccountPreflightService,
+    order_state_service: ExecutionOrderStateService,
+    logger: logging.Logger,
+    now: datetime,
+) -> ExecutionJournalEntry | None:
+    """Close one monitored hedged pair when the automated exit rules trigger."""
+
+    if not settings.execution_auto_pair_close_enabled:
+        return None
+    if pair_status.derived_state != "hedged":
+        return None
+    if pair_status.recommended_action != "monitor_open_hedge":
+        return None
+
+    paper_trade = execution.paper_trade
+    if paper_trade is None or paper_trade.entry_id is None:
+        return None
+
+    latest_snapshot = approved_store.latest(label=paper_trade.intent.label)
+    if latest_snapshot is None:
+        logger.debug(
+            "skipping auto-close for paper_trade_id=%s because no approved snapshot exists",
+            paper_trade.entry_id,
+        )
+        return None
+    if not _approved_snapshot_matches_paper_trade(
+        snapshot=latest_snapshot,
+        paper_trade=paper_trade,
+    ):
+        logger.debug(
+            (
+                "skipping auto-close for paper_trade_id=%s because latest "
+                "approved snapshot no longer matches the live route"
+            ),
+            paper_trade.entry_id,
+        )
+        return None
+
+    close_reason = _build_open_hedge_auto_close_reason(
+        paper_trade=paper_trade,
+        snapshot=latest_snapshot,
+        settings=settings,
+        now=now,
+    )
+    if close_reason is None:
+        return None
+
+    api_settings = _build_api_settings_from_worker_settings(settings)
+    pair_close_preview_service = _build_pair_close_preview_service_for_candidate(
+        api_settings,
+        latest_snapshot.candidate,
+    )
+    cleanup_preview_service = _build_cleanup_preview_router_for_candidate(
+        api_settings,
+        latest_snapshot.candidate,
+    )
+    pair_close_live_service = _build_pair_close_live_execution_coordinator_for_candidate(
+        api_settings,
+        latest_snapshot.candidate,
+    )
+    cleanup_live_router = _build_cleanup_live_execution_router_for_candidate(
+        api_settings,
+        latest_snapshot.candidate,
+    )
+
+    try:
+        async with asyncio.timeout(settings.execution_auto_pair_close_timeout_seconds):
+            paper_trade_entry, latest_execution, _, pair_close_preview = (
+                await _build_pair_close_context_for_paper_trade(
+                    paper_trade_id=paper_trade.entry_id,
+                    settings=api_settings,
+                    paper_store=PaperTradeStore(api_settings.database_path),
+                    execution_store=execution_store,
+                    account_service=account_service,
+                    order_state_service=order_state_service,
+                    pair_close_service=pair_close_preview_service,
+                )
+            )
+            confirmation = _append_pair_close_confirmation_for_preview(
+                paper_trade=paper_trade_entry,
+                confirmation_store=PairClosePreviewConfirmationStore(api_settings.database_path),
+                preview=pair_close_preview,
+                note=f"worker auto-close: {close_reason}",
+            )
+            result = await _execute_guarded_pair_close_from_confirmation(
+                paper_trade=paper_trade_entry,
+                confirmation=confirmation,
+                settings=api_settings,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                cleanup_confirmation_store=CleanupPreviewConfirmationStore(
+                    api_settings.database_path
+                ),
+                account_preflight_service=account_service,
+                order_state_service=order_state_service,
+                cleanup_preview_service=cleanup_preview_service,
+                cleanup_live_router=cleanup_live_router,
+                service=pair_close_live_service,
+                first_venue="auto",
+                poll_attempts=5,
+                poll_interval_seconds=2.0,
+                auto_cleanup=True,
+            )
+    except TimeoutError:
+        logger.warning(
+            (
+                "timed out auto-closing paper_trade_id=%s from execution_entry_id=%s "
+                "after %.1f seconds"
+            ),
+            paper_trade.entry_id,
+            execution.entry_id,
+            settings.execution_auto_pair_close_timeout_seconds,
+        )
+        return None
+    logger.info(
+        "auto-closed paper_trade_id=%s from execution_entry_id=%s because %s",
+        paper_trade.entry_id,
+        latest_execution.entry_id,
+        close_reason,
+    )
+    return result.primary_execution
 
 
 def _build_latest_launch_ready_stability(
@@ -2530,6 +2753,7 @@ async def observe_live_executions_once(
     *,
     execution_store: ExecutionJournalStore | None = None,
     observation_store: ExecutionObservationStore | None = None,
+    approved_store: ApprovedCanaryStore | None = None,
     alert_sink: ExecutionAlertSink | None = None,
     alert_notifier: ExecutionAlertNotifier | None = None,
     account_service: AccountPreflightService | None = None,
@@ -2541,6 +2765,7 @@ async def observe_live_executions_once(
 
     journal_store = execution_store or ExecutionJournalStore(settings.database_path)
     history_store = observation_store or ExecutionObservationStore(settings.database_path)
+    approved_snapshot_store = approved_store or ApprovedCanaryStore(settings.database_path)
     execution_alert_sink = alert_sink or ExecutionAlertStore(settings.database_path)
     account_probe_service = account_service or AccountPreflightService()
     state_service = order_state_service or ExecutionOrderStateService(
@@ -2657,6 +2882,26 @@ async def observe_live_executions_once(
             continue
         observed_executions += 1
         saved_observations += 1
+        try:
+            await _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=pair_status,
+                approved_store=approved_snapshot_store,
+                execution_store=journal_store,
+                observation_store=history_store,
+                account_service=account_probe_service,
+                order_state_service=state_service,
+                logger=loop_logger,
+                now=timestamp,
+            )
+        except Exception:
+            loop_logger.warning(
+                "Failed to auto-close hedged execution entry_id=%s paper_trade_id=%s",
+                execution.entry_id,
+                execution.paper_trade_id,
+                exc_info=True,
+            )
 
     return ExecutionObservationSummary(
         scanned_executions=scanned_executions,
@@ -2673,6 +2918,7 @@ async def run_supervised_execution_observation_loop(
     *,
     execution_store: ExecutionJournalStore | None = None,
     observation_store: ExecutionObservationStore | None = None,
+    approved_store: ApprovedCanaryStore | None = None,
     alert_sink: ExecutionAlertSink | None = None,
     alert_notifier: ExecutionAlertNotifier | None = None,
     account_service: AccountPreflightService | None = None,
@@ -2689,6 +2935,7 @@ async def run_supervised_execution_observation_loop(
 
     journal_store = execution_store or ExecutionJournalStore(settings.database_path)
     history_store = observation_store or ExecutionObservationStore(settings.database_path)
+    approved_snapshot_store = approved_store or ApprovedCanaryStore(settings.database_path)
     execution_alert_sink = alert_sink or ExecutionAlertStore(settings.database_path)
     account_probe_service = account_service or AccountPreflightService()
     state_service = order_state_service or ExecutionOrderStateService(
@@ -2720,6 +2967,7 @@ async def run_supervised_execution_observation_loop(
                 settings,
                 execution_store=journal_store,
                 observation_store=history_store,
+                approved_store=approved_snapshot_store,
                 alert_sink=execution_alert_sink,
                 alert_notifier=execution_notifier,
                 account_service=account_probe_service,
