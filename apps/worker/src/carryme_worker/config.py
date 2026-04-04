@@ -43,6 +43,15 @@ class WorkerSettings(BaseSettings):
         default=None,
         ge=0,
     )
+    stable_canary_launch_recent_closed_trade_limit: int = Field(default=10, gt=0)
+    stable_canary_launch_max_recent_negative_total_collateral: float | None = Field(
+        default=None,
+        ge=0,
+    )
+    stable_canary_launch_max_consecutive_losing_trades: int | None = Field(
+        default=None,
+        ge=1,
+    )
     launch_ready_canary_max_snapshot_age_seconds: int = Field(default=300, gt=0)
     stable_launch_ready_min_snapshot_count: int = Field(default=2, gt=0)
     stable_launch_ready_min_stable_seconds: float = Field(default=30.0, ge=0)
