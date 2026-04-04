@@ -60,6 +60,18 @@ class WorkerSettings(BaseSettings):
         default=None,
         ge=0,
     )
+    stable_canary_launch_recent_launch_window_seconds: int | None = Field(
+        default=None,
+        gt=0,
+    )
+    stable_canary_launch_max_launches_per_window: int | None = Field(
+        default=None,
+        ge=1,
+    )
+    stable_canary_launch_max_label_launches_per_window: int | None = Field(
+        default=None,
+        ge=1,
+    )
     stable_canary_launch_min_execution_quality_score: float | None = Field(
         default=None,
         ge=0,

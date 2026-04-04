@@ -289,6 +289,9 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_max_consecutive_losing_trades is None
     assert settings.stable_canary_launch_global_cooldown_seconds is None
     assert settings.stable_canary_launch_label_cooldown_seconds is None
+    assert settings.stable_canary_launch_recent_launch_window_seconds is None
+    assert settings.stable_canary_launch_max_launches_per_window is None
+    assert settings.stable_canary_launch_max_label_launches_per_window is None
     assert settings.stable_canary_launch_min_execution_quality_score is None
     assert settings.stable_canary_launch_min_execution_samples is None
     assert settings.stable_canary_launch_min_daily_volume is None
@@ -3847,6 +3850,195 @@ def test_launch_latest_stable_canary_once_respects_shadow_cooldowns_in_shadow_mo
     assert summary.detail == (
         "Stable launch global cooldown active: "
         "last_label=near_extended_paradex remaining_seconds=180"
+    )
+
+
+def test_launch_latest_stable_canary_once_skips_when_global_launch_rate_cap_reached(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_recent_launch_window_seconds=3600,
+        stable_canary_launch_max_launches_per_window=2,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    for launch_id, launched_at in (
+        (101, datetime(2026, 4, 4, 10, 0, tzinfo=UTC)),
+        (102, datetime(2026, 4, 4, 10, 10, tzinfo=UTC)),
+    ):
+        launch_store.append(
+            StableCanaryLaunchRecord(
+                launched_at=launched_at,
+                status="launched",
+                label=f"route_{launch_id}",
+                launch_ready_snapshot_id=launch_id,
+                approved_snapshot_id=launch_id,
+                paper_trade_id=launch_id,
+                final_pair_state="closed",
+            )
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("global launch rate cap must block before launch selection")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 4, 4, 10, 20, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch rate cap reached: "
+        "launches_in_window=2 >= max=2 window_seconds=3600"
+    )
+
+
+def test_launch_latest_stable_canary_once_skips_when_label_launch_rate_cap_reached(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_recent_launch_window_seconds=3600,
+        stable_canary_launch_max_label_launches_per_window=2,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    for launch_id, launched_at in (
+        (111, datetime(2026, 4, 4, 10, 0, tzinfo=UTC)),
+        (112, datetime(2026, 4, 4, 10, 10, tzinfo=UTC)),
+    ):
+        launch_store.append(
+            StableCanaryLaunchRecord(
+                launched_at=launched_at,
+                status="launched",
+                label="arb_extended_paradex",
+                launch_ready_snapshot_id=launch_id,
+                approved_snapshot_id=launch_id,
+                paper_trade_id=launch_id,
+                final_pair_state="closed",
+            )
+        )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("label launch rate cap must block before lifecycle launch")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 4, 4, 10, 20, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch label rate cap reached: "
+        "label=arb_extended_paradex launches_in_window=2 >= max=2 window_seconds=3600"
+    )
+
+
+def test_launch_latest_stable_canary_once_ignores_shadow_rate_caps_in_live_mode(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_recent_launch_window_seconds=3600,
+        stable_canary_launch_max_launches_per_window=1,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            status="shadowed",
+            label="near_extended_paradex",
+            launch_ready_snapshot_id=121,
+            approved_snapshot_id=121,
+            paper_trade_id=0,
+            final_pair_state="shadowed",
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                HTTPException(status_code=404, detail="No launch-ready canary snapshot found")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 4, 4, 10, 20, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == "No launch-ready canary snapshot found"
+
+
+def test_launch_latest_stable_canary_once_respects_shadow_rate_caps_in_shadow_mode(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_shadow_mode=True,
+        stable_canary_launch_recent_launch_window_seconds=3600,
+        stable_canary_launch_max_launches_per_window=1,
+    )
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            status="shadowed",
+            label="near_extended_paradex",
+            launch_ready_snapshot_id=122,
+            approved_snapshot_id=122,
+            paper_trade_id=0,
+            final_pair_state="shadowed",
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("shadow launch rate cap must block before launch selection")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                launch_store=launch_store,
+                now=datetime(2026, 4, 4, 10, 20, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch rate cap reached: "
+        "launches_in_window=1 >= max=1 window_seconds=3600"
     )
 
 

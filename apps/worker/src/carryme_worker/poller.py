@@ -9,7 +9,7 @@ import signal
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, cast
 
 import httpx
@@ -675,6 +675,64 @@ def _build_stable_launch_cooldown_reason(
     return (
         "Stable launch label cooldown active: "
         f"label={label} remaining_seconds={remaining_seconds}"
+    )
+
+
+def _build_stable_launch_rate_cap_reason(
+    *,
+    settings: WorkerSettings,
+    launch_store: StableCanaryLaunchStore,
+    now: datetime,
+    label: str | None = None,
+) -> str | None:
+    """Return the deterministic reason unattended launch is blocked by launch-rate caps."""
+
+    window_seconds = settings.stable_canary_launch_recent_launch_window_seconds
+    max_launches = settings.stable_canary_launch_max_launches_per_window
+    max_label_launches = settings.stable_canary_launch_max_label_launches_per_window
+    if window_seconds is None or (max_launches is None and max_label_launches is None):
+        return None
+
+    include_shadowed = settings.stable_canary_launch_shadow_mode
+    cutoff = now - timedelta(seconds=window_seconds)
+    lookup_limit = max(
+        20,
+        (max_launches or 0) + (max_label_launches or 0) + 5,
+    )
+
+    if max_launches is not None:
+        recent_records = _list_recent_effective_stable_launch_records(
+            launch_store=launch_store,
+            limit=lookup_limit,
+            include_shadowed=include_shadowed,
+        )
+        launches_in_window = sum(1 for record in recent_records if record.launched_at >= cutoff)
+        if launches_in_window >= max_launches:
+            return (
+                "Stable launch rate cap reached: "
+                f"launches_in_window={launches_in_window} >= max={max_launches} "
+                f"window_seconds={window_seconds}"
+            )
+
+    if max_label_launches is None or label is None:
+        return None
+
+    recent_label_records = _list_recent_effective_stable_launch_records(
+        launch_store=launch_store,
+        limit=lookup_limit,
+        label=label,
+        include_shadowed=include_shadowed,
+    )
+    label_launches_in_window = sum(
+        1 for record in recent_label_records if record.launched_at >= cutoff
+    )
+    if label_launches_in_window < max_label_launches:
+        return None
+
+    return (
+        "Stable launch label rate cap reached: "
+        f"label={label} launches_in_window={label_launches_in_window} "
+        f">= max={max_label_launches} window_seconds={window_seconds}"
     )
 
 
@@ -2563,6 +2621,18 @@ async def launch_latest_stable_canary_once(
             detail=global_cooldown_reason,
         )
 
+    global_rate_cap_reason = _build_stable_launch_rate_cap_reason(
+        settings=settings,
+        launch_store=stable_launch_store,
+        now=timestamp,
+    )
+    if global_rate_cap_reason is not None:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            detail=global_rate_cap_reason,
+        )
+
     try:
         stability = _build_launch_ready_canary_stability(
             store=launch_ready_store,
@@ -2602,6 +2672,22 @@ async def launch_latest_stable_canary_once(
             launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
             approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
             detail=label_cooldown_reason,
+        )
+
+    label_rate_cap_reason = _build_stable_launch_rate_cap_reason(
+        settings=settings,
+        launch_store=stable_launch_store,
+        now=timestamp,
+        label=snapshot.label,
+    )
+    if label_rate_cap_reason is not None:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=label_rate_cap_reason,
         )
 
     latest_approved_snapshot = source_approved_store.latest(label=snapshot.label)
