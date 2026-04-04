@@ -2996,6 +2996,7 @@ async def observe_live_executions_once(
     timestamp = now or datetime.now(UTC)
     recent_live_executions = _list_recent_live_executions(
         journal_store,
+        history_store,
         limit=settings.execution_observation_limit,
         now=timestamp,
         max_age_seconds=settings.execution_observation_max_age_seconds,
@@ -3585,6 +3586,7 @@ async def _wait_for_notification(
 
 def _list_recent_live_executions(
     journal_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
     *,
     limit: int,
     now: datetime,
@@ -3596,9 +3598,8 @@ def _list_recent_live_executions(
     offset = 0
     seen_paper_trade_ids: set[int] = set()
     selected: list[ExecutionJournalEntry] = []
-    reached_stale_cutoff = False
 
-    while len(selected) < limit and not reached_stale_cutoff:
+    while len(selected) < limit:
         batch = journal_store.list_recent(limit=page_size, offset=offset)
         if not batch:
             break
@@ -3608,9 +3609,11 @@ def _list_recent_live_executions(
             if execution.mode != "live" or execution.status not in {"submitted", "partial"}:
                 continue
             age_seconds = max(0.0, (now - execution.executed_at).total_seconds())
-            if age_seconds > max_age_seconds:
-                reached_stale_cutoff = True
-                break
+            if age_seconds > max_age_seconds and not _execution_requires_continued_monitoring(
+                observation_store,
+                execution=execution,
+            ):
+                continue
             if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
                 continue
             seen_paper_trade_ids.add(execution.paper_trade_id)
@@ -3622,6 +3625,27 @@ def _list_recent_live_executions(
             break
 
     return selected
+
+
+def _execution_requires_continued_monitoring(
+    observation_store: ExecutionObservationStore,
+    *,
+    execution: ExecutionJournalEntry,
+) -> bool:
+    """Return whether an older live execution still has an active monitoring state."""
+
+    paper_trade_id = execution.paper_trade_id
+    if paper_trade_id is None:
+        return False
+    latest = observation_store.latest_for_paper_trade(paper_trade_id)
+    if latest is None or latest.pair_status is None:
+        return False
+    pair_status = latest.pair_status
+    return pair_status.derived_state in {
+        "hedged",
+        "cleanup_needed",
+        "review_required",
+    } or pair_status.recommended_action != "no_action"
 
 
 def _should_emit_execution_alert(
