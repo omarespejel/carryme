@@ -438,6 +438,70 @@ def _build_blocking_live_execution_detail(
     )
 
 
+def _summarize_active_live_notional_for_stable_launch(
+    executions: list[ExecutionJournalEntry],
+) -> tuple[float, dict[str, float]]:
+    """Return total and per-venue active live target notional."""
+
+    total_active_notional = 0.0
+    active_notional_by_venue: dict[str, float] = {}
+    for execution in executions:
+        paper_trade = execution.paper_trade
+        if paper_trade is None:
+            continue
+        intent = paper_trade.intent
+        target_notional = intent.target_notional
+        total_active_notional += target_notional
+        for venue in {intent.long_leg.venue, intent.short_leg.venue}:
+            active_notional_by_venue[venue] = (
+                active_notional_by_venue.get(venue, 0.0) + target_notional
+            )
+    return total_active_notional, active_notional_by_venue
+
+
+def _build_stable_launch_risk_budget_reason(
+    *,
+    settings: WorkerSettings,
+    active_executions: list[ExecutionJournalEntry],
+    candidate: FundingUniverseCanaryCandidate,
+) -> str | None:
+    """Return the deterministic reason a proposed unattended launch exceeds budget."""
+
+    max_total_live_notional = settings.stable_canary_launch_max_total_live_notional
+    max_live_notional_per_venue = settings.stable_canary_launch_max_live_notional_per_venue
+    if max_total_live_notional is None and max_live_notional_per_venue is None:
+        return None
+
+    proposed_notional = candidate.suggested_canary_notional
+    total_active_notional, active_notional_by_venue = (
+        _summarize_active_live_notional_for_stable_launch(active_executions)
+    )
+    if max_total_live_notional is not None:
+        proposed_total_notional = total_active_notional + proposed_notional
+        if proposed_total_notional - max_total_live_notional > 1e-9:
+            return (
+                "Stable launch total live notional budget exceeded: "
+                f"active={total_active_notional:.2f} + proposed={proposed_notional:.2f} "
+                f"> max={max_total_live_notional:.2f}"
+            )
+
+    if max_live_notional_per_venue is None:
+        return None
+
+    opportunity = candidate.opportunity.opportunity
+    for venue in (opportunity.short_venue, opportunity.long_venue):
+        venue_active_notional = active_notional_by_venue.get(venue, 0.0)
+        proposed_venue_notional = venue_active_notional + proposed_notional
+        if proposed_venue_notional - max_live_notional_per_venue > 1e-9:
+            return (
+                "Stable launch venue live notional budget exceeded: "
+                f"venue={venue} active={venue_active_notional:.2f} + "
+                f"proposed={proposed_notional:.2f} > max={max_live_notional_per_venue:.2f}"
+            )
+
+    return None
+
+
 @dataclass
 class ProductionSupervisorCycleSummary:
     """Summary emitted after one end-to-end production supervisor cycle."""
@@ -2186,6 +2250,33 @@ async def launch_latest_stable_canary_once(
                         f"paper trade {previous_launch.paper_trade_id}"
                     ),
                 )
+
+    risk_budget_reason = _build_stable_launch_risk_budget_reason(
+        settings=settings,
+        active_executions=_list_recent_live_executions(
+            execution_store,
+            observation_store,
+            limit=settings.stable_canary_launch_active_execution_limit,
+            now=timestamp,
+            max_age_seconds=settings.execution_observation_max_age_seconds,
+        ),
+        candidate=selected,
+    )
+    if risk_budget_reason is not None:
+        if settings.stable_canary_launch_shadow_mode:
+            logging.getLogger("carryme.worker").info(
+                "shadow launch budget blocked label=%s because %s",
+                snapshot.label,
+                risk_budget_reason,
+            )
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=risk_budget_reason,
+        )
 
     if settings.stable_canary_launch_shadow_mode:
         logging.getLogger("carryme.worker").info(

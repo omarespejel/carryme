@@ -35,6 +35,14 @@ class WorkerSettings(BaseSettings):
     stable_canary_launch_max_active_live_executions: int = Field(default=0, ge=0)
     # Fetch enough rows to decide whether the blocking threshold is exceeded.
     stable_canary_launch_active_execution_limit: int = Field(default=20, gt=0)
+    stable_canary_launch_max_total_live_notional: float | None = Field(
+        default=None,
+        ge=0,
+    )
+    stable_canary_launch_max_live_notional_per_venue: float | None = Field(
+        default=None,
+        ge=0,
+    )
     launch_ready_canary_max_snapshot_age_seconds: int = Field(default=300, gt=0)
     stable_launch_ready_min_snapshot_count: int = Field(default=2, gt=0)
     stable_launch_ready_min_stable_seconds: float = Field(default=30.0, ge=0)
