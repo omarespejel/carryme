@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import signal
 import sqlite3
 from collections.abc import Awaitable, Callable
@@ -600,6 +601,81 @@ def _build_stable_launch_loss_circuit_breaker_reason(
         )
 
     return None
+
+
+def _list_recent_effective_stable_launch_records(
+    *,
+    launch_store: StableCanaryLaunchStore,
+    limit: int = 20,
+    label: str | None = None,
+    include_shadowed: bool,
+) -> list[StableCanaryLaunchRecord]:
+    """Return recent launch records relevant to the current worker mode."""
+
+    records = launch_store.list_recent(limit=limit, label=label)
+    if include_shadowed:
+        return records
+    return [record for record in records if record.status == "launched"]
+
+
+def _build_stable_launch_cooldown_reason(
+    *,
+    settings: WorkerSettings,
+    launch_store: StableCanaryLaunchStore,
+    now: datetime,
+    label: str | None = None,
+) -> str | None:
+    """Return the deterministic reason unattended launch is blocked by cooldowns."""
+
+    global_cooldown_seconds = settings.stable_canary_launch_global_cooldown_seconds
+    label_cooldown_seconds = settings.stable_canary_launch_label_cooldown_seconds
+    if global_cooldown_seconds is None and label_cooldown_seconds is None:
+        return None
+
+    include_shadowed = settings.stable_canary_launch_shadow_mode
+    if global_cooldown_seconds is not None:
+        recent_records = _list_recent_effective_stable_launch_records(
+            launch_store=launch_store,
+            include_shadowed=include_shadowed,
+        )
+        if recent_records:
+            latest_record = recent_records[0]
+            elapsed_seconds = (now - latest_record.launched_at).total_seconds()
+            if elapsed_seconds + 1e-9 < global_cooldown_seconds:
+                remaining_seconds = max(
+                    0,
+                    math.ceil(global_cooldown_seconds - elapsed_seconds),
+                )
+                return (
+                    "Stable launch global cooldown active: "
+                    f"last_label={latest_record.label} "
+                    f"remaining_seconds={remaining_seconds}"
+                )
+
+    if label_cooldown_seconds is None or label is None:
+        return None
+
+    recent_label_records = _list_recent_effective_stable_launch_records(
+        launch_store=launch_store,
+        label=label,
+        include_shadowed=include_shadowed,
+    )
+    if not recent_label_records:
+        return None
+
+    latest_label_record = recent_label_records[0]
+    elapsed_seconds = (now - latest_label_record.launched_at).total_seconds()
+    if elapsed_seconds + 1e-9 >= label_cooldown_seconds:
+        return None
+
+    remaining_seconds = max(
+        0,
+        math.ceil(label_cooldown_seconds - elapsed_seconds),
+    )
+    return (
+        "Stable launch label cooldown active: "
+        f"label={label} remaining_seconds={remaining_seconds}"
+    )
 
 
 @dataclass
@@ -2349,6 +2425,18 @@ async def launch_latest_stable_canary_once(
             detail=loss_circuit_breaker_reason,
         )
 
+    global_cooldown_reason = _build_stable_launch_cooldown_reason(
+        settings=settings,
+        launch_store=stable_launch_store,
+        now=timestamp,
+    )
+    if global_cooldown_reason is not None:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            detail=global_cooldown_reason,
+        )
+
     try:
         stability = _build_launch_ready_canary_stability(
             store=launch_ready_store,
@@ -2373,6 +2461,22 @@ async def launch_latest_stable_canary_once(
                 detail=exc.detail,
             )
         raise
+
+    label_cooldown_reason = _build_stable_launch_cooldown_reason(
+        settings=settings,
+        launch_store=stable_launch_store,
+        now=timestamp,
+        label=snapshot.label,
+    )
+    if label_cooldown_reason is not None:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=label_cooldown_reason,
+        )
 
     latest_approved_snapshot = source_approved_store.latest(label=snapshot.label)
     if latest_approved_snapshot is None:
