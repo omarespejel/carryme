@@ -77,7 +77,10 @@ from carryme_runtime import (
 )
 from carryme_runtime.balance_accounting import FUNDING_WINDOW_CHECKPOINT_STAGE
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
-from carryme_runtime.route_approvals import scan_exact_canary_candidate_for_approval
+from carryme_runtime.route_approvals import (
+    scan_exact_canary_candidate_for_approval,
+    scan_live_route_candidate_for_approval,
+)
 from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
@@ -943,6 +946,168 @@ def _build_open_hedge_auto_close_reason(
     return None
 
 
+def _approved_snapshot_is_fresh(
+    *,
+    snapshot: ApprovedCanarySnapshot,
+    settings: WorkerSettings,
+    now: datetime,
+) -> bool:
+    age_seconds = max(0.0, (now - snapshot.captured_at).total_seconds())
+    return age_seconds <= settings.execution_auto_pair_close_max_snapshot_age_seconds
+
+
+async def _resolve_auto_close_snapshot(
+    *,
+    settings: WorkerSettings,
+    execution: ExecutionJournalEntry,
+    approved_store: ApprovedCanaryStore,
+    approval_service: RouteApprovalService | None,
+    scanner: OpportunityUniverseService | None,
+    logger: logging.Logger,
+    now: datetime,
+) -> tuple[ApprovedCanarySnapshot | None, Literal["approved_snapshot", "live_revalidation"] | None]:
+    paper_trade = execution.paper_trade
+    if paper_trade is None:
+        return None, None
+
+    latest_snapshot = approved_store.latest(label=paper_trade.intent.label)
+    if (
+        latest_snapshot is not None
+        and _approved_snapshot_matches_paper_trade(
+            snapshot=latest_snapshot,
+            paper_trade=paper_trade,
+        )
+        and _approved_snapshot_is_fresh(
+            snapshot=latest_snapshot,
+            settings=settings,
+            now=now,
+        )
+    ):
+        return latest_snapshot, "approved_snapshot"
+
+    fallback_reason = "no approved snapshot exists"
+    if latest_snapshot is not None:
+        if not _approved_snapshot_matches_paper_trade(
+            snapshot=latest_snapshot,
+            paper_trade=paper_trade,
+        ):
+            fallback_reason = "latest approved snapshot no longer matches the live route"
+        else:
+            fallback_reason = (
+                "latest approved snapshot is stale "
+                f"(captured_at={latest_snapshot.captured_at.isoformat()})"
+            )
+
+    route_approval_service = approval_service or RouteApprovalService(
+        store=RouteApprovalStore(settings.database_path)
+    )
+    approval = route_approval_service.get_for_intent(paper_trade.intent)
+    if approval is None:
+        intent = paper_trade.intent
+        approval = RouteApprovalEntry(
+            updated_at=now,
+            label=intent.label,
+            canonical_symbol=intent.canonical_symbol,
+            short_venue=intent.short_leg.venue,
+            long_venue=intent.long_leg.venue,
+            short_fee_profile=intent.short_leg.fee_profile,
+            long_fee_profile=intent.long_leg.fee_profile,
+            approved=False,
+            max_live_notional=intent.max_target_notional,
+            note="synthetic exit revalidation route",
+        )
+
+    runtime = scanner or _build_worker_universe_scanner(
+        settings,
+        history_store=OpportunityHistoryStore(settings.database_path),
+    )
+    try:
+        async with asyncio.timeout(
+            settings.execution_auto_pair_close_live_revalidation_timeout_seconds
+        ):
+            live_candidate, _ = await scan_live_route_candidate_for_approval(
+                scanner=runtime,
+                approval=approval,
+                venues=[approval.short_venue, approval.long_venue],
+                fee_profile_overrides=_build_approved_canary_fee_profile_overrides(settings),
+                target_notional=max(
+                    settings.approved_canary_scan_target_notional,
+                    paper_trade.intent.target_notional,
+                    approval.max_live_notional,
+                ),
+                canary_max_notional=max(
+                    settings.approved_canary_scan_max_notional,
+                    paper_trade.intent.target_notional,
+                    approval.max_live_notional,
+                ),
+                min_capacity_notional=0.0,
+                min_daily_volume=0.0,
+                min_open_interest=0.0,
+                min_roundtrip_edge=-1.0,
+                min_execution_quality_score=0.0,
+                min_execution_samples=0,
+                min_route_stability_weight=0.0,
+                min_route_presence_ratio=0.0,
+                min_route_samples=0,
+                include_symbols=[approval.canonical_symbol],
+                exclude_symbols=None,
+                exclude_tags=None,
+                limit=max(2, settings.approved_canary_exact_scan_limit),
+            )
+    except TimeoutError:
+        logger.warning(
+            "auto-close live revalidation timed out for paper_trade_id=%s label=%s",
+            paper_trade.entry_id,
+            approval.label,
+        )
+        return None, None
+    except (ConnectorError, UpstreamDataError, httpx.HTTPError, ValueError) as exc:
+        logger.warning(
+            "auto-close live revalidation failed for paper_trade_id=%s label=%s: %s",
+            paper_trade.entry_id,
+            approval.label,
+            exc,
+        )
+        return None, None
+
+    if live_candidate is None:
+        logger.debug(
+            (
+                "skipping auto-close for paper_trade_id=%s because %s and live "
+                "route revalidation found no exact match"
+            ),
+            paper_trade.entry_id,
+            fallback_reason,
+        )
+        return None, None
+
+    live_snapshot = ApprovedCanarySnapshot(
+        captured_at=now,
+        label=approval.label,
+        candidate=live_candidate,
+        approval=approval,
+    )
+    if not _approved_snapshot_matches_paper_trade(
+        snapshot=live_snapshot,
+        paper_trade=paper_trade,
+    ):
+        logger.debug(
+            (
+                "skipping auto-close for paper_trade_id=%s because live route "
+                "revalidation returned a mismatched route"
+            ),
+            paper_trade.entry_id,
+        )
+        return None, None
+
+    logger.debug(
+        "auto-close using live route revalidation for paper_trade_id=%s because %s",
+        paper_trade.entry_id,
+        fallback_reason,
+    )
+    return live_snapshot, "live_revalidation"
+
+
 def _build_execution_hold_window_hours(paper_trade: PaperTradeEntry) -> float:
     """Return the effective hold window for one open hedged route."""
 
@@ -1100,6 +1265,8 @@ async def _maybe_auto_close_open_hedged_execution(
     observation_store: ExecutionObservationStore,
     account_service: AccountPreflightService,
     order_state_service: ExecutionOrderStateService,
+    approval_service: RouteApprovalService | None = None,
+    scanner: OpportunityUniverseService | None = None,
     logger: logging.Logger,
     now: datetime,
 ) -> ExecutionJournalEntry | None:
@@ -1119,24 +1286,16 @@ async def _maybe_auto_close_open_hedged_execution(
     if paper_trade is None or paper_trade.entry_id is None:
         return None
 
-    latest_snapshot = approved_store.latest(label=paper_trade.intent.label)
+    latest_snapshot, snapshot_source = await _resolve_auto_close_snapshot(
+        settings=settings,
+        execution=execution,
+        approved_store=approved_store,
+        approval_service=approval_service,
+        scanner=scanner,
+        logger=logger,
+        now=now,
+    )
     if latest_snapshot is None:
-        logger.debug(
-            "skipping auto-close for paper_trade_id=%s because no approved snapshot exists",
-            paper_trade.entry_id,
-        )
-        return None
-    if not _approved_snapshot_matches_paper_trade(
-        snapshot=latest_snapshot,
-        paper_trade=paper_trade,
-    ):
-        logger.debug(
-            (
-                "skipping auto-close for paper_trade_id=%s because latest "
-                "approved snapshot no longer matches the live route"
-            ),
-            paper_trade.entry_id,
-        )
         return None
 
     close_reason = _build_open_hedge_auto_close_reason(
@@ -1151,9 +1310,10 @@ async def _maybe_auto_close_open_hedged_execution(
 
     if settings.execution_auto_pair_close_shadow_mode:
         logger.info(
-            "shadow auto-close for paper_trade_id=%s because %s",
+            "shadow auto-close for paper_trade_id=%s because %s (source=%s)",
             paper_trade.entry_id,
             close_reason,
+            snapshot_source or "unknown",
         )
         return None
 
@@ -1192,7 +1352,7 @@ async def _maybe_auto_close_open_hedged_execution(
                 paper_trade=paper_trade_entry,
                 confirmation_store=PairClosePreviewConfirmationStore(api_settings.database_path),
                 preview=pair_close_preview,
-                note=f"worker auto-close: {close_reason}",
+                note=f"worker auto-close [{snapshot_source or 'unknown'}]: {close_reason}",
             )
             result = await _execute_guarded_pair_close_from_confirmation(
                 paper_trade=paper_trade_entry,
@@ -2996,6 +3156,19 @@ async def observe_live_executions_once(
     state_service = order_state_service or ExecutionOrderStateService(
         observers=_build_order_state_observers(settings)
     )
+    auto_close_approval_service = None
+    auto_close_scanner = None
+    if (
+        settings.execution_auto_pair_close_enabled
+        or settings.execution_auto_pair_close_shadow_mode
+    ):
+        auto_close_approval_service = RouteApprovalService(
+            store=RouteApprovalStore(settings.database_path)
+        )
+        auto_close_scanner = _build_worker_universe_scanner(
+            settings,
+            history_store=OpportunityHistoryStore(settings.database_path),
+        )
     loop_logger = logger or logging.getLogger("carryme.worker")
     timestamp = now or datetime.now(UTC)
     recent_live_executions = _list_recent_live_executions(
@@ -3135,6 +3308,8 @@ async def observe_live_executions_once(
                 observation_store=history_store,
                 account_service=account_probe_service,
                 order_state_service=state_service,
+                approval_service=auto_close_approval_service,
+                scanner=auto_close_scanner,
                 logger=loop_logger,
                 now=timestamp,
             )

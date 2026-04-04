@@ -108,6 +108,7 @@ from carryme_runtime.account_preflight import (
     _row_represents_open_position,
 )
 from carryme_runtime.execution_quality import ExecutionQualityService
+from carryme_runtime.route_approvals import scan_live_route_candidate_for_approval
 from carryme_runtime.system_state import ParadexSystemStateProbe, SystemStateService
 from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import (
@@ -3087,6 +3088,90 @@ def test_opportunity_universe_service_rejects_invalid_ranking() -> None:
                 venues=["extended", "hyperliquid"],
                 ranking="typo-ranking",  # type: ignore[arg-type]
             )
+
+    asyncio.run(run())
+
+
+def test_scan_live_route_candidate_for_approval_returns_negative_edge_route() -> None:
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        label="near_extended_paradex",
+        canonical_symbol="NEAR-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=25.0,
+        note="approved canary",
+    )
+    negative_edge_opportunity = FundingUniverseOpportunity(
+        opportunity=FundingArbOpportunity(
+            canonical_symbol="NEAR-USD-PERP",
+            long_venue="paradex",
+            short_venue="extended",
+            long_fee_profile="pro_fastfills",
+            short_fee_profile="default",
+            gross_daily_edge=0.0003,
+            entry_cost_rate=0.0003,
+            round_trip_cost_rate=0.0006,
+            one_day_net_edge_after_entry=0.0,
+            one_day_net_edge_after_round_trip=-0.0001,
+            break_even_days_entry=0.5,
+            break_even_days_round_trip=1.0,
+            capacity=CapacityEstimate(
+                short_bid_notional=500.0,
+                long_ask_notional=400.0,
+                max_entry_notional=400.0,
+                limiting_venue="paradex",
+            ),
+        ),
+        venue_markets={
+            "extended": FundingUniverseVenueMarket(venue="extended", symbol="NEAR-USD"),
+            "paradex": FundingUniverseVenueMarket(venue="paradex", symbol="NEAR-USD-PERP"),
+        },
+        deployable_notional=150.0,
+        estimated_one_day_pnl_after_round_trip=-0.05,
+    )
+
+    class StubScanner:
+        async def scan(self, **_: object) -> FundingUniverseScan:
+            return FundingUniverseScan(
+                venues=["extended", "paradex"],
+                ranking="route_adjusted_quality_pnl",
+                target_notional=5_000,
+                overlap_count=1,
+                overlaps=[],
+                opportunities=[negative_edge_opportunity],
+            )
+
+    async def run() -> None:
+        candidate, candidate_count = await scan_live_route_candidate_for_approval(
+            scanner=cast(Any, StubScanner()),
+            approval=approval,
+            venues=["extended", "paradex"],
+            target_notional=5_000.0,
+            canary_max_notional=25.0,
+            min_capacity_notional=0.0,
+            min_daily_volume=0.0,
+            min_open_interest=0.0,
+            min_roundtrip_edge=-1.0,
+            min_execution_quality_score=0.0,
+            min_execution_samples=0,
+            min_route_stability_weight=0.0,
+            min_route_presence_ratio=0.0,
+            min_route_samples=0,
+            include_symbols=None,
+            exclude_symbols=None,
+            exclude_tags=None,
+            limit=5,
+        )
+
+        assert candidate_count == 1
+        assert candidate is not None
+        assert candidate.opportunity.opportunity.canonical_symbol == "NEAR-USD-PERP"
+        assert candidate.opportunity.opportunity.one_day_net_edge_after_round_trip == -0.0001
+        assert candidate.suggested_canary_notional == 25.0
 
     asyncio.run(run())
 
