@@ -68,6 +68,18 @@ class WorkerSettings(BaseSettings):
         default=None,
         ge=0,
     )
+    stable_canary_launch_min_daily_volume: float | None = Field(
+        default=None,
+        ge=0,
+    )
+    stable_canary_launch_min_deployable_notional: float | None = Field(
+        default=None,
+        ge=0,
+    )
+    stable_canary_launch_min_expected_one_day_round_trip_pnl: float | None = Field(
+        default=None,
+        ge=0,
+    )
     stable_canary_launch_block_adverse_latest_outcome: bool = False
     launch_ready_canary_max_snapshot_age_seconds: int = Field(default=300, gt=0)
     stable_launch_ready_min_snapshot_count: int = Field(default=2, gt=0)

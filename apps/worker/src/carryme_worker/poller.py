@@ -736,6 +736,74 @@ def _build_stable_launch_latest_outcome_reason(
     )
 
 
+def _scaled_stable_launch_round_trip_pnl(candidate: FundingUniverseCanaryCandidate) -> float:
+    """Return one-day expected round-trip PnL scaled to the selected launch notional."""
+
+    opportunity = candidate.opportunity
+    deployable_notional = opportunity.deployable_notional or 0.0
+    selected_notional = candidate.suggested_canary_notional
+    if deployable_notional <= 0 or selected_notional <= 0:
+        return 0.0
+
+    raw_pnl = (
+        opportunity.execution_adjusted_one_day_pnl_after_round_trip
+        if opportunity.execution_adjusted_one_day_pnl_after_round_trip is not None
+        else opportunity.estimated_one_day_pnl_after_round_trip
+    )
+    if raw_pnl is None:
+        return 0.0
+
+    return raw_pnl * (selected_notional / deployable_notional)
+
+
+def _build_stable_launch_liquidity_and_value_reason(
+    *,
+    settings: WorkerSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> str | None:
+    """Return the deterministic reason unattended launch is blocked by weak economics."""
+
+    min_daily_volume = settings.stable_canary_launch_min_daily_volume
+    min_deployable_notional = settings.stable_canary_launch_min_deployable_notional
+    min_expected_pnl = settings.stable_canary_launch_min_expected_one_day_round_trip_pnl
+    if (
+        min_daily_volume is None
+        and min_deployable_notional is None
+        and min_expected_pnl is None
+    ):
+        return None
+
+    opportunity = candidate.opportunity
+    if min_daily_volume is not None:
+        actual_min_daily_volume = opportunity.min_daily_volume or 0.0
+        if actual_min_daily_volume + 1e-9 < min_daily_volume:
+            return (
+                "Stable launch minimum daily volume requirement not met: "
+                f"min_daily_volume={actual_min_daily_volume:.4f} < min={min_daily_volume:.4f}"
+            )
+
+    if min_deployable_notional is not None:
+        deployable_notional = opportunity.deployable_notional or 0.0
+        if deployable_notional + 1e-9 < min_deployable_notional:
+            return (
+                "Stable launch deployable notional requirement not met: "
+                f"deployable_notional={deployable_notional:.4f} "
+                f"< min={min_deployable_notional:.4f}"
+            )
+
+    if min_expected_pnl is None:
+        return None
+
+    scaled_round_trip_pnl = _scaled_stable_launch_round_trip_pnl(candidate)
+    if scaled_round_trip_pnl + 1e-9 >= min_expected_pnl:
+        return None
+
+    return (
+        "Stable launch expected one-day round-trip pnl requirement not met: "
+        f"expected_pnl={scaled_round_trip_pnl:.6f} < min={min_expected_pnl:.6f}"
+    )
+
+
 @dataclass
 class ProductionSupervisorCycleSummary:
     """Summary emitted after one end-to-end production supervisor cycle."""
@@ -2597,6 +2665,26 @@ async def launch_latest_stable_canary_once(
             launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
             approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
             detail=latest_outcome_reason,
+        )
+
+    liquidity_and_value_reason = _build_stable_launch_liquidity_and_value_reason(
+        settings=settings,
+        candidate=latest_approved_snapshot.candidate,
+    )
+    if liquidity_and_value_reason is not None:
+        if settings.stable_canary_launch_shadow_mode:
+            logging.getLogger("carryme.worker").info(
+                "shadow launch liquidity/value blocked label=%s because %s",
+                snapshot.label,
+                liquidity_and_value_reason,
+            )
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=liquidity_and_value_reason,
         )
 
     recent_approved_chain = _list_recent_approved_snapshot_chain(
