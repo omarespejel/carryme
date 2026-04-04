@@ -4205,6 +4205,10 @@ def test_launch_latest_stable_canary_once_allows_launch_at_exact_maturity_thresh
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_min_execution_quality_score=0.55,
         stable_canary_launch_min_execution_samples=2,
+<<<<<<< HEAD
+=======
+        stable_canary_launch_max_active_live_executions=1,
+>>>>>>> 1658022 (test: harden stable launch maturity coverage)
     )
     approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
         label="arb_extended_paradex",
