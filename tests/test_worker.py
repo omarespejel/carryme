@@ -263,6 +263,9 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_active_execution_limit == 20
     assert settings.stable_canary_launch_max_total_live_notional is None
     assert settings.stable_canary_launch_max_live_notional_per_venue is None
+    assert settings.stable_canary_launch_recent_closed_trade_limit == 10
+    assert settings.stable_canary_launch_max_recent_negative_total_collateral is None
+    assert settings.stable_canary_launch_max_consecutive_losing_trades is None
     assert settings.execution_auto_pair_close_enabled is False
     assert settings.execution_auto_pair_close_shadow_mode is False
     assert settings.execution_auto_pair_close_max_snapshot_age_seconds == 300
@@ -4524,6 +4527,465 @@ def test_launch_latest_stable_canary_once_skips_when_venue_live_notional_budget_
         "Stable launch venue live notional budget exceeded: "
         "venue=extended active=25.00 + proposed=20.00 > max=30.00"
     )
+
+
+def test_launch_latest_stable_canary_once_skips_when_recent_negative_collateral_budget_exceeded(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_active_live_executions=1,
+        stable_canary_launch_max_recent_negative_total_collateral=0.10,
+        stable_canary_launch_recent_closed_trade_limit=5,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    snapshot_store = BalanceSnapshotStore(settings.database_path)
+
+    for paper_trade_id, loss_amount in ((61, -0.06), (62, -0.05)):
+        execution = execution_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+                adapter="paired_live:extended_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"closed-loss-preview-{paper_trade_id}",
+                confirmation_entry_id=paper_trade_id + 100,
+                paper_trade=_build_auto_close_paper_trade(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
+                    label=f"loss_{paper_trade_id}",
+                ),
+                legs=[_build_auto_close_execution_leg()],
+            )
+        )
+        observation_store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                context="worker_execution_monitor",
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=execution.preview_hash,
+                order_state=ExecutionOrderState(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=execution.preview_hash,
+                    legs=[],
+                    notes=[],
+                ),
+                pair_status=_build_auto_close_pair_status(
+                    execution=execution,
+                    derived_state="closed",
+                    recommended_action="no_action",
+                ),
+            )
+        )
+        for venue in ("extended", "paradex"):
+            snapshot_store.append(
+                VenueBalanceSnapshot(
+                    captured_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=f"loss_{paper_trade_id}",
+                    stage="pre_open",
+                    venue=venue,
+                    total_collateral=500.0,
+                )
+            )
+            snapshot_store.append(
+                VenueBalanceSnapshot(
+                    captured_at=datetime(2026, 4, 4, 10, 5, tzinfo=UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=f"loss_{paper_trade_id}",
+                    stage="post_close",
+                    venue=venue,
+                    total_collateral=500.0 + (loss_amount / 2.0),
+                )
+            )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("loss circuit breaker must block before launch selection")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                now=datetime(2026, 4, 4, 10, 6, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch recent negative collateral budget exceeded: "
+        "loss=0.110000 > max=0.100000"
+    )
+
+
+def test_launch_latest_stable_canary_once_skips_when_consecutive_losing_trades_threshold_reached(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_active_live_executions=1,
+        stable_canary_launch_max_consecutive_losing_trades=2,
+        stable_canary_launch_recent_closed_trade_limit=5,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    snapshot_store = BalanceSnapshotStore(settings.database_path)
+
+    for idx, paper_trade_id in enumerate((71, 72), start=1):
+        execution = execution_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 4, 4, 10, idx, tzinfo=UTC),
+                adapter="paired_live:extended_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"closed-loss-preview-{paper_trade_id}",
+                confirmation_entry_id=paper_trade_id + 100,
+                paper_trade=_build_auto_close_paper_trade(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
+                    label=f"loss_{paper_trade_id}",
+                ),
+                legs=[_build_auto_close_execution_leg()],
+            )
+        )
+        observation_store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 4, 4, 10, idx + 1, tzinfo=UTC),
+                context="worker_execution_monitor",
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=execution.preview_hash,
+                order_state=ExecutionOrderState(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=execution.preview_hash,
+                    legs=[],
+                    notes=[],
+                ),
+                pair_status=_build_auto_close_pair_status(
+                    execution=execution,
+                    derived_state="closed",
+                    recommended_action="no_action",
+                ),
+            )
+        )
+        for venue in ("extended", "paradex"):
+            snapshot_store.append(
+                VenueBalanceSnapshot(
+                    captured_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=f"loss_{paper_trade_id}",
+                    stage="pre_open",
+                    venue=venue,
+                    total_collateral=500.0,
+                )
+            )
+            snapshot_store.append(
+                VenueBalanceSnapshot(
+                    captured_at=datetime(2026, 4, 4, 10, idx + 5, tzinfo=UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=f"loss_{paper_trade_id}",
+                    stage="post_close",
+                    venue=venue,
+                    total_collateral=499.97,
+                )
+            )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("consecutive-loss breaker must block before launch selection")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                now=datetime(2026, 4, 4, 10, 8, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch consecutive losing trades threshold reached: "
+        "losses=2 >= max=2"
+    )
+
+
+def test_launch_latest_stable_canary_once_allows_launch_when_recent_win_breaks_loss_streak(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_active_live_executions=1,
+        stable_canary_launch_max_consecutive_losing_trades=2,
+        stable_canary_launch_recent_closed_trade_limit=5,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    snapshot_store = BalanceSnapshotStore(settings.database_path)
+
+    for paper_trade_id, executed_at, final_total in (
+        (81, datetime(2026, 4, 4, 10, 0, tzinfo=UTC), 499.96),
+        (82, datetime(2026, 4, 4, 10, 2, tzinfo=UTC), 500.04),
+        (83, datetime(2026, 4, 4, 10, 4, tzinfo=UTC), 499.97),
+    ):
+        execution = execution_store.append(
+            ExecutionJournalEntry(
+                executed_at=executed_at,
+                adapter="paired_live:extended_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"closed-mixed-preview-{paper_trade_id}",
+                confirmation_entry_id=paper_trade_id + 100,
+                paper_trade=_build_auto_close_paper_trade(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
+                    label=f"mixed_{paper_trade_id}",
+                ),
+                legs=[_build_auto_close_execution_leg()],
+            )
+        )
+        observation_store.append(
+            ExecutionObservationEntry(
+                observed_at=executed_at,
+                context="worker_execution_monitor",
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=execution.preview_hash,
+                order_state=ExecutionOrderState(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=execution.preview_hash,
+                    legs=[],
+                    notes=[],
+                ),
+                pair_status=_build_auto_close_pair_status(
+                    execution=execution,
+                    derived_state="closed",
+                    recommended_action="no_action",
+                ),
+            )
+        )
+        for venue in ("extended", "paradex"):
+            snapshot_store.append(
+                VenueBalanceSnapshot(
+                    captured_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
+                    paper_trade_id=paper_trade_id,
+                    label=f"mixed_{paper_trade_id}",
+                    stage="pre_open",
+                    venue=venue,
+                    total_collateral=500.0,
+                )
+            )
+            snapshot_store.append(
+                VenueBalanceSnapshot(
+                    captured_at=executed_at.replace(minute=executed_at.minute + 5),
+                    paper_trade_id=paper_trade_id,
+                    label=f"mixed_{paper_trade_id}",
+                    stage="post_close",
+                    venue=venue,
+                    total_collateral=final_total,
+                )
+            )
+
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=11.0,
+        note="approved canary",
+    )
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(venue="extended", symbol="ARB-USD"),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=11.0,
+    )
+    snapshot = LaunchReadyCanarySnapshot(
+        launch_ready_snapshot_id=21,
+        captured_at=datetime(2026, 4, 4, 10, 10, tzinfo=UTC),
+        label="arb_extended_paradex",
+        max_snapshot_age_seconds=300,
+        approved_snapshot=ApprovedCanarySnapshot(
+            snapshot_id=20,
+            captured_at=datetime(2026, 4, 4, 10, 9, tzinfo=UTC),
+            label="arb_extended_paradex",
+            candidate=candidate,
+            approval=approval,
+        ),
+        system_state=PaperTradeSystemState(
+            paper_trade_id=0,
+            label="arb_extended_paradex",
+            ready=True,
+            venues=[
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ],
+            blocking_reasons=[],
+        ),
+    )
+    stability = LaunchReadyCanaryStability(
+        snapshot=snapshot,
+        consecutive_snapshots=3,
+        stable_seconds=45.0,
+        min_snapshot_count=2,
+        min_stable_seconds=30.0,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
+    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
+    stability = stability.model_copy(update={"snapshot": snapshot})
+
+    class StubLifecycleResult:
+        def __init__(self) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=17,
+                created_at=datetime(2026, 3, 30, 10, 2, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 30, 10, 1, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00355,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=900.0,
+                    target_notional=11.0,
+                    capacity_fraction=11.0 / 900.0,
+                    max_target_notional=11.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=11.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                    ),
+                ),
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=31,
+                paper_trade_id=17,
+                preview_hash="preview",
+                derived_state="closed",
+                recommended_action="no_action",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=31,
+                    paper_trade_id=17,
+                    preview_hash="preview",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=31,
+                    paper_trade_id=17,
+                    preview_hash="preview",
+                    status="accepted",
+                    recommended_action="no_action",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+
+    async def run_stub_lifecycle(**_: object) -> StubLifecycleResult:
+        return StubLifecycleResult()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                now=datetime(2026, 4, 4, 10, 11, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.paper_trade_id == 17
 
 
 def test_launch_latest_stable_canary_once_allows_venue_live_notional_budget_at_exact_threshold(

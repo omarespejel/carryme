@@ -503,6 +503,105 @@ def _build_stable_launch_risk_budget_reason(
     return None
 
 
+def _list_recent_closed_live_trade_outcomes(
+    *,
+    settings: WorkerSettings,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    balance_service: BalanceAccountingService,
+    now: datetime,
+) -> list[tuple[int, float]]:
+    """Return recent closed live paper trades with realized total collateral deltas."""
+
+    limit = settings.stable_canary_launch_recent_closed_trade_limit
+    page_size = max(limit * 4, 20)
+    offset = 0
+    seen_paper_trade_ids: set[int] = set()
+    outcomes: list[tuple[int, float]] = []
+
+    while len(outcomes) < limit:
+        batch = execution_store.list_recent(limit=page_size, offset=offset)
+        if not batch:
+            break
+        offset += len(batch)
+
+        for execution in batch:
+            if execution.mode != "live" or execution.paper_trade_id is None:
+                continue
+            paper_trade_id = execution.paper_trade_id
+            if paper_trade_id in seen_paper_trade_ids:
+                continue
+            seen_paper_trade_ids.add(paper_trade_id)
+            latest_observation = observation_store.latest_for_paper_trade(paper_trade_id)
+            if latest_observation is None or latest_observation.pair_status is None:
+                continue
+            pair_status = latest_observation.pair_status
+            if pair_status.derived_state not in {"closed", "unfilled"}:
+                continue
+            attribution = balance_service.summarize_paper_trade_attribution(paper_trade_id)
+            if attribution is None or attribution.total_collateral_delta is None:
+                continue
+            outcomes.append((paper_trade_id, attribution.total_collateral_delta))
+            if len(outcomes) >= limit:
+                break
+
+        if len(batch) < page_size:
+            break
+
+    return outcomes
+
+
+def _build_stable_launch_loss_circuit_breaker_reason(
+    *,
+    settings: WorkerSettings,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    balance_service: BalanceAccountingService,
+    now: datetime,
+) -> str | None:
+    """Return the deterministic reason unattended launch is blocked by recent losses."""
+
+    max_negative_total = settings.stable_canary_launch_max_recent_negative_total_collateral
+    max_consecutive_losses = settings.stable_canary_launch_max_consecutive_losing_trades
+    if max_negative_total is None and max_consecutive_losses is None:
+        return None
+
+    outcomes = _list_recent_closed_live_trade_outcomes(
+        settings=settings,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        balance_service=balance_service,
+        now=now,
+    )
+    if not outcomes:
+        return None
+
+    if max_negative_total is not None:
+        total_negative_collateral = -sum(min(delta, 0.0) for _, delta in outcomes)
+        if total_negative_collateral - max_negative_total > 1e-9:
+            return (
+                "Stable launch recent negative collateral budget exceeded: "
+                f"loss={total_negative_collateral:.6f} > max={max_negative_total:.6f}"
+            )
+
+    if max_consecutive_losses is None:
+        return None
+
+    consecutive_losses = 0
+    for _, delta in outcomes:
+        if delta < 0:
+            consecutive_losses += 1
+        else:
+            break
+    if consecutive_losses >= max_consecutive_losses:
+        return (
+            "Stable launch consecutive losing trades threshold reached: "
+            f"losses={consecutive_losses} >= max={max_consecutive_losses}"
+        )
+
+    return None
+
+
 @dataclass
 class ProductionSupervisorCycleSummary:
     """Summary emitted after one end-to-end production supervisor cycle."""
@@ -2209,6 +2308,9 @@ async def launch_latest_stable_canary_once(
     source_approved_store = approved_store or ApprovedCanaryStore(runtime_settings.database_path)
     execution_store = ExecutionJournalStore(runtime_settings.database_path)
     observation_store = ExecutionObservationStore(runtime_settings.database_path)
+    balance_service = BalanceAccountingService(
+        store=BalanceSnapshotStore(runtime_settings.database_path)
+    )
     route_approval_service = RouteApprovalService(
         store=RouteApprovalStore(runtime_settings.database_path)
     )
@@ -2231,6 +2333,20 @@ async def launch_latest_stable_canary_once(
                 blocking=blocking_live_executions,
                 max_active_live_executions=settings.stable_canary_launch_max_active_live_executions,
             ),
+        )
+
+    loss_circuit_breaker_reason = _build_stable_launch_loss_circuit_breaker_reason(
+        settings=settings,
+        execution_store=execution_store,
+        observation_store=observation_store,
+        balance_service=balance_service,
+        now=timestamp,
+    )
+    if loss_circuit_breaker_reason is not None:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            detail=loss_circuit_breaker_reason,
         )
 
     try:
