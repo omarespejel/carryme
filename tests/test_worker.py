@@ -248,6 +248,18 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
         raising=False,
     )
     monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_RECENT_LAUNCH_WINDOW_SECONDS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_LAUNCHES_PER_WINDOW",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_LABEL_LAUNCHES_PER_WINDOW",
+        raising=False,
+    )
+    monkeypatch.delenv(
         "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MIN_EXECUTION_QUALITY_SCORE",
         raising=False,
     )
