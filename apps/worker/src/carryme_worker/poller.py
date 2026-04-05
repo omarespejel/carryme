@@ -2536,7 +2536,9 @@ def _build_api_settings_from_worker_settings(settings: WorkerSettings) -> ApiSet
 
     return ApiSettings(
         environment=settings.environment,
-        database_path=settings.database_target,
+        # Keep the real URL for runtime DB access. `database_target` is redacted and
+        # only safe for summaries/logging.
+        database_path=settings.database_path,
         watchlist_path=settings.watchlist_path,
         extended_live_enabled=settings.extended_live_enabled,
         extended_api_key=settings.extended_api_key,

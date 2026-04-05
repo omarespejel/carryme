@@ -118,6 +118,7 @@ from carryme_worker.poller import (
     SystemStateObservationSummary,
     UniverseScanLoopSummary,
     UniverseScanSummary,
+    _build_api_settings_from_worker_settings,
     _build_open_hedge_auto_close_reason,
     _build_open_hedge_profit_protection_reason,
     _build_order_state_observers,
@@ -494,6 +495,17 @@ def test_worker_database_target_redacts_urls() -> None:
 
     assert settings.database_target == redact_database_url(settings.database_path)
     assert settings.database_target == "postgresql+psycopg://***@db.example.com/carryme"
+
+
+def test_build_api_settings_from_worker_settings_keeps_unredacted_database_url() -> None:
+    settings = WorkerSettings(
+        database_path="postgresql+psycopg://user:secret@db.example.com/carryme"
+    )
+
+    api_settings = _build_api_settings_from_worker_settings(settings)
+
+    assert api_settings.database_path == settings.database_path
+    assert api_settings.database_path != settings.database_target
 
 
 def test_worker_readiness_payload(tmp_path: Path) -> None:
@@ -7319,6 +7331,7 @@ def test_launch_latest_stable_canary_once_uses_worker_settings_when_api_settings
 
     async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
         runtime_settings = cast(ApiSettings, kwargs["settings"])
+        assert runtime_settings.database_path == settings.database_path
         assert runtime_settings.extended_live_enabled is True
         assert runtime_settings.extended_api_key == "extended-key"
         assert runtime_settings.extended_stark_private_key == "extended-secret"
