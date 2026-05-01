@@ -2013,6 +2013,108 @@ def _resolve_cleanup_confirmation_for_live_submit(
     )
 
 
+def _effective_cleanup_submission_paper_trade_id(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: CleanupPreviewConfirmationEntry,
+) -> int:
+    paper_trade_id = paper_trade.entry_id or confirmation.paper_trade_id
+    if paper_trade_id < 1:
+        raise HTTPException(
+            status_code=500,
+            detail="paper_trade_id is required before cleanup live submission",
+        )
+    return paper_trade_id
+
+
+def _reserve_cleanup_live_submission_or_existing(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: CleanupPreviewConfirmationEntry,
+    execution_store: ExecutionJournalStore,
+) -> ExecutionJournalEntry | None:
+    if confirmation.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Cleanup preview confirmation entry_id is required before live submission",
+        )
+    paper_trade_id = _effective_cleanup_submission_paper_trade_id(
+        paper_trade=paper_trade,
+        confirmation=confirmation,
+    )
+    existing_entry = execution_store.find_by_paper_trade_preview_hash(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+    )
+    if existing_entry is not None:
+        return existing_entry
+    if not execution_store.reserve_cleanup_live_submission(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+        confirmation_entry_id=confirmation.entry_id,
+    ):
+        existing_entry = execution_store.find_by_paper_trade_preview_hash(
+            paper_trade_id=paper_trade_id,
+            preview_hash=confirmation.preview_hash,
+        )
+        if existing_entry is not None:
+            return existing_entry
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cleanup live submission was already reserved for this paper trade and "
+                "preview without a matching journaled execution; manual reconciliation "
+                "is required before retrying"
+            ),
+        )
+    if not execution_store.reserve_live_submission(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+    ):
+        existing_entry = execution_store.find_by_confirmation(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        )
+        if existing_entry is not None:
+            return existing_entry
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cleanup live submission was already reserved without a matching "
+                "journaled execution; manual reconciliation is required before retrying"
+            ),
+        )
+    return None
+
+
+def _mark_cleanup_live_submission_completed(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: CleanupPreviewConfirmationEntry,
+    execution_store: ExecutionJournalStore,
+    execution_entry_id: int,
+) -> None:
+    if confirmation.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Cleanup preview confirmation entry_id is required before live submission",
+        )
+    paper_trade_id = _effective_cleanup_submission_paper_trade_id(
+        paper_trade=paper_trade,
+        confirmation=confirmation,
+    )
+    execution_store.mark_live_submission_completed(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+        execution_entry_id=execution_entry_id,
+    )
+    execution_store.mark_cleanup_live_submission_completed(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+        execution_entry_id=execution_entry_id,
+    )
+
+
 async def _observe_pair_status_for_execution(
     *,
     paper_trade: PaperTradeEntry,
@@ -2164,29 +2266,12 @@ async def _run_guarded_auto_cleanup_sequence(
                     note=confirmation_note,
                 )
             )
-        if cleanup_confirmation.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Cleanup preview confirmation entry_id is required before live submission",
-            )
-
-        if not execution_store.reserve_live_submission(
-            confirmation_entry_id=cleanup_confirmation.entry_id,
-            preview_hash=cleanup_confirmation.preview_hash,
-        ):
-            existing_entry = execution_store.find_by_confirmation(
-                confirmation_entry_id=cleanup_confirmation.entry_id,
-                preview_hash=cleanup_confirmation.preview_hash,
-            )
-            if existing_entry is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Cleanup live submission was already reserved without a matching "
-                        "journaled execution; manual reconciliation is required before "
-                        "retrying"
-                    ),
-                )
+        existing_entry = _reserve_cleanup_live_submission_or_existing(
+            paper_trade=paper_trade,
+            confirmation=cleanup_confirmation,
+            execution_store=execution_store,
+        )
+        if existing_entry is not None:
             latest_cleanup_execution = existing_entry
             reused_existing_cleanup = True
         else:
@@ -2208,9 +2293,10 @@ async def _run_guarded_auto_cleanup_sequence(
                     status_code=500,
                     detail="Execution journal append did not return an id",
                 )
-            execution_store.mark_live_submission_completed(
-                confirmation_entry_id=cleanup_confirmation.entry_id,
-                preview_hash=cleanup_confirmation.preview_hash,
+            _mark_cleanup_live_submission_completed(
+                paper_trade=paper_trade,
+                confirmation=cleanup_confirmation,
+                execution_store=execution_store,
                 execution_entry_id=latest_cleanup_execution.entry_id,
             )
 
@@ -5748,28 +5834,13 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if confirmation.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Cleanup preview confirmation entry_id is required before live submission",
-            )
-        if not execution_store.reserve_live_submission(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
-        ):
-            existing_entry = execution_store.find_by_confirmation(
-                confirmation_entry_id=confirmation.entry_id,
-                preview_hash=confirmation.preview_hash,
-            )
-            if existing_entry is not None:
-                raise HTTPException(status_code=409, detail=existing_entry.model_dump(mode="json"))
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "A live submission is already reserved for this confirmed cleanup preview; "
-                    "manual reconciliation is required before retrying"
-                ),
-            )
+        existing_entry = _reserve_cleanup_live_submission_or_existing(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
+        )
+        if existing_entry is not None:
+            raise HTTPException(status_code=409, detail=existing_entry.model_dump(mode="json"))
         try:
             journal_entry = await live_service.submit_confirmed_cleanup_preview(
                 paper_trade=paper_trade,
@@ -5785,9 +5856,10 @@ def create_app() -> FastAPI:
                 status_code=500,
                 detail="Execution journal append did not return an id",
             )
-        execution_store.mark_live_submission_completed(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
+        _mark_cleanup_live_submission_completed(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
             execution_entry_id=saved_entry.entry_id,
         )
         return saved_entry
@@ -5854,28 +5926,13 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if confirmation.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Cleanup preview confirmation entry_id is required before live submission",
-            )
-        if not execution_store.reserve_live_submission(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
-        ):
-            existing_entry = execution_store.find_by_confirmation(
-                confirmation_entry_id=confirmation.entry_id,
-                preview_hash=confirmation.preview_hash,
-            )
-            if existing_entry is not None:
-                raise HTTPException(status_code=409, detail=existing_entry.model_dump(mode="json"))
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "A live submission is already reserved for this confirmed cleanup preview; "
-                    "manual reconciliation is required before retrying"
-                ),
-            )
+        existing_entry = _reserve_cleanup_live_submission_or_existing(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
+        )
+        if existing_entry is not None:
+            raise HTTPException(status_code=409, detail=existing_entry.model_dump(mode="json"))
         try:
             journal_entry = await live_service.submit_confirmed_cleanup_preview(
                 paper_trade=paper_trade,
@@ -5891,9 +5948,10 @@ def create_app() -> FastAPI:
                 status_code=500,
                 detail="Execution journal append did not return an id",
             )
-        execution_store.mark_live_submission_completed(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
+        _mark_cleanup_live_submission_completed(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
             execution_entry_id=saved_entry.entry_id,
         )
         return saved_entry
@@ -5960,6 +6018,13 @@ def create_app() -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        existing_entry = _reserve_cleanup_live_submission_or_existing(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
+        )
+        if existing_entry is not None:
+            raise HTTPException(status_code=409, detail=existing_entry.model_dump(mode="json"))
         try:
             journal_entry = await live_service.submit_confirmed_cleanup_preview(
                 paper_trade=paper_trade,
@@ -5969,7 +6034,19 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return execution_store.append(journal_entry)
+        saved_entry = execution_store.append(journal_entry)
+        if saved_entry.entry_id is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution journal append did not return an id",
+            )
+        _mark_cleanup_live_submission_completed(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
+            execution_entry_id=saved_entry.entry_id,
+        )
+        return saved_entry
 
     @app.post(
         "/v1/executions/live/pair/from-paper-trade/{paper_trade_id}",

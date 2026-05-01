@@ -828,6 +828,33 @@ def test_execution_journal_store_reserves_pair_close_submission_once_per_trade(
     )
 
 
+def test_execution_journal_store_reserves_cleanup_submission_once_per_trade(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_cleanup_live_submission(
+        paper_trade_id=7,
+        preview_hash="cleanup-hash",
+        confirmation_entry_id=11,
+    )
+    assert not store.reserve_cleanup_live_submission(
+        paper_trade_id=7,
+        preview_hash="cleanup-hash",
+        confirmation_entry_id=12,
+    )
+    assert store.reserve_cleanup_live_submission(
+        paper_trade_id=7,
+        preview_hash="next-cleanup-hash",
+        confirmation_entry_id=13,
+    )
+    assert store.reserve_cleanup_live_submission(
+        paper_trade_id=8,
+        preview_hash="cleanup-hash",
+        confirmation_entry_id=14,
+    )
+
+
 def test_execution_journal_store_finds_entry_by_confirmation_entry_id(tmp_path: Path) -> None:
     store = ExecutionJournalStore(tmp_path / "history.sqlite3")
     saved = store.append(

@@ -12640,6 +12640,16 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
         preview_hash=existing_cleanup.preview_hash,
         execution_entry_id=existing_cleanup_execution.entry_id,
     )
+    cleanup_confirmation_store.append(
+        CleanupPreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 17, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label="arb_extended_paradex",
+            preview_hash=existing_cleanup.preview_hash,
+            preview=existing_cleanup.preview,
+            note="parallel monitor duplicate cleanup confirmation",
+        )
+    )
 
     class StubAccountPreflightService:
         def __init__(self) -> None:
@@ -12841,7 +12851,7 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
     assert (
         "Existing cleanup execution reused for this confirmation" in payload["pair_status"]["notes"]
     )
-    assert len(cleanup_confirmation_store.list_recent(limit=10)) == 1
+    assert len(cleanup_confirmation_store.list_recent(limit=10)) == 2
     saved_executions = execution_store.list_recent(limit=10)
     assert len(saved_executions) == 2
     cleanup_entries = [
