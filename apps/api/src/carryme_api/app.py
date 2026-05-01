@@ -3635,6 +3635,107 @@ def _append_pair_close_confirmation_for_preview(
     )
 
 
+def _effective_pair_open_submission_paper_trade_id(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: PreviewConfirmationEntry,
+) -> int:
+    paper_trade_id = paper_trade.entry_id or confirmation.paper_trade_id
+    if paper_trade_id < 1:
+        raise HTTPException(
+            status_code=500,
+            detail="paper_trade_id is required before paired live submission",
+        )
+    return paper_trade_id
+
+
+def _reserve_pair_open_live_submission_or_existing(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: PreviewConfirmationEntry,
+    execution_store: ExecutionJournalStore,
+) -> ExecutionJournalEntry | None:
+    if confirmation.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Preview confirmation entry_id is required before live submission",
+        )
+    paper_trade_id = _effective_pair_open_submission_paper_trade_id(
+        paper_trade=paper_trade,
+        confirmation=confirmation,
+    )
+    existing_entry = execution_store.find_by_paper_trade_preview_hash(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+    )
+    if existing_entry is not None:
+        return existing_entry
+    if not execution_store.reserve_pair_open_live_submission(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+        confirmation_entry_id=confirmation.entry_id,
+    ):
+        existing_entry = execution_store.find_by_paper_trade_preview_hash(
+            paper_trade_id=paper_trade_id,
+            preview_hash=confirmation.preview_hash,
+        )
+        if existing_entry is not None:
+            return existing_entry
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A paired live submission is already reserved for this paper trade "
+                "and preview hash; manual reconciliation is required before retrying"
+            ),
+        )
+    if not execution_store.reserve_live_submission(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+    ):
+        existing_entry = execution_store.find_by_confirmation(
+            confirmation_entry_id=confirmation.entry_id,
+            preview_hash=confirmation.preview_hash,
+        )
+        if existing_entry is not None:
+            return existing_entry
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A live submission is already reserved for this confirmed preview; "
+                "manual reconciliation is required before retrying"
+            ),
+        )
+    return None
+
+
+def _mark_pair_open_live_submission_completed(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: PreviewConfirmationEntry,
+    execution_store: ExecutionJournalStore,
+    execution_entry_id: int,
+) -> None:
+    if confirmation.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Preview confirmation entry_id is required before live submission",
+        )
+    paper_trade_id = _effective_pair_open_submission_paper_trade_id(
+        paper_trade=paper_trade,
+        confirmation=confirmation,
+    )
+    execution_store.mark_live_submission_completed(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+        execution_entry_id=execution_entry_id,
+    )
+    execution_store.mark_pair_open_live_submission_completed(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+        execution_entry_id=execution_entry_id,
+    )
+
+
 async def _execute_guarded_pair_from_confirmation(
     *,
     paper_trade: PaperTradeEntry,
@@ -3654,30 +3755,15 @@ async def _execute_guarded_pair_from_confirmation(
     auto_cleanup: bool,
 ) -> GuardedPairExecutionResult:
     paper_trade_id = paper_trade.entry_id or 0
-    if confirmation.entry_id is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Preview confirmation entry_id is required before live submission",
-        )
-    if not execution_store.reserve_live_submission(
-        confirmation_entry_id=confirmation.entry_id,
-        preview_hash=confirmation.preview_hash,
-    ):
-        existing_entry = execution_store.find_by_confirmation(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
-        )
-        if existing_entry is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=existing_entry.model_dump(mode="json"),
-            )
+    existing_entry = _reserve_pair_open_live_submission_or_existing(
+        paper_trade=paper_trade,
+        confirmation=confirmation,
+        execution_store=execution_store,
+    )
+    if existing_entry is not None:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "A live submission is already reserved for this confirmed preview; "
-                "manual reconciliation is required before retrying"
-            ),
+            detail=existing_entry.model_dump(mode="json"),
         )
     try:
         primary_execution = await service.submit_confirmed_preview(
@@ -3696,9 +3782,10 @@ async def _execute_guarded_pair_from_confirmation(
             status_code=500,
             detail="Execution journal append did not return an id",
         )
-    execution_store.mark_live_submission_completed(
-        confirmation_entry_id=confirmation.entry_id,
-        preview_hash=confirmation.preview_hash,
+    _mark_pair_open_live_submission_completed(
+        paper_trade=paper_trade,
+        confirmation=confirmation,
+        execution_store=execution_store,
         execution_entry_id=primary_execution.entry_id,
     )
     try:
@@ -5493,30 +5580,15 @@ def create_app() -> FastAPI:
                     "No preview confirmation matched the requested paper trade and preview hash"
                 ),
             )
-        if confirmation.entry_id is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Preview confirmation entry_id is required before live submission",
-            )
-        if not execution_store.reserve_live_submission(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
-        ):
-            existing_entry = execution_store.find_by_confirmation(
-                confirmation_entry_id=confirmation.entry_id,
-                preview_hash=confirmation.preview_hash,
-            )
-            if existing_entry is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=existing_entry.model_dump(mode="json"),
-                )
+        existing_entry = _reserve_pair_open_live_submission_or_existing(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
+        )
+        if existing_entry is not None:
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    "A live submission is already reserved for this confirmed preview; "
-                    "manual reconciliation is required before retrying"
-                ),
+                detail=existing_entry.model_dump(mode="json"),
             )
 
         try:
@@ -5535,9 +5607,10 @@ def create_app() -> FastAPI:
                 status_code=500,
                 detail="Execution journal append did not return an id",
             )
-        execution_store.mark_live_submission_completed(
-            confirmation_entry_id=confirmation.entry_id,
-            preview_hash=confirmation.preview_hash,
+        _mark_pair_open_live_submission_completed(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
             execution_entry_id=saved_entry.entry_id,
         )
         return saved_entry
