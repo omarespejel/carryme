@@ -3,9 +3,55 @@ pr_commands = [
   "/agentic_describe",
   "/agentic_review"
 ]
+handle_push_trigger = true
+push_commands = [
+  "/agentic_review"
+]
 
 [review_agent]
 comments_location_policy = "both"
-inline_comments_severity_threshold = 3
-issues_user_guidelines = "Prioritize correctness, data integrity, fee-model accuracy, funding-unit normalization, symbol mapping, and execution-risk issues. Avoid style-only comments unless they hide a real defect."
-compliance_user_guidelines = "Focus on deterministic behavior, explicit assumptions, official-API sourcing, and prevention of silent fallback or stale-data logic."
+inline_comments_severity_threshold = 2
+demand_self_review = true
+approve_pr_on_self_review = false
+issues_user_guidelines = """\
+Prioritize production correctness over style. For carryme, focus on live-money safety, stale-data gates, route approval identity, fee/slippage math, funding-rate unit normalization, venue symbol mapping, async retries, idempotency, and Render worker behavior. Treat silent fallback, redacted runtime credentials, unbounded scans, and missing tests on launch/close paths as high severity. Do not suggest widening notional caps or removing fail-closed gates unless the PR explicitly justifies it.
+"""
+compliance_user_guidelines = """\
+Check changes against pr_compliance_checklist.yaml and best_practices.md. For any PR that can affect live execution, require explicit validation of launch readiness, auto-close/cleanup behavior, and bounded risk exposure. Call out claims that overstate profitability or readiness without hosted evidence.
+"""
+
+[review_agent_ux]
+finding_overflow_count = 5
+resolved_overflow_count = 3
+expand_description = true
+expand_code = true
+expand_relevance = true
+expand_evidence = true
+expand_prompt = false
+
+[checks]
+enable_auto_checks_feedback = true
+persistent_comment = true
+enable_help_text = true
+final_update_message = true
+
+[pr_code_suggestions]
+enable_chat_in_code_suggestions = true
+
+[pr_compliance]
+persistent_comment = true
+enable_user_defined_compliance_labels = true
+enable_security_compliance = true
+enable_compliance_labels_security = true
+enable_todo_scan = true
+enable_help_text = true
+extra_instructions = """\
+For this repository, compliance means safe live trading automation. Prefer concrete, testable findings over broad advice. If a requirement is not applicable to a documentation-only PR, state that clearly rather than forcing a violation.
+"""
+
+[config]
+ignore_pr_title = [
+  "^WIP",
+  "\\[skip review\\]",
+  "do not review"
+]

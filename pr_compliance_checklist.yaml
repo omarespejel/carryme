@@ -1,0 +1,36 @@
+pr_compliances:
+  - title: "Live-money launch gate safety"
+    compliance_label: true
+    objective: "Changes that can affect live execution must preserve fail-closed launch behavior."
+    success_criteria: "The PR blocks unattended launch when credentials, live flags, route approvals, system state, snapshot freshness, active-execution limits, or risk budgets are missing or invalid."
+    failure_criteria: "The PR allows live submission through silent fallback, stale data, incomplete credentials, disabled venue flags, unknown system state, or bypassed route approval."
+
+  - title: "Hold and auto-close safety"
+    compliance_label: true
+    objective: "Held hedges must be protected by real monitor-driven close or cleanup automation."
+    success_criteria: "If a stable launch can leave positions open, the PR proves execution auto-close is enabled, not shadow-only, and has deterministic close triggers with tests."
+    failure_criteria: "The PR opens or holds live hedges without a tested close path, relies only on manual monitoring, or disables immediate close without fail-closed monitor requirements."
+
+  - title: "Funding economics correctness"
+    compliance_label: true
+    objective: "Opportunity selection must use net economics, not raw funding spread alone."
+    success_criteria: "The PR keeps fee profiles, slippage, capacity, funding cadence, entry edge, round-trip edge, and expected PnL units explicit and tested where behavior changes."
+    failure_criteria: "The PR treats gross edge as profit, mixes units, ignores fee profiles, drops capacity constraints, or overstates profitability without hosted evidence."
+
+  - title: "Route approval and notional cap integrity"
+    compliance_label: true
+    objective: "Route approvals remain the final authorization boundary for live trades."
+    success_criteria: "The PR preserves exact matching on label, symbol, venues, fee profiles, approval status, and max live notional before live execution."
+    failure_criteria: "The PR launches unapproved routes, weakens exact identity checks, silently raises caps, or makes dynamic discovery equivalent to live approval."
+
+  - title: "Operational scalability and bounded responses"
+    compliance_label: true
+    objective: "Production scans and operator endpoints must remain bounded under Render constraints."
+    success_criteria: "The PR caps expensive work, shortlists before full snapshots where applicable, and avoids unbounded full nested responses in operational list endpoints."
+    failure_criteria: "The PR adds unbounded fan-out, unbounded API limits, full nested list responses by default, or memory-heavy behavior without safeguards."
+
+  - title: "Regression tests for changed automation behavior"
+    compliance_label: true
+    objective: "Money-moving automation changes must be protected by targeted tests."
+    success_criteria: "The PR includes deterministic tests for the new allowed path and the important blocked path, plus relevant validation commands in the PR body."
+    failure_criteria: "The PR changes launch, close, cleanup, readiness, approval, or scan behavior without tests that would fail on the previous bug."
