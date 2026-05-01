@@ -1208,7 +1208,7 @@ def _candidate_execution_venue_names(candidate: FundingUniverseCanaryCandidate) 
 
 def _build_candidate_live_execution_preflight(
     *,
-    settings: WorkerSettings,
+    settings: WorkerSettings | ApiSettings,
     candidate: FundingUniverseCanaryCandidate,
     label: str,
 ) -> PaperTradeExecutionPreflight:
@@ -2426,7 +2426,14 @@ async def cache_launch_ready_canaries_once(
             label=label,
         )
         if not execution_preflight.ready:
-            ready_store.delete_label(label)
+            try:
+                ready_store.delete_label(label)
+            except Exception:
+                loop_logger.exception(
+                    "failed to invalidate launch-ready snapshots for label=%s "
+                    "after live execution preflight failure",
+                    label,
+                )
             loop_logger.warning(
                 "skipping launch-ready snapshot label=%s because live execution is not ready: %s",
                 label,
@@ -3007,6 +3014,32 @@ async def launch_latest_stable_canary_once(
             launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
             approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
             detail=hold_mode_blocker,
+        )
+
+    execution_preflight = _build_candidate_live_execution_preflight(
+        settings=runtime_settings,
+        candidate=selected,
+        label=snapshot.label,
+    )
+    if not execution_preflight.ready:
+        try:
+            launch_ready_store.delete_label(snapshot.label)
+        except Exception:
+            logging.getLogger("carryme.worker").exception(
+                "failed to invalidate launch-ready snapshots for label=%s "
+                "during stable launch preflight",
+                snapshot.label,
+            )
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=(
+                "Latest launch-ready snapshot no longer satisfies live execution "
+                f"readiness: {'; '.join(execution_preflight.blocking_reasons)}"
+            ),
         )
 
     try:

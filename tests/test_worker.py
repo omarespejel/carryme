@@ -275,6 +275,7 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_RECV_WINDOW_MS", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_EXTENDED_API_KEY", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_EXTENDED_STARK_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("CARRYME_API_EXTENDED_STARK_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("CARRYME_API_EXTENDED_API_KEY", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_ACCOUNT_ADDRESS", raising=False)
@@ -284,6 +285,20 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_BEARER_TOKEN", raising=False)
     monkeypatch.delenv("CARRYME_API_PARADEX_BEARER_TOKEN", raising=False)
     monkeypatch.delenv("CARRYME_API_PARADEX_RECV_WINDOW_MS", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_HYPERLIQUID_LIVE_ENABLED", raising=False)
+    monkeypatch.delenv("CARRYME_API_HYPERLIQUID_LIVE_ENABLED", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_HYPERLIQUID_ACCOUNT_ADDRESS", raising=False)
+    monkeypatch.delenv("CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_HYPERLIQUID_VAULT_ADDRESS", raising=False)
+    monkeypatch.delenv("CARRYME_API_HYPERLIQUID_VAULT_ADDRESS", raising=False)
+    monkeypatch.delenv(
+        "CARRYME_WORKER_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY",
+        raising=False,
+    )
     monkeypatch.delenv("CARRYME_WORKER_STOP_SIGNALS", raising=False)
 
 
@@ -3390,6 +3405,91 @@ def test_cache_launch_ready_canaries_once_invalidates_existing_snapshot_when_unr
     assert second_summary.launch_ready_candidates == 0
     assert second_summary.saved_snapshots == 0
     assert launch_ready_store.list_recent(limit=10, label="arb_extended_paradex") == []
+
+
+def test_cache_launch_ready_canaries_once_skips_when_snapshot_invalidation_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _clear_worker_env(monkeypatch)
+    database_path = str(tmp_path / "history.sqlite3")
+    ready_settings = WorkerSettings(
+        database_path=database_path,
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="0x123",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="token",
+    )
+    approved_store = _append_launch_ready_gate_approved_snapshot(ready_settings)
+
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            return [
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ]
+
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+    asyncio.run(
+        cache_launch_ready_canaries_once(
+            ready_settings,
+            approved_store=approved_store,
+            launch_ready_store=launch_ready_store,
+            system_state_service=cast(Any, StubSystemStateService()),
+            now=datetime(2026, 3, 29, 20, 6, tzinfo=UTC),
+        )
+    )
+
+    degraded_settings = WorkerSettings(
+        database_path=database_path,
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+
+    class FailingDeleteLaunchReadyStore(LaunchReadyCanaryStore):
+        def delete_label(self, label: str) -> int:
+            raise RuntimeError(f"boom {label}")
+
+    class FailingSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            raise AssertionError("system-state probe should not run before credential gate passes")
+
+    with caplog.at_level(logging.WARNING):
+        summary = asyncio.run(
+            cache_launch_ready_canaries_once(
+                degraded_settings,
+                approved_store=approved_store,
+                launch_ready_store=FailingDeleteLaunchReadyStore(database_path),
+                system_state_service=cast(Any, FailingSystemStateService()),
+                now=datetime(2026, 3, 29, 20, 7, tzinfo=UTC),
+            )
+        )
+
+    assert summary.launch_ready_candidates == 0
+    assert summary.saved_snapshots == 0
+    assert "failed to invalidate launch-ready snapshots" in caplog.text
 
 
 def test_cache_launch_ready_canaries_once_skips_decayed_approved_snapshot_chain(
@@ -8301,6 +8401,63 @@ def test_launch_latest_stable_canary_once_ignores_unselected_live_credentials(
 
     assert summary.status == "launched"
     assert summary.paper_trade_id == 17
+
+
+def test_launch_latest_stable_canary_once_rechecks_live_execution_readiness(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_bearer_token="token",
+    )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex"
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
+    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
+    stability = stability.model_copy(update={"snapshot": snapshot})
+    LaunchReadyCanaryStore(settings.database_path).append(snapshot)
+
+    async def run_unexpected_lifecycle(**_: object) -> object:
+        pytest.fail("stable launch should not submit when live execution credentials are missing")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_unexpected_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                now=datetime(2026, 3, 30, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.label == "arb_extended_paradex"
+    assert summary.detail == (
+        "Latest launch-ready snapshot no longer satisfies live execution readiness: "
+        "Venue paradex is missing required credentials: "
+        "CARRYME_API_PARADEX_PRIVATE_KEY"
+    )
+    assert (
+        LaunchReadyCanaryStore(settings.database_path).latest(label="arb_extended_paradex")
+        is None
+    )
 
 
 def _build_auto_close_paper_trade(
