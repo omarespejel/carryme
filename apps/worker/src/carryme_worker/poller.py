@@ -2161,14 +2161,21 @@ async def scan_approved_canary_once(
     scanned_labels: set[str] = set()
     scanned_candidates = 0
 
-    selected_labels = list(approvals_by_label)[: settings.approved_canary_scan_limit]
+    all_labels = list(approvals_by_label)
+    selected_labels = (
+        all_labels
+        if settings.approved_canary_scan_limit == 0
+        else all_labels[: settings.approved_canary_scan_limit]
+    )
     if len(selected_labels) < len(approvals_by_label):
         loop_logger.info(
-            "approved canary exact scan limit reached at %s labels",
+            "approved canary label scan limit selected %s of %s labels",
             settings.approved_canary_scan_limit,
+            len(approvals_by_label),
         )
+    label_scan_semaphore = asyncio.Semaphore(settings.approved_canary_scan_concurrency)
 
-    async def _scan_label(
+    async def _scan_label_unbounded(
         label: str,
     ) -> tuple[
         str,
@@ -2235,6 +2242,18 @@ async def scan_approved_canary_once(
             return label, scanned_candidate_count, label_scanned, None, None
         candidate, matched_approval = best_match
         return label, scanned_candidate_count, label_scanned, candidate, matched_approval
+
+    async def _scan_label(
+        label: str,
+    ) -> tuple[
+        str,
+        int,
+        bool,
+        FundingUniverseCanaryCandidate | None,
+        RouteApprovalEntry | None,
+    ]:
+        async with label_scan_semaphore:
+            return await _scan_label_unbounded(label)
 
     results = await asyncio.gather(*(_scan_label(label) for label in selected_labels))
     for label, candidate_count, label_scanned, candidate, matched_approval in results:
