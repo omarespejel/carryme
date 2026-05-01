@@ -1,8 +1,12 @@
+import os
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-from carryme_dev.render import build_render_validation_report
+from carryme_dev.render import (
+    build_render_blueprint_validation_report,
+    build_render_validation_report,
+)
 
 
 def test_render_validation_requires_database_url() -> None:
@@ -16,6 +20,119 @@ def test_render_validation_requires_database_url() -> None:
             "CARRYME_WORKER_ENVIRONMENT",
         ],
         "warnings": [],
+    }
+    assert cast(dict[str, Any], report["render_blueprint"])["status"] == "ready"
+
+
+def test_render_blueprint_requires_all_production_services() -> None:
+    report = build_render_blueprint_validation_report()
+
+    assert report == {
+        "status": "ready",
+        "path": "render.yaml",
+        "missing_databases": [],
+        "missing_services": [],
+        "invalid_services": [],
+    }
+
+
+def test_render_blueprint_flags_missing_stable_launch(tmp_path: Path) -> None:
+    blueprint = tmp_path / "render.yaml"
+    blueprint.write_text(
+        """
+databases:
+  - name: carryme-postgres
+
+services:
+  - type: web
+    name: carryme-api
+    startCommand: uv run carryme-api
+  - type: worker
+    name: carryme-approved-canary-scan
+    startCommand: uv run carryme-worker --scan-approved-canary-supervise
+  - type: worker
+    name: carryme-launch-ready-cache
+    startCommand: uv run carryme-worker --cache-launch-ready-canary-supervise
+  - type: worker
+    name: carryme-execution-monitor
+    startCommand: uv run carryme-worker --observe-executions-supervise
+""".lstrip()
+    )
+
+    report = build_render_blueprint_validation_report(blueprint)
+
+    assert report["status"] == "degraded"
+    assert "carryme-stable-launch" in cast(list[str], report["missing_services"])
+
+
+def test_render_blueprint_rejects_worker_start_command_substring_matches(tmp_path: Path) -> None:
+    blueprint = tmp_path / "render.yaml"
+    blueprint.write_text(
+        """
+databases:
+  - name: carryme-postgres
+
+services:
+  - type: web
+    name: carryme-api
+    startCommand: sh -c 'uv run alembic upgrade head && uv run carryme-api'
+  - type: worker
+    name: carryme-universe-scan
+    startCommand: uv run carryme-worker --scan-universe-supervise
+  - type: worker
+    name: carryme-approved-canary-scan
+    startCommand: uv run carryme-worker --scan-approved-canary-supervise
+  - type: worker
+    name: carryme-launch-ready-cache
+    startCommand: uv run carryme-worker --cache-launch-ready-canary-supervise
+  - type: worker
+    name: carryme-stable-launch
+    startCommand: echo 'uv run carryme-worker --launch-latest-stable-canary-supervise'
+  - type: worker
+    name: carryme-system-state
+    startCommand: uv run carryme-worker --observe-system-state-supervise
+  - type: worker
+    name: carryme-execution-monitor
+    startCommand: uv run carryme-worker --observe-executions-supervise
+""".lstrip()
+    )
+
+    report = build_render_blueprint_validation_report(blueprint)
+
+    assert report["status"] == "degraded"
+    assert {
+        "name": "carryme-stable-launch",
+        "field": "startCommand",
+        "expected": "uv run carryme-worker --launch-latest-stable-canary-supervise",
+        "actual": "echo 'uv run carryme-worker --launch-latest-stable-canary-supervise'",
+    } in cast(list[dict[str, str]], report["invalid_services"])
+
+
+def test_render_validation_skips_blueprint_outside_repo(tmp_path: Path) -> None:
+    watchlist_path = Path(__file__).resolve().parents[1] / "config/watchlists/default.json"
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        report = build_render_validation_report(
+            {
+                "DATABASE_URL": f"sqlite:///{tmp_path / 'render.sqlite3'}",
+                "CARRYME_API_ENVIRONMENT": "production",
+                "CARRYME_WORKER_ENVIRONMENT": "production",
+                "CARRYME_API_EXTENDED_LIVE_ENABLED": "false",
+                "CARRYME_API_PARADEX_LIVE_ENABLED": "false",
+                "CARRYME_API_HYPERLIQUID_LIVE_ENABLED": "false",
+                "CARRYME_WORKER_WATCHLIST_PATH": str(watchlist_path),
+            },
+            blueprint_path=None,
+        )
+    finally:
+        os.chdir(original_cwd)
+
+    assert report["status"] == "ready"
+    assert report["render_blueprint"] == {
+        "status": "skipped",
+        "path": None,
+        "reason": "render.yaml not found from current working directory",
     }
 
 
