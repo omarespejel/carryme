@@ -278,7 +278,8 @@ def _summarize_launch_ready_canary_snapshot(
 
     approved_summary = _summarize_approved_canary_snapshot(snapshot.approved_snapshot)
     return LaunchReadyCanarySnapshotSummary(
-        **approved_summary.model_dump(mode="python"),
+        **approved_summary.model_dump(mode="python", exclude={"captured_at"}),
+        captured_at=snapshot.captured_at,
         launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
         approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
         max_snapshot_age_seconds=snapshot.max_snapshot_age_seconds,

@@ -1347,6 +1347,7 @@ def test_launch_ready_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> 
     assert summary_payload[0]["launch_ready_snapshot_id"] == 1
     assert summary_payload[0]["approved_snapshot_id"] == 3
     assert summary_payload[0]["label"] == "arb_extended_paradex"
+    assert summary_payload[0]["captured_at"] == "2026-03-29T16:07:00Z"
     assert summary_payload[0]["system_state_ready"] is True
 
 
