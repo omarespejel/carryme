@@ -6935,6 +6935,56 @@ def test_launch_latest_stable_canary_once_skips_when_recent_live_trade_is_unobse
     )
 
 
+def test_launch_latest_stable_canary_once_blocks_stale_unobserved_live_trade(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_observation_max_age_seconds=600,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=33,
+            preview_hash="stale-unobserved-live-preview",
+            confirmation_entry_id=43,
+            paper_trade=_build_auto_close_paper_trade(
+                entry_id=33,
+                created_at=datetime(2026, 4, 4, 9, 58, tzinfo=UTC),
+                label="jup_extended_paradex",
+                canonical_symbol="JUP-USD-PERP",
+            ),
+            legs=[_build_auto_close_execution_leg()],
+        )
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("stale unobserved live submissions must block launch")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                now=datetime(2026, 4, 4, 10, 20, 1, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Active live executions still require monitoring before unattended launch "
+        "(max_allowed=0, current=1): "
+        "paper_trade_id=33 label=jup_extended_paradex "
+        "state=pending_initial_monitoring"
+    )
+
+
 def test_launch_latest_stable_canary_once_counts_beyond_active_execution_scan_limit(
     tmp_path: Path,
 ) -> None:

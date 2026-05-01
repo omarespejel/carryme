@@ -390,6 +390,7 @@ def _list_blocking_live_executions_for_stable_launch(
         limit=scan_limit,
         now=now,
         max_age_seconds=settings.execution_observation_max_age_seconds,
+        unobserved_requires_monitoring=True,
     )
     for execution in recent_live_executions:
         paper_trade_id = execution.paper_trade_id
@@ -2894,6 +2895,7 @@ async def launch_latest_stable_canary_once(
         limit=risk_budget_scan_limit + 1,
         now=timestamp,
         max_age_seconds=settings.execution_observation_max_age_seconds,
+        unobserved_requires_monitoring=True,
     )
     if (
         (
@@ -5017,6 +5019,7 @@ def _list_recent_live_executions(
     limit: int,
     now: datetime,
     max_age_seconds: int,
+    unobserved_requires_monitoring: bool = False,
 ) -> list[ExecutionJournalEntry]:
     """Return recent unique live executions after filtering irrelevant journal rows."""
 
@@ -5038,6 +5041,7 @@ def _list_recent_live_executions(
             if age_seconds > max_age_seconds and not _execution_requires_continued_monitoring(
                 observation_store,
                 execution=execution,
+                unobserved_requires_monitoring=unobserved_requires_monitoring,
             ):
                 continue
             if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
@@ -5058,6 +5062,7 @@ def _execution_requires_continued_monitoring(
     *,
     execution: ExecutionJournalEntry,
     latest_observation: ExecutionObservationEntry | None = None,
+    unobserved_requires_monitoring: bool = False,
 ) -> bool:
     """Return whether an older live execution still has an active monitoring state."""
 
@@ -5068,7 +5073,7 @@ def _execution_requires_continued_monitoring(
     if latest is None:
         latest = observation_store.latest_for_paper_trade(paper_trade_id)
     if latest is None:
-        return False
+        return unobserved_requires_monitoring
     pair_status = latest.pair_status
     if pair_status is None:
         for observation in observation_store.list_recent(limit=None, paper_trade_id=paper_trade_id):
