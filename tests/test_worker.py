@@ -8405,7 +8405,9 @@ def test_launch_latest_stable_canary_once_ignores_unselected_live_credentials(
 
 def test_launch_latest_stable_canary_once_rechecks_live_execution_readiness(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _clear_worker_env(monkeypatch)
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
         extended_live_enabled=True,
