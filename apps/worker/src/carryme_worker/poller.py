@@ -3277,7 +3277,6 @@ async def launch_latest_stable_canary_once(
             database_path=settings.database_target,
             detail=detail,
         )
-
     if settings.stable_canary_launch_shadow_mode:
         logging.getLogger("carryme.worker").info(
             "shadow launch for label=%s from launch_ready_snapshot_id=%s",
@@ -3344,6 +3343,22 @@ async def launch_latest_stable_canary_once(
                 f"readiness: {'; '.join(execution_preflight.blocking_reasons)}"
             ),
         )
+
+    if snapshot.launch_ready_snapshot_id is not None:
+        reserved = stable_launch_store.reserve_snapshot_launch(
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            label=snapshot.label,
+            reserved_at=timestamp,
+        )
+        if not reserved:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_target,
+                label=snapshot.label,
+                launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+                approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+                detail="Launch-ready canary snapshot is already reserved for launch by worker",
+            )
 
     try:
         lifecycle = await _run_guarded_canary_lifecycle(

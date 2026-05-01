@@ -2899,6 +2899,27 @@ def test_stable_canary_launch_store_filters_by_status(tmp_path: Path) -> None:
     assert results[0].launch_ready_snapshot_id == 9
 
 
+def test_stable_canary_launch_store_reserves_snapshot_launch_once(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    first_reserved = store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+    )
+    second_reserved = store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=1),
+    )
+
+    assert first_reserved is True
+    assert second_reserved is False
+
+
 def test_approved_canary_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:
     store = ApprovedCanaryAlertStore(tmp_path / "history.sqlite3")
     previous_snapshot = ApprovedCanarySnapshot(

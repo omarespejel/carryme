@@ -5260,6 +5260,116 @@ def test_launch_latest_stable_canary_once_skips_when_selected_snapshot_lacks_rev
     )
 
 
+def test_launch_latest_stable_canary_once_falls_through_reserved_snapshot(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    high_approval, high_candidate, high_snapshot, high_stability = (
+        _build_stable_launch_test_snapshot(
+            label="bera_extended_paradex",
+            canonical_symbol="BERA-USD-PERP",
+            short_symbol="BERA-USD",
+            long_symbol="BERA-USD-PERP",
+            launch_ready_snapshot_id=29,
+            approved_snapshot_id=28,
+            estimated_one_day_pnl_after_round_trip=3.0,
+        )
+    )
+    fallback_approval, fallback_candidate, fallback_snapshot, fallback_stability = (
+        _build_stable_launch_test_snapshot(
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_symbol="ARB-USD",
+            long_symbol="ARB-USD-PERP",
+            launch_ready_snapshot_id=39,
+            approved_snapshot_id=38,
+            estimated_one_day_pnl_after_round_trip=1.5,
+        )
+    )
+    high_approved = approved_store.append(high_snapshot.approved_snapshot)
+    fallback_approved = approved_store.append(fallback_snapshot.approved_snapshot)
+    high_snapshot = high_snapshot.model_copy(update={"approved_snapshot": high_approved})
+    fallback_snapshot = fallback_snapshot.model_copy(
+        update={"approved_snapshot": fallback_approved}
+    )
+    high_stability = high_stability.model_copy(update={"snapshot": high_snapshot})
+    fallback_stability = fallback_stability.model_copy(update={"snapshot": fallback_snapshot})
+    assert high_snapshot.launch_ready_snapshot_id is not None
+    assert launch_store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=high_snapshot.launch_ready_snapshot_id,
+        label=high_snapshot.label,
+        reserved_at=datetime(2026, 4, 4, 10, 1, 5, tzinfo=UTC),
+    )
+    selected_by_label = {
+        high_snapshot.label: (high_snapshot, high_candidate, high_approval),
+        fallback_snapshot.label: (
+            fallback_snapshot,
+            fallback_candidate,
+            fallback_approval,
+        ),
+    }
+    captured_labels: list[str] = []
+
+    class StubLifecycleResult:
+        def __init__(self) -> None:
+            self.paper_trade = type("StubPaperTrade", (), {"entry_id": 48})()
+            self.final_pair_status = type("StubPairStatus", (), {"derived_state": "closed"})()
+
+    async def run_stub_lifecycle(**kwargs: object) -> Any:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        captured_labels.append(approval.label)
+        return StubLifecycleResult()
+
+    def select_stub(**kwargs: object) -> tuple[
+        LaunchReadyCanarySnapshot,
+        FundingUniverseCanaryCandidate,
+        RouteApprovalEntry,
+    ]:
+        label = cast(str, kwargs["label"])
+        return selected_by_label[label]
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._list_ranked_stable_launch_ready_stabilities",
+            lambda **_: [high_stability, fallback_stability],
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            select_stub,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                launch_store=launch_store,
+                approved_store=approved_store,
+                now=datetime(2026, 4, 4, 10, 1, 30, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.label == "arb_extended_paradex"
+    assert summary.launch_ready_snapshot_id == fallback_snapshot.launch_ready_snapshot_id
+    assert captured_labels == ["arb_extended_paradex"]
+
+
 def test_launch_latest_stable_canary_once_skips_when_global_cooldown_active(
     tmp_path: Path,
 ) -> None:

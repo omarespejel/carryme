@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from carryme_models import StableCanaryLaunchRecord
@@ -47,6 +48,21 @@ class StableCanaryLaunchStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_stable_canary_launch_records_label
                 ON stable_canary_launch_records(label)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS stable_canary_launch_reservations (
+                    launch_ready_snapshot_id INTEGER PRIMARY KEY,
+                    reserved_at TEXT NOT NULL,
+                    label TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_stable_canary_launch_reservations_label
+                ON stable_canary_launch_reservations(label)
                 """
             )
 
@@ -137,3 +153,41 @@ class StableCanaryLaunchStore:
 
         records = self.list_recent(limit=1, launch_ready_snapshot_id=launch_ready_snapshot_id)
         return records[0] if records else None
+
+    def reserve_snapshot_launch(
+        self,
+        *,
+        launch_ready_snapshot_id: int,
+        label: str,
+        reserved_at: datetime,
+    ) -> bool:
+        """Reserve one launch-ready snapshot for a single live launch attempt."""
+
+        self.initialize()
+        if launch_ready_snapshot_id < 1:
+            raise ValueError("launch_ready_snapshot_id must be positive")
+        normalized_label = label.strip()
+        if not normalized_label:
+            raise ValueError("label must be non-empty")
+        if reserved_at.tzinfo is None or reserved_at.utcoffset() is None:
+            raise ValueError("reserved_at must be timezone-aware")
+
+        with self.database.begin() as connection:
+            result = connection.execute(
+                """
+                INSERT INTO stable_canary_launch_reservations (
+                    launch_ready_snapshot_id,
+                    reserved_at,
+                    label
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(launch_ready_snapshot_id) DO NOTHING
+                """,
+                (
+                    launch_ready_snapshot_id,
+                    reserved_at.astimezone(UTC).isoformat(),
+                    normalized_label,
+                ),
+            )
+
+        rowcount = getattr(result, "rowcount", None)
+        return isinstance(rowcount, int) and rowcount > 0
