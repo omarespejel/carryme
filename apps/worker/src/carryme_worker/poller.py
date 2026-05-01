@@ -523,6 +523,16 @@ def _build_stable_launch_hold_mode_blocker(settings: WorkerSettings) -> str | No
             "Stable launch hold mode is blocked because "
             "execution_auto_pair_close_shadow_mode is true"
         )
+    if settings.execution_auto_pair_close_min_profit_total_collateral is None:
+        return (
+            "Stable launch hold mode is blocked because "
+            "execution_auto_pair_close_min_profit_total_collateral is unset"
+        )
+    if settings.execution_auto_pair_close_max_profit_giveback_ratio is None:
+        return (
+            "Stable launch hold mode is blocked because "
+            "execution_auto_pair_close_max_profit_giveback_ratio is unset"
+        )
     return None
 
 
