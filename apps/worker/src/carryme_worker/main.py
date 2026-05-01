@@ -88,6 +88,64 @@ def build_readiness_payload(settings: WorkerSettings) -> ServiceReadiness:
     )
 
 
+def build_automation_mode_payload(
+    *,
+    worker_mode: str,
+    settings: WorkerSettings,
+) -> dict[str, bool | float | int | str | None]:
+    """Build a redacted summary of live automation settings for hosted logs."""
+
+    return {
+        "worker_mode": worker_mode,
+        "environment": settings.environment,
+        "database_target": settings.database_target,
+        "stable_canary_launch_close_position": settings.stable_canary_launch_close_position,
+        "stable_canary_launch_hold_mode": not settings.stable_canary_launch_close_position,
+        "stable_canary_launch_shadow_mode": settings.stable_canary_launch_shadow_mode,
+        "stable_canary_launch_max_active_live_executions": (
+            settings.stable_canary_launch_max_active_live_executions
+        ),
+        "stable_canary_launch_active_execution_limit": (
+            settings.stable_canary_launch_active_execution_limit
+        ),
+        "stable_canary_launch_max_total_live_notional": (
+            settings.stable_canary_launch_max_total_live_notional
+        ),
+        "stable_canary_launch_max_live_notional_per_venue": (
+            settings.stable_canary_launch_max_live_notional_per_venue
+        ),
+        "execution_auto_pair_close_enabled": settings.execution_auto_pair_close_enabled,
+        "execution_auto_pair_close_shadow_mode": settings.execution_auto_pair_close_shadow_mode,
+        "execution_auto_pair_close_min_entry_edge_retention_ratio": (
+            settings.execution_auto_pair_close_min_entry_edge_retention_ratio
+        ),
+        "execution_auto_pair_close_max_round_trip_break_even_hold_windows": (
+            settings.execution_auto_pair_close_max_round_trip_break_even_hold_windows
+        ),
+        "execution_auto_pair_close_max_hold_windows": (
+            settings.execution_auto_pair_close_max_hold_windows
+        ),
+        "execution_auto_pair_close_min_profit_total_collateral": (
+            settings.execution_auto_pair_close_min_profit_total_collateral
+        ),
+        "execution_auto_pair_close_max_profit_giveback_ratio": (
+            settings.execution_auto_pair_close_max_profit_giveback_ratio
+        ),
+    }
+
+
+def log_automation_mode(*, worker_mode: str, settings: WorkerSettings) -> None:
+    """Log live automation settings without exposing credentials."""
+
+    logging.getLogger("carryme.worker").info(
+        "worker automation mode %s",
+        json.dumps(
+            build_automation_mode_payload(worker_mode=worker_mode, settings=settings),
+            sort_keys=True,
+        ),
+    )
+
+
 def build_cycle_payload(summary: PollCycleSummary) -> dict[str, int | str]:
     """Build a deterministic summary payload for one poll cycle."""
 
@@ -556,10 +614,17 @@ def main() -> None:
         print(build_launch_ready_canary_cache_loop_payload(supervised_launch_ready_summary))
         return
     if args.launch_latest_stable_canary_once:
+        log_automation_mode(worker_mode="launch_latest_stable_canary_once", settings=settings)
         launch_summary = asyncio.run(launch_latest_stable_canary_once(settings))
         print(build_stable_canary_launch_payload(launch_summary))
         return
     if args.launch_latest_stable_canary_supervise:
+
+        log_automation_mode(
+            worker_mode="launch_latest_stable_canary_supervise",
+            settings=settings,
+        )
+
         async def run_stable_canary_launch_supervised() -> StableCanaryLaunchLoopSummary:
             stop_event = asyncio.Event()
             install_signal_handlers(
@@ -578,10 +643,17 @@ def main() -> None:
         print(build_stable_canary_launch_loop_payload(supervised_stable_launch_summary))
         return
     if args.run_production_supervisor_once:
+        log_automation_mode(worker_mode="run_production_supervisor_once", settings=settings)
         supervisor_summary = asyncio.run(run_production_supervisor_cycle_once(settings))
         print(build_production_supervisor_cycle_payload(supervisor_summary))
         return
     if args.run_production_supervisor_supervise:
+
+        log_automation_mode(
+            worker_mode="run_production_supervisor_supervise",
+            settings=settings,
+        )
+
         async def run_production_supervisor() -> ProductionSupervisorLoopSummary:
             stop_event = asyncio.Event()
             install_signal_handlers(
@@ -598,10 +670,13 @@ def main() -> None:
         print(build_production_supervisor_loop_payload(supervisor_loop_summary))
         return
     if args.observe_executions_once:
+        log_automation_mode(worker_mode="observe_executions_once", settings=settings)
         observation_summary = asyncio.run(observe_live_executions_once(settings))
         print(json.dumps(build_execution_observation_payload(observation_summary), indent=2))
         return
     if args.observe_executions_supervise:
+
+        log_automation_mode(worker_mode="observe_executions_supervise", settings=settings)
 
         async def run_execution_supervised() -> ExecutionObservationLoopSummary:
             stop_event = asyncio.Event()

@@ -73,6 +73,7 @@ from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
     build_approved_canary_scan_loop_payload,
     build_approved_canary_scan_payload,
+    build_automation_mode_payload,
     build_candidate_payload,
     build_cycle_payload,
     build_execution_observation_loop_payload,
@@ -90,6 +91,7 @@ from carryme_worker.main import (
     build_system_state_observation_payload,
     build_universe_scan_loop_payload,
     build_universe_scan_payload,
+    log_automation_mode,
 )
 from carryme_worker.main import (
     main as worker_main,
@@ -572,6 +574,60 @@ def test_worker_database_target_redacts_urls() -> None:
 
     assert settings.database_target == redact_database_url(settings.database_path)
     assert settings.database_target == "postgresql+psycopg://***@db.example.com/carryme"
+
+
+def test_worker_automation_mode_payload_is_redacted_and_shows_hold_controls() -> None:
+    settings = WorkerSettings(
+        environment="production",
+        database_path="postgresql+psycopg://user:secret@db.example.com/carryme",
+        stable_canary_launch_close_position=False,
+        stable_canary_launch_max_active_live_executions=0,
+        stable_canary_launch_max_total_live_notional=25.0,
+        stable_canary_launch_max_live_notional_per_venue=20.0,
+        execution_auto_pair_close_enabled=True,
+        execution_auto_pair_close_shadow_mode=False,
+        execution_auto_pair_close_min_profit_total_collateral=0.5,
+        execution_auto_pair_close_max_profit_giveback_ratio=0.4,
+    )
+
+    payload = build_automation_mode_payload(
+        worker_mode="launch_latest_stable_canary_supervise",
+        settings=settings,
+    )
+
+    assert payload["worker_mode"] == "launch_latest_stable_canary_supervise"
+    assert payload["environment"] == "production"
+    assert payload["database_target"] == "postgresql+psycopg://***@db.example.com/carryme"
+    assert "secret" not in json.dumps(payload)
+    assert payload["stable_canary_launch_close_position"] is False
+    assert payload["stable_canary_launch_hold_mode"] is True
+    assert payload["stable_canary_launch_max_active_live_executions"] == 0
+    assert payload["stable_canary_launch_max_total_live_notional"] == 25.0
+    assert payload["stable_canary_launch_max_live_notional_per_venue"] == 20.0
+    assert payload["execution_auto_pair_close_enabled"] is True
+    assert payload["execution_auto_pair_close_shadow_mode"] is False
+    assert payload["execution_auto_pair_close_min_profit_total_collateral"] == 0.5
+    assert payload["execution_auto_pair_close_max_profit_giveback_ratio"] == 0.4
+
+
+def test_log_automation_mode_emits_json_payload(caplog: pytest.LogCaptureFixture) -> None:
+    settings = WorkerSettings(
+        environment="production",
+        database_path="postgresql+psycopg://user:secret@db.example.com/carryme",
+        execution_auto_pair_close_enabled=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger="carryme.worker"):
+        log_automation_mode(worker_mode="observe_executions_supervise", settings=settings)
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert message.startswith("worker automation mode ")
+    payload = json.loads(message.removeprefix("worker automation mode "))
+    assert payload["worker_mode"] == "observe_executions_supervise"
+    assert payload["database_target"] == "postgresql+psycopg://***@db.example.com/carryme"
+    assert payload["execution_auto_pair_close_enabled"] is True
+    assert "secret" not in message
 
 
 def test_build_api_settings_from_worker_settings_keeps_unredacted_database_url() -> None:
