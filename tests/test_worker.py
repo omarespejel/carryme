@@ -11449,6 +11449,152 @@ def test_maybe_auto_close_open_hedged_execution_skips_when_stale_snapshot_cannot
     assert result is None
 
 
+def test_maybe_auto_close_open_hedged_execution_uses_stale_snapshot_for_max_hold(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_shadow_mode=True,
+        execution_auto_pair_close_max_snapshot_age_seconds=300,
+        execution_auto_pair_close_max_hold_windows=0.01,
+    )
+    approval_store = ApprovedCanaryStore(settings.database_path)
+    approval_store.append(
+        _build_auto_close_snapshot(
+            captured_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+            round_trip_edge=0.0009,
+        )
+    )
+    execution = ExecutionJournalEntry(
+        executed_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=27,
+        preview_hash="stale-max-hold-preview",
+        confirmation_entry_id=27,
+        paper_trade=_build_auto_close_paper_trade(
+            entry_id=27,
+            created_at=datetime(2026, 4, 4, 8, 58, tzinfo=UTC),
+        ),
+        legs=[_build_auto_close_execution_leg()],
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        async def missing_live_revalidation(
+            **_: object,
+        ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+            return None, 0
+
+        monkeypatch.setattr(
+            "carryme_worker.poller.scan_live_route_candidate_for_approval",
+            missing_live_revalidation,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("shadow mode should not build a close context")
+            ),
+        )
+        caplog.set_level(logging.INFO)
+        result = asyncio.run(
+            _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=_build_auto_close_pair_status(execution=execution),
+                approved_store=approval_store,
+                execution_store=ExecutionJournalStore(settings.database_path),
+                observation_store=ExecutionObservationStore(settings.database_path),
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                approval_service=RouteApprovalService(
+                    store=RouteApprovalStore(settings.database_path)
+                ),
+                scanner=cast(Any, object()),
+                logger=logging.getLogger("carryme.worker"),
+                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result is None
+    assert "shadow auto-close for paper_trade_id=27" in caplog.text
+    assert "hold age windows" in caplog.text
+    assert "source=stale_approved_snapshot" in caplog.text
+
+
+def test_maybe_auto_close_open_hedged_execution_does_not_use_stale_edge_decay(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_shadow_mode=True,
+        execution_auto_pair_close_max_snapshot_age_seconds=300,
+        execution_auto_pair_close_max_hold_windows=10.0,
+    )
+    approval_store = ApprovedCanaryStore(settings.database_path)
+    approval_store.append(
+        _build_auto_close_snapshot(
+            captured_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
+            round_trip_edge=-0.0001,
+        )
+    )
+    execution = ExecutionJournalEntry(
+        executed_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=28,
+        preview_hash="stale-edge-preview",
+        confirmation_entry_id=28,
+        paper_trade=_build_auto_close_paper_trade(
+            entry_id=28,
+            created_at=datetime(2026, 4, 4, 9, 54, tzinfo=UTC),
+        ),
+        legs=[_build_auto_close_execution_leg()],
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        async def missing_live_revalidation(
+            **_: object,
+        ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+            return None, 0
+
+        monkeypatch.setattr(
+            "carryme_worker.poller.scan_live_route_candidate_for_approval",
+            missing_live_revalidation,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("stale edge data must not build a close context")
+            ),
+        )
+        caplog.set_level(logging.INFO)
+        result = asyncio.run(
+            _maybe_auto_close_open_hedged_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=_build_auto_close_pair_status(execution=execution),
+                approved_store=approval_store,
+                execution_store=ExecutionJournalStore(settings.database_path),
+                observation_store=ExecutionObservationStore(settings.database_path),
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                approval_service=RouteApprovalService(
+                    store=RouteApprovalStore(settings.database_path)
+                ),
+                scanner=cast(Any, object()),
+                logger=logging.getLogger("carryme.worker"),
+                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            )
+        )
+
+    assert result is None
+    assert "shadow auto-close for paper_trade_id=28" not in caplog.text
+
+
 def test_maybe_auto_close_open_hedged_execution_revalidates_without_active_approval(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

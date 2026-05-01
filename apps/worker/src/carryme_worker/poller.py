@@ -1596,6 +1596,23 @@ def _build_open_hedge_auto_close_reason(
                 f"{settings.execution_auto_pair_close_max_round_trip_break_even_hold_windows:.2f}"
             )
 
+    return _build_open_hedge_max_hold_reason(
+        opened_at=opened_at,
+        hold_window_hours=hold_window_hours,
+        settings=settings,
+        now=now,
+    )
+
+
+def _build_open_hedge_max_hold_reason(
+    *,
+    opened_at: datetime,
+    hold_window_hours: float,
+    settings: WorkerSettings,
+    now: datetime,
+) -> str | None:
+    """Return the deterministic max-hold close reason for one open hedge."""
+
     hold_age_seconds = max(0.0, (now - opened_at).total_seconds())
     hold_age_windows = hold_age_seconds / (hold_window_hours * 3600.0)
     if hold_age_windows >= settings.execution_auto_pair_close_max_hold_windows:
@@ -1627,25 +1644,27 @@ async def _resolve_auto_close_snapshot(
     scanner: OpportunityUniverseService | None,
     logger: logging.Logger,
     now: datetime,
-) -> tuple[ApprovedCanarySnapshot | None, Literal["approved_snapshot", "live_revalidation"] | None]:
+) -> tuple[
+    ApprovedCanarySnapshot | None,
+    Literal["approved_snapshot", "live_revalidation", "stale_approved_snapshot"] | None,
+]:
     paper_trade = execution.paper_trade
     if paper_trade is None:
         return None, None
 
     latest_snapshot = approved_store.latest(label=paper_trade.intent.label)
-    if (
-        latest_snapshot is not None
-        and _approved_snapshot_matches_paper_trade(
-            snapshot=latest_snapshot,
-            paper_trade=paper_trade,
-        )
-        and _approved_snapshot_is_fresh(
+    stale_matching_snapshot: ApprovedCanarySnapshot | None = None
+    if latest_snapshot is not None and _approved_snapshot_matches_paper_trade(
+        snapshot=latest_snapshot,
+        paper_trade=paper_trade,
+    ):
+        if _approved_snapshot_is_fresh(
             snapshot=latest_snapshot,
             settings=settings,
             now=now,
-        )
-    ):
-        return latest_snapshot, "approved_snapshot"
+        ):
+            return latest_snapshot, "approved_snapshot"
+        stale_matching_snapshot = latest_snapshot
 
     fallback_reason = "no approved snapshot exists"
     if latest_snapshot is not None:
@@ -1722,6 +1741,8 @@ async def _resolve_auto_close_snapshot(
             paper_trade.entry_id,
             approval.label,
         )
+        if stale_matching_snapshot is not None:
+            return stale_matching_snapshot, "stale_approved_snapshot"
         return None, None
     except (ConnectorError, UpstreamDataError, httpx.HTTPError, ValueError) as exc:
         logger.warning(
@@ -1730,6 +1751,8 @@ async def _resolve_auto_close_snapshot(
             approval.label,
             exc,
         )
+        if stale_matching_snapshot is not None:
+            return stale_matching_snapshot, "stale_approved_snapshot"
         return None, None
 
     if live_candidate is None:
@@ -1741,6 +1764,8 @@ async def _resolve_auto_close_snapshot(
             paper_trade.entry_id,
             fallback_reason,
         )
+        if stale_matching_snapshot is not None:
+            return stale_matching_snapshot, "stale_approved_snapshot"
         return None, None
 
     live_snapshot = ApprovedCanarySnapshot(
@@ -1760,6 +1785,8 @@ async def _resolve_auto_close_snapshot(
             ),
             paper_trade.entry_id,
         )
+        if stale_matching_snapshot is not None:
+            return stale_matching_snapshot, "stale_approved_snapshot"
         return None, None
 
     logger.debug(
@@ -1974,13 +2001,21 @@ async def _maybe_auto_close_open_hedged_execution(
         attribution=latest_attribution,
     )
     if close_reason is None:
-        close_reason = _build_open_hedge_auto_close_reason(
-            paper_trade=paper_trade,
-            opened_at=execution.executed_at,
-            snapshot=latest_snapshot,
-            settings=settings,
-            now=now,
-        )
+        if snapshot_source == "stale_approved_snapshot":
+            close_reason = _build_open_hedge_max_hold_reason(
+                opened_at=execution.executed_at,
+                hold_window_hours=_hold_window_hours(latest_snapshot),
+                settings=settings,
+                now=now,
+            )
+        else:
+            close_reason = _build_open_hedge_auto_close_reason(
+                paper_trade=paper_trade,
+                opened_at=execution.executed_at,
+                snapshot=latest_snapshot,
+                settings=settings,
+                now=now,
+            )
     if close_reason is None:
         return None
 
