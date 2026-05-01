@@ -31,14 +31,23 @@ class AutomationSnapshotSummary(BaseModel):
 
     snapshot_id: int | None = None
     label: str = Field(min_length=1)
-    captured_at: datetime
-    age_seconds: float = Field(ge=0)
+    captured_at: datetime = Field(
+        description="UTC timestamp when the underlying snapshot was captured."
+    )
+    age_seconds: float = Field(
+        description=(
+            "Age of the snapshot in seconds at checked_at. Negative values indicate the "
+            "snapshot timestamp is in the future and should be treated as invalid."
+        )
+    )
 
 
 class ProductionAutomationReadiness(BaseModel):
     """Read-only summary of whether unattended canary launch can proceed."""
 
-    checked_at: datetime
+    checked_at: datetime = Field(
+        description="UTC timestamp when the readiness evaluation was computed."
+    )
     ready: bool
     status: Literal["ready", "blocked"]
     blocking_reasons: list[str] = Field(default_factory=list)

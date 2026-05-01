@@ -11,6 +11,7 @@ from carryme_api.app import (
     get_api_settings,
     get_approved_canary_alert_store,
     get_approved_canary_store,
+    get_automation_readiness_checked_at,
     get_balance_accounting_service,
     get_execution_accounting_service,
     get_execution_journal_store,
@@ -2088,17 +2089,12 @@ def test_production_automation_readiness_endpoint_reports_stable_launch_ready(
     app.dependency_overrides[get_stable_canary_launch_store] = lambda: stable_launch_store
     app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
     app.dependency_overrides[get_execution_observation_store] = lambda: observation_store
+    app.dependency_overrides[get_automation_readiness_checked_at] = (
+        lambda: datetime(2026, 3, 29, 16, 1, 10, tzinfo=UTC)
+    )
     try:
         client = TestClient(app)
-        response = client.get(
-            "/v1/automation/readiness",
-            params={
-                "now": "2026-03-29T16:01:10Z",
-                "min_snapshot_count": "2",
-                "min_stable_seconds": "30",
-                "max_snapshot_age_seconds": "300",
-            },
-        )
+        response = client.get("/v1/automation/readiness")
     finally:
         app.dependency_overrides.clear()
 
@@ -2138,7 +2134,7 @@ def test_production_automation_readiness_endpoint_blocks_active_live_execution(
             executed_at=datetime(2026, 3, 29, 16, 1, 2, tzinfo=UTC),
             adapter="paired_live:extended_then_paradex",
             mode="live",
-            status="accepted",
+            status="submitted",
             paper_trade_id=paper_trade.entry_id,
             preview_hash="preview-hash",
             confirmation_entry_id=9,
@@ -2210,17 +2206,12 @@ def test_production_automation_readiness_endpoint_blocks_active_live_execution(
     app.dependency_overrides[get_stable_canary_launch_store] = lambda: stable_launch_store
     app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
     app.dependency_overrides[get_execution_observation_store] = lambda: observation_store
+    app.dependency_overrides[get_automation_readiness_checked_at] = (
+        lambda: datetime(2026, 3, 29, 16, 1, 10, tzinfo=UTC)
+    )
     try:
         client = TestClient(app)
-        response = client.get(
-            "/v1/automation/readiness",
-            params={
-                "now": "2026-03-29T16:01:10Z",
-                "min_snapshot_count": "2",
-                "min_stable_seconds": "30",
-                "max_snapshot_age_seconds": "300",
-            },
-        )
+        response = client.get("/v1/automation/readiness")
     finally:
         app.dependency_overrides.clear()
 
@@ -2234,6 +2225,183 @@ def test_production_automation_readiness_endpoint_blocks_active_live_execution(
         "Active live executions still require monitoring" in reason
         for reason in payload["blocking_reasons"]
     )
+
+
+def test_production_automation_readiness_endpoint_blocks_future_snapshot_timestamps(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "readiness-future.sqlite3"
+    approved_store = ApprovedCanaryStore(database_path)
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+    stable_launch_store = StableCanaryLaunchStore(database_path)
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    snapshot = _build_api_test_launch_ready_snapshot(
+        captured_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+    )
+    approved_store.append(snapshot.approved_snapshot)
+    launch_ready_store.append(snapshot)
+
+    app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
+    app.dependency_overrides[get_stable_canary_launch_store] = lambda: stable_launch_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_execution_observation_store] = lambda: observation_store
+    app.dependency_overrides[get_automation_readiness_checked_at] = (
+        lambda: datetime(2026, 3, 29, 16, 1, 10, tzinfo=UTC)
+    )
+    try:
+        client = TestClient(app)
+        response = client.get("/v1/automation/readiness")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is False
+    assert "Approved canary snapshot timestamp is in the future" in payload["blocking_reasons"]
+    assert "Launch-ready canary snapshot timestamp is in the future" in payload["blocking_reasons"]
+    assert payload["approved_snapshot"]["age_seconds"] < 0
+    assert payload["launch_ready_snapshot"]["age_seconds"] < 0
+
+
+def test_production_automation_readiness_endpoint_counts_beyond_scan_window(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "readiness-scan-window.sqlite3"
+    approved_store = ApprovedCanaryStore(database_path)
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+    stable_launch_store = StableCanaryLaunchStore(database_path)
+    execution_store = ExecutionJournalStore(database_path)
+    observation_store = ExecutionObservationStore(database_path)
+    first_snapshot = _build_api_test_launch_ready_snapshot(
+        captured_at=datetime(2026, 3, 29, 16, 0, tzinfo=UTC),
+    )
+    second_snapshot = _build_api_test_launch_ready_snapshot(
+        captured_at=datetime(2026, 3, 29, 16, 1, tzinfo=UTC),
+    )
+    approved_store.append(second_snapshot.approved_snapshot)
+    launch_ready_store.append(first_snapshot)
+    launch_ready_store.append(second_snapshot)
+
+    for index in range(app_module.AUTOMATION_READINESS_ACTIVE_EXECUTION_SCAN_LIMIT + 5):
+        execution_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 16, 3, index % 60, tzinfo=UTC),
+                adapter="paper:noop",
+                mode="live",
+                status="accepted",
+                paper_trade_id=10_000 + index,
+                preview_hash=f"irrelevant-{index}",
+                confirmation_entry_id=None,
+                paper_trade=_build_api_test_paper_trade(entry_id=10_000 + index),
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1.0,
+                        status="accepted",
+                        simulated=False,
+                        external_reference=f"irrelevant-order-{index}",
+                    )
+                ],
+            )
+        )
+
+    for paper_trade_id, label, preview_hash in (
+        (91, "near_extended_paradex", "blocking-preview-1"),
+        (92, "jup_extended_paradex", "blocking-preview-2"),
+    ):
+        execution = execution_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 16, 0, 30, tzinfo=UTC),
+                adapter="paired_live:extended_then_paradex",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=preview_hash,
+                confirmation_entry_id=paper_trade_id + 100,
+                paper_trade=_build_api_test_paper_trade(
+                    entry_id=paper_trade_id,
+                    label=label,
+                    created_at=datetime(2026, 3, 29, 15, 55, tzinfo=UTC),
+                ),
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference=f"blocking-order-{paper_trade_id}",
+                    )
+                ],
+            )
+        )
+        observation_store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 3, 29, 16, 1, 8, tzinfo=UTC),
+                context="execution_monitor",
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=preview_hash,
+                order_state=ExecutionOrderState(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=preview_hash,
+                    legs=[],
+                    notes=[],
+                ),
+                pair_status=ExecutionPairStatus(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=preview_hash,
+                    derived_state="hedged",
+                    recommended_action="monitor_open_hedge",
+                    order_state=ExecutionOrderState(
+                        execution_entry_id=execution.entry_id,
+                        paper_trade_id=paper_trade_id,
+                        preview_hash=preview_hash,
+                        legs=[],
+                        notes=[],
+                    ),
+                    reconciliation=ExecutionReconciliation(
+                        execution_entry_id=execution.entry_id,
+                        paper_trade_id=paper_trade_id,
+                        preview_hash=preview_hash,
+                        status="accepted",
+                        recommended_action="monitor",
+                        matched_all_leg_symbols=True,
+                        venues=[],
+                        notes=[],
+                    ),
+                    notes=[],
+                ),
+            )
+        )
+
+    app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
+    app.dependency_overrides[get_stable_canary_launch_store] = lambda: stable_launch_store
+    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_execution_observation_store] = lambda: observation_store
+    app.dependency_overrides[get_automation_readiness_checked_at] = (
+        lambda: datetime(2026, 3, 29, 16, 1, 10, tzinfo=UTC)
+    )
+    try:
+        client = TestClient(app)
+        response = client.get("/v1/automation/readiness")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["active_live_execution_count"] == 2
 
 
 def _build_api_test_launch_ready_snapshot(
@@ -2324,13 +2492,19 @@ def _build_api_test_launch_ready_snapshot(
     )
 
 
-def _build_api_test_paper_trade() -> PaperTradeEntry:
+def _build_api_test_paper_trade(
+    *,
+    entry_id: int = 7,
+    label: str = "arb_extended_paradex",
+    created_at: datetime | None = None,
+) -> PaperTradeEntry:
+    created_at = created_at or datetime(2026, 3, 29, 16, 1, tzinfo=UTC)
     return PaperTradeEntry(
-        entry_id=7,
-        created_at=datetime(2026, 3, 29, 16, 1, tzinfo=UTC),
+        entry_id=entry_id,
+        created_at=created_at,
         note="approved canary",
         intent=FundingPairTradeIntent(
-            label="arb_extended_paradex",
+            label=label,
             canonical_symbol="ARB-USD-PERP",
             source_recorded_at=datetime(2026, 3, 29, 16, 0, tzinfo=UTC),
             one_day_net_edge_after_entry=0.00355,

@@ -169,6 +169,12 @@ DEFAULT_APP_ENVIRONMENT = "development"
 APP_ENVIRONMENT_VARIABLE = "CARRYME_API_ENVIRONMENT"
 MAX_GUARDED_AUTO_CLEANUP_STEPS = 3
 MAX_HISTORY_LIMIT = 1000
+AUTOMATION_READINESS_MAX_SNAPSHOT_AGE_SECONDS = 300
+AUTOMATION_READINESS_MIN_SNAPSHOT_COUNT = 2
+AUTOMATION_READINESS_MIN_STABLE_SECONDS = 30.0
+AUTOMATION_READINESS_MAX_ACTIVE_LIVE_EXECUTIONS = 0
+AUTOMATION_READINESS_ACTIVE_EXECUTION_SCAN_LIMIT = 200
+AUTOMATION_READINESS_MAX_OBSERVATION_AGE_SECONDS = 1800
 PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 logger = logging.getLogger(__name__)
@@ -393,6 +399,12 @@ def get_app_environment() -> str:
         os.getenv(APP_ENVIRONMENT_VARIABLE, DEFAULT_APP_ENVIRONMENT).strip()
         or DEFAULT_APP_ENVIRONMENT
     )
+
+
+def get_automation_readiness_checked_at() -> datetime:
+    """Return the authoritative UTC evaluation time for automation readiness."""
+
+    return datetime.now(UTC)
 
 
 async def _resolve_api_settings_for_request(request: Request) -> ApiSettings:
@@ -2776,10 +2788,12 @@ def _select_latest_launch_ready_canary_snapshot(
     if snapshot is None:
         raise HTTPException(status_code=404, detail="No launch-ready canary snapshot found")
     current_time = now or datetime.now(UTC)
-    snapshot_age_seconds = max(
-        0.0,
-        (current_time - snapshot.captured_at).total_seconds(),
-    )
+    snapshot_age_seconds = (current_time - snapshot.captured_at).total_seconds()
+    if snapshot_age_seconds < 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Launch-ready canary snapshot timestamp is in the future",
+        )
     effective_max_age_seconds = min(
         max_snapshot_age_seconds,
         snapshot.max_snapshot_age_seconds,
@@ -2871,10 +2885,12 @@ def _build_launch_ready_canary_stability(
         raise HTTPException(status_code=404, detail="No launch-ready canary snapshot found")
 
     current_time = now or datetime.now(UTC)
-    snapshot_age_seconds = max(
-        0.0,
-        (current_time - latest_snapshot.captured_at).total_seconds(),
-    )
+    snapshot_age_seconds = (current_time - latest_snapshot.captured_at).total_seconds()
+    if snapshot_age_seconds < 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Launch-ready canary snapshot timestamp is in the future",
+        )
     effective_max_age_seconds = min(
         max_snapshot_age_seconds,
         latest_snapshot.max_snapshot_age_seconds,
@@ -2943,7 +2959,7 @@ def _automation_snapshot_summary(
         snapshot_id=snapshot_id,
         label=label,
         captured_at=captured_at,
-        age_seconds=max(0.0, (now - captured_at).total_seconds()),
+        age_seconds=(now - captured_at).total_seconds(),
     )
 
 
@@ -2955,23 +2971,26 @@ def _count_blocking_live_executions_for_automation_readiness(
     max_observation_age_seconds: int,
     scan_limit: int,
 ) -> int:
-    seen_paper_trade_ids: set[int] = set()
     blocking_count = 0
-    for execution in execution_store.list_recent(limit=scan_limit):
-        if execution.mode != "live" or execution.paper_trade_id is None:
-            continue
+    for execution in _list_recent_live_executions_for_automation_readiness(
+        execution_store=execution_store,
+        observation_store=observation_store,
+        now=now,
+        max_age_seconds=max_observation_age_seconds,
+        limit=scan_limit,
+    ):
         paper_trade_id = execution.paper_trade_id
-        if paper_trade_id in seen_paper_trade_ids:
+        if paper_trade_id is None:
+            blocking_count += 1
             continue
-        seen_paper_trade_ids.add(paper_trade_id)
         latest_observation = observation_store.latest_for_paper_trade(paper_trade_id)
         if latest_observation is None:
             blocking_count += 1
             continue
-        observation_age_seconds = max(
-            0.0,
-            (now - latest_observation.observed_at).total_seconds(),
-        )
+        observation_age_seconds = (now - latest_observation.observed_at).total_seconds()
+        if observation_age_seconds < 0:
+            blocking_count += 1
+            continue
         if observation_age_seconds > max_observation_age_seconds:
             blocking_count += 1
             continue
@@ -2985,6 +3004,80 @@ def _count_blocking_live_executions_for_automation_readiness(
         ):
             blocking_count += 1
     return blocking_count
+
+
+def _list_recent_live_executions_for_automation_readiness(
+    *,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    now: datetime,
+    max_age_seconds: int,
+    limit: int,
+) -> list[ExecutionJournalEntry]:
+    """Return recent unique live executions using the same paging semantics as the worker."""
+
+    page_size = max(min(limit, 100), 20)
+    offset = 0
+    seen_paper_trade_ids: set[int] = set()
+    selected: list[ExecutionJournalEntry] = []
+
+    while len(selected) < limit:
+        batch = execution_store.list_recent(limit=page_size, offset=offset)
+        if not batch:
+            break
+        offset += len(batch)
+
+        for execution in batch:
+            if execution.mode != "live" or execution.status not in {"submitted", "partial"}:
+                continue
+            age_seconds = (now - execution.executed_at).total_seconds()
+            if age_seconds > max_age_seconds and not _execution_requires_continued_monitoring(
+                observation_store,
+                execution=execution,
+            ):
+                continue
+            if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
+                continue
+            seen_paper_trade_ids.add(execution.paper_trade_id)
+            selected.append(execution)
+            if len(selected) >= limit:
+                break
+
+        if len(batch) < page_size:
+            break
+
+    return selected
+
+
+def _execution_requires_continued_monitoring(
+    observation_store: ExecutionObservationStore,
+    *,
+    execution: ExecutionJournalEntry,
+    latest_observation: ExecutionObservationEntry | None = None,
+) -> bool:
+    """Return whether an older live execution still has an active monitoring state."""
+
+    paper_trade_id = execution.paper_trade_id
+    if paper_trade_id is None:
+        return False
+    latest = latest_observation
+    if latest is None:
+        latest = observation_store.latest_for_paper_trade(paper_trade_id)
+    if latest is None:
+        return False
+    pair_status = latest.pair_status
+    if pair_status is None:
+        for observation in observation_store.list_recent(limit=None, paper_trade_id=paper_trade_id):
+            if observation.pair_status is not None:
+                pair_status = observation.pair_status
+                break
+        else:
+            return True
+    return pair_status.derived_state in {
+        "hedged",
+        "cleanup_needed",
+        "review_required",
+    } or pair_status.recommended_action != "no_action"
 
 
 def _append_paper_trade_from_canary_candidate(
@@ -4179,38 +4272,10 @@ def create_app() -> FastAPI:
             ExecutionObservationStore,
             Depends(get_execution_observation_store),
         ],
+        checked_at: Annotated[datetime, Depends(get_automation_readiness_checked_at)],
         label: str | None = None,
-        max_snapshot_age_seconds: int = 300,
-        min_snapshot_count: int = 2,
-        min_stable_seconds: float = 30.0,
-        max_active_live_executions: int = 0,
-        active_execution_scan_limit: int = 20,
-        max_observation_age_seconds: int = 1800,
-        now: datetime | None = None,
     ) -> ProductionAutomationReadiness:
-        checked_at = now or datetime.now(UTC)
         blocking_reasons: list[str] = []
-
-        if max_snapshot_age_seconds < 1:
-            raise HTTPException(
-                status_code=400,
-                detail="max_snapshot_age_seconds must be positive",
-            )
-        if max_active_live_executions < 0:
-            raise HTTPException(
-                status_code=400,
-                detail="max_active_live_executions must be non-negative",
-            )
-        if active_execution_scan_limit < 1:
-            raise HTTPException(
-                status_code=400,
-                detail="active_execution_scan_limit must be positive",
-            )
-        if max_observation_age_seconds < 1:
-            raise HTTPException(
-                status_code=400,
-                detail="max_observation_age_seconds must be positive",
-            )
 
         latest_approved = approved_store.latest(label=label)
         approved_summary: AutomationSnapshotSummary | None = None
@@ -4223,13 +4288,18 @@ def create_app() -> FastAPI:
                 captured_at=latest_approved.captured_at,
                 now=checked_at,
             )
-            if approved_summary.age_seconds > max_snapshot_age_seconds:
+            if approved_summary.age_seconds < 0:
+                _append_unique_blocking_reason(
+                    blocking_reasons,
+                    "Approved canary snapshot timestamp is in the future",
+                )
+            elif approved_summary.age_seconds > AUTOMATION_READINESS_MAX_SNAPSHOT_AGE_SECONDS:
                 _append_unique_blocking_reason(
                     blocking_reasons,
                     (
                         "Approved canary snapshot is stale "
                         f"({approved_summary.age_seconds:.1f}s > "
-                        f"{max_snapshot_age_seconds}s)"
+                        f"{AUTOMATION_READINESS_MAX_SNAPSHOT_AGE_SECONDS}s)"
                     ),
                 )
 
@@ -4248,10 +4318,15 @@ def create_app() -> FastAPI:
                 now=checked_at,
             )
             effective_max_age_seconds = min(
-                max_snapshot_age_seconds,
+                AUTOMATION_READINESS_MAX_SNAPSHOT_AGE_SECONDS,
                 latest_launch_ready.max_snapshot_age_seconds,
             )
-            if launch_ready_summary.age_seconds > effective_max_age_seconds:
+            if launch_ready_summary.age_seconds < 0:
+                _append_unique_blocking_reason(
+                    blocking_reasons,
+                    "Launch-ready canary snapshot timestamp is in the future",
+                )
+            elif launch_ready_summary.age_seconds > effective_max_age_seconds:
                 _append_unique_blocking_reason(
                     blocking_reasons,
                     (
@@ -4271,9 +4346,9 @@ def create_app() -> FastAPI:
             stability = _build_launch_ready_canary_stability(
                 store=launch_ready_store,
                 label=label,
-                max_snapshot_age_seconds=max_snapshot_age_seconds,
-                min_snapshot_count=min_snapshot_count,
-                min_stable_seconds=min_stable_seconds,
+                max_snapshot_age_seconds=AUTOMATION_READINESS_MAX_SNAPSHOT_AGE_SECONDS,
+                min_snapshot_count=AUTOMATION_READINESS_MIN_SNAPSHOT_COUNT,
+                min_stable_seconds=AUTOMATION_READINESS_MIN_STABLE_SECONDS,
                 now=checked_at,
             )
         except HTTPException as exc:
@@ -4304,16 +4379,16 @@ def create_app() -> FastAPI:
                 execution_store=execution_store,
                 observation_store=observation_store,
                 now=checked_at,
-                max_observation_age_seconds=max_observation_age_seconds,
-                scan_limit=active_execution_scan_limit,
+                max_observation_age_seconds=AUTOMATION_READINESS_MAX_OBSERVATION_AGE_SECONDS,
+                scan_limit=AUTOMATION_READINESS_ACTIVE_EXECUTION_SCAN_LIMIT,
             )
         )
-        if active_live_execution_count > max_active_live_executions:
+        if active_live_execution_count > AUTOMATION_READINESS_MAX_ACTIVE_LIVE_EXECUTIONS:
             _append_unique_blocking_reason(
                 blocking_reasons,
                 (
                     "Active live executions still require monitoring before unattended "
-                    f"launch (max_allowed={max_active_live_executions}, "
+                    f"launch (max_allowed={AUTOMATION_READINESS_MAX_ACTIVE_LIVE_EXECUTIONS}, "
                     f"current={active_live_execution_count})"
                 ),
             )
@@ -4335,7 +4410,7 @@ def create_app() -> FastAPI:
             ),
             latest_stable_launch=latest_stable_launch,
             active_live_execution_count=active_live_execution_count,
-            max_active_live_executions=max_active_live_executions,
+            max_active_live_executions=AUTOMATION_READINESS_MAX_ACTIVE_LIVE_EXECUTIONS,
         )
 
     @app.get(
