@@ -116,6 +116,19 @@ Do not put webhook URLs in the shared group either. Alert endpoints are service-
 | `carryme-system-state` | yes | no | no | `CARRYME_WORKER_SYSTEM_STATE_ALERT_WEBHOOK_URL` (service-level secret only) |
 | `carryme-execution-monitor` | yes | yes | yes, for the venues you intend to reconcile live on | `CARRYME_WORKER_EXECUTION_ALERT_WEBHOOK_URL` (service-level secret only) |
 
+### Stable Launch Hold Mode
+
+By default `carryme-stable-launch` keeps `CARRYME_WORKER_STABLE_CANARY_LAUNCH_CLOSE_POSITION=true`.
+That mode opens and closes the route inside one guarded canary lifecycle, which is useful for execution testing but does not hold the hedge for funding capture.
+
+Only set `CARRYME_WORKER_STABLE_CANARY_LAUNCH_CLOSE_POSITION=false` after `carryme-execution-monitor` is deployed with:
+
+1. `CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_ENABLED=true`
+2. `CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_SHADOW_MODE=false`
+3. the same live venue credentials as `carryme-stable-launch`
+
+The worker fails closed if hold mode is requested while auto-close is disabled or shadow-only.
+
 ### Venue Secret Ownership
 
 Use this to avoid over-sharing secrets across workers:
@@ -216,8 +229,10 @@ Enable only `Extended` and `Paradex` first.
 1. keep route approvals capped at tiny notional
 2. do not exceed the current canary size ceiling
 3. require stable launch-ready state before launch
-4. review execution-monitor logs after every hosted canary
-5. do not scale capital until repeated hosted cycles are clean
+4. keep `CARRYME_WORKER_STABLE_CANARY_LAUNCH_CLOSE_POSITION=true` until execution-only canaries are clean
+5. set `CARRYME_WORKER_STABLE_CANARY_LAUNCH_CLOSE_POSITION=false` only with live execution auto-close enabled
+6. review execution-monitor logs after every hosted canary
+7. do not scale capital until repeated hosted cycles are clean
 
 ### Phase 5: Scale Decision
 

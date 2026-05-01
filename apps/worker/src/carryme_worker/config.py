@@ -97,6 +97,7 @@ class WorkerSettings(BaseSettings):
     stable_launch_ready_min_snapshot_count: int = Field(default=2, gt=0)
     stable_launch_ready_min_stable_seconds: float = Field(default=30.0, ge=0)
     stable_canary_launch_shadow_mode: bool = False
+    stable_canary_launch_close_position: bool = True
     stable_launch_ready_min_edge_retention_ratio: float = Field(
         default=0.7,
         ge=0,

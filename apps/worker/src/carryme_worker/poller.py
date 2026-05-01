@@ -504,6 +504,24 @@ def _build_stable_launch_risk_budget_reason(
     return None
 
 
+def _build_stable_launch_hold_mode_blocker(settings: WorkerSettings) -> str | None:
+    """Return why stable launch cannot leave a live hedge open unattended."""
+
+    if settings.stable_canary_launch_close_position:
+        return None
+    if not settings.execution_auto_pair_close_enabled:
+        return (
+            "Stable launch hold mode is blocked because "
+            "execution_auto_pair_close_enabled is false"
+        )
+    if settings.execution_auto_pair_close_shadow_mode:
+        return (
+            "Stable launch hold mode is blocked because "
+            "execution_auto_pair_close_shadow_mode is true"
+        )
+    return None
+
+
 def _list_recent_closed_live_trade_outcomes(
     *,
     settings: WorkerSettings,
@@ -2916,6 +2934,17 @@ async def launch_latest_stable_canary_once(
             ),
         )
 
+    hold_mode_blocker = _build_stable_launch_hold_mode_blocker(settings)
+    if hold_mode_blocker is not None:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=hold_mode_blocker,
+        )
+
     try:
         lifecycle = await _run_guarded_canary_lifecycle(
             candidate=selected,
@@ -2975,7 +3004,7 @@ async def launch_latest_stable_canary_once(
             poll_attempts=5,
             poll_interval_seconds=2.0,
             auto_cleanup=True,
-            close_position=True,
+            close_position=settings.stable_canary_launch_close_position,
         )
     except HTTPException as exc:
         if exc.status_code in {404, 409}:
