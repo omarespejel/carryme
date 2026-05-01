@@ -32,6 +32,7 @@ class RequirementSpec(NamedTuple):
     env_var: str
     description: str
     secret: bool
+    alternative_keys: tuple[str, ...] = ()
 
 
 class VenueSpec(TypedDict):
@@ -41,6 +42,16 @@ class VenueSpec(TypedDict):
     credential_settings: dict[str, str]
     requirements: list[RequirementSpec]
     notes: list[str]
+
+
+def _credential_value_present(value: object) -> bool:
+    """Return whether one credential value should count as present."""
+
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
 
 
 LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
@@ -76,6 +87,7 @@ LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
         "credential_settings": {
             "account_address": "paradex_account_address",
             "private_key": "paradex_private_key",
+            "bearer_token": "paradex_bearer_token",
         },
         "requirements": [
             RequirementSpec(
@@ -87,14 +99,14 @@ LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
             RequirementSpec(
                 "private_key",
                 "CARRYME_API_PARADEX_PRIVATE_KEY",
-                "Paradex trading subkey private key used to derive authenticated API access.",
+                "Paradex trading subkey private key used for authenticated live trading.",
                 True,
             ),
         ],
         "notes": [
             (
                 "Paradex live trading requires the main account address and the "
-                "trading subkey private key used for authenticated API access."
+                "trading subkey private key used for authenticated live trading."
             ),
         ],
     },
@@ -163,7 +175,10 @@ def build_venue_execution_preflights(
                 env_var=requirement.env_var,
                 description=requirement.description,
                 secret=requirement.secret,
-                present=bool(credentials.get(requirement.key)),
+                present=any(
+                    _credential_value_present(credentials.get(key))
+                    for key in (requirement.key, *requirement.alternative_keys)
+                ),
             )
             for requirement in spec["requirements"]
         ]

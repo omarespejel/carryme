@@ -4,7 +4,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from carryme_runtime.preflight import LIVE_EXECUTION_VENUE_SPECS
+from carryme_runtime.preflight import build_live_execution_configs, build_venue_execution_preflights
 from carryme_storage.db import redact_database_url
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -72,20 +72,14 @@ class ApiSettings(BaseSettings):
     def warn_on_enabled_live_execution_without_credentials(self) -> "ApiSettings":
         """Warn operators when live execution flags are enabled without credentials."""
 
-        for spec in LIVE_EXECUTION_VENUE_SPECS.values():
-            flag_name = spec["enabled_setting"]
-            if not getattr(self, flag_name):
+        for status in build_venue_execution_preflights(build_live_execution_configs(self)):
+            if not status.enabled:
                 continue
-            missing = [
-                attribute_name
-                for attribute_name in spec["credential_settings"].values()
-                if not getattr(self, attribute_name)
-            ]
-            if missing:
+            if status.missing_env_vars:
                 logger.warning(
-                    "%s is enabled but missing live credentials: %s",
-                    flag_name,
-                    ", ".join(missing),
+                    "%s_live_enabled is enabled but missing live credentials: %s",
+                    status.venue,
+                    ", ".join(status.missing_env_vars),
                 )
         return self
 

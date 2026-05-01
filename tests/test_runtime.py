@@ -4659,6 +4659,84 @@ def test_build_venue_execution_preflights_reports_missing_credentials() -> None:
     assert paradex.missing_env_vars == []
 
 
+def test_build_venue_execution_preflights_requires_paradex_private_key() -> None:
+    statuses = build_venue_execution_preflights(
+        {
+            "extended": {
+                "enabled": False,
+                "credentials": {
+                    "api_key": None,
+                    "stark_private_key": None,
+                },
+            },
+            "paradex": {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xabc",
+                    "private_key": None,
+                    "bearer_token": "jwt-token",
+                },
+            },
+            "hyperliquid": {
+                "enabled": False,
+                "credentials": {
+                    "account_address": None,
+                    "api_wallet_private_key": None,
+                },
+            },
+        }
+    )
+
+    paradex = {status.venue: status for status in statuses}["paradex"]
+
+    assert paradex.ready is False
+    assert paradex.missing_env_vars == ["CARRYME_API_PARADEX_PRIVATE_KEY"]
+    assert any(
+        requirement.env_var == "CARRYME_API_PARADEX_PRIVATE_KEY"
+        and not requirement.present
+        for requirement in paradex.requirements
+    )
+
+
+def test_build_venue_execution_preflights_treats_whitespace_credentials_as_missing() -> None:
+    statuses = build_venue_execution_preflights(
+        {
+            "extended": {
+                "enabled": True,
+                "credentials": {
+                    "api_key": "   ",
+                    "stark_private_key": "0x123",
+                },
+            },
+            "paradex": {
+                "enabled": False,
+                "credentials": {
+                    "account_address": None,
+                    "private_key": None,
+                    "bearer_token": None,
+                },
+            },
+            "hyperliquid": {
+                "enabled": False,
+                "credentials": {
+                    "account_address": None,
+                    "api_wallet_private_key": None,
+                },
+            },
+        }
+    )
+
+    extended = {status.venue: status for status in statuses}["extended"]
+
+    assert extended.ready is False
+    assert extended.missing_env_vars == ["CARRYME_API_EXTENDED_API_KEY"]
+    assert any(
+        requirement.env_var == "CARRYME_API_EXTENDED_API_KEY"
+        and not requirement.present
+        for requirement in extended.requirements
+    )
+
+
 def test_build_paper_trade_execution_preflight_filters_to_trade_venues() -> None:
     intent = build_trade_intent(
         OpportunityRecord(

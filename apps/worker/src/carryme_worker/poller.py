@@ -45,11 +45,13 @@ from carryme_models import (
     PaperTradeAccountPreflight,
     PaperTradeBalanceAttribution,
     PaperTradeEntry,
+    PaperTradeExecutionPreflight,
     PaperTradeSystemState,
     RouteApprovalEntry,
     StableCanaryLaunchRecord,
     StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
+    VenueExecutionPreflight,
     VenueSystemState,
 )
 from carryme_runtime import (
@@ -72,8 +74,10 @@ from carryme_runtime import (
     UpstreamDataError,
     build_account_preflight_configs,
     build_execution_pair_status,
+    build_live_execution_configs,
     build_opportunity_record_from_universe_opportunity,
     build_pair_spec_from_universe_opportunity,
+    build_venue_execution_preflights,
     filter_candidate_records,
     reconcile_execution,
 )
@@ -1188,6 +1192,57 @@ def _build_system_state_configs(settings: WorkerSettings) -> SystemStateConfigMa
     }
 
 
+def _candidate_execution_venue_names(candidate: FundingUniverseCanaryCandidate) -> list[str]:
+    """Return de-duplicated venue names touched by a canary candidate."""
+
+    venue_names = [
+        candidate.opportunity.opportunity.long_venue,
+        candidate.opportunity.opportunity.short_venue,
+    ]
+    selected_names: list[str] = []
+    for venue in venue_names:
+        if venue not in selected_names:
+            selected_names.append(venue)
+    return selected_names
+
+
+def _build_candidate_live_execution_preflight(
+    *,
+    settings: WorkerSettings | ApiSettings,
+    candidate: FundingUniverseCanaryCandidate,
+    label: str,
+) -> PaperTradeExecutionPreflight:
+    """Build live-execution readiness for the exact venues touched by one canary."""
+
+    all_statuses = {
+        item.venue: item
+        for item in build_venue_execution_preflights(build_live_execution_configs(settings))
+    }
+    selected: list[VenueExecutionPreflight] = []
+    blocking_reasons: list[str] = []
+    for venue in _candidate_execution_venue_names(candidate):
+        status = all_statuses.get(venue)
+        if status is None:
+            blocking_reasons.append(f"Venue {venue} live execution is not configured")
+            continue
+        selected.append(status)
+        if not status.enabled:
+            blocking_reasons.append(f"Venue {venue} live execution is not enabled")
+        if status.missing_env_vars:
+            blocking_reasons.append(
+                f"Venue {venue} is missing required credentials: "
+                + ", ".join(status.missing_env_vars)
+            )
+
+    return PaperTradeExecutionPreflight(
+        paper_trade_id=0,
+        label=label,
+        ready=not blocking_reasons,
+        venues=selected,
+        blocking_reasons=blocking_reasons,
+    )
+
+
 async def _probe_candidate_system_state(
     *,
     settings: WorkerSettings,
@@ -1201,18 +1256,14 @@ async def _probe_candidate_system_state(
         item.venue: item
         for item in await service.probe_venues(_build_system_state_configs(settings))
     }
-    venue_names = [
-        candidate.opportunity.opportunity.long_venue,
-        candidate.opportunity.opportunity.short_venue,
-    ]
-    selected_names: list[str] = []
-    for venue in venue_names:
-        if venue not in selected_names:
-            selected_names.append(venue)
-    selected = [all_statuses[venue] for venue in selected_names]
-
+    selected: list[VenueSystemState] = []
     blocking_reasons: list[str] = []
-    for status in selected:
+    for venue in _candidate_execution_venue_names(candidate):
+        status = all_statuses.get(venue)
+        if status is None:
+            blocking_reasons.append(f"Venue {venue} system state is unknown")
+            continue
+        selected.append(status)
         blocking_reasons.extend(status.blocking_reasons)
 
     return PaperTradeSystemState(
@@ -2369,6 +2420,26 @@ async def cache_launch_ready_canaries_once(
                     automation_gate_reason,
                 )
             continue
+        execution_preflight = _build_candidate_live_execution_preflight(
+            settings=settings,
+            candidate=refreshed_candidate,
+            label=label,
+        )
+        if not execution_preflight.ready:
+            try:
+                ready_store.delete_label(label)
+            except Exception:
+                loop_logger.exception(
+                    "failed to invalidate launch-ready snapshots for label=%s "
+                    "after live execution preflight failure",
+                    label,
+                )
+            loop_logger.warning(
+                "skipping launch-ready snapshot label=%s because live execution is not ready: %s",
+                label,
+                "; ".join(execution_preflight.blocking_reasons),
+            )
+            continue
         system_state = await _probe_candidate_system_state(
             settings=settings,
             service=runtime,
@@ -2943,6 +3014,32 @@ async def launch_latest_stable_canary_once(
             launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
             approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
             detail=hold_mode_blocker,
+        )
+
+    execution_preflight = _build_candidate_live_execution_preflight(
+        settings=runtime_settings,
+        candidate=selected,
+        label=snapshot.label,
+    )
+    if not execution_preflight.ready:
+        try:
+            launch_ready_store.delete_label(snapshot.label)
+        except Exception:
+            logging.getLogger("carryme.worker").exception(
+                "failed to invalidate launch-ready snapshots for label=%s "
+                "during stable launch preflight",
+                snapshot.label,
+            )
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=(
+                "Latest launch-ready snapshot no longer satisfies live execution "
+                f"readiness: {'; '.join(execution_preflight.blocking_reasons)}"
+            ),
         )
 
     try:

@@ -69,8 +69,8 @@ Before you host this, rotate any venue secrets that were ever pasted into chat o
 
 1. `CARRYME_API_PARADEX_LIVE_ENABLED=true`
 2. `CARRYME_API_PARADEX_ACCOUNT_ADDRESS`
-3. `CARRYME_API_PARADEX_PRIVATE_KEY`
-4. Optional: `CARRYME_API_PARADEX_BEARER_TOKEN`
+3. `CARRYME_API_PARADEX_PRIVATE_KEY` for live trading and cleanup submission
+4. optional `CARRYME_API_PARADEX_BEARER_TOKEN` only for authenticated read-only probes; it does not satisfy live execution readiness
 
 ### Hyperliquid
 
@@ -106,12 +106,16 @@ Do not put webhook URLs in the shared group either. Alert endpoints are service-
 
 ### Per-Service Matrix
 
+`carryme-launch-ready-cache` needs selected-venue live credential env vars for
+readiness checks only. It does not submit orders, but it must fail closed before
+stable launch if a route cannot be executed by the hosted workers.
+
 | Service | Needs `DATABASE_URL` | Needs venue enable flags | Needs live trading secrets | Needs alert webhooks |
 |---|---|---|---|---|
 | `carryme-api` | yes | yes | all venue secrets if you want operator-triggered live actions from the API | no |
 | `carryme-universe-scan` | yes | no | no | no |
 | `carryme-approved-canary-scan` | yes | yes | no | `CARRYME_WORKER_APPROVED_CANARY_ALERT_WEBHOOK_URL` (service-level secret only) |
-| `carryme-launch-ready-cache` | yes | yes | no | `CARRYME_WORKER_STABLE_LAUNCH_READY_ALERT_WEBHOOK_URL` (service-level secret only) |
+| `carryme-launch-ready-cache` | yes | yes | yes, for selected-route readiness checks | `CARRYME_WORKER_STABLE_LAUNCH_READY_ALERT_WEBHOOK_URL` (service-level secret only) |
 | `carryme-stable-launch` | yes | yes | yes, for the venues you intend to launch live on | no |
 | `carryme-system-state` | yes | no | no | `CARRYME_WORKER_SYSTEM_STATE_ALERT_WEBHOOK_URL` (service-level secret only) |
 | `carryme-execution-monitor` | yes | yes | yes, for the venues you intend to reconcile live on | `CARRYME_WORKER_EXECUTION_ALERT_WEBHOOK_URL` (service-level secret only) |
@@ -133,16 +137,16 @@ The worker fails closed if hold mode is requested while auto-close is disabled o
 
 Use this to avoid over-sharing secrets across workers:
 
-| Secret | `carryme-api` | `carryme-stable-launch` | `carryme-execution-monitor` | Other workers |
-|---|---|---|---|---|
-| `CARRYME_API_EXTENDED_API_KEY` | if API live actions enabled | yes | yes | no |
-| `CARRYME_API_EXTENDED_STARK_PRIVATE_KEY` | if API live actions enabled | yes | yes | no |
-| `CARRYME_API_PARADEX_ACCOUNT_ADDRESS` | if API live actions enabled | yes | yes | no |
-| `CARRYME_API_PARADEX_PRIVATE_KEY` | if API live actions enabled | yes | yes | no |
-| `CARRYME_API_PARADEX_BEARER_TOKEN` | optional | optional | optional | no |
-| `CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS` | if API live actions enabled | yes | yes | no |
-| `CARRYME_API_HYPERLIQUID_VAULT_ADDRESS` | optional | optional | optional | no |
-| `CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY` | if API live actions enabled | yes | yes | no |
+| Secret | `carryme-api` | `carryme-launch-ready-cache` | `carryme-stable-launch` | `carryme-execution-monitor` | Other workers |
+|---|---|---|---|---|---|
+| `CARRYME_API_EXTENDED_API_KEY` | if API live actions enabled | yes | yes | yes | no |
+| `CARRYME_API_EXTENDED_STARK_PRIVATE_KEY` | if API live actions enabled | yes | yes | yes | no |
+| `CARRYME_API_PARADEX_ACCOUNT_ADDRESS` | if API live actions enabled | yes | yes | yes | no |
+| `CARRYME_API_PARADEX_PRIVATE_KEY` | if API live actions enabled | yes | yes | yes | no |
+| `CARRYME_API_PARADEX_BEARER_TOKEN` | optional for authenticated read-only API/account probes | no | no | no | no |
+| `CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS` | if API live actions enabled | yes | yes | yes | no |
+| `CARRYME_API_HYPERLIQUID_VAULT_ADDRESS` | optional | optional | optional | optional | no |
+| `CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY` | if API live actions enabled | yes | yes | yes | no |
 
 ## Health and Readiness
 
@@ -220,6 +224,7 @@ Enable only `Extended` and `Paradex` first.
 3. keep `CARRYME_API_HYPERLIQUID_LIVE_ENABLED=false`
 4. add only the `Extended` and `Paradex` secrets to:
    - `carryme-api`
+   - `carryme-launch-ready-cache`
    - `carryme-stable-launch`
    - `carryme-execution-monitor`
 5. leave `Hyperliquid` out until the hosted `Extended/Paradex` loop proves stable
