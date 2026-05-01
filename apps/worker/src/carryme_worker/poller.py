@@ -2111,6 +2111,70 @@ def _build_latest_launch_ready_stability(
     )
 
 
+def _rank_launch_ready_stability(
+    stability: LaunchReadyCanaryStability,
+) -> tuple[float, float, float, datetime, int]:
+    """Return the deterministic launch ranking for one stable launch-ready label."""
+
+    snapshot_id = stability.snapshot.launch_ready_snapshot_id or 0
+    return (
+        *_rank_approved_canary_candidate(stability.snapshot.approved_snapshot.candidate),
+        stability.snapshot.captured_at,
+        snapshot_id,
+    )
+
+
+def _list_ranked_stable_launch_ready_stabilities(
+    *,
+    store: LaunchReadyCanaryStore,
+    max_snapshot_age_seconds: int,
+    min_snapshot_count: int,
+    min_stable_seconds: float,
+    now: datetime,
+    scan_limit: int,
+) -> list[LaunchReadyCanaryStability]:
+    """Return stable launch-ready labels ranked by route quality, then freshness."""
+
+    if scan_limit < 1:
+        raise ValueError("scan_limit must be positive")
+
+    recent_snapshots = store.list_recent(limit=scan_limit)
+    if not recent_snapshots:
+        return [
+            _build_launch_ready_canary_stability(
+                store=store,
+                label=None,
+                max_snapshot_age_seconds=max_snapshot_age_seconds,
+                min_snapshot_count=min_snapshot_count,
+                min_stable_seconds=min_stable_seconds,
+                now=now,
+            )
+        ]
+
+    labels: list[str] = []
+    seen_labels: set[str] = set()
+    for snapshot in recent_snapshots:
+        if snapshot.label in seen_labels:
+            continue
+        seen_labels.add(snapshot.label)
+        labels.append(snapshot.label)
+
+    stabilities: list[LaunchReadyCanaryStability] = []
+    for label in labels:
+        stability = _build_latest_launch_ready_stability(
+            store=store,
+            label=label,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            min_snapshot_count=min_snapshot_count,
+            min_stable_seconds=min_stable_seconds,
+            now=now,
+        )
+        if stability is not None:
+            stabilities.append(stability)
+
+    return sorted(stabilities, key=_rank_launch_ready_stability, reverse=True)
+
+
 async def scan_approved_canary_once(
     settings: WorkerSettings,
     *,
@@ -2764,14 +2828,20 @@ async def launch_latest_stable_canary_once(
         )
 
     try:
-        stability = _build_launch_ready_canary_stability(
+        stable_candidates = _list_ranked_stable_launch_ready_stabilities(
             store=launch_ready_store,
-            label=None,
             max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
             min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
             min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
             now=timestamp,
+            scan_limit=settings.stable_canary_launch_candidate_scan_limit,
         )
+        if not stable_candidates:
+            raise HTTPException(
+                status_code=409,
+                detail="No stable launch-ready canary snapshot found",
+            )
+        stability = stable_candidates[0]
         snapshot, selected, approval = _select_latest_launch_ready_canary_snapshot(
             store=launch_ready_store,
             approval_service=route_approval_service,
