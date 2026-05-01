@@ -533,6 +533,11 @@ def _build_stable_launch_hold_mode_blocker(settings: WorkerSettings) -> str | No
             "Stable launch hold mode is blocked because "
             "execution_auto_pair_close_max_profit_giveback_ratio is unset"
         )
+    if not settings.execution_balance_checkpoint_enabled:
+        return (
+            "Stable launch hold mode is blocked because "
+            "execution_balance_checkpoint_enabled is false"
+        )
     return None
 
 
