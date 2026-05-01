@@ -21,6 +21,7 @@ from carryme_models import (
     ApprovedCanaryAlertEvent,
     ApprovedCanaryBasketPlan,
     ApprovedCanarySnapshot,
+    AutomationSnapshotSummary,
     CanaryBasketBalanceDelta,
     CanaryBasketLaunchResult,
     CanaryBasketRouteOutcome,
@@ -59,6 +60,7 @@ from carryme_models import (
     PaperTradeOrderPreview,
     PaperTradeSystemState,
     PreviewConfirmationEntry,
+    ProductionAutomationReadiness,
     RouteAccountingSummary,
     RouteApprovalEntry,
     RouteApprovalUpsert,
@@ -142,6 +144,7 @@ from carryme_storage import (
     PaperTradeStore,
     PreviewConfirmationStore,
     RouteApprovalStore,
+    StableCanaryLaunchStore,
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
     WatchlistStore,
@@ -607,6 +610,14 @@ def get_stable_launch_ready_alert_store(
     """Return the shared stable launch-ready alert store."""
 
     return StableLaunchReadyAlertStore(settings.database_path)
+
+
+def get_stable_canary_launch_store(
+    settings: Annotated[ApiSettings, Depends(get_api_settings)],
+) -> StableCanaryLaunchStore:
+    """Return the shared stable canary launch record store."""
+
+    return StableCanaryLaunchStore(settings.database_path)
 
 
 def get_route_stability_service(
@@ -2915,6 +2926,67 @@ def _build_launch_ready_canary_stability(
     )
 
 
+def _append_unique_blocking_reason(reasons: list[str], reason: object) -> None:
+    normalized = str(reason)
+    if normalized not in reasons:
+        reasons.append(normalized)
+
+
+def _automation_snapshot_summary(
+    *,
+    snapshot_id: int | None,
+    label: str,
+    captured_at: datetime,
+    now: datetime,
+) -> AutomationSnapshotSummary:
+    return AutomationSnapshotSummary(
+        snapshot_id=snapshot_id,
+        label=label,
+        captured_at=captured_at,
+        age_seconds=max(0.0, (now - captured_at).total_seconds()),
+    )
+
+
+def _count_blocking_live_executions_for_automation_readiness(
+    *,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    now: datetime,
+    max_observation_age_seconds: int,
+    scan_limit: int,
+) -> int:
+    seen_paper_trade_ids: set[int] = set()
+    blocking_count = 0
+    for execution in execution_store.list_recent(limit=scan_limit):
+        if execution.mode != "live" or execution.paper_trade_id is None:
+            continue
+        paper_trade_id = execution.paper_trade_id
+        if paper_trade_id in seen_paper_trade_ids:
+            continue
+        seen_paper_trade_ids.add(paper_trade_id)
+        latest_observation = observation_store.latest_for_paper_trade(paper_trade_id)
+        if latest_observation is None:
+            blocking_count += 1
+            continue
+        observation_age_seconds = max(
+            0.0,
+            (now - latest_observation.observed_at).total_seconds(),
+        )
+        if observation_age_seconds > max_observation_age_seconds:
+            blocking_count += 1
+            continue
+        pair_status = latest_observation.pair_status
+        if pair_status is None:
+            blocking_count += 1
+            continue
+        if (
+            pair_status.derived_state in {"hedged", "cleanup_needed", "review_required"}
+            or pair_status.recommended_action != "no_action"
+        ):
+            blocking_count += 1
+    return blocking_count
+
+
 def _append_paper_trade_from_canary_candidate(
     *,
     candidate: FundingUniverseCanaryCandidate,
@@ -4086,6 +4158,184 @@ def create_app() -> FastAPI:
             max_snapshot_age_seconds=max_snapshot_age_seconds,
             min_snapshot_count=min_snapshot_count,
             min_stable_seconds=min_stable_seconds,
+        )
+
+    @app.get(
+        "/v1/automation/readiness",
+        response_model=ProductionAutomationReadiness,
+    )
+    def production_automation_readiness(
+        approved_store: Annotated[ApprovedCanaryStore, Depends(get_approved_canary_store)],
+        launch_ready_store: Annotated[
+            LaunchReadyCanaryStore,
+            Depends(get_launch_ready_canary_store),
+        ],
+        stable_launch_store: Annotated[
+            StableCanaryLaunchStore,
+            Depends(get_stable_canary_launch_store),
+        ],
+        execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
+        observation_store: Annotated[
+            ExecutionObservationStore,
+            Depends(get_execution_observation_store),
+        ],
+        label: str | None = None,
+        max_snapshot_age_seconds: int = 300,
+        min_snapshot_count: int = 2,
+        min_stable_seconds: float = 30.0,
+        max_active_live_executions: int = 0,
+        active_execution_scan_limit: int = 20,
+        max_observation_age_seconds: int = 1800,
+        now: datetime | None = None,
+    ) -> ProductionAutomationReadiness:
+        checked_at = now or datetime.now(UTC)
+        blocking_reasons: list[str] = []
+
+        if max_snapshot_age_seconds < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="max_snapshot_age_seconds must be positive",
+            )
+        if max_active_live_executions < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="max_active_live_executions must be non-negative",
+            )
+        if active_execution_scan_limit < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="active_execution_scan_limit must be positive",
+            )
+        if max_observation_age_seconds < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="max_observation_age_seconds must be positive",
+            )
+
+        latest_approved = approved_store.latest(label=label)
+        approved_summary: AutomationSnapshotSummary | None = None
+        if latest_approved is None:
+            _append_unique_blocking_reason(blocking_reasons, "No approved canary snapshot found")
+        else:
+            approved_summary = _automation_snapshot_summary(
+                snapshot_id=latest_approved.snapshot_id,
+                label=latest_approved.label,
+                captured_at=latest_approved.captured_at,
+                now=checked_at,
+            )
+            if approved_summary.age_seconds > max_snapshot_age_seconds:
+                _append_unique_blocking_reason(
+                    blocking_reasons,
+                    (
+                        "Approved canary snapshot is stale "
+                        f"({approved_summary.age_seconds:.1f}s > "
+                        f"{max_snapshot_age_seconds}s)"
+                    ),
+                )
+
+        latest_launch_ready = launch_ready_store.latest(label=label)
+        launch_ready_summary: AutomationSnapshotSummary | None = None
+        if latest_launch_ready is None:
+            _append_unique_blocking_reason(
+                blocking_reasons,
+                "No launch-ready canary snapshot found",
+            )
+        else:
+            launch_ready_summary = _automation_snapshot_summary(
+                snapshot_id=latest_launch_ready.launch_ready_snapshot_id,
+                label=latest_launch_ready.label,
+                captured_at=latest_launch_ready.captured_at,
+                now=checked_at,
+            )
+            effective_max_age_seconds = min(
+                max_snapshot_age_seconds,
+                latest_launch_ready.max_snapshot_age_seconds,
+            )
+            if launch_ready_summary.age_seconds > effective_max_age_seconds:
+                _append_unique_blocking_reason(
+                    blocking_reasons,
+                    (
+                        "Launch-ready canary snapshot is stale "
+                        f"({launch_ready_summary.age_seconds:.1f}s > "
+                        f"{effective_max_age_seconds}s)"
+                    ),
+                )
+            if not latest_launch_ready.system_state.ready:
+                _append_unique_blocking_reason(
+                    blocking_reasons,
+                    "Latest launch-ready canary snapshot is not ready for live execution",
+                )
+
+        stability: LaunchReadyCanaryStability | None = None
+        try:
+            stability = _build_launch_ready_canary_stability(
+                store=launch_ready_store,
+                label=label,
+                max_snapshot_age_seconds=max_snapshot_age_seconds,
+                min_snapshot_count=min_snapshot_count,
+                min_stable_seconds=min_stable_seconds,
+                now=checked_at,
+            )
+        except HTTPException as exc:
+            if exc.status_code in {404, 409}:
+                _append_unique_blocking_reason(blocking_reasons, exc.detail)
+            else:
+                raise
+
+        latest_stable_launch = None
+        if (
+            stability is not None
+            and stability.snapshot.launch_ready_snapshot_id is not None
+        ):
+            latest_stable_launch = stable_launch_store.latest_for_snapshot(
+                stability.snapshot.launch_ready_snapshot_id
+            )
+            if latest_stable_launch is not None and latest_stable_launch.status != "shadowed":
+                _append_unique_blocking_reason(
+                    blocking_reasons,
+                    (
+                        "Latest stable launch-ready snapshot already launched by worker "
+                        f"as paper trade {latest_stable_launch.paper_trade_id}"
+                    ),
+                )
+
+        active_live_execution_count = (
+            _count_blocking_live_executions_for_automation_readiness(
+                execution_store=execution_store,
+                observation_store=observation_store,
+                now=checked_at,
+                max_observation_age_seconds=max_observation_age_seconds,
+                scan_limit=active_execution_scan_limit,
+            )
+        )
+        if active_live_execution_count > max_active_live_executions:
+            _append_unique_blocking_reason(
+                blocking_reasons,
+                (
+                    "Active live executions still require monitoring before unattended "
+                    f"launch (max_allowed={max_active_live_executions}, "
+                    f"current={active_live_execution_count})"
+                ),
+            )
+
+        ready = not blocking_reasons
+        return ProductionAutomationReadiness(
+            checked_at=checked_at,
+            ready=ready,
+            status="ready" if ready else "blocked",
+            blocking_reasons=blocking_reasons,
+            approved_snapshot=approved_summary,
+            launch_ready_snapshot=launch_ready_summary,
+            stable_launch_ready=stability is not None,
+            stable_launch_consecutive_snapshots=(
+                stability.consecutive_snapshots if stability is not None else None
+            ),
+            stable_launch_stable_seconds=(
+                stability.stable_seconds if stability is not None else None
+            ),
+            latest_stable_launch=latest_stable_launch,
+            active_live_execution_count=active_live_execution_count,
+            max_active_live_executions=max_active_live_executions,
         )
 
     @app.get(
