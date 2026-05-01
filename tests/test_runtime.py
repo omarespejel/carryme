@@ -1074,6 +1074,88 @@ def test_opportunity_universe_service_filters_overlaps_before_snapshot_fetch() -
     asyncio.run(run())
 
 
+def test_opportunity_universe_service_shortlists_summaries_before_full_snapshots() -> None:
+    symbol_lists = {
+        "extended": ["TOP-USD", "MID-USD", "LOW-USD"],
+        "paradex": ["TOP-USD-PERP", "MID-USD-PERP", "LOW-USD-PERP"],
+    }
+    summary_snapshots = {
+        ("extended", "TOP-USD"): _snapshot(
+            "extended", "TOP-USD", 0.0004, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("paradex", "TOP-USD-PERP"): _snapshot(
+            "paradex", "TOP-USD-PERP", -0.0004, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("extended", "MID-USD"): _snapshot(
+            "extended", "MID-USD", 0.0002, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("paradex", "MID-USD-PERP"): _snapshot(
+            "paradex", "MID-USD-PERP", -0.0001, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("extended", "LOW-USD"): _snapshot(
+            "extended", "LOW-USD", 0.00001, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("paradex", "LOW-USD-PERP"): _snapshot(
+            "paradex", "LOW-USD-PERP", 0.0, 1.0, 10_000, 1.001, 10_000
+        ),
+    }
+    full_snapshots = {
+        ("extended", "TOP-USD"): summary_snapshots[("extended", "TOP-USD")],
+        ("paradex", "TOP-USD-PERP"): summary_snapshots[("paradex", "TOP-USD-PERP")],
+    }
+    fetched_stats: list[tuple[str, str]] = []
+    fetched_full_snapshots: list[tuple[str, str]] = []
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_market_stats(venue: str, symbol: str) -> MarketStats:
+        fetched_stats.append((venue, symbol))
+        return summary_snapshots[(venue, symbol)].market.model_copy(
+            update={"top_of_book": None}
+        )
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        fetched_full_snapshots.append((venue, symbol))
+        try:
+            return full_snapshots[(venue, symbol)]
+        except KeyError as exc:
+            raise AssertionError(
+                f"unexpected full snapshot for non-shortlisted symbol: {(venue, symbol)}"
+            ) from exc
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_market_stats=fetch_market_stats,
+            fetch_snapshot=fetch_snapshot,
+            snapshot_shortlist_min_overlaps=1,
+            snapshot_shortlist_multiplier=1,
+        )
+        scan = await service.scan(
+            venues=["extended", "paradex"],
+            ranking="roundtrip_edge",
+            limit=1,
+        )
+
+        assert scan.overlap_count == 3
+        assert {item.canonical_symbol for item in scan.overlaps} == {
+            "TOP-USD-PERP",
+            "MID-USD-PERP",
+            "LOW-USD-PERP",
+        }
+        assert [item.opportunity.canonical_symbol for item in scan.opportunities] == [
+            "TOP-USD-PERP"
+        ]
+        assert set(fetched_stats) == set(summary_snapshots)
+        assert set(fetched_full_snapshots) == {
+            ("extended", "TOP-USD"),
+            ("paradex", "TOP-USD-PERP"),
+        }
+
+    asyncio.run(run())
+
+
 def test_opportunity_universe_service_excludes_policy_tags() -> None:
     symbol_lists = {
         "extended": ["TRUMP-USD", "LIT-USD"],

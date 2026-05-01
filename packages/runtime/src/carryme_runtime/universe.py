@@ -29,19 +29,27 @@ from carryme_models import (
     FundingUniversePortfolioPlan,
     FundingUniverseScan,
     FundingUniverseVenueMarket,
+    MarketStats,
     NormalizedMarketSnapshot,
     OpportunityRecord,
     RouteStabilitySummary,
     TopOfBook,
 )
-from carryme_normalizers import get_fee_profile, normalize_symbol
+from carryme_normalizers import (
+    NormalizationError,
+    get_fee_profile,
+    normalize_market_snapshot,
+    normalize_symbol,
+)
 from carryme_scoring import score_funding_pair
 
 from carryme_runtime.execution_quality import ExecutionQualityService
 from carryme_runtime.opportunities import (
     VENUE_REGISTRY,
+    MarketStatsFetcher,
     SnapshotFetcher,
     UpstreamDataError,
+    fetch_live_market_stats,
     fetch_live_snapshot,
 )
 from carryme_runtime.route_stability import RouteStabilityService
@@ -77,6 +85,8 @@ DEFAULT_SNAPSHOT_CONCURRENCY_BY_VENUE: dict[str, int] = {
     "hyperliquid": 8,
     "paradex": 3,
 }
+DEFAULT_SNAPSHOT_SHORTLIST_MIN_OVERLAPS = 20
+DEFAULT_SNAPSHOT_SHORTLIST_MULTIPLIER = 4
 RETRYABLE_SNAPSHOT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 UNIVERSE_RANKINGS: tuple[UniverseRanking, ...] = (
     "roundtrip_edge",
@@ -102,11 +112,14 @@ class OpportunityUniverseService:
 
     list_symbols: VenueSymbolLister = field(default_factory=lambda: list_live_symbols)
     fetch_snapshot: SnapshotFetcher = field(default_factory=lambda: fetch_live_snapshot)
+    fetch_market_stats: MarketStatsFetcher = field(default_factory=lambda: fetch_live_market_stats)
     default_fee_profiles: dict[str, str] = field(default_factory=_default_universe_fee_profiles)
     snapshot_concurrency_by_venue: dict[str, int] = field(
         default_factory=lambda: dict(DEFAULT_SNAPSHOT_CONCURRENCY_BY_VENUE)
     )
     snapshot_batch_size: int | None = None
+    snapshot_shortlist_min_overlaps: int = DEFAULT_SNAPSHOT_SHORTLIST_MIN_OVERLAPS
+    snapshot_shortlist_multiplier: int = DEFAULT_SNAPSHOT_SHORTLIST_MULTIPLIER
     snapshot_retry_attempts: int = 3
     snapshot_retry_backoff_seconds: float = 0.25
     execution_quality_service: ExecutionQualityService | None = None
@@ -248,7 +261,15 @@ class OpportunityUniverseService:
                 exclude_tags=exclude_tags,
             )
         ]
-        snapshots = await self._fetch_overlapping_snapshots(filtered_overlaps)
+        snapshot_overlaps = await self._shortlist_overlaps_for_snapshots(
+            filtered_overlaps,
+            fee_profiles=fee_profiles,
+            limit=limit,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+        )
+        snapshots = await self._fetch_overlapping_snapshots(snapshot_overlaps)
         (
             execution_quality_index,
             execution_prior_score,
@@ -256,7 +277,7 @@ class OpportunityUniverseService:
         route_stability_index = await self._build_route_stability_index_cached()
 
         opportunities: list[FundingUniverseOpportunity] = []
-        for overlap in filtered_overlaps:
+        for overlap in snapshot_overlaps:
             entries = [
                 (venue, symbol, snapshots[(venue, symbol)])
                 for venue, symbol in overlap.venue_symbols.items()
@@ -389,6 +410,108 @@ class OpportunityUniverseService:
         assert self.route_stability_service is not None
         return self.route_stability_service.build_index()
 
+    async def _shortlist_overlaps_for_snapshots(
+        self,
+        overlaps: list[FundingUniverseOverlap],
+        *,
+        fee_profiles: dict[str, str],
+        limit: int,
+        min_daily_volume: float,
+        min_open_interest: float,
+        min_roundtrip_edge: float,
+    ) -> list[FundingUniverseOverlap]:
+        """Use lightweight market stats to choose which overlaps need full orderbooks."""
+
+        shortlist_size = self._snapshot_shortlist_size(limit)
+        if shortlist_size <= 0 or len(overlaps) <= shortlist_size:
+            return overlaps
+
+        stats = await self._fetch_overlapping_market_stats(overlaps)
+        scored: list[tuple[tuple[float, float, float, str], FundingUniverseOverlap]] = []
+        for overlap in overlaps:
+            best_score: tuple[float, float, float, str] | None = None
+            entries = [
+                (venue, symbol, stats[(venue, symbol)])
+                for venue, symbol in overlap.venue_symbols.items()
+                if (venue, symbol) in stats
+            ]
+            for (left_venue, _left_symbol, left), (
+                right_venue,
+                _right_symbol,
+                right,
+            ) in itertools.combinations(entries, 2):
+                try:
+                    opportunity = score_funding_pair(
+                        left,
+                        right,
+                        get_fee_profile(left_venue, fee_profiles[left_venue]),
+                        get_fee_profile(right_venue, fee_profiles[right_venue]),
+                    )
+                except ValueError:
+                    continue
+                venue_markets = [_venue_market(left), _venue_market(right)]
+                min_volume = _min_metric(venue_markets, "daily_volume")
+                min_oi = _min_metric(venue_markets, "open_interest")
+                if opportunity.one_day_net_edge_after_round_trip < min_roundtrip_edge:
+                    continue
+                if (min_volume or 0.0) < min_daily_volume:
+                    continue
+                if (min_oi or 0.0) < min_open_interest:
+                    continue
+                score = (
+                    opportunity.one_day_net_edge_after_round_trip,
+                    min_volume or 0.0,
+                    min_oi or 0.0,
+                    overlap.canonical_symbol,
+                )
+                if best_score is None or score > best_score:
+                    best_score = score
+            if best_score is not None:
+                scored.append((best_score, overlap))
+
+        ranked = sorted(scored, key=lambda item: item[0], reverse=True)
+        return [overlap for _score, overlap in ranked[:shortlist_size]]
+
+    async def _fetch_overlapping_market_stats(
+        self,
+        overlaps: list[FundingUniverseOverlap],
+    ) -> dict[tuple[str, str], NormalizedMarketSnapshot]:
+        semaphores = {
+            venue: asyncio.Semaphore(max(self.snapshot_concurrency_by_venue.get(venue, 1), 1))
+            for venue in VENUE_REGISTRY
+        }
+        snapshots: dict[tuple[str, str], NormalizedMarketSnapshot] = {}
+        items = [
+            (venue, symbol)
+            for overlap in overlaps
+            for venue, symbol in overlap.venue_symbols.items()
+        ]
+        batch_size = self._effective_snapshot_batch_size()
+        for start in range(0, len(items), batch_size):
+            batch = items[start : start + batch_size]
+            tasks = {
+                (venue, symbol): asyncio.create_task(
+                    self._fetch_market_stats_with_controls(
+                        venue,
+                        symbol,
+                        semaphore=semaphores[venue],
+                    )
+                )
+                for venue, symbol in batch
+            }
+            for key, task in tasks.items():
+                try:
+                    snapshots[key] = await task
+                except (
+                    ValueError,
+                    NormalizationError,
+                    UpstreamDataError,
+                    ConnectorError,
+                    httpx.HTTPError,
+                ):
+                    continue
+        return snapshots
+
     async def _fetch_overlapping_snapshots(
         self,
         overlaps: list[FundingUniverseOverlap],
@@ -433,6 +556,36 @@ class OpportunityUniverseService:
             ),
             1,
         )
+
+    def _snapshot_shortlist_size(self, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        return max(
+            max(self.snapshot_shortlist_min_overlaps, 1),
+            limit * max(self.snapshot_shortlist_multiplier, 1),
+        )
+
+    async def _fetch_market_stats_with_controls(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        semaphore: asyncio.Semaphore,
+    ) -> NormalizedMarketSnapshot:
+        attempts = max(self.snapshot_retry_attempts, 1)
+        for attempt in range(1, attempts + 1):
+            try:
+                async with semaphore:
+                    market = await self.fetch_market_stats(venue, symbol)
+                return _normalize_market_stats_snapshot(venue, symbol, market)
+            except (ValueError, NormalizationError, UpstreamDataError):
+                raise
+            except (ConnectorError, httpx.HTTPError) as exc:
+                if attempt >= attempts or not _is_retryable_snapshot_error(exc):
+                    raise
+                base_delay = self.snapshot_retry_backoff_seconds * (2 ** (attempt - 1))
+                await asyncio.sleep(base_delay * random.uniform(0.75, 1.25))
+        raise UpstreamDataError(f"Could not fetch market stats for {venue}:{symbol}")
 
     async def _fetch_snapshot_with_controls(
         self,
@@ -480,6 +633,23 @@ async def list_live_symbols(venue: str) -> list[str]:
     async with httpx.AsyncClient(base_url=base_url, timeout=20.0) as client:
         connector = _build_connector(key, client)
         return await connector.list_market_symbols()
+
+
+def _normalize_market_stats_snapshot(
+    venue: str,
+    symbol: str,
+    market: MarketStats,
+) -> NormalizedMarketSnapshot:
+    key = venue.strip().lower()
+    expected_identity = normalize_symbol(key, symbol)
+    normalized = normalize_market_snapshot(key, market)
+    if normalized.identity.canonical_symbol != expected_identity.canonical_symbol:
+        raise UpstreamDataError(
+            f"Upstream market data symbol mismatch for {key}:{symbol}: "
+            "expected "
+            f"{expected_identity.canonical_symbol}, got {normalized.identity.canonical_symbol}"
+        )
+    return normalized
 
 
 def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnector:
