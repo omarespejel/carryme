@@ -100,6 +100,7 @@ UNIVERSE_RANKINGS: tuple[UniverseRanking, ...] = (
     "stability_adjusted_quality_pnl",
     "route_adjusted_quality_pnl",
 )
+SHORTLIST_CAPPED_RANKINGS = frozenset({"roundtrip_edge", "entry_edge"})
 
 
 def _default_universe_fee_profiles() -> dict[str, str]:
@@ -263,6 +264,7 @@ class OpportunityUniverseService:
         ]
         snapshot_overlaps = await self._shortlist_overlaps_for_snapshots(
             filtered_overlaps,
+            ranking=normalized_ranking,
             fee_profiles=fee_profiles,
             limit=limit,
             min_daily_volume=min_daily_volume,
@@ -414,6 +416,7 @@ class OpportunityUniverseService:
         self,
         overlaps: list[FundingUniverseOverlap],
         *,
+        ranking: UniverseRanking,
         fee_profiles: dict[str, str],
         limit: int,
         min_daily_volume: float,
@@ -423,11 +426,12 @@ class OpportunityUniverseService:
         """Use lightweight market stats to choose which overlaps need full orderbooks."""
 
         shortlist_size = self._snapshot_shortlist_size(limit)
-        if shortlist_size <= 0 or len(overlaps) <= shortlist_size:
+        if len(overlaps) <= 1:
             return overlaps
 
         stats = await self._fetch_overlapping_market_stats(overlaps)
         scored: list[tuple[tuple[float, float, float, str], FundingUniverseOverlap]] = []
+        unscored: list[FundingUniverseOverlap] = []
         for overlap in overlaps:
             best_score: tuple[float, float, float, str] | None = None
             entries = [
@@ -459,7 +463,7 @@ class OpportunityUniverseService:
                 if (min_oi or 0.0) < min_open_interest:
                     continue
                 score = (
-                    opportunity.one_day_net_edge_after_round_trip,
+                    _shortlist_ranking_value(opportunity, ranking),
                     min_volume or 0.0,
                     min_oi or 0.0,
                     overlap.canonical_symbol,
@@ -468,9 +472,15 @@ class OpportunityUniverseService:
                     best_score = score
             if best_score is not None:
                 scored.append((best_score, overlap))
+            else:
+                unscored.append(overlap)
 
         ranked = sorted(scored, key=lambda item: item[0], reverse=True)
-        return [overlap for _score, overlap in ranked[:shortlist_size]]
+        ordered = [overlap for _score, overlap in ranked]
+        ordered.extend(unscored)
+        if shortlist_size <= 0 or ranking not in SHORTLIST_CAPPED_RANKINGS:
+            return ordered
+        return ordered[:shortlist_size]
 
     async def _fetch_overlapping_market_stats(
         self,
@@ -1106,6 +1116,12 @@ def _ranking_value(opportunity: FundingUniverseOpportunity, ranking: UniverseRan
     if ranking == "stability_adjusted_quality_pnl":
         return _rankable(opportunity.stability_adjusted_quality_score)
     return _rankable(opportunity.quality_score)
+
+
+def _shortlist_ranking_value(opportunity: FundingArbOpportunity, ranking: UniverseRanking) -> float:
+    if ranking == "entry_edge":
+        return opportunity.one_day_net_edge_after_entry
+    return opportunity.one_day_net_edge_after_round_trip
 
 
 def _normalize_venues(venues: list[str]) -> list[str]:
