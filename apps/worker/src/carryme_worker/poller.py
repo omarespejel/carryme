@@ -2426,6 +2426,7 @@ async def cache_launch_ready_canaries_once(
             label=label,
         )
         if not execution_preflight.ready:
+            ready_store.delete_label(label)
             loop_logger.warning(
                 "skipping launch-ready snapshot label=%s because live execution is not ready: %s",
                 label,

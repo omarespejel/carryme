@@ -3310,6 +3310,88 @@ def test_cache_launch_ready_canaries_once_skips_selected_missing_live_execution_
     assert "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY" in caplog.text
 
 
+def test_cache_launch_ready_canaries_once_invalidates_existing_snapshot_when_unready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_worker_env(monkeypatch)
+    database_path = str(tmp_path / "history.sqlite3")
+    ready_settings = WorkerSettings(
+        database_path=database_path,
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="0x123",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="token",
+    )
+    approved_store = _append_launch_ready_gate_approved_snapshot(ready_settings)
+
+    class StubSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            return [
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ]
+
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+    first_summary = asyncio.run(
+        cache_launch_ready_canaries_once(
+            ready_settings,
+            approved_store=approved_store,
+            launch_ready_store=launch_ready_store,
+            system_state_service=cast(Any, StubSystemStateService()),
+            now=datetime(2026, 3, 29, 20, 6, tzinfo=UTC),
+        )
+    )
+
+    assert first_summary.saved_snapshots == 1
+    assert len(launch_ready_store.list_recent(limit=10, label="arb_extended_paradex")) == 1
+
+    degraded_settings = WorkerSettings(
+        database_path=database_path,
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+
+    class FailingSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            raise AssertionError("system-state probe should not run before credential gate passes")
+
+    second_summary = asyncio.run(
+        cache_launch_ready_canaries_once(
+            degraded_settings,
+            approved_store=approved_store,
+            launch_ready_store=launch_ready_store,
+            system_state_service=cast(Any, FailingSystemStateService()),
+            now=datetime(2026, 3, 29, 20, 7, tzinfo=UTC),
+        )
+    )
+
+    assert second_summary.launch_ready_candidates == 0
+    assert second_summary.saved_snapshots == 0
+    assert launch_ready_store.list_recent(limit=10, label="arb_extended_paradex") == []
+
+
 def test_cache_launch_ready_canaries_once_skips_decayed_approved_snapshot_chain(
     tmp_path: Path,
 ) -> None:

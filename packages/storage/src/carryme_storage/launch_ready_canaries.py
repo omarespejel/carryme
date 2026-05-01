@@ -115,3 +115,17 @@ class LaunchReadyCanaryStore:
 
         snapshots = self.list_recent(limit=1, label=label)
         return snapshots[0] if snapshots else None
+
+    def delete_label(self, label: str) -> int:
+        """Delete all launch-ready canary snapshots for one label."""
+
+        self.initialize()
+        with self.database.begin() as connection:
+            result = connection.execute(
+                """
+                DELETE FROM launch_ready_canary_snapshots
+                WHERE label = ?
+                """,
+                (label,),
+            )
+        return int(getattr(result, "rowcount", 0) or 0)
