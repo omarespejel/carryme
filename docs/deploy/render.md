@@ -69,9 +69,8 @@ Before you host this, rotate any venue secrets that were ever pasted into chat o
 
 1. `CARRYME_API_PARADEX_LIVE_ENABLED=true`
 2. `CARRYME_API_PARADEX_ACCOUNT_ADDRESS`
-3. One of:
-   - `CARRYME_API_PARADEX_PRIVATE_KEY`
-   - `CARRYME_API_PARADEX_BEARER_TOKEN`
+3. `CARRYME_API_PARADEX_PRIVATE_KEY` for live trading and cleanup submission
+4. optional `CARRYME_API_PARADEX_BEARER_TOKEN` only for authenticated read-only probes; it does not satisfy live execution readiness
 
 ### Hyperliquid
 
@@ -143,8 +142,8 @@ Use this to avoid over-sharing secrets across workers:
 | `CARRYME_API_EXTENDED_API_KEY` | if API live actions enabled | yes | yes | yes | no |
 | `CARRYME_API_EXTENDED_STARK_PRIVATE_KEY` | if API live actions enabled | yes | yes | yes | no |
 | `CARRYME_API_PARADEX_ACCOUNT_ADDRESS` | if API live actions enabled | yes | yes | yes | no |
-| `CARRYME_API_PARADEX_PRIVATE_KEY` | if using subkey auth | if using subkey auth | if using subkey auth | if using subkey auth | no |
-| `CARRYME_API_PARADEX_BEARER_TOKEN` | if using bearer-token auth | if using bearer-token auth | if using bearer-token auth | if using bearer-token auth | no |
+| `CARRYME_API_PARADEX_PRIVATE_KEY` | if API live actions enabled | yes | yes | yes | no |
+| `CARRYME_API_PARADEX_BEARER_TOKEN` | optional for authenticated read-only API/account probes | no | no | no | no |
 | `CARRYME_API_HYPERLIQUID_ACCOUNT_ADDRESS` | if API live actions enabled | yes | yes | yes | no |
 | `CARRYME_API_HYPERLIQUID_VAULT_ADDRESS` | optional | optional | optional | optional | no |
 | `CARRYME_API_HYPERLIQUID_API_WALLET_PRIVATE_KEY` | if API live actions enabled | yes | yes | yes | no |
@@ -225,6 +224,7 @@ Enable only `Extended` and `Paradex` first.
 3. keep `CARRYME_API_HYPERLIQUID_LIVE_ENABLED=false`
 4. add only the `Extended` and `Paradex` secrets to:
    - `carryme-api`
+   - `carryme-launch-ready-cache`
    - `carryme-stable-launch`
    - `carryme-execution-monitor`
 5. leave `Hyperliquid` out until the hosted `Extended/Paradex` loop proves stable

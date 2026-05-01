@@ -2974,7 +2974,7 @@ def test_cache_launch_ready_canaries_once_saves_fresh_ready_snapshots(
         extended_stark_private_key="0x123",
         paradex_live_enabled=True,
         paradex_account_address="0xabc",
-        paradex_bearer_token="token",
+        paradex_private_key="token",
     )
     approval_store = RouteApprovalStore(settings.database_path)
     approval = approval_store.upsert(
@@ -3245,7 +3245,7 @@ def test_cache_launch_ready_canaries_once_skips_decayed_approved_snapshot_chain(
         extended_api_key="extended-key",
         paradex_live_enabled=True,
         paradex_account_address="0xabc",
-        paradex_bearer_token="token",
+        paradex_private_key="token",
     )
     approval_store = RouteApprovalStore(settings.database_path)
     approval = approval_store.upsert(
@@ -3407,7 +3407,7 @@ def test_cache_launch_ready_canaries_once_skips_long_break_even_routes(
         extended_api_key="extended-key",
         paradex_live_enabled=True,
         paradex_account_address="0xabc",
-        paradex_bearer_token="token",
+        paradex_private_key="token",
     )
     approval_store = RouteApprovalStore(settings.database_path)
     approval = approval_store.upsert(
@@ -3594,7 +3594,7 @@ def test_cache_launch_ready_canaries_once_emits_stable_launch_ready_available_al
         extended_stark_private_key="0x123",
         paradex_live_enabled=True,
         paradex_account_address="0xabc",
-        paradex_bearer_token="token",
+        paradex_private_key="token",
     )
     approval_store = RouteApprovalStore(settings.database_path)
     approval = approval_store.upsert(

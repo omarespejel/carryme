@@ -44,6 +44,16 @@ class VenueSpec(TypedDict):
     notes: list[str]
 
 
+def _credential_value_present(value: object) -> bool:
+    """Return whether one credential value should count as present."""
+
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
 LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
     "extended": {
         "enabled_setting": "extended_live_enabled",
@@ -88,19 +98,15 @@ LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
             ),
             RequirementSpec(
                 "private_key",
-                "CARRYME_API_PARADEX_PRIVATE_KEY|CARRYME_API_PARADEX_BEARER_TOKEN",
-                (
-                    "Paradex trading subkey private key or pre-issued bearer token used "
-                    "for authenticated API access."
-                ),
+                "CARRYME_API_PARADEX_PRIVATE_KEY",
+                "Paradex trading subkey private key used for authenticated live trading.",
                 True,
-                ("bearer_token",),
             ),
         ],
         "notes": [
             (
                 "Paradex live trading requires the main account address and the "
-                "trading subkey private key used for authenticated API access."
+                "trading subkey private key used for authenticated live trading."
             ),
         ],
     },
@@ -170,7 +176,7 @@ def build_venue_execution_preflights(
                 description=requirement.description,
                 secret=requirement.secret,
                 present=any(
-                    bool(credentials.get(key))
+                    _credential_value_present(credentials.get(key))
                     for key in (requirement.key, *requirement.alternative_keys)
                 ),
             )
