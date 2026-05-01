@@ -14,7 +14,7 @@ from carryme_connectors import (
     ParadexPublicConnector,
     PublicVenueConnector,
 )
-from carryme_models import FundingArbOpportunity, NormalizedMarketSnapshot
+from carryme_models import FundingArbOpportunity, MarketStats, NormalizedMarketSnapshot
 from carryme_normalizers import (
     NormalizationError,
     get_fee_profile,
@@ -28,6 +28,12 @@ class SnapshotFetcher(Protocol):
     """Interface for fetching normalized live market snapshots."""
 
     async def __call__(self, venue: str, symbol: str) -> NormalizedMarketSnapshot: ...
+
+
+class MarketStatsFetcher(Protocol):
+    """Interface for fetching lightweight live market stats without an orderbook."""
+
+    async def __call__(self, venue: str, symbol: str) -> MarketStats: ...
 
 
 ConnectorFactory = Callable[[httpx.AsyncClient], PublicVenueConnector]
@@ -79,6 +85,19 @@ async def fetch_live_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapsh
     return normalized
 
 
+async def fetch_live_market_stats(venue: str, symbol: str) -> MarketStats:
+    """Fetch lightweight live market stats without joining the top of book."""
+
+    key = venue.strip().lower()
+    venue_config = VENUE_REGISTRY.get(key)
+    if venue_config is None:
+        raise ValueError(f"Unsupported venue: {venue}")
+    base_url, _connector_class = venue_config
+
+    async with httpx.AsyncClient(base_url=base_url, timeout=15.0) as client:
+        return await _build_connector(key, client).fetch_market_stats(symbol)
+
+
 @dataclass
 class OpportunityService:
     """Application service for live funding opportunity scoring."""
@@ -121,4 +140,11 @@ def _build_connector(venue: str, client: httpx.AsyncClient) -> PublicVenueConnec
     return connector_class(client)
 
 
-__all__ = ["OpportunityService", "UpstreamDataError", "fetch_live_snapshot"]
+__all__ = [
+    "MarketStatsFetcher",
+    "OpportunityService",
+    "SnapshotFetcher",
+    "UpstreamDataError",
+    "fetch_live_market_stats",
+    "fetch_live_snapshot",
+]

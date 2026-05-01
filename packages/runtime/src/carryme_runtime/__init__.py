@@ -33,7 +33,12 @@ from carryme_runtime.extended_live_execution import ExtendedLiveExecutionService
 from carryme_runtime.hyperliquid_cleanup_preview import HyperliquidCleanupPreviewService
 from carryme_runtime.hyperliquid_live_execution import HyperliquidLiveExecutionService
 from carryme_runtime.intents import InvalidTradeCandidateError, build_trade_intent
-from carryme_runtime.opportunities import OpportunityService, UpstreamDataError, fetch_live_snapshot
+from carryme_runtime.opportunities import (
+    OpportunityService,
+    UpstreamDataError,
+    fetch_live_market_stats,
+    fetch_live_snapshot,
+)
 from carryme_runtime.order_preview import OrderPreviewService
 from carryme_runtime.pair_close_live_execution import PairCloseLiveExecutionCoordinator
 from carryme_runtime.pair_close_preview import PairClosePreviewService
@@ -116,6 +121,7 @@ __all__ = [
     "VenueSystemProbe",
     "build_opportunity_record_from_universe_opportunity",
     "build_pair_spec_from_universe_opportunity",
+    "fetch_live_market_stats",
     "fetch_live_snapshot",
     "filter_candidate_records",
     "list_live_symbols",
