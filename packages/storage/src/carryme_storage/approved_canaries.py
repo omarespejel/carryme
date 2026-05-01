@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from carryme_models import ApprovedCanarySnapshot
 
@@ -80,6 +81,24 @@ class ApprovedCanaryStore:
     ) -> list[ApprovedCanarySnapshot]:
         """Return recent approved canary snapshots."""
 
+        return [
+            ApprovedCanarySnapshot.model_validate(
+                {
+                    **snapshot_payload,
+                    "snapshot_id": stored_id,
+                }
+            )
+            for stored_id, snapshot_payload in self.list_recent_payloads(limit=limit, label=label)
+        ]
+
+    def list_recent_payloads(
+        self,
+        *,
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Return recent approved canary snapshot payloads without model validation."""
+
         self.initialize()
         query = """
             SELECT id, snapshot_json
@@ -89,21 +108,13 @@ class ApprovedCanaryStore:
         if label:
             query += " WHERE label = ?"
             values.append(label)
-        query += " ORDER BY captured_at DESC LIMIT ?"
+        query += " ORDER BY captured_at DESC, id DESC LIMIT ?"
         values.append(limit)
 
         with self.database.begin() as connection:
             rows = connection.execute(query, tuple(values)).fetchall()
 
-        return [
-            ApprovedCanarySnapshot.model_validate(
-                {
-                    **json.loads(snapshot_json),
-                    "snapshot_id": stored_id,
-                }
-            )
-            for stored_id, snapshot_json in rows
-        ]
+        return [(stored_id, json.loads(snapshot_json)) for stored_id, snapshot_json in rows]
 
     def latest(self, *, label: str | None = None) -> ApprovedCanarySnapshot | None:
         """Return the latest approved canary snapshot, if any."""

@@ -1230,6 +1230,82 @@ def test_latest_approved_canary_snapshot_endpoint_returns_latest(tmp_path: Path)
     assert payload["approval"]["max_live_notional"] == 11.0
 
 
+def test_approved_canary_snapshot_summaries_order_tied_captures_by_id(tmp_path: Path) -> None:
+    store = ApprovedCanaryStore(tmp_path / "history.sqlite3")
+    captured_at = datetime(2026, 3, 29, 16, 6, tzinfo=UTC)
+    for label in ("first_extended_paradex", "second_extended_paradex"):
+        store.append(
+            ApprovedCanarySnapshot(
+                captured_at=captured_at,
+                label=label,
+                candidate=FundingUniverseCanaryCandidate(
+                    opportunity=FundingUniverseOpportunity(
+                        opportunity=FundingArbOpportunity(
+                            canonical_symbol="ARB-USD-PERP",
+                            long_venue="paradex",
+                            short_venue="extended",
+                            long_fee_profile="pro_fastfills",
+                            short_fee_profile="default",
+                            gross_daily_edge=0.004,
+                            entry_cost_rate=0.00045,
+                            round_trip_cost_rate=0.0009,
+                            one_day_net_edge_after_entry=0.00355,
+                            one_day_net_edge_after_round_trip=0.0031,
+                            break_even_days_entry=0.2,
+                            break_even_days_round_trip=0.3,
+                            capacity=CapacityEstimate(
+                                short_bid_notional=1400.0,
+                                long_ask_notional=900.0,
+                                max_entry_notional=900.0,
+                                limiting_venue="paradex",
+                            ),
+                        ),
+                        venue_markets={
+                            "extended": FundingUniverseVenueMarket(
+                                venue="extended",
+                                symbol="ARB-USD",
+                            ),
+                            "paradex": FundingUniverseVenueMarket(
+                                venue="paradex",
+                                symbol="ARB-USD-PERP",
+                            ),
+                        },
+                        deployable_notional=900.0,
+                        estimated_one_day_pnl_after_round_trip=2.79,
+                    ),
+                    suggested_canary_notional=11.0,
+                ),
+                approval=RouteApprovalEntry(
+                    updated_at=datetime(2026, 3, 29, 16, 5, tzinfo=UTC),
+                    label=label,
+                    canonical_symbol="ARB-USD-PERP",
+                    short_venue="extended",
+                    long_venue="paradex",
+                    short_fee_profile="default",
+                    long_fee_profile="pro_fastfills",
+                    approved=True,
+                    max_live_notional=11.0,
+                    note="approved canary",
+                ),
+            )
+        )
+
+    app.dependency_overrides[get_approved_canary_store] = lambda: store
+    client = TestClient(app)
+    response = client.get(
+        "/v1/opportunities/funding-universe/canary/snapshot-summaries",
+        params={"limit": 5},
+    )
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["label"] for item in payload] == [
+        "second_extended_paradex",
+        "first_extended_paradex",
+    ]
+
+
 def test_launch_ready_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> None:
     approved_snapshot = ApprovedCanarySnapshot(
         snapshot_id=3,
