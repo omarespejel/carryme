@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "repo": "omarespejel/carryme",
+  "project": "carryme live funding automation",
+  "goal": "automatically open, hold, monitor, and close small route-approved venue hedges when net opportunity is real and fresh",
+  "historical_live_commit": "f2591db5d0caa13e8377a5be8f0df0245bd71591",
+  "render_services": {
+    "api": "carryme-api",
+    "approved_scan": "carryme-approved-canary-scan",
+    "launch_ready_cache": "carryme-launch-ready-cache",
+    "stable_launch": "carryme-stable-launch",
+    "execution_monitor": "carryme-execution-monitor",
+    "system_state": "carryme-system-state",
+    "universe_scan": "carryme-universe-scan",
+    "database": "carryme-postgres"
+  },
+  "automation_pipeline": [
+    "route approval",
+    "approved canary scan",
+    "launch-ready cache",
+    "stable launch",
+    "execution monitor",
+    "auto close or cleanup"
+  ],
+  "known_blockers": [
+    {
+      "id": "stable-launch-profit-hold-mode",
+      "severity": "P0",
+      "summary": "stable launch currently launches via guarded canary lifecycle with close_position=true, which tests execution but does not hold for funding capture"
+    },
+    {
+      "id": "stable-launch-service-required",
+      "severity": "P0",
+      "summary": "approved-scan and launch-ready-cache only create signals; carryme-stable-launch must be deployed and live for unattended submissions"
+    },
+    {
+      "id": "launch-ready-credential-gate",
+      "severity": "P1",
+      "summary": "launch-ready should fail closed when touched venues are not live-enabled or missing live credentials"
+    },
+    {
+      "id": "dynamic-opportunity-promotion",
+      "severity": "P1",
+      "summary": "automation only launches pre-approved static routes; stronger current routes need a safe proposal or approval path"
+    },
+    {
+      "id": "approved-scan-coverage",
+      "severity": "P1",
+      "summary": "default approved_canary_scan_limit=5 can skip approved labels silently when more labels exist"
+    },
+    {
+      "id": "fast-universe-shortlist",
+      "severity": "P1",
+      "summary": "universe scan fetches expensive snapshots for all overlaps before applying result limit"
+    },
+    {
+      "id": "lightweight-production-summaries",
+      "severity": "P2",
+      "summary": "operator list endpoints return full nested snapshots and can trigger large responses or 502s"
+    }
+  ],
+  "agent_rules": [
+    "verify live Render/API state before making current go/no-go claims",
+    "prefer fail-closed behavior for missing credentials, stale data, and ambiguous route identity",
+    "add tests before behavior changes when practical",
+    "do not widen live-money risk without explicit PR body disclosure"
+  ]
+}
