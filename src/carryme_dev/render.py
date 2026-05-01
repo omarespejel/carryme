@@ -6,12 +6,14 @@ import argparse
 import json
 import os
 import re
+import shlex
 import signal
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
+import yaml
 from carryme_api.config import ApiSettings
 from carryme_storage.db import Database, redact_database_url
 from carryme_worker.config import WorkerSettings
@@ -100,29 +102,68 @@ def _paradex_missing_env(resolved_env: Mapping[str, str]) -> list[str]:
     return missing
 
 
-def _parse_render_services(blueprint_text: str) -> dict[str, dict[str, str]]:
-    """Extract the Render service name/type/start command without a YAML dependency."""
+def _discover_render_blueprint_path(start: Path | None = None) -> Path | None:
+    """Search the current directory and parents for the repo Render blueprint."""
+
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        candidate = directory / "render.yaml"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _load_render_blueprint(blueprint_path: str | Path) -> dict[str, object]:
+    """Load one Render blueprint from YAML and normalize to a mapping."""
+
+    path = Path(blueprint_path)
+    loaded = yaml.safe_load(path.read_text())
+    if not isinstance(loaded, dict):
+        raise ValueError("render blueprint must be a top-level mapping")
+    return loaded
+
+
+def _parse_render_services(blueprint: Mapping[str, object]) -> dict[str, dict[str, str]]:
+    """Extract service name, type, and start command from a parsed Render blueprint."""
+
+    services_raw = blueprint.get("services")
+    if not isinstance(services_raw, list):
+        return {}
 
     services: dict[str, dict[str, str]] = {}
-    for block in re.split(r"\n(?=\s{2}- type:)", blueprint_text):
-        service_type_match = re.search(r"^\s*-\s*type:\s*(?P<value>\S+)\s*$", block, re.M)
-        name_match = re.search(r"^\s+name:\s*(?P<value>\S+)\s*$", block, re.M)
-        if service_type_match is None or name_match is None:
+    for service_raw in services_raw:
+        if not isinstance(service_raw, Mapping):
             continue
-        start_command_match = re.search(
-            r"^\s+startCommand:\s*(?P<value>.+?)\s*$",
-            block,
-            re.M,
-        )
-        services[name_match.group("value")] = {
-            "type": service_type_match.group("value"),
-            "start_command": (
-                start_command_match.group("value").strip("'\"")
-                if start_command_match is not None
-                else ""
-            ),
+        name = service_raw.get("name")
+        service_type = service_raw.get("type")
+        start_command = service_raw.get("startCommand", "")
+        if not isinstance(name, str) or not isinstance(service_type, str):
+            continue
+        services[name] = {
+            "type": service_type,
+            "start_command": start_command if isinstance(start_command, str) else "",
         }
     return services
+
+
+def _command_executes_expected(*, service_type: str, actual: str, expected: str) -> bool:
+    """Return whether one Render start command executes the required command."""
+
+    expected_tokens = shlex.split(expected)
+    actual_tokens = shlex.split(actual)
+
+    if service_type == "worker":
+        return actual_tokens == expected_tokens
+
+    if actual_tokens == expected_tokens:
+        return True
+
+    if len(actual_tokens) >= 3 and actual_tokens[0] == "sh" and actual_tokens[1] == "-c":
+        script = actual_tokens[2]
+        for segment in re.split(r"\s*(?:&&|\|\||;)\s*", script):
+            if shlex.split(segment) == expected_tokens:
+                return True
+    return False
 
 
 def build_render_blueprint_validation_report(
@@ -140,13 +181,21 @@ def build_render_blueprint_validation_report(
             "invalid_services": [],
         }
 
-    blueprint_text = path.read_text()
-    services = _parse_render_services(blueprint_text)
+    blueprint = _load_render_blueprint(path)
+    services = _parse_render_services(blueprint)
+    databases_raw = blueprint.get("databases")
+    database_names: set[str] = set()
+    if isinstance(databases_raw, list):
+        for entry in databases_raw:
+            if not isinstance(entry, Mapping):
+                continue
+            name = entry.get("name")
+            if isinstance(name, str):
+                database_names.add(name)
     missing_databases = [
         name
         for name in REQUIRED_RENDER_DATABASES
-        if re.search(rf"^\s*-\s*name:\s*{re.escape(name)}\s*$", blueprint_text, re.M)
-        is None
+        if name not in database_names
     ]
     missing_services = [
         name for name in REQUIRED_RENDER_SERVICE_SPECS if name not in services
@@ -165,7 +214,11 @@ def build_render_blueprint_validation_report(
                     "actual": service["type"],
                 }
             )
-        if spec["start_command"] not in service["start_command"]:
+        if not _command_executes_expected(
+            service_type=spec["type"],
+            actual=service["start_command"],
+            expected=spec["start_command"],
+        ):
             invalid_services.append(
                 {
                     "name": name,
@@ -254,7 +307,7 @@ def build_render_validation_report(
     *,
     ping_database: bool = True,
     database_ping_timeout_seconds: float = DEFAULT_DATABASE_PING_TIMEOUT_SECONDS,
-    blueprint_path: str | Path | None = "render.yaml",
+    blueprint_path: str | Path | None = None,
 ) -> dict[str, object]:
     """Validate the current environment for Render-style deployment."""
 
@@ -331,10 +384,19 @@ def build_render_validation_report(
         database_ready = None
         database_skipped = True
 
-    blueprint_report = (
-        build_render_blueprint_validation_report(blueprint_path)
+    effective_blueprint_path = (
+        Path(blueprint_path)
         if blueprint_path is not None
-        else {"status": "skipped"}
+        else _discover_render_blueprint_path()
+    )
+    blueprint_report = (
+        build_render_blueprint_validation_report(effective_blueprint_path)
+        if effective_blueprint_path is not None
+        else {
+            "status": "skipped",
+            "path": None,
+            "reason": "render.yaml not found from current working directory",
+        }
     )
 
     status = "ready"
