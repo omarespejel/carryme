@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 
 from carryme_api.config import ApiSettings
 from carryme_storage.db import Database, redact_database_url
@@ -19,6 +21,39 @@ REQUIRED_RENDER_ENV_VARS = (
     "CARRYME_API_ENVIRONMENT",
     "CARRYME_WORKER_ENVIRONMENT",
 )
+
+REQUIRED_RENDER_DATABASES = ("carryme-postgres",)
+
+REQUIRED_RENDER_SERVICE_SPECS: dict[str, dict[str, str]] = {
+    "carryme-api": {
+        "type": "web",
+        "start_command": "uv run carryme-api",
+    },
+    "carryme-universe-scan": {
+        "type": "worker",
+        "start_command": "uv run carryme-worker --scan-universe-supervise",
+    },
+    "carryme-approved-canary-scan": {
+        "type": "worker",
+        "start_command": "uv run carryme-worker --scan-approved-canary-supervise",
+    },
+    "carryme-launch-ready-cache": {
+        "type": "worker",
+        "start_command": "uv run carryme-worker --cache-launch-ready-canary-supervise",
+    },
+    "carryme-stable-launch": {
+        "type": "worker",
+        "start_command": "uv run carryme-worker --launch-latest-stable-canary-supervise",
+    },
+    "carryme-system-state": {
+        "type": "worker",
+        "start_command": "uv run carryme-worker --observe-system-state-supervise",
+    },
+    "carryme-execution-monitor": {
+        "type": "worker",
+        "start_command": "uv run carryme-worker --observe-executions-supervise",
+    },
+}
 
 LIVE_VENUE_ENV_VARS: dict[str, tuple[str, tuple[str, ...]]] = {
     "extended": (
@@ -63,6 +98,94 @@ def _paradex_missing_env(resolved_env: Mapping[str, str]) -> list[str]:
     ):
         missing.append("CARRYME_API_PARADEX_PRIVATE_KEY|CARRYME_API_PARADEX_BEARER_TOKEN")
     return missing
+
+
+def _parse_render_services(blueprint_text: str) -> dict[str, dict[str, str]]:
+    """Extract the Render service name/type/start command without a YAML dependency."""
+
+    services: dict[str, dict[str, str]] = {}
+    for block in re.split(r"\n(?=\s{2}- type:)", blueprint_text):
+        service_type_match = re.search(r"^\s*-\s*type:\s*(?P<value>\S+)\s*$", block, re.M)
+        name_match = re.search(r"^\s+name:\s*(?P<value>\S+)\s*$", block, re.M)
+        if service_type_match is None or name_match is None:
+            continue
+        start_command_match = re.search(
+            r"^\s+startCommand:\s*(?P<value>.+?)\s*$",
+            block,
+            re.M,
+        )
+        services[name_match.group("value")] = {
+            "type": service_type_match.group("value"),
+            "start_command": (
+                start_command_match.group("value").strip("'\"")
+                if start_command_match is not None
+                else ""
+            ),
+        }
+    return services
+
+
+def build_render_blueprint_validation_report(
+    blueprint_path: str | Path = "render.yaml",
+) -> dict[str, object]:
+    """Validate that the checked-in Render blueprint contains every production stage."""
+
+    path = Path(blueprint_path)
+    if not path.is_file():
+        return {
+            "status": "degraded",
+            "path": str(path),
+            "missing_databases": list(REQUIRED_RENDER_DATABASES),
+            "missing_services": list(REQUIRED_RENDER_SERVICE_SPECS),
+            "invalid_services": [],
+        }
+
+    blueprint_text = path.read_text()
+    services = _parse_render_services(blueprint_text)
+    missing_databases = [
+        name
+        for name in REQUIRED_RENDER_DATABASES
+        if re.search(rf"^\s*-\s*name:\s*{re.escape(name)}\s*$", blueprint_text, re.M)
+        is None
+    ]
+    missing_services = [
+        name for name in REQUIRED_RENDER_SERVICE_SPECS if name not in services
+    ]
+    invalid_services: list[dict[str, str]] = []
+    for name, spec in REQUIRED_RENDER_SERVICE_SPECS.items():
+        service = services.get(name)
+        if service is None:
+            continue
+        if service["type"] != spec["type"]:
+            invalid_services.append(
+                {
+                    "name": name,
+                    "field": "type",
+                    "expected": spec["type"],
+                    "actual": service["type"],
+                }
+            )
+        if spec["start_command"] not in service["start_command"]:
+            invalid_services.append(
+                {
+                    "name": name,
+                    "field": "startCommand",
+                    "expected": spec["start_command"],
+                    "actual": service["start_command"],
+                }
+            )
+
+    return {
+        "status": (
+            "ready"
+            if not missing_databases and not missing_services and not invalid_services
+            else "degraded"
+        ),
+        "path": str(path),
+        "missing_databases": missing_databases,
+        "missing_services": missing_services,
+        "invalid_services": invalid_services,
+    }
 
 
 @contextmanager
@@ -131,6 +254,7 @@ def build_render_validation_report(
     *,
     ping_database: bool = True,
     database_ping_timeout_seconds: float = DEFAULT_DATABASE_PING_TIMEOUT_SECONDS,
+    blueprint_path: str | Path | None = "render.yaml",
 ) -> dict[str, object]:
     """Validate the current environment for Render-style deployment."""
 
@@ -207,6 +331,12 @@ def build_render_validation_report(
         database_ready = None
         database_skipped = True
 
+    blueprint_report = (
+        build_render_blueprint_validation_report(blueprint_path)
+        if blueprint_path is not None
+        else {"status": "skipped"}
+    )
+
     status = "ready"
     if (
         missing_required
@@ -215,6 +345,7 @@ def build_render_validation_report(
         or worker_error is not None
         or live_missing
         or (database_ready is False)
+        or blueprint_report["status"] == "degraded"
     ):
         status = "degraded"
 
@@ -241,6 +372,7 @@ def build_render_validation_report(
             "error": worker_error,
         },
         "live_venues": live_venues,
+        "render_blueprint": blueprint_report,
     }
 
 
