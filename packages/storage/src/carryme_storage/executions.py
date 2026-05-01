@@ -374,6 +374,62 @@ class ExecutionJournalStore:
         rowcount = getattr(result, "rowcount", None)
         return isinstance(rowcount, int) and rowcount > 0
 
+    def reserve_pair_open_and_live_submission(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+        confirmation_entry_id: int,
+    ) -> str:
+        """Reserve paired-open and confirmation submission slots atomically."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        if confirmation_entry_id < 1:
+            raise ValueError("confirmation_entry_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        with self.database.begin() as connection:
+            pair_open_result = connection.execute(
+                """
+                INSERT INTO pair_open_live_submission_reservations (
+                    paper_trade_id,
+                    preview_hash,
+                    confirmation_entry_id
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(paper_trade_id, preview_hash) DO NOTHING
+                """,
+                (paper_trade_id, normalized_preview_hash, confirmation_entry_id),
+            )
+            pair_open_rowcount = getattr(pair_open_result, "rowcount", None)
+            if not (isinstance(pair_open_rowcount, int) and pair_open_rowcount > 0):
+                return "pair_open_conflict"
+
+            live_result = connection.execute(
+                """
+                INSERT INTO live_submission_reservations (
+                    confirmation_entry_id,
+                    preview_hash
+                ) VALUES (?, ?)
+                ON CONFLICT(confirmation_entry_id, preview_hash) DO NOTHING
+                """,
+                (confirmation_entry_id, normalized_preview_hash),
+            )
+            live_rowcount = getattr(live_result, "rowcount", None)
+            if isinstance(live_rowcount, int) and live_rowcount > 0:
+                return "reserved"
+
+            connection.execute(
+                """
+                DELETE FROM pair_open_live_submission_reservations
+                WHERE paper_trade_id = ? AND preview_hash = ? AND confirmation_entry_id = ?
+                """,
+                (paper_trade_id, normalized_preview_hash, confirmation_entry_id),
+            )
+            return "live_conflict"
+
     def mark_pair_open_live_submission_completed(
         self,
         *,
