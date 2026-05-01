@@ -213,6 +213,144 @@ class ConfirmPreviewRequest(BaseModel):
     note: str | None = None
 
 
+class ApprovedCanarySnapshotSummary(BaseModel):
+    """Lightweight approved-canary snapshot payload for production operators."""
+
+    snapshot_id: int | None = None
+    captured_at: datetime = Field(
+        description="ISO-8601 UTC timestamp when the approved canary snapshot was captured.",
+    )
+    label: str
+    canonical_symbol: str
+    long_venue: str
+    short_venue: str
+    long_fee_profile: str
+    short_fee_profile: str
+    suggested_canary_notional: float
+    max_live_notional: float
+    one_day_net_edge_after_round_trip: float
+    estimated_one_day_pnl_after_round_trip: float | None = None
+    deployable_notional: float | None = None
+    route_adjusted_quality_score: float | None = None
+    execution_adjusted_quality_score: float | None = None
+
+
+class LaunchReadyCanarySnapshotSummary(ApprovedCanarySnapshotSummary):
+    """Lightweight launch-ready snapshot payload for production operators."""
+
+    launch_ready_snapshot_id: int | None = None
+    approved_snapshot_id: int | None = None
+    max_snapshot_age_seconds: int = Field(
+        description=(
+            "Maximum age in seconds before the launch-ready snapshot should be treated "
+            "as stale."
+        ),
+    )
+    system_state_ready: bool
+    system_state_blocking_reasons: list[str] = Field(default_factory=list)
+
+
+def _summarize_approved_canary_snapshot(
+    snapshot: ApprovedCanarySnapshot,
+) -> ApprovedCanarySnapshotSummary:
+    """Return the operator-safe scalar fields from one approved canary snapshot."""
+
+    opportunity = snapshot.candidate.opportunity
+    route = opportunity.opportunity
+    return ApprovedCanarySnapshotSummary(
+        snapshot_id=snapshot.snapshot_id,
+        captured_at=snapshot.captured_at,
+        label=snapshot.label,
+        canonical_symbol=route.canonical_symbol,
+        long_venue=route.long_venue,
+        short_venue=route.short_venue,
+        long_fee_profile=route.long_fee_profile,
+        short_fee_profile=route.short_fee_profile,
+        suggested_canary_notional=snapshot.candidate.suggested_canary_notional,
+        max_live_notional=snapshot.approval.max_live_notional,
+        one_day_net_edge_after_round_trip=route.one_day_net_edge_after_round_trip,
+        estimated_one_day_pnl_after_round_trip=(
+            opportunity.estimated_one_day_pnl_after_round_trip
+        ),
+        deployable_notional=opportunity.deployable_notional,
+        route_adjusted_quality_score=opportunity.route_adjusted_quality_score,
+        execution_adjusted_quality_score=opportunity.execution_adjusted_quality_score,
+    )
+
+
+def _summarize_launch_ready_canary_snapshot(
+    snapshot: LaunchReadyCanarySnapshot,
+) -> LaunchReadyCanarySnapshotSummary:
+    """Return the operator-safe scalar fields from one launch-ready canary snapshot."""
+
+    approved_summary = _summarize_approved_canary_snapshot(snapshot.approved_snapshot)
+    return LaunchReadyCanarySnapshotSummary(
+        **approved_summary.model_dump(mode="python", exclude={"captured_at"}),
+        captured_at=snapshot.captured_at,
+        launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+        approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+        max_snapshot_age_seconds=snapshot.max_snapshot_age_seconds,
+        system_state_ready=snapshot.system_state.ready,
+        system_state_blocking_reasons=snapshot.system_state.blocking_reasons,
+    )
+
+
+def _summarize_approved_canary_snapshot_payload(
+    *,
+    snapshot_id: int | None,
+    snapshot_payload: dict[str, Any],
+) -> ApprovedCanarySnapshotSummary:
+    """Return a lightweight approved snapshot summary from raw stored JSON."""
+
+    opportunity = cast(dict[str, Any], snapshot_payload["candidate"]["opportunity"])
+    route = cast(dict[str, Any], opportunity["opportunity"])
+    approval = cast(dict[str, Any], snapshot_payload["approval"])
+    candidate = cast(dict[str, Any], snapshot_payload["candidate"])
+    return ApprovedCanarySnapshotSummary(
+        snapshot_id=snapshot_id,
+        captured_at=snapshot_payload["captured_at"],
+        label=snapshot_payload["label"],
+        canonical_symbol=route["canonical_symbol"],
+        long_venue=route["long_venue"],
+        short_venue=route["short_venue"],
+        long_fee_profile=route["long_fee_profile"],
+        short_fee_profile=route["short_fee_profile"],
+        suggested_canary_notional=candidate["suggested_canary_notional"],
+        max_live_notional=approval["max_live_notional"],
+        one_day_net_edge_after_round_trip=route["one_day_net_edge_after_round_trip"],
+        estimated_one_day_pnl_after_round_trip=opportunity.get(
+            "estimated_one_day_pnl_after_round_trip"
+        ),
+        deployable_notional=opportunity.get("deployable_notional"),
+        route_adjusted_quality_score=opportunity.get("route_adjusted_quality_score"),
+        execution_adjusted_quality_score=opportunity.get("execution_adjusted_quality_score"),
+    )
+
+
+def _summarize_launch_ready_canary_snapshot_payload(
+    *,
+    launch_ready_snapshot_id: int | None,
+    snapshot_payload: dict[str, Any],
+) -> LaunchReadyCanarySnapshotSummary:
+    """Return a lightweight launch-ready snapshot summary from raw stored JSON."""
+
+    approved_payload = cast(dict[str, Any], snapshot_payload["approved_snapshot"])
+    approved_summary = _summarize_approved_canary_snapshot_payload(
+        snapshot_id=approved_payload.get("snapshot_id"),
+        snapshot_payload=approved_payload,
+    )
+    system_state = cast(dict[str, Any], snapshot_payload["system_state"])
+    return LaunchReadyCanarySnapshotSummary(
+        **approved_summary.model_dump(mode="python", exclude={"captured_at"}),
+        captured_at=snapshot_payload["captured_at"],
+        launch_ready_snapshot_id=launch_ready_snapshot_id,
+        approved_snapshot_id=approved_payload.get("snapshot_id"),
+        max_snapshot_age_seconds=snapshot_payload["max_snapshot_age_seconds"],
+        system_state_ready=system_state["ready"],
+        system_state_blocking_reasons=system_state.get("blocking_reasons", []),
+    )
+
+
 def get_app_environment() -> str:
     """Return the runtime environment exposed by the API health endpoints."""
 
@@ -532,6 +670,19 @@ def _validated_history_limit(name: str, value: int) -> int:
 
     if value < 1:
         raise HTTPException(status_code=400, detail=f"{name} must be at least 1")
+    if value > MAX_HISTORY_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be at most {MAX_HISTORY_LIMIT}",
+        )
+    return value
+
+
+def _validated_list_limit(name: str, value: int) -> int:
+    """Validate bounded list query parameters that may intentionally request zero rows."""
+
+    if value < 0:
+        raise HTTPException(status_code=400, detail=f"{name} must be non-negative")
     if value > MAX_HISTORY_LIMIT:
         raise HTTPException(
             status_code=400,
@@ -3797,9 +3948,29 @@ def create_app() -> FastAPI:
         limit: int = 50,
         label: str | None = None,
     ) -> list[ApprovedCanarySnapshot]:
-        if limit < 0:
-            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        limit = _validated_list_limit("limit", limit)
         return store.list_recent(limit=limit, label=label)
+
+    @app.get(
+        "/v1/opportunities/funding-universe/canary/snapshot-summaries",
+        response_model=list[ApprovedCanarySnapshotSummary],
+    )
+    def approved_canary_snapshot_summaries(
+        store: Annotated[ApprovedCanaryStore, Depends(get_approved_canary_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[ApprovedCanarySnapshotSummary]:
+        limit = _validated_list_limit("limit", limit)
+        return [
+            _summarize_approved_canary_snapshot_payload(
+                snapshot_id=stored_id,
+                snapshot_payload=snapshot_payload,
+            )
+            for stored_id, snapshot_payload in store.list_recent_payloads(
+                limit=limit,
+                label=label,
+            )
+        ]
 
     @app.get(
         "/v1/opportunities/funding-universe/canary/latest-approved",
@@ -3823,9 +3994,29 @@ def create_app() -> FastAPI:
         limit: int = 50,
         label: str | None = None,
     ) -> list[LaunchReadyCanarySnapshot]:
-        if limit < 0:
-            raise HTTPException(status_code=400, detail="limit must be non-negative")
+        limit = _validated_list_limit("limit", limit)
         return store.list_recent(limit=limit, label=label)
+
+    @app.get(
+        "/v1/executions/live/canary-cycle/launch-ready-snapshot-summaries",
+        response_model=list[LaunchReadyCanarySnapshotSummary],
+    )
+    def launch_ready_canary_snapshot_summaries(
+        store: Annotated[LaunchReadyCanaryStore, Depends(get_launch_ready_canary_store)],
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[LaunchReadyCanarySnapshotSummary]:
+        limit = _validated_list_limit("limit", limit)
+        return [
+            _summarize_launch_ready_canary_snapshot_payload(
+                launch_ready_snapshot_id=stored_id,
+                snapshot_payload=snapshot_payload,
+            )
+            for stored_id, snapshot_payload in store.list_recent_payloads(
+                limit=limit,
+                label=label,
+            )
+        ]
 
     @app.get(
         "/v1/executions/live/canary-cycle/latest-launch-ready",

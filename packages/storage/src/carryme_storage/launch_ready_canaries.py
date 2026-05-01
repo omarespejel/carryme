@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from carryme_models import LaunchReadyCanarySnapshot
 
@@ -84,6 +85,24 @@ class LaunchReadyCanaryStore:
     ) -> list[LaunchReadyCanarySnapshot]:
         """Return recent launch-ready canary snapshots."""
 
+        return [
+            LaunchReadyCanarySnapshot.model_validate(
+                {
+                    **snapshot_payload,
+                    "launch_ready_snapshot_id": row_id,
+                }
+            )
+            for row_id, snapshot_payload in self.list_recent_payloads(limit=limit, label=label)
+        ]
+
+    def list_recent_payloads(
+        self,
+        *,
+        limit: int = 50,
+        label: str | None = None,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Return recent launch-ready snapshot payloads without model validation."""
+
         self.initialize()
         query = """
             SELECT id, snapshot_json
@@ -100,15 +119,7 @@ class LaunchReadyCanaryStore:
         with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
 
-        return [
-            LaunchReadyCanarySnapshot.model_validate(
-                {
-                    **json.loads(snapshot_json),
-                    "launch_ready_snapshot_id": row_id,
-                }
-            )
-            for row_id, snapshot_json in rows
-        ]
+        return [(row_id, json.loads(snapshot_json)) for row_id, snapshot_json in rows]
 
     def latest(self, *, label: str | None = None) -> LaunchReadyCanarySnapshot | None:
         """Return the latest launch-ready canary snapshot, if any."""
