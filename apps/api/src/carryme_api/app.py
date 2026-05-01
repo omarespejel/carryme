@@ -3703,6 +3703,28 @@ async def _execute_guarded_pair_close_from_confirmation(
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    if not execution_store.reserve_pair_close_live_submission(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+        confirmation_entry_id=confirmation.entry_id,
+    ):
+        existing_entry = execution_store.find_by_paper_trade_preview_hash(
+            paper_trade_id=paper_trade_id,
+            preview_hash=confirmation.preview_hash,
+        )
+        if existing_entry is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=existing_entry.model_dump(mode="json"),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A pair-close live submission is already reserved for this paper trade "
+                "and preview hash; manual reconciliation is required before retrying"
+            ),
+        )
+
     if not execution_store.reserve_live_submission(
         confirmation_entry_id=confirmation.entry_id,
         preview_hash=confirmation.preview_hash,
@@ -3742,6 +3764,11 @@ async def _execute_guarded_pair_close_from_confirmation(
         )
     execution_store.mark_live_submission_completed(
         confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+        execution_entry_id=primary_execution.entry_id,
+    )
+    execution_store.mark_pair_close_live_submission_completed(
+        paper_trade_id=paper_trade_id,
         preview_hash=confirmation.preview_hash,
         execution_entry_id=primary_execution.entry_id,
     )

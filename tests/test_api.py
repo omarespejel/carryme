@@ -7498,6 +7498,20 @@ def test_guarded_pair_close_endpoint_rejects_duplicate_retry(
             "auto_cleanup": "false",
         },
     )
+    original_confirmation = confirmation_store.find_latest_by_preview_hash(
+        paper_trade_id=paper_trade.entry_id or 0,
+        preview_hash="pair-close-hash",
+    )
+    assert original_confirmation is not None
+    confirmation_store.append(
+        original_confirmation.model_copy(
+            update={
+                "entry_id": None,
+                "confirmed_at": datetime(2026, 3, 29, 13, 11, tzinfo=UTC),
+                "note": "duplicate confirmation from parallel monitor",
+            }
+        )
+    )
     second = client.post(
         f"/v1/executions/live/pair/close/from-paper-trade/{paper_trade.entry_id}",
         params={
