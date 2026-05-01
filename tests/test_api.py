@@ -1130,6 +1130,14 @@ def test_approved_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> None
         "/v1/opportunities/funding-universe/canary/snapshots",
         params={"label": "arb_extended_paradex", "limit": 5},
     )
+    summary_response = client.get(
+        "/v1/opportunities/funding-universe/canary/snapshot-summaries",
+        params={"label": "arb_extended_paradex", "limit": 5},
+    )
+    capped_response = client.get(
+        "/v1/opportunities/funding-universe/canary/snapshots",
+        params={"limit": 1001},
+    )
     app.dependency_overrides.clear()
 
     assert response.status_code == 200
@@ -1137,6 +1145,17 @@ def test_approved_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> None
     assert len(payload) == 1
     assert payload[0]["label"] == "arb_extended_paradex"
     assert payload[0]["candidate"]["suggested_canary_notional"] == 11.0
+    assert capped_response.status_code == 400
+    assert summary_response.status_code == 200
+    summary_payload = summary_response.json()
+    assert len(summary_payload) == 1
+    assert "candidate" not in summary_payload[0]
+    assert "approval" not in summary_payload[0]
+    assert summary_payload[0]["snapshot_id"] == 1
+    assert summary_payload[0]["label"] == "arb_extended_paradex"
+    assert summary_payload[0]["canonical_symbol"] == "ARB-USD-PERP"
+    assert summary_payload[0]["suggested_canary_notional"] == 11.0
+    assert summary_payload[0]["max_live_notional"] == 11.0
 
 
 def test_latest_approved_canary_snapshot_endpoint_returns_latest(tmp_path: Path) -> None:
@@ -1304,6 +1323,14 @@ def test_launch_ready_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> 
         "/v1/executions/live/canary-cycle/launch-ready-snapshots",
         params={"label": "arb_extended_paradex", "limit": 5},
     )
+    summary_response = client.get(
+        "/v1/executions/live/canary-cycle/launch-ready-snapshot-summaries",
+        params={"label": "arb_extended_paradex", "limit": 5},
+    )
+    capped_response = client.get(
+        "/v1/executions/live/canary-cycle/launch-ready-snapshots",
+        params={"limit": 1001},
+    )
     app.dependency_overrides.clear()
 
     assert response.status_code == 200
@@ -1311,6 +1338,16 @@ def test_launch_ready_canary_snapshots_endpoint_lists_recent(tmp_path: Path) -> 
     assert len(payload) == 1
     assert payload[0]["label"] == "arb_extended_paradex"
     assert payload[0]["approved_snapshot"]["snapshot_id"] == 3
+    assert capped_response.status_code == 400
+    assert summary_response.status_code == 200
+    summary_payload = summary_response.json()
+    assert len(summary_payload) == 1
+    assert "approved_snapshot" not in summary_payload[0]
+    assert "system_state" not in summary_payload[0]
+    assert summary_payload[0]["launch_ready_snapshot_id"] == 1
+    assert summary_payload[0]["approved_snapshot_id"] == 3
+    assert summary_payload[0]["label"] == "arb_extended_paradex"
+    assert summary_payload[0]["system_state_ready"] is True
 
 
 def test_latest_launch_ready_canary_snapshot_endpoint_returns_latest(tmp_path: Path) -> None:
