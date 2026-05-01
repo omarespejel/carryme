@@ -12,6 +12,8 @@ This is not just an execution test. The system must hold profitable hedges long 
 
 Use Render API or dashboard to verify current status before making launch recommendations:
 
+`render.yaml` is the deployment source of truth for these service names. Keep this list aligned with `render.yaml` whenever services are added, removed, or renamed.
+
 - `carryme-api`
 - `carryme-approved-canary-scan`
 - `carryme-launch-ready-cache`

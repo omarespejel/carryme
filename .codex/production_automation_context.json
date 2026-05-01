@@ -4,6 +4,7 @@
   "project": "carryme live funding automation",
   "goal": "automatically open, hold, monitor, and close small route-approved venue hedges when net opportunity is real and fresh",
   "historical_live_commit": "f2591db5d0caa13e8377a5be8f0df0245bd71591",
+  "render_source_of_truth": "render.yaml",
   "render_services": {
     "api": "carryme-api",
     "approved_scan": "carryme-approved-canary-scan",
