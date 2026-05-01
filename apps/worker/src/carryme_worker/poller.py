@@ -2136,7 +2136,7 @@ async def scan_approved_canary_once(
         history_store=OpportunityHistoryStore(settings.database_path),
     )
 
-    approvals = route_approval_service.list_recent(limit=1_000, approved=True)
+    approvals = route_approval_service.list_recent(limit=None, approved=True)
     unique_approvals: list[RouteApprovalEntry] = []
     seen_route_keys: set[tuple[str, str, str, str, str, str]] = set()
     for approval in approvals:
@@ -2161,14 +2161,19 @@ async def scan_approved_canary_once(
     scanned_labels: set[str] = set()
     scanned_candidates = 0
 
-    selected_labels = list(approvals_by_label)[: settings.approved_canary_scan_limit]
+    all_labels = list(approvals_by_label)
+    selected_labels = (
+        all_labels
+        if settings.approved_canary_scan_limit == 0
+        else all_labels[: settings.approved_canary_scan_limit]
+    )
     if len(selected_labels) < len(approvals_by_label):
         loop_logger.info(
-            "approved canary exact scan limit reached at %s labels",
+            "approved canary label scan limit selected %s of %s labels",
             settings.approved_canary_scan_limit,
+            len(approvals_by_label),
         )
-
-    async def _scan_label(
+    async def _scan_label_unbounded(
         label: str,
     ) -> tuple[
         str,
@@ -2222,6 +2227,12 @@ async def scan_approved_canary_once(
                     exc,
                 )
                 continue
+            except Exception:
+                loop_logger.exception(
+                    "approved canary exact scan crashed for label=%s",
+                    approved_route.label,
+                )
+                continue
             label_scanned = True
             scanned_candidate_count += candidate_count
             if candidate is None:
@@ -2236,7 +2247,34 @@ async def scan_approved_canary_once(
         candidate, matched_approval = best_match
         return label, scanned_candidate_count, label_scanned, candidate, matched_approval
 
-    results = await asyncio.gather(*(_scan_label(label) for label in selected_labels))
+    async def _scan_label(
+        label: str,
+    ) -> tuple[
+        str,
+        int,
+        bool,
+        FundingUniverseCanaryCandidate | None,
+        RouteApprovalEntry | None,
+    ]:
+        try:
+            return await _scan_label_unbounded(label)
+        except Exception:
+            loop_logger.exception("approved canary label scan crashed for label=%s", label)
+            return label, 0, False, None, None
+
+    results: list[
+        tuple[
+            str,
+            int,
+            bool,
+            FundingUniverseCanaryCandidate | None,
+            RouteApprovalEntry | None,
+        ]
+    ] = []
+    batch_size = settings.approved_canary_scan_concurrency
+    for start in range(0, len(selected_labels), batch_size):
+        batch_labels = selected_labels[start : start + batch_size]
+        results.extend(await asyncio.gather(*(_scan_label(label) for label in batch_labels)))
     for label, candidate_count, label_scanned, candidate, matched_approval in results:
         scanned_candidates += candidate_count
         if label_scanned:

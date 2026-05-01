@@ -57,7 +57,7 @@ class RouteApprovalService:
     def list_recent(
         self,
         *,
-        limit: int = 50,
+        limit: int | None = 50,
         label: str | None = None,
         canonical_symbol: str | None = None,
         approved: bool | None = None,

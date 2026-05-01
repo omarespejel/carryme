@@ -210,7 +210,9 @@ class WorkerSettings(BaseSettings):
     approved_canary_scan_min_route_stability_weight: float = 0.0
     approved_canary_scan_min_route_presence_ratio: float = 0.0
     approved_canary_scan_min_route_samples: int = 0
-    approved_canary_scan_limit: int = 5
+    # `0` means scan every approved label; concurrency still limits fan-out.
+    approved_canary_scan_limit: int = Field(default=0, ge=0)
+    approved_canary_scan_concurrency: int = Field(default=5, gt=0)
     approved_canary_exact_scan_limit: int = 25
     approved_canary_scan_include_symbols: tuple[str, ...] = ()
     approved_canary_scan_exclude_symbols: tuple[str, ...] = ()

@@ -111,7 +111,7 @@ class RouteApprovalStore:
     def list_recent(
         self,
         *,
-        limit: int = 50,
+        limit: int | None = 50,
         label: str | None = None,
         canonical_symbol: str | None = None,
         approved: bool | None = None,
@@ -136,8 +136,10 @@ class RouteApprovalStore:
             params.append(int(approved))
         if filters:
             query += " WHERE " + " AND ".join(filters)
-        query += " ORDER BY updated_at DESC LIMIT ?"
-        params.append(limit)
+        query += " ORDER BY updated_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
 
         with self.database.begin() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
