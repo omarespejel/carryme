@@ -1256,10 +1256,14 @@ async def _probe_candidate_system_state(
         item.venue: item
         for item in await service.probe_venues(_build_system_state_configs(settings))
     }
-    selected = [all_statuses[venue] for venue in _candidate_execution_venue_names(candidate)]
-
+    selected: list[VenueSystemState] = []
     blocking_reasons: list[str] = []
-    for status in selected:
+    for venue in _candidate_execution_venue_names(candidate):
+        status = all_statuses.get(venue)
+        if status is None:
+            blocking_reasons.append(f"Venue {venue} system state is unknown")
+            continue
+        selected.append(status)
         blocking_reasons.extend(status.blocking_reasons)
 
     return PaperTradeSystemState(

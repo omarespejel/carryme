@@ -124,6 +124,7 @@ from carryme_worker.poller import (
     _build_order_state_observers,
     _execution_requires_continued_monitoring,
     _maybe_auto_close_open_hedged_execution,
+    _probe_candidate_system_state,
     cache_launch_ready_canaries_once,
     install_signal_handlers,
     launch_latest_stable_canary_once,
@@ -273,7 +274,15 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
         raising=False,
     )
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_RECV_WINDOW_MS", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_EXTENDED_API_KEY", raising=False)
     monkeypatch.delenv("CARRYME_API_EXTENDED_STARK_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("CARRYME_API_EXTENDED_API_KEY", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_PARADEX_ACCOUNT_ADDRESS", raising=False)
+    monkeypatch.delenv("CARRYME_API_PARADEX_ACCOUNT_ADDRESS", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_PARADEX_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("CARRYME_API_PARADEX_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("CARRYME_WORKER_PARADEX_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("CARRYME_API_PARADEX_BEARER_TOKEN", raising=False)
     monkeypatch.delenv("CARRYME_API_PARADEX_RECV_WINDOW_MS", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_STOP_SIGNALS", raising=False)
 
@@ -3157,8 +3166,10 @@ def _append_launch_ready_gate_approved_snapshot(
 
 def test_cache_launch_ready_canaries_once_skips_selected_disabled_live_execution_venue(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _clear_worker_env(monkeypatch)
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
         launch_ready_canary_max_snapshot_age_seconds=300,
@@ -3195,10 +3206,75 @@ def test_cache_launch_ready_canaries_once_skips_selected_disabled_live_execution
     assert "Venue paradex live execution is not enabled" in caplog.text
 
 
-def test_cache_launch_ready_canaries_once_skips_selected_missing_live_execution_credentials(
+def test_cache_launch_ready_canaries_once_skips_selected_unknown_system_state_venue(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    _clear_worker_env(monkeypatch)
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="0x123",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="token",
+    )
+    approved_store = _append_launch_ready_gate_approved_snapshot(settings)
+
+    class PartialSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            return [
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+            ]
+
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    probe_state = asyncio.run(
+        _probe_candidate_system_state(
+            settings=settings,
+            service=cast(Any, PartialSystemStateService()),
+            candidate=approved_store.list_recent(
+                limit=1,
+                label="arb_extended_paradex",
+            )[0].candidate,
+            label="arb_extended_paradex",
+        )
+    )
+    with caplog.at_level(logging.DEBUG):
+        summary = asyncio.run(
+            cache_launch_ready_canaries_once(
+                settings,
+                approved_store=approved_store,
+                launch_ready_store=launch_ready_store,
+                system_state_service=cast(Any, PartialSystemStateService()),
+                now=datetime(2026, 3, 29, 20, 6, tzinfo=UTC),
+            )
+        )
+
+    assert summary.scanned_snapshots == 1
+    assert summary.launch_ready_candidates == 0
+    assert summary.saved_snapshots == 0
+    assert probe_state.ready is False
+    assert probe_state.blocking_reasons == ["Venue paradex system state is unknown"]
+    assert launch_ready_store.list_recent(limit=10, label="arb_extended_paradex") == []
+    assert "system state is not ready" in caplog.text
+
+
+def test_cache_launch_ready_canaries_once_skips_selected_missing_live_execution_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _clear_worker_env(monkeypatch)
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
         launch_ready_canary_max_snapshot_age_seconds=300,
