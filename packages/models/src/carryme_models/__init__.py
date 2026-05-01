@@ -80,7 +80,11 @@ from carryme_models.preview import (
     PaperTradeOrderPreview,
     VenueOrderPreview,
 )
-from carryme_models.readiness import LiveSubmissionReadiness
+from carryme_models.readiness import (
+    AutomationSnapshotSummary,
+    LiveSubmissionReadiness,
+    ProductionAutomationReadiness,
+)
 from carryme_models.stable_canary_launch import StableCanaryLaunchRecord
 from carryme_models.stable_launch_ready_alert import StableLaunchReadyAlertEvent
 from carryme_models.system_state import PaperTradeSystemState, VenueSystemState
@@ -104,6 +108,7 @@ from carryme_models.universe import (
 
 __all__ = [
     "AppDescriptor",
+    "AutomationSnapshotSummary",
     "ApprovedCanaryBasketEntry",
     "ApprovedCanaryBasketPlan",
     "ApprovedCanaryAlertEvent",
@@ -161,6 +166,7 @@ __all__ = [
     "PaperTradeAccountingSummary",
     "PaperTradeEntry",
     "PaperTradeExecutionPreflight",
+    "ProductionAutomationReadiness",
     "ExecutionCleanupPreview",
     "PairClosePreviewConfirmationEntry",
     "PaperTradeOrderPreview",

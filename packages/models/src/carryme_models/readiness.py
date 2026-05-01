@@ -1,9 +1,13 @@
-"""Unified live submission readiness models."""
+"""Unified live submission and production automation readiness models."""
+
+from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from carryme_models.account_preflight import PaperTradeAccountPreflight
 from carryme_models.preflight import PaperTradeExecutionPreflight
+from carryme_models.stable_canary_launch import StableCanaryLaunchRecord
 from carryme_models.system_state import PaperTradeSystemState
 
 
@@ -20,3 +24,38 @@ class LiveSubmissionReadiness(BaseModel):
     account_preflight: PaperTradeAccountPreflight
     system_state: PaperTradeSystemState | None = None
     blocking_reasons: list[str] = Field(default_factory=list)
+
+
+class AutomationSnapshotSummary(BaseModel):
+    """Bounded snapshot identity for production automation status views."""
+
+    snapshot_id: int | None = None
+    label: str = Field(min_length=1)
+    captured_at: datetime = Field(
+        description="UTC timestamp when the underlying snapshot was captured."
+    )
+    age_seconds: float = Field(
+        description=(
+            "Age of the snapshot in seconds at checked_at. Negative values indicate the "
+            "snapshot timestamp is in the future and should be treated as invalid."
+        )
+    )
+
+
+class ProductionAutomationReadiness(BaseModel):
+    """Read-only summary of whether unattended canary launch can proceed."""
+
+    checked_at: datetime = Field(
+        description="UTC timestamp when the readiness evaluation was computed."
+    )
+    ready: bool
+    status: Literal["ready", "blocked"]
+    blocking_reasons: list[str] = Field(default_factory=list)
+    approved_snapshot: AutomationSnapshotSummary | None = None
+    launch_ready_snapshot: AutomationSnapshotSummary | None = None
+    stable_launch_ready: bool
+    stable_launch_consecutive_snapshots: int | None = None
+    stable_launch_stable_seconds: float | None = None
+    latest_stable_launch: StableCanaryLaunchRecord | None = None
+    active_live_execution_count: int = Field(ge=0)
+    max_active_live_executions: int = Field(ge=0)
