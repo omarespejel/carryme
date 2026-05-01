@@ -39,6 +39,8 @@ from carryme_models import (
     ExecutionReconciliation,
     FundingArbOpportunity,
     FundingPairTradeIntent,
+    FundingUniverseCanaryApprovalProposal,
+    FundingUniverseCanaryApprovalProposalSummary,
     FundingUniverseCanaryCandidate,
     FundingUniversePortfolioPlan,
     FundingUniverseScan,
@@ -351,6 +353,36 @@ def _summarize_launch_ready_canary_snapshot_payload(
     )
 
 
+def _summarize_canary_approval_proposal(
+    proposal: FundingUniverseCanaryApprovalProposal,
+    *,
+    generated_at: datetime,
+) -> FundingUniverseCanaryApprovalProposalSummary:
+    """Return the operator-safe scalar fields for one approval proposal."""
+
+    return FundingUniverseCanaryApprovalProposalSummary(
+        generated_at=generated_at,
+        candidate_rank=proposal.candidate_rank,
+        label=proposal.label,
+        canonical_symbol=proposal.canonical_symbol,
+        short_venue=proposal.short_venue,
+        long_venue=proposal.long_venue,
+        short_fee_profile=proposal.short_fee_profile,
+        long_fee_profile=proposal.long_fee_profile,
+        approval_status=proposal.approval_status,
+        suggested_canary_notional=proposal.candidate.suggested_canary_notional,
+        suggested_max_live_notional=proposal.suggested_max_live_notional,
+        deployable_notional=proposal.candidate.opportunity.deployable_notional,
+        estimated_one_day_pnl_after_round_trip=(
+            proposal.candidate.opportunity.estimated_one_day_pnl_after_round_trip
+        ),
+        route_adjusted_quality_score=proposal.candidate.opportunity.route_adjusted_quality_score,
+        pair=proposal.pair,
+        approval_payload=proposal.approval_payload,
+        existing_approval=proposal.existing_approval,
+    )
+
+
 def get_app_environment() -> str:
     """Return the runtime environment exposed by the API health endpoints."""
 
@@ -447,16 +479,22 @@ def _build_fee_profile_overrides(
     extended_fee_profile: str | None,
     paradex_fee_profile: str | None,
     hyperliquid_fee_profile: str | None,
+    selected_venues: list[str] | None = None,
 ) -> dict[str, str] | None:
     configured_profiles = {
         "extended": extended_fee_profile,
         "paradex": paradex_fee_profile,
         "hyperliquid": hyperliquid_fee_profile,
     }
+    normalized_selected_venues = (
+        {venue.strip().lower() for venue in selected_venues if venue.strip()}
+        if selected_venues is not None
+        else set(SUPPORTED_UNIVERSE_VENUES)
+    )
     overrides = {
         venue: profile
         for venue in SUPPORTED_UNIVERSE_VENUES
-        if (profile := configured_profiles.get(venue))
+        if venue in normalized_selected_venues and (profile := configured_profiles.get(venue))
     }
     return overrides or None
 
@@ -6116,6 +6154,85 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/opportunities/funding-universe/canary/approval-proposals",
+        response_model=list[FundingUniverseCanaryApprovalProposalSummary],
+    )
+    async def funding_universe_canary_approval_proposals(
+        service: Annotated[OpportunityUniverseService, Depends(get_opportunity_universe_service)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        venues: Annotated[list[str] | None, Query()] = None,
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = "pro_fastfills",
+        hyperliquid_fee_profile: str | None = None,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.10,
+        min_route_presence_ratio: float = 0.15,
+        min_route_samples: int = 2,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+        limit: int = 10,
+        candidate_sample: int = 50,
+    ) -> list[FundingUniverseCanaryApprovalProposalSummary]:
+        try:
+            limit = _validated_history_limit("limit", limit)
+            candidate_sample = max(
+                limit,
+                _validated_history_limit("candidate_sample", candidate_sample),
+            )
+            selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
+            generated_at = datetime.now(UTC)
+            candidates = await service.scan_canary_candidates(
+                venues=selected_venues,
+                fee_profile_overrides=_build_fee_profile_overrides(
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                    selected_venues=selected_venues,
+                ),
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+                limit=candidate_sample,
+            )
+            proposals = approval_service.propose_canary_route_approvals(
+                candidates,
+                limit=limit,
+            )
+            return [
+                _summarize_canary_approval_proposal(
+                    proposal,
+                    generated_at=generated_at,
+                )
+                for proposal in proposals
+            ]
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post(

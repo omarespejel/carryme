@@ -10,6 +10,7 @@ from carryme_models import (
     ApprovedCanaryBasketEntry,
     ApprovedCanaryBasketPlan,
     FundingPairTradeIntent,
+    FundingUniverseCanaryApprovalProposal,
     FundingUniverseCanaryCandidate,
     FundingUniverseOpportunity,
     RouteApprovalEntry,
@@ -143,6 +144,67 @@ class RouteApprovalService:
                 )
             )
         return approved_candidates
+
+    def propose_canary_route_approvals(
+        self,
+        candidates: list[FundingUniverseCanaryCandidate],
+        *,
+        limit: int = 10,
+    ) -> list[FundingUniverseCanaryApprovalProposal]:
+        """Return ranked unapproved canary routes for explicit operator review."""
+
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        proposals: list[FundingUniverseCanaryApprovalProposal] = []
+        if limit == 0:
+            return proposals
+        for candidate_rank, candidate in enumerate(candidates, start=1):
+            existing_approval = self.get_for_candidate(candidate)
+            if existing_approval is not None and existing_approval.approved:
+                continue
+            scored = candidate.opportunity.opportunity
+            pair = build_pair_spec_from_universe_opportunity(candidate.opportunity)
+            suggested_max_live_notional = candidate.suggested_canary_notional
+            if existing_approval is not None:
+                suggested_max_live_notional = min(
+                    suggested_max_live_notional,
+                    existing_approval.max_live_notional,
+                )
+            if suggested_max_live_notional <= 0:
+                continue
+            label = pair.label or scored.canonical_symbol
+            approval_payload = RouteApprovalUpsert(
+                canonical_symbol=scored.canonical_symbol,
+                short_venue=scored.short_venue,
+                long_venue=scored.long_venue,
+                short_fee_profile=scored.short_fee_profile,
+                long_fee_profile=scored.long_fee_profile,
+                approved=False,
+                max_live_notional=suggested_max_live_notional,
+                note="Review before approving live canary route.",
+            )
+            proposals.append(
+                FundingUniverseCanaryApprovalProposal(
+                    candidate_rank=candidate_rank,
+                    label=label,
+                    canonical_symbol=scored.canonical_symbol,
+                    short_venue=scored.short_venue,
+                    long_venue=scored.long_venue,
+                    short_fee_profile=scored.short_fee_profile,
+                    long_fee_profile=scored.long_fee_profile,
+                    approval_status="missing"
+                    if existing_approval is None
+                    else "disabled",
+                    suggested_max_live_notional=suggested_max_live_notional,
+                    pair=pair,
+                    approval_payload=approval_payload,
+                    existing_approval=existing_approval,
+                    candidate=candidate,
+                )
+            )
+            if len(proposals) >= limit:
+                break
+        return proposals
 
     def build_approved_canary_basket_plan(
         self,

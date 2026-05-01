@@ -6,7 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from carryme_models.approval import RouteApprovalEntry
+from carryme_models.approval import RouteApprovalEntry, RouteApprovalUpsert
+from carryme_models.history import FundingPairSpec
 from carryme_models.opportunity import FundingArbOpportunity
 
 SUPPORTED_UNIVERSE_VENUES: tuple[str, ...] = ("extended", "paradex", "hyperliquid")
@@ -143,6 +144,48 @@ class FundingUniverseCanaryCandidate(BaseModel):
 
     opportunity: FundingUniverseOpportunity
     suggested_canary_notional: float = Field(ge=0)
+
+
+class FundingUniverseCanaryApprovalProposal(BaseModel):
+    """A live canary route that is promising but not live-approved yet."""
+
+    candidate_rank: int = Field(ge=1)
+    label: str = Field(min_length=1)
+    canonical_symbol: str = Field(min_length=1)
+    short_venue: str = Field(min_length=1)
+    long_venue: str = Field(min_length=1)
+    short_fee_profile: str = Field(min_length=1)
+    long_fee_profile: str = Field(min_length=1)
+    approval_status: Literal["missing", "disabled"]
+    suggested_max_live_notional: float = Field(gt=0)
+    pair: FundingPairSpec
+    approval_payload: RouteApprovalUpsert
+    existing_approval: RouteApprovalEntry | None = None
+    candidate: FundingUniverseCanaryCandidate
+
+
+class FundingUniverseCanaryApprovalProposalSummary(BaseModel):
+    """A lightweight operator-facing summary of one approval proposal."""
+
+    generated_at: datetime = Field(
+        description="UTC timestamp when this proposal summary was generated."
+    )
+    candidate_rank: int = Field(ge=1)
+    label: str = Field(min_length=1)
+    canonical_symbol: str = Field(min_length=1)
+    short_venue: str = Field(min_length=1)
+    long_venue: str = Field(min_length=1)
+    short_fee_profile: str = Field(min_length=1)
+    long_fee_profile: str = Field(min_length=1)
+    approval_status: Literal["missing", "disabled"]
+    suggested_canary_notional: float = Field(gt=0)
+    suggested_max_live_notional: float = Field(gt=0)
+    deployable_notional: float | None = Field(default=None, ge=0)
+    estimated_one_day_pnl_after_round_trip: float | None = None
+    route_adjusted_quality_score: float | None = None
+    pair: FundingPairSpec
+    approval_payload: RouteApprovalUpsert
+    existing_approval: RouteApprovalEntry | None = None
 
 
 class ApprovedCanaryBasketEntry(BaseModel):
