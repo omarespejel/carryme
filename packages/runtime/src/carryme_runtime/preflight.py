@@ -32,6 +32,7 @@ class RequirementSpec(NamedTuple):
     env_var: str
     description: str
     secret: bool
+    alternative_keys: tuple[str, ...] = ()
 
 
 class VenueSpec(TypedDict):
@@ -76,6 +77,7 @@ LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
         "credential_settings": {
             "account_address": "paradex_account_address",
             "private_key": "paradex_private_key",
+            "bearer_token": "paradex_bearer_token",
         },
         "requirements": [
             RequirementSpec(
@@ -86,9 +88,13 @@ LIVE_EXECUTION_VENUE_SPECS: dict[str, VenueSpec] = {
             ),
             RequirementSpec(
                 "private_key",
-                "CARRYME_API_PARADEX_PRIVATE_KEY",
-                "Paradex trading subkey private key used to derive authenticated API access.",
+                "CARRYME_API_PARADEX_PRIVATE_KEY|CARRYME_API_PARADEX_BEARER_TOKEN",
+                (
+                    "Paradex trading subkey private key or pre-issued bearer token used "
+                    "for authenticated API access."
+                ),
                 True,
+                ("bearer_token",),
             ),
         ],
         "notes": [
@@ -163,7 +169,10 @@ def build_venue_execution_preflights(
                 env_var=requirement.env_var,
                 description=requirement.description,
                 secret=requirement.secret,
-                present=bool(credentials.get(requirement.key)),
+                present=any(
+                    bool(credentials.get(key))
+                    for key in (requirement.key, *requirement.alternative_keys)
+                ),
             )
             for requirement in spec["requirements"]
         ]

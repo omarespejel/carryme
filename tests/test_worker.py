@@ -2971,6 +2971,7 @@ def test_cache_launch_ready_canaries_once_saves_fresh_ready_snapshots(
         launch_ready_canary_max_snapshot_age_seconds=300,
         extended_live_enabled=True,
         extended_api_key="extended-key",
+        extended_stark_private_key="0x123",
         paradex_live_enabled=True,
         paradex_account_address="0xabc",
         paradex_bearer_token="token",
@@ -3084,6 +3085,153 @@ def test_cache_launch_ready_canaries_once_saves_fresh_ready_snapshots(
     assert snapshots[0].approved_snapshot.approval.max_live_notional == 11.0
     assert snapshots[0].approved_snapshot.candidate.suggested_canary_notional == 11.0
     assert snapshots[0].system_state.ready is True
+
+
+def _append_launch_ready_gate_approved_snapshot(
+    settings: WorkerSettings,
+    *,
+    label: str = "arb_extended_paradex",
+) -> ApprovedCanaryStore:
+    approval_store = RouteApprovalStore(settings.database_path)
+    approval = approval_store.upsert(
+        RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 20, 0, tzinfo=UTC),
+            label=label,
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        )
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    approved_store.append(
+        ApprovedCanarySnapshot(
+            captured_at=datetime(2026, 3, 29, 20, 5, tzinfo=UTC),
+            label=label,
+            candidate=FundingUniverseCanaryCandidate(
+                opportunity=FundingUniverseOpportunity(
+                    opportunity=FundingArbOpportunity(
+                        canonical_symbol="ARB-USD-PERP",
+                        long_venue="paradex",
+                        short_venue="extended",
+                        long_fee_profile="pro_fastfills",
+                        short_fee_profile="default",
+                        gross_daily_edge=0.004,
+                        entry_cost_rate=0.00045,
+                        round_trip_cost_rate=0.0009,
+                        one_day_net_edge_after_entry=0.00355,
+                        one_day_net_edge_after_round_trip=0.0031,
+                        break_even_days_entry=0.2,
+                        break_even_days_round_trip=0.3,
+                        capacity=CapacityEstimate(
+                            short_bid_notional=1400.0,
+                            long_ask_notional=900.0,
+                            max_entry_notional=900.0,
+                            limiting_venue="paradex",
+                        ),
+                    ),
+                    venue_markets={
+                        "extended": FundingUniverseVenueMarket(
+                            venue="extended",
+                            symbol="ARB-USD",
+                        ),
+                        "paradex": FundingUniverseVenueMarket(
+                            venue="paradex",
+                            symbol="ARB-USD-PERP",
+                        ),
+                    },
+                    deployable_notional=900.0,
+                    estimated_one_day_pnl_after_round_trip=2.79,
+                ),
+                suggested_canary_notional=25.0,
+            ),
+            approval=approval,
+        )
+    )
+    return approved_store
+
+
+def test_cache_launch_ready_canaries_once_skips_selected_disabled_live_execution_venue(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="0x123",
+        paradex_live_enabled=False,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+    approved_store = _append_launch_ready_gate_approved_snapshot(settings)
+
+    class FailingSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            raise AssertionError("system-state probe should not run before credential gate passes")
+
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    with caplog.at_level(logging.DEBUG):
+        summary = asyncio.run(
+            cache_launch_ready_canaries_once(
+                settings,
+                approved_store=approved_store,
+                launch_ready_store=launch_ready_store,
+                system_state_service=cast(Any, FailingSystemStateService()),
+                now=datetime(2026, 3, 29, 20, 6, tzinfo=UTC),
+            )
+        )
+
+    assert summary.scanned_snapshots == 1
+    assert summary.launch_ready_candidates == 0
+    assert summary.saved_snapshots == 0
+    assert launch_ready_store.list_recent(limit=10, label="arb_extended_paradex") == []
+    assert "Venue paradex live execution is not enabled" in caplog.text
+
+
+def test_cache_launch_ready_canaries_once_skips_selected_missing_live_execution_credentials(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        launch_ready_canary_max_snapshot_age_seconds=300,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_bearer_token="token",
+    )
+    approved_store = _append_launch_ready_gate_approved_snapshot(settings)
+
+    class FailingSystemStateService:
+        async def probe_venues(self, configs: dict[str, dict[str, bool]]) -> list[VenueSystemState]:
+            _ = configs
+            raise AssertionError("system-state probe should not run before credential gate passes")
+
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    with caplog.at_level(logging.DEBUG):
+        summary = asyncio.run(
+            cache_launch_ready_canaries_once(
+                settings,
+                approved_store=approved_store,
+                launch_ready_store=launch_ready_store,
+                system_state_service=cast(Any, FailingSystemStateService()),
+                now=datetime(2026, 3, 29, 20, 6, tzinfo=UTC),
+            )
+        )
+
+    assert summary.scanned_snapshots == 1
+    assert summary.launch_ready_candidates == 0
+    assert summary.saved_snapshots == 0
+    assert launch_ready_store.list_recent(limit=10, label="arb_extended_paradex") == []
+    assert "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY" in caplog.text
 
 
 def test_cache_launch_ready_canaries_once_skips_decayed_approved_snapshot_chain(
@@ -3443,6 +3591,7 @@ def test_cache_launch_ready_canaries_once_emits_stable_launch_ready_available_al
         stable_launch_ready_min_stable_seconds=30.0,
         extended_live_enabled=True,
         extended_api_key="extended-key",
+        extended_stark_private_key="0x123",
         paradex_live_enabled=True,
         paradex_account_address="0xabc",
         paradex_bearer_token="token",

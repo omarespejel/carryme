@@ -45,11 +45,13 @@ from carryme_models import (
     PaperTradeAccountPreflight,
     PaperTradeBalanceAttribution,
     PaperTradeEntry,
+    PaperTradeExecutionPreflight,
     PaperTradeSystemState,
     RouteApprovalEntry,
     StableCanaryLaunchRecord,
     StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
+    VenueExecutionPreflight,
     VenueSystemState,
 )
 from carryme_runtime import (
@@ -72,8 +74,10 @@ from carryme_runtime import (
     UpstreamDataError,
     build_account_preflight_configs,
     build_execution_pair_status,
+    build_live_execution_configs,
     build_opportunity_record_from_universe_opportunity,
     build_pair_spec_from_universe_opportunity,
+    build_venue_execution_preflights,
     filter_candidate_records,
     reconcile_execution,
 )
@@ -1188,6 +1192,57 @@ def _build_system_state_configs(settings: WorkerSettings) -> SystemStateConfigMa
     }
 
 
+def _candidate_execution_venue_names(candidate: FundingUniverseCanaryCandidate) -> list[str]:
+    """Return de-duplicated venue names touched by a canary candidate."""
+
+    venue_names = [
+        candidate.opportunity.opportunity.long_venue,
+        candidate.opportunity.opportunity.short_venue,
+    ]
+    selected_names: list[str] = []
+    for venue in venue_names:
+        if venue not in selected_names:
+            selected_names.append(venue)
+    return selected_names
+
+
+def _build_candidate_live_execution_preflight(
+    *,
+    settings: WorkerSettings,
+    candidate: FundingUniverseCanaryCandidate,
+    label: str,
+) -> PaperTradeExecutionPreflight:
+    """Build live-execution readiness for the exact venues touched by one canary."""
+
+    all_statuses = {
+        item.venue: item
+        for item in build_venue_execution_preflights(build_live_execution_configs(settings))
+    }
+    selected: list[VenueExecutionPreflight] = []
+    blocking_reasons: list[str] = []
+    for venue in _candidate_execution_venue_names(candidate):
+        status = all_statuses.get(venue)
+        if status is None:
+            blocking_reasons.append(f"Venue {venue} live execution is not configured")
+            continue
+        selected.append(status)
+        if not status.enabled:
+            blocking_reasons.append(f"Venue {venue} live execution is not enabled")
+        if status.missing_env_vars:
+            blocking_reasons.append(
+                f"Venue {venue} is missing required credentials: "
+                + ", ".join(status.missing_env_vars)
+            )
+
+    return PaperTradeExecutionPreflight(
+        paper_trade_id=0,
+        label=label,
+        ready=not blocking_reasons,
+        venues=selected,
+        blocking_reasons=blocking_reasons,
+    )
+
+
 async def _probe_candidate_system_state(
     *,
     settings: WorkerSettings,
@@ -1201,15 +1256,7 @@ async def _probe_candidate_system_state(
         item.venue: item
         for item in await service.probe_venues(_build_system_state_configs(settings))
     }
-    venue_names = [
-        candidate.opportunity.opportunity.long_venue,
-        candidate.opportunity.opportunity.short_venue,
-    ]
-    selected_names: list[str] = []
-    for venue in venue_names:
-        if venue not in selected_names:
-            selected_names.append(venue)
-    selected = [all_statuses[venue] for venue in selected_names]
+    selected = [all_statuses[venue] for venue in _candidate_execution_venue_names(candidate)]
 
     blocking_reasons: list[str] = []
     for status in selected:
@@ -2368,6 +2415,18 @@ async def cache_launch_ready_canaries_once(
                     label,
                     automation_gate_reason,
                 )
+            continue
+        execution_preflight = _build_candidate_live_execution_preflight(
+            settings=settings,
+            candidate=refreshed_candidate,
+            label=label,
+        )
+        if not execution_preflight.ready:
+            loop_logger.debug(
+                "skipping launch-ready snapshot label=%s because live execution is not ready: %s",
+                label,
+                "; ".join(execution_preflight.blocking_reasons),
+            )
             continue
         system_state = await _probe_candidate_system_state(
             settings=settings,
