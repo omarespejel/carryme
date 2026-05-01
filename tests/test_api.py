@@ -908,9 +908,54 @@ def test_funding_universe_canary_approval_proposals_endpoint_uses_candidate_samp
     assert captured["limit"] == 25
     assert captured["fee_profile_overrides"] == {"paradex": "pro_fastfills"}
     payload = response.json()
+    assert "generated_at" in payload[0]
     assert payload[0]["label"] == "arb_extended_paradex"
     assert payload[0]["approval_status"] == "missing"
+    assert payload[0]["suggested_canary_notional"] == 25.0
     assert payload[0]["approval_payload"]["approved"] is False
+    assert "candidate" not in payload[0]
+
+
+def test_funding_universe_canary_approval_proposals_filters_fee_overrides_to_selected_venues(
+) -> None:
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == []
+            assert limit == 2
+            return []
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("venues", "extended"),
+                ("venues", "hyperliquid"),
+                ("limit", "2"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["venues"] == ["extended", "hyperliquid"]
+    assert captured["fee_profile_overrides"] is None
 
 
 def test_approved_canary_basket_endpoint_uses_service_dependency() -> None:
