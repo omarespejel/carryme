@@ -6803,6 +6803,7 @@ def create_app() -> FastAPI:
         limit: int = 10,
     ) -> list[FundingUniverseCanaryCandidate]:
         try:
+            limit = _validated_history_limit("limit", limit)
             selected_venues = venues or ["extended", "paradex", "hyperliquid"]
             candidates = await service.scan_canary_candidates(
                 venues=selected_venues,

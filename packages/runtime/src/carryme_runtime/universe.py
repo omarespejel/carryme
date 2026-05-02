@@ -190,6 +190,8 @@ class OpportunityUniverseService:
         use_execution_quality: bool = True,
         use_route_stability: bool = True,
     ) -> list[FundingUniverseCanaryCandidate]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
         scan = await self.scan(
             venues=venues,
             ranking="route_adjusted_quality_pnl",

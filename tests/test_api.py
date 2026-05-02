@@ -736,6 +736,32 @@ def test_funding_universe_canary_endpoint_uses_policy_defaults() -> None:
     assert captured["exclude_tags"] is None
 
 
+def test_funding_universe_canary_endpoint_rejects_unbounded_limit() -> None:
+    called = False
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            nonlocal called
+            called = True
+            return []
+
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary",
+            params={"limit": "0"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "limit must be at least 1"
+    assert called is False
+
+
 def test_funding_universe_canary_endpoint_can_filter_approved_routes() -> None:
     candidate = FundingUniverseCanaryCandidate(
         opportunity=FundingUniverseOpportunity(

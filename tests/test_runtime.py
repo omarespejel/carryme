@@ -1383,6 +1383,18 @@ def test_opportunity_universe_service_canary_candidates_force_snapshot_shortlist
     asyncio.run(run())
 
 
+def test_opportunity_universe_service_canary_candidates_rejects_unbounded_limit() -> None:
+    async def run() -> None:
+        service = OpportunityUniverseService()
+        with pytest.raises(ValueError, match="limit must be at least 1"):
+            await service.scan_canary_candidates(
+                venues=["extended", "paradex"],
+                limit=0,
+            )
+
+    asyncio.run(run())
+
+
 def test_opportunity_universe_service_preserves_non_edge_ranking_correctness() -> None:
     symbol_lists = {
         "extended": ["HIGHEDGE-USD", "BIG-USD"],
