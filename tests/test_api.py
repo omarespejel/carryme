@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,6 +13,7 @@ from carryme_api.app import (
     get_approved_canary_store,
     get_automation_readiness_checked_at,
     get_balance_accounting_service,
+    get_current_utc_time,
     get_execution_accounting_service,
     get_execution_journal_store,
     get_execution_observation_store,
@@ -105,6 +106,8 @@ from carryme_storage import (
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
+
+FIXED_APPROVAL_PROPOSAL_NOW = datetime(2026, 4, 3, 12, 0, tzinfo=UTC)
 
 
 def test_health_endpoint() -> None:
@@ -1025,7 +1028,9 @@ def test_funding_universe_canary_endpoint_can_filter_approved_routes() -> None:
     assert payload[0]["suggested_canary_notional"] == 11.0
 
 
-def test_funding_universe_canary_approval_proposals_endpoint_uses_candidate_sample() -> None:
+def test_funding_universe_canary_approval_proposals_endpoint_uses_candidate_sample(
+    tmp_path: Path,
+) -> None:
     candidate = FundingUniverseCanaryCandidate(
         opportunity=FundingUniverseOpportunity(
             opportunity=FundingArbOpportunity(
@@ -1116,6 +1121,8 @@ def test_funding_universe_canary_approval_proposals_endpoint_uses_candidate_samp
                 )
             ]
 
+    history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    app.dependency_overrides[get_history_store] = lambda: history_store
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
     app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
     try:
@@ -1144,7 +1151,743 @@ def test_funding_universe_canary_approval_proposals_endpoint_uses_candidate_samp
     assert "candidate" not in payload[0]
 
 
+def test_funding_universe_canary_approval_proposals_rejects_unbounded_history_shortlist_age(
+    tmp_path: Path,
+) -> None:
+    called = False
+    proposal_called = False
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            nonlocal called
+            called = True
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            nonlocal proposal_called
+            proposal_called = True
+            assert candidates == []
+            assert limit == 1
+            return []
+
+    history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    app.dependency_overrides[get_history_store] = lambda: history_store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params={
+                "limit": "1",
+                "history_shortlist_max_age_seconds": str(
+                    app_module.MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS + 1
+                ),
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "history_shortlist_max_age_seconds must be at most "
+        f"{app_module.MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS}"
+    )
+    assert called is False
+    assert proposal_called is False
+
+
+def test_funding_universe_canary_approval_proposals_rejects_zero_history_shortlist_age(
+    tmp_path: Path,
+) -> None:
+    called = False
+    proposal_called = False
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            nonlocal called
+            called = True
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            nonlocal proposal_called
+            proposal_called = True
+            assert candidates == []
+            assert limit == 1
+            return []
+
+    history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    app.dependency_overrides[get_history_store] = lambda: history_store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params={
+                "limit": "1",
+                "history_shortlist_max_age_seconds": "0",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"] == "history_shortlist_max_age_seconds must be at least 1"
+    )
+    assert called is False
+    assert proposal_called is False
+
+
+def test_funding_universe_canary_approval_proposals_uses_history_shortlist(
+    tmp_path: Path,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    now = FIXED_APPROVAL_PROPOSAL_NOW
+    for label, symbol, roundtrip_edge, capacity, spread_rate, liquidity in (
+        ("ton_extended_paradex", "TON-USD-PERP", 0.003, 2_500.0, 0.020, 100_000.0),
+        ("zro_extended_paradex", "ZRO-USD-PERP", 0.003, 1_500.0, 0.001, 2_000_000.0),
+        ("jup_extended_paradex", "JUP-USD-PERP", -0.001, 4_000.0, 0.001, 5_000_000.0),
+        (
+            "near_extended_hyperliquid",
+            "NEAR-USD-PERP",
+            0.004,
+            3_000.0,
+            0.001,
+            2_000_000.0,
+        ),
+    ):
+        right_venue = "hyperliquid" if "hyperliquid" in label else "paradex"
+        store.append(
+            OpportunityRecord(
+                recorded_at=now,
+                pair=FundingPairSpec(
+                    label=label,
+                    left_venue="extended",
+                    left_symbol=symbol.removesuffix("-PERP"),
+                    left_fee_profile="default",
+                    right_venue=right_venue,
+                    right_symbol=(
+                        symbol
+                        if right_venue == "paradex"
+                        else symbol.removesuffix("-USD-PERP")
+                    ),
+                    right_fee_profile="pro_fastfills" if right_venue == "paradex" else "tier0",
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol=symbol,
+                    long_venue=right_venue,
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills" if right_venue == "paradex" else "tier0",
+                    short_fee_profile="default",
+                    gross_daily_edge=roundtrip_edge + 0.001,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=roundtrip_edge + 0.0003,
+                    one_day_net_edge_after_round_trip=roundtrip_edge,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.4,
+                    short_spread_rate=spread_rate,
+                    long_spread_rate=spread_rate,
+                    short_daily_volume=liquidity,
+                    long_daily_volume=liquidity,
+                    short_open_interest=liquidity,
+                    long_open_interest=liquidity,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=capacity + 100.0,
+                        long_ask_notional=capacity,
+                        max_entry_notional=capacity,
+                        limiting_venue=right_venue,
+                    ),
+                ),
+            )
+        )
+    candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="TON-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1_400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="TON-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="TON-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            return [candidate]
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == [candidate]
+            assert limit == 1
+            return []
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("limit", "1"),
+                ("history_shortlist_limit", "2"),
+                ("history_shortlist_sample", "20"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["include_symbols"] == ["ZRO-USD-PERP", "TON-USD-PERP"]
+    assert captured["limit"] == 50
+
+
+def test_funding_universe_canary_approval_proposals_shortlist_matches_live_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    now = FIXED_APPROVAL_PROPOSAL_NOW
+    for label, symbol, short_daily_volume, long_daily_volume in (
+        ("wif_extended_paradex", "WIF-USD-PERP", 1_000_000.0, 1_000_000.0),
+        ("ton_extended_paradex", "TON-USD-PERP", None, 1_000_000.0),
+    ):
+        store.append(
+            OpportunityRecord(
+                recorded_at=now,
+                pair=FundingPairSpec(
+                    label=label,
+                    left_venue="extended",
+                    left_symbol=symbol.removesuffix("-PERP"),
+                    left_fee_profile="default",
+                    right_venue="paradex",
+                    right_symbol=symbol,
+                    right_fee_profile="pro_fastfills",
+                ),
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol=symbol,
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.0003,
+                    round_trip_cost_rate=0.0006,
+                    one_day_net_edge_after_entry=0.0037,
+                    one_day_net_edge_after_round_trip=0.0034,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.4,
+                    short_daily_volume=short_daily_volume,
+                    long_daily_volume=long_daily_volume,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=2_500.0,
+                        long_ask_notional=2_000.0,
+                        max_entry_notional=2_000.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+            )
+        )
+    calls: list[dict[str, object]] = []
+    selector_calls: list[dict[str, Any]] = []
+    original_selector = app_module._select_canary_reprice_symbols_from_history
+
+    def spy_selector(*args: Any, **kwargs: Any) -> list[str]:
+        selector_calls.append(dict(kwargs))
+        return original_selector(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "_select_canary_reprice_symbols_from_history", spy_selector)
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            calls.append(kwargs)
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == []
+            assert limit == 2
+            return []
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("limit", "2"),
+                ("min_daily_volume", "100000"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert len(selector_calls) == 1
+    assert selector_calls[0]["now"] == FIXED_APPROVAL_PROPOSAL_NOW
+    assert selector_calls[0]["exclude_tags"] == ["meme", "political"]
+    assert len(calls) == 1
+    assert calls[0]["include_symbols"] is None
+    assert calls[0]["exclude_tags"] == ["meme", "political"]
+
+
+def test_funding_universe_canary_approval_proposals_ignores_stale_history_shortlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=FIXED_APPROVAL_PROPOSAL_NOW
+            - timedelta(seconds=app_module.DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS + 1),
+            pair=FundingPairSpec(
+                label="ton_extended_paradex",
+                left_venue="extended",
+                left_symbol="TON-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="TON-USD-PERP",
+                right_fee_profile="pro_fastfills",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="TON-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0037,
+                one_day_net_edge_after_round_trip=0.0034,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.4,
+                capacity=CapacityEstimate(
+                    short_bid_notional=2_500.0,
+                    long_ask_notional=2_000.0,
+                    max_entry_notional=2_000.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+    captured: dict[str, object] = {}
+    selector_calls: list[dict[str, Any]] = []
+    original_selector = app_module._select_canary_reprice_symbols_from_history
+
+    def spy_selector(*args: Any, **kwargs: Any) -> list[str]:
+        selector_calls.append(dict(kwargs))
+        return original_selector(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "_select_canary_reprice_symbols_from_history", spy_selector)
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == []
+            assert limit == 2
+            return []
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("limit", "2"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert len(selector_calls) == 1
+    assert selector_calls[0]["now"] == FIXED_APPROVAL_PROPOSAL_NOW
+    assert (
+        selector_calls[0]["max_age_seconds"]
+        == app_module.DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS
+    )
+    assert captured["include_symbols"] is None
+
+
+def test_funding_universe_canary_approval_proposals_falls_back_when_shortlist_misses(
+    tmp_path: Path,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=FIXED_APPROVAL_PROPOSAL_NOW,
+            pair=FundingPairSpec(
+                label="ton_extended_paradex",
+                left_venue="extended",
+                left_symbol="TON-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="TON-USD-PERP",
+                right_fee_profile="pro_fastfills",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="TON-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0037,
+                one_day_net_edge_after_round_trip=0.0034,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.4,
+                capacity=CapacityEstimate(
+                    short_bid_notional=2_500.0,
+                    long_ask_notional=2_000.0,
+                    max_entry_notional=2_000.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+    fallback_candidate = FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ZRO-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1_400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ZRO-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ZRO-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=25.0,
+    )
+    calls: list[dict[str, object]] = []
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            calls.append(kwargs)
+            if kwargs["include_symbols"] is None:
+                return [fallback_candidate]
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == [fallback_candidate]
+            assert limit == 2
+            return []
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("limit", "2"),
+                ("history_shortlist_limit", "2"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert [call["include_symbols"] for call in calls] == [["TON-USD-PERP"], None]
+    assert [call["limit"] for call in calls] == [50, 2]
+
+
+def test_funding_universe_canary_approval_proposals_preserves_explicit_symbols(
+    tmp_path: Path,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=FIXED_APPROVAL_PROPOSAL_NOW,
+            pair=FundingPairSpec(
+                label="ton_extended_paradex",
+                left_venue="extended",
+                left_symbol="TON-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="TON-USD-PERP",
+                right_fee_profile="pro_fastfills",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="TON-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0037,
+                one_day_net_edge_after_round_trip=0.0034,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.4,
+                capacity=CapacityEstimate(
+                    short_bid_notional=2_500.0,
+                    long_ask_notional=2_000.0,
+                    max_entry_notional=2_000.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == []
+            assert limit == 1
+            return []
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("include_symbols", "S-USD-PERP"),
+                ("limit", "1"),
+                ("history_shortlist_limit", "10"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["include_symbols"] == ["S-USD-PERP"]
+
+
+def test_funding_universe_canary_approval_proposals_can_bypass_history_shortlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=FIXED_APPROVAL_PROPOSAL_NOW,
+            pair=FundingPairSpec(
+                label="ton_extended_paradex",
+                left_venue="extended",
+                left_symbol="TON-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="TON-USD-PERP",
+                right_fee_profile="pro_fastfills",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="TON-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0037,
+                one_day_net_edge_after_round_trip=0.0034,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.4,
+                capacity=CapacityEstimate(
+                    short_bid_notional=2_500.0,
+                    long_ask_notional=2_000.0,
+                    max_entry_notional=2_000.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+    selector_calls: list[dict[str, Any]] = []
+
+    def spy_selector(*_: Any, **kwargs: Any) -> list[str]:
+        selector_calls.append(dict(kwargs))
+        return ["TON-USD-PERP"]
+
+    monkeypatch.setattr(app_module, "_select_canary_reprice_symbols_from_history", spy_selector)
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == []
+            assert limit == 2
+            return []
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("limit", "2"),
+                ("use_history_shortlist", "false"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert selector_calls == []
+    assert captured["include_symbols"] is None
+
+
 def test_funding_universe_canary_approval_proposals_filters_fee_overrides_to_selected_venues(
+    tmp_path: Path,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -1166,6 +1909,8 @@ def test_funding_universe_canary_approval_proposals_filters_fee_overrides_to_sel
             assert limit == 2
             return []
 
+    history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    app.dependency_overrides[get_history_store] = lambda: history_store
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
     app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
     try:
