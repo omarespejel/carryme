@@ -3892,6 +3892,7 @@ async def _execute_guarded_pair_close_from_confirmation(
             status_code=500,
             detail="Pair-close confirmation entry_id is required before live submission",
         )
+    confirmation_entry_id = confirmation.entry_id
     paper_trade_id = paper_trade.entry_id or confirmation.paper_trade_id
     if paper_trade_id < 1:
         raise HTTPException(
@@ -3928,7 +3929,7 @@ async def _execute_guarded_pair_close_from_confirmation(
     if not execution_store.reserve_pair_close_live_submission(
         paper_trade_id=paper_trade_id,
         preview_hash=confirmation.preview_hash,
-        confirmation_entry_id=confirmation.entry_id,
+        confirmation_entry_id=confirmation_entry_id,
     ):
         existing_entry = execution_store.find_by_paper_trade_preview_hash(
             paper_trade_id=paper_trade_id,
@@ -3948,7 +3949,7 @@ async def _execute_guarded_pair_close_from_confirmation(
         )
 
     if not execution_store.reserve_live_submission(
-        confirmation_entry_id=confirmation.entry_id,
+        confirmation_entry_id=confirmation_entry_id,
         preview_hash=confirmation.preview_hash,
     ):
         existing_entry = execution_store.find_by_confirmation(
@@ -3967,6 +3968,28 @@ async def _execute_guarded_pair_close_from_confirmation(
                 "manual reconciliation is required before retrying"
             ),
         )
+
+    def _release_pair_close_reservations_or_raise() -> None:
+        released_live = execution_store.release_live_submission(
+            confirmation_entry_id=confirmation_entry_id,
+            preview_hash=confirmation.preview_hash,
+        )
+        released_pair_close = execution_store.release_pair_close_live_submission(
+            paper_trade_id=paper_trade_id,
+            preview_hash=confirmation.preview_hash,
+            confirmation_entry_id=confirmation_entry_id,
+        )
+        if released_live and released_pair_close:
+            return
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Pair-close live submission failed before journaling, but its "
+                "reservations could not be safely released; manual reconciliation "
+                "is required before retrying"
+            ),
+        )
+
     try:
         primary_execution = await service.submit_confirmed_preview(
             paper_trade=paper_trade,
@@ -3974,8 +3997,10 @@ async def _execute_guarded_pair_close_from_confirmation(
             first_venue=first_venue,
         )
     except ValueError as exc:
+        _release_pair_close_reservations_or_raise()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+        _release_pair_close_reservations_or_raise()
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     primary_execution = execution_store.append(primary_execution)
@@ -3985,7 +4010,7 @@ async def _execute_guarded_pair_close_from_confirmation(
             detail="Execution journal append did not return an id",
         )
     execution_store.mark_live_submission_completed(
-        confirmation_entry_id=confirmation.entry_id,
+        confirmation_entry_id=confirmation_entry_id,
         preview_hash=confirmation.preview_hash,
         execution_entry_id=primary_execution.entry_id,
     )
