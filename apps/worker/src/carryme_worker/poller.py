@@ -2932,6 +2932,40 @@ async def launch_latest_stable_canary_once(
     selected: FundingUniverseCanaryCandidate | None = None
     approval: RouteApprovalEntry | None = None
     candidate_skip_details: list[str] = []
+    single_candidate = len(stable_candidates) == 1
+
+    def _single_candidate_skip(
+        *,
+        candidate_snapshot: LaunchReadyCanarySnapshot | None,
+        detail: str,
+        approved_snapshot_id: int | None = None,
+        paper_trade_id: int | None = None,
+        final_pair_state: str | None = None,
+    ) -> StableCanaryLaunchSummary | None:
+        if not single_candidate:
+            return None
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=candidate_snapshot.label if candidate_snapshot is not None else None,
+            launch_ready_snapshot_id=(
+                candidate_snapshot.launch_ready_snapshot_id
+                if candidate_snapshot is not None
+                else None
+            ),
+            approved_snapshot_id=(
+                approved_snapshot_id
+                if approved_snapshot_id is not None
+                else (
+                    candidate_snapshot.approved_snapshot.snapshot_id
+                    if candidate_snapshot is not None
+                    else None
+                )
+            ),
+            paper_trade_id=paper_trade_id,
+            final_pair_state=final_pair_state,
+            detail=detail,
+        )
 
     for candidate_stability in stable_candidates:
         try:
@@ -2946,6 +2980,12 @@ async def launch_latest_stable_canary_once(
             )
         except HTTPException as exc:
             if exc.status_code in {404, 409}:
+                summary = _single_candidate_skip(
+                    candidate_snapshot=None,
+                    detail=str(exc.detail),
+                )
+                if summary is not None:
+                    return summary
                 candidate_skip_details.append(
                     f"{candidate_stability.snapshot.label}: {exc.detail}"
                 )
@@ -2959,6 +2999,12 @@ async def launch_latest_stable_canary_once(
             label=candidate_snapshot.label,
         )
         if label_cooldown_reason is not None:
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=label_cooldown_reason,
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: {label_cooldown_reason}"
             )
@@ -2971,6 +3017,12 @@ async def launch_latest_stable_canary_once(
             label=candidate_snapshot.label,
         )
         if label_rate_cap_reason is not None:
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=label_rate_cap_reason,
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: {label_rate_cap_reason}"
             )
@@ -2980,6 +3032,12 @@ async def launch_latest_stable_canary_once(
             label=candidate_snapshot.label
         )
         if candidate_latest_approved_snapshot is None:
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail="Latest approved canary snapshot is missing for the selected label",
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: latest approved canary snapshot is missing"
             )
@@ -2988,6 +3046,15 @@ async def launch_latest_stable_canary_once(
             candidate_latest_approved_snapshot.snapshot_id
             != candidate_snapshot.approved_snapshot.snapshot_id
         ):
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=(
+                    "Launch-ready canary snapshot is stale relative to the latest "
+                    "approved snapshot"
+                ),
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: launch-ready canary snapshot is stale relative "
                 "to the latest approved snapshot"
@@ -3005,6 +3072,12 @@ async def launch_latest_stable_canary_once(
                     candidate_snapshot.label,
                     execution_maturity_reason,
                 )
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=execution_maturity_reason,
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: {execution_maturity_reason}"
             )
@@ -3021,6 +3094,12 @@ async def launch_latest_stable_canary_once(
                     candidate_snapshot.label,
                     latest_outcome_reason,
                 )
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=latest_outcome_reason,
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: {latest_outcome_reason}"
             )
@@ -3037,6 +3116,12 @@ async def launch_latest_stable_canary_once(
                     candidate_snapshot.label,
                     liquidity_and_value_reason,
                 )
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=liquidity_and_value_reason,
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: {liquidity_and_value_reason}"
             )
@@ -3059,6 +3144,15 @@ async def launch_latest_stable_canary_once(
                     candidate_snapshot.label,
                     automation_gate_reason,
                 )
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=(
+                    "Latest approved snapshot no longer satisfies automated launch "
+                    f"gates: {automation_gate_reason}"
+                ),
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: latest approved snapshot no longer "
                 f"satisfies automated launch gates: {automation_gate_reason}"
@@ -3072,6 +3166,16 @@ async def launch_latest_stable_canary_once(
             if previous_launch is not None:
                 if previous_launch.status == "shadowed":
                     if settings.stable_canary_launch_shadow_mode:
+                        summary = _single_candidate_skip(
+                            candidate_snapshot=candidate_snapshot,
+                            detail=(
+                                "Launch-ready canary snapshot already evaluated in shadow mode "
+                                "by worker"
+                            ),
+                            final_pair_state=previous_launch.final_pair_state,
+                        )
+                        if summary is not None:
+                            return summary
                         candidate_skip_details.append(
                             f"{candidate_snapshot.label}: launch-ready canary snapshot "
                             "already evaluated in shadow mode by worker"
@@ -3079,6 +3183,17 @@ async def launch_latest_stable_canary_once(
                         continue
                     # Shadow mode is off but was previously on: allow a real launch now.
                 else:
+                    summary = _single_candidate_skip(
+                        candidate_snapshot=candidate_snapshot,
+                        detail=(
+                            "Launch-ready canary snapshot already launched by worker as "
+                            f"paper trade {previous_launch.paper_trade_id}"
+                        ),
+                        paper_trade_id=previous_launch.paper_trade_id,
+                        final_pair_state=previous_launch.final_pair_state,
+                    )
+                    if summary is not None:
+                        return summary
                     candidate_skip_details.append(
                         f"{candidate_snapshot.label}: launch-ready canary snapshot already "
                         f"launched by worker as paper trade {previous_launch.paper_trade_id}"
@@ -3097,29 +3212,14 @@ async def launch_latest_stable_canary_once(
                     candidate_snapshot.label,
                     risk_budget_reason,
                 )
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=risk_budget_reason,
+            )
+            if summary is not None:
+                return summary
             candidate_skip_details.append(
                 f"{candidate_snapshot.label}: {risk_budget_reason}"
-            )
-            continue
-
-        execution_preflight = _build_candidate_live_execution_preflight(
-            settings=runtime_settings,
-            candidate=candidate_selected,
-            label=candidate_snapshot.label,
-        )
-        if not execution_preflight.ready:
-            try:
-                launch_ready_store.delete_label(candidate_snapshot.label)
-            except Exception:
-                logging.getLogger("carryme.worker").exception(
-                    "failed to invalidate launch-ready snapshots for label=%s "
-                    "during stable launch preflight",
-                    candidate_snapshot.label,
-                )
-            candidate_skip_details.append(
-                f"{candidate_snapshot.label}: latest launch-ready snapshot no longer "
-                "satisfies live execution readiness: "
-                f"{'; '.join(execution_preflight.blocking_reasons)}"
             )
             continue
 
@@ -3180,6 +3280,32 @@ async def launch_latest_stable_canary_once(
             launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
             approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
             detail=hold_mode_blocker,
+        )
+
+    execution_preflight = _build_candidate_live_execution_preflight(
+        settings=runtime_settings,
+        candidate=selected,
+        label=snapshot.label,
+    )
+    if not execution_preflight.ready:
+        try:
+            launch_ready_store.delete_label(snapshot.label)
+        except Exception:
+            logging.getLogger("carryme.worker").exception(
+                "failed to invalidate launch-ready snapshots for label=%s "
+                "during stable launch preflight",
+                snapshot.label,
+            )
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            label=snapshot.label,
+            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
+            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
+            detail=(
+                "Latest launch-ready snapshot no longer satisfies live execution "
+                f"readiness: {'; '.join(execution_preflight.blocking_reasons)}"
+            ),
         )
 
     try:
