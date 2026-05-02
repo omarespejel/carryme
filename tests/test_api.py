@@ -202,6 +202,41 @@ def _arb_extended_paradex_canary_candidate(
     )
 
 
+def _arb_extended_paradex_canary_candidate_for_symbol(
+    *,
+    canonical_symbol: str,
+    extended_symbol: str,
+    paradex_symbol: str,
+    estimated_one_day_pnl_after_round_trip: float,
+    route_adjusted_quality_score: float,
+    suggested_canary_notional: float = 25.0,
+) -> FundingUniverseCanaryCandidate:
+    candidate = _arb_extended_paradex_canary_candidate(
+        suggested_canary_notional=suggested_canary_notional,
+    )
+    opportunity = candidate.opportunity.opportunity.model_copy(
+        update={"canonical_symbol": canonical_symbol}
+    )
+    universe_opportunity = candidate.opportunity.model_copy(
+        update={
+            "opportunity": opportunity,
+            "venue_markets": {
+                "extended": candidate.opportunity.venue_markets["extended"].model_copy(
+                    update={"symbol": extended_symbol}
+                ),
+                "paradex": candidate.opportunity.venue_markets["paradex"].model_copy(
+                    update={"symbol": paradex_symbol}
+                ),
+            },
+            "estimated_one_day_pnl_after_round_trip": (
+                estimated_one_day_pnl_after_round_trip
+            ),
+            "route_adjusted_quality_score": route_adjusted_quality_score,
+        }
+    )
+    return candidate.model_copy(update={"opportunity": universe_opportunity})
+
+
 def test_health_endpoint() -> None:
     client = TestClient(app)
 
@@ -1498,30 +1533,13 @@ def test_approve_refresh_and_cache_launch_ready_canary_proposal_saves_ready_snap
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database_path = tmp_path / "history.sqlite3"
+    approval_service = RouteApprovalService(store=RouteApprovalStore(database_path))
     approved_store = ApprovedCanaryStore(database_path)
     launch_ready_store = LaunchReadyCanaryStore(database_path)
-    captured_upsert: dict[str, object] = {}
     captured_system_state_configs: dict[str, dict[str, bool]] = {}
 
     class StubUniverseService:
         pass
-
-    class StubRouteApprovalService:
-        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
-            captured_upsert["label"] = label
-            captured_upsert["payload"] = payload
-            return RouteApprovalEntry(
-                updated_at=FIXED_APPROVAL_PROPOSAL_NOW,
-                label=label,
-                canonical_symbol=payload.canonical_symbol,
-                short_venue=payload.short_venue,
-                long_venue=payload.long_venue,
-                short_fee_profile=payload.short_fee_profile,
-                long_fee_profile=payload.long_fee_profile,
-                approved=payload.approved,
-                max_live_notional=payload.max_live_notional,
-                note=payload.note,
-            )
 
     class StubSystemStateService:
         async def probe_venues(
@@ -1576,7 +1594,7 @@ def test_approve_refresh_and_cache_launch_ready_canary_proposal_saves_ready_snap
         paradex_private_key="0xdef",
     )
     app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
-    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    app.dependency_overrides[get_route_approval_service] = lambda: approval_service
     app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
     app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
     app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
@@ -1593,9 +1611,9 @@ def test_approve_refresh_and_cache_launch_ready_canary_proposal_saves_ready_snap
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
-    assert captured_upsert["label"] == "arb_extended_paradex"
-    upsert_payload = cast(RouteApprovalUpsert, captured_upsert["payload"])
-    assert upsert_payload.approved is True
+    persisted_approval = approval_service.list_recent(label="arb_extended_paradex")[0]
+    assert persisted_approval.approved is True
+    assert persisted_approval.max_live_notional == 11.0
     assert captured_system_state_configs["extended"]["enabled"] is True
     assert captured_system_state_configs["paradex"]["enabled"] is True
 
@@ -1695,6 +1713,20 @@ def test_approve_best_launch_ready_canary_proposal_saves_top_ready_snapshot(
     history_store = OpportunityHistoryStore(database_path)
     captured_candidate_scan: dict[str, object] = {}
     captured_refresh_scan: dict[str, object] = {}
+    top_candidate = _arb_extended_paradex_canary_candidate_for_symbol(
+        canonical_symbol="OP-USD-PERP",
+        extended_symbol="OP-USD",
+        paradex_symbol="OP-USD-PERP",
+        estimated_one_day_pnl_after_round_trip=4.2,
+        route_adjusted_quality_score=0.91,
+    )
+    second_candidate = _arb_extended_paradex_canary_candidate_for_symbol(
+        canonical_symbol="ARB-USD-PERP",
+        extended_symbol="ARB-USD",
+        paradex_symbol="ARB-USD-PERP",
+        estimated_one_day_pnl_after_round_trip=2.79,
+        route_adjusted_quality_score=0.75,
+    )
 
     class StubUniverseService:
         async def scan_canary_candidates(
@@ -1702,7 +1734,7 @@ def test_approve_best_launch_ready_canary_proposal_saves_top_ready_snapshot(
             **kwargs: object,
         ) -> list[FundingUniverseCanaryCandidate]:
             captured_candidate_scan.update(kwargs)
-            return [_arb_extended_paradex_canary_candidate()]
+            return [top_candidate, second_candidate]
 
     class StubSystemStateService:
         async def probe_venues(
@@ -1732,9 +1764,10 @@ def test_approve_best_launch_ready_canary_proposal_saves_top_ready_snapshot(
     ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
         captured_refresh_scan.update(kwargs)
         approval = cast(RouteApprovalEntry, kwargs["approval"])
-        assert approval.label == "arb_extended_paradex"
+        assert approval.label == "op_extended_paradex"
+        assert approval.canonical_symbol == "OP-USD-PERP"
         assert approval.approved is True
-        return _arb_extended_paradex_canary_candidate(suggested_canary_notional=25.0), 1
+        return top_candidate, 1
 
     monkeypatch.setattr(
         "carryme_api.app.scan_live_route_candidate_for_approval",
@@ -1761,7 +1794,12 @@ def test_approve_best_launch_ready_canary_proposal_saves_top_ready_snapshot(
         response = client.post(
             "/v1/opportunities/funding-universe/canary/approval-proposals/"
             "approve-best-launch-ready",
-            params={"use_history_shortlist": "false", "candidate_sample": "10"},
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("use_history_shortlist", "false"),
+                ("candidate_sample", "10"),
+            ],
         )
     finally:
         app.dependency_overrides.clear()
@@ -1772,12 +1810,13 @@ def test_approve_best_launch_ready_canary_proposal_saves_top_ready_snapshot(
     assert captured_refresh_scan["venues"] == ["extended", "paradex"]
     payload = response.json()
     assert payload["launch_ready_snapshot_id"] == 1
-    assert payload["label"] == "arb_extended_paradex"
+    assert payload["label"] == "op_extended_paradex"
+    assert payload["approved_snapshot"]["approval"]["canonical_symbol"] == "OP-USD-PERP"
     assert payload["approved_snapshot"]["approval"]["approved"] is True
     assert payload["approved_snapshot"]["approval"]["max_live_notional"] == 25.0
-    assert approval_service.list_recent(label="arb_extended_paradex")[0].approved is True
-    assert approved_store.latest(label="arb_extended_paradex") is not None
-    assert launch_ready_store.latest(label="arb_extended_paradex") is not None
+    assert approval_service.list_recent(label="op_extended_paradex")[0].approved is True
+    assert approved_store.latest(label="op_extended_paradex") is not None
+    assert launch_ready_store.latest(label="op_extended_paradex") is not None
 
 
 def test_approve_best_launch_ready_canary_proposal_rejects_missing_credentials(
@@ -2393,7 +2432,7 @@ def test_funding_universe_canary_approval_proposals_falls_back_when_shortlist_mi
             limit: int,
         ) -> list[FundingUniverseCanaryApprovalProposal]:
             assert candidates == [fallback_candidate]
-            assert limit == 2
+            assert limit == 3
             return []
 
     app.dependency_overrides[get_history_store] = lambda: store
@@ -2407,7 +2446,7 @@ def test_funding_universe_canary_approval_proposals_falls_back_when_shortlist_mi
             params=[
                 ("venues", "extended"),
                 ("venues", "paradex"),
-                ("limit", "2"),
+                ("limit", "3"),
                 ("history_shortlist_limit", "2"),
             ],
         )
@@ -2416,7 +2455,7 @@ def test_funding_universe_canary_approval_proposals_falls_back_when_shortlist_mi
 
     assert response.status_code == 200
     assert [call["include_symbols"] for call in calls] == [["TON-USD-PERP"], None]
-    assert [call["limit"] for call in calls] == [50, 2]
+    assert [call["limit"] for call in calls] == [50, 3]
 
 
 def test_funding_universe_canary_approval_proposals_preserves_explicit_symbols(

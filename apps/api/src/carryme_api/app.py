@@ -741,8 +741,7 @@ async def _generate_canary_approval_proposal_summaries(
 
     candidates = await _scan_candidates(effective_include_symbols, candidate_sample)
     if used_history_shortlist and len(candidates) < limit:
-        remaining_candidate_slots = max(1, limit - len(candidates))
-        broad_candidates = await _scan_candidates(None, remaining_candidate_slots)
+        broad_candidates = await _scan_candidates(None, limit)
         candidates = _merge_canary_candidates(
             candidates,
             broad_candidates,
@@ -3795,14 +3794,141 @@ async def _approve_refresh_and_cache_launch_ready_canary_proposal(
         snapshot=snapshot,
         now=current_time,
     )
-    persisted_approval = approval_service.upsert(label=label, payload=approval_payload)
-    persisted_approved_snapshot = approved_store.append(
-        snapshot.model_copy(update={"approval": persisted_approval})
+    return _persist_launch_ready_promotion_atomically(
+        approval_service=approval_service,
+        approved_store=approved_store,
+        launch_ready_store=launch_ready_store,
+        approval_payload=approval_payload,
+        snapshot=snapshot,
+        launch_ready_snapshot=launch_ready_snapshot,
     )
-    return launch_ready_store.append(
-        launch_ready_snapshot.model_copy(
+
+
+def _persist_launch_ready_promotion_atomically(
+    *,
+    approval_service: RouteApprovalService,
+    approved_store: ApprovedCanaryStore,
+    launch_ready_store: LaunchReadyCanaryStore,
+    approval_payload: RouteApprovalUpsert,
+    snapshot: ApprovedCanarySnapshot,
+    launch_ready_snapshot: LaunchReadyCanarySnapshot,
+) -> LaunchReadyCanarySnapshot:
+    """Persist approval, approved snapshot, and launch-ready snapshot in one transaction."""
+
+    database_urls = {
+        approval_service.store.database.url,
+        approved_store.database.url,
+        launch_ready_store.database.url,
+    }
+    if len(database_urls) != 1:
+        raise RuntimeError("launch-ready promotion stores must share one database target")
+
+    approval_service.store.initialize()
+    approved_store.initialize()
+    launch_ready_store.initialize()
+
+    approval_entry = RouteApprovalEntry(
+        label=snapshot.label,
+        updated_at=datetime.now(UTC),
+        canonical_symbol=approval_payload.canonical_symbol,
+        short_venue=approval_payload.short_venue,
+        long_venue=approval_payload.long_venue,
+        short_fee_profile=approval_payload.short_fee_profile,
+        long_fee_profile=approval_payload.long_fee_profile,
+        approved=approval_payload.approved,
+        max_live_notional=approval_payload.max_live_notional,
+        note=approval_payload.note,
+    )
+    approved_snapshot_to_persist = snapshot.model_copy(
+        update={"approval": approval_entry}
+    )
+
+    with approval_service.store.database.begin() as connection:
+        connection.execute(
+            """
+            INSERT INTO route_approval_entries (
+                updated_at,
+                label,
+                canonical_symbol,
+                short_venue,
+                long_venue,
+                short_fee_profile,
+                long_fee_profile,
+                approved,
+                max_live_notional,
+                entry_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (
+                label,
+                canonical_symbol,
+                short_venue,
+                long_venue,
+                short_fee_profile,
+                long_fee_profile
+            ) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                approved = excluded.approved,
+                max_live_notional = excluded.max_live_notional,
+                entry_json = excluded.entry_json
+            """,
+            (
+                approval_entry.updated_at.isoformat(),
+                approval_entry.label,
+                approval_entry.canonical_symbol,
+                approval_entry.short_venue,
+                approval_entry.long_venue,
+                approval_entry.short_fee_profile,
+                approval_entry.long_fee_profile,
+                int(approval_entry.approved),
+                approval_entry.max_live_notional,
+                approval_entry.model_dump_json(),
+            ),
+        )
+        approved_snapshot_id = connection.insert_returning_id(
+            """
+            INSERT INTO approved_canary_snapshots (
+                captured_at,
+                label,
+                snapshot_json
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                approved_snapshot_to_persist.captured_at.isoformat(),
+                approved_snapshot_to_persist.label,
+                approved_snapshot_to_persist.model_dump_json(),
+            ),
+        )
+        persisted_approved_snapshot = ApprovedCanarySnapshot.model_validate(
+            {
+                **approved_snapshot_to_persist.model_dump(mode="json"),
+                "snapshot_id": approved_snapshot_id,
+            }
+        )
+        launch_ready_to_persist = launch_ready_snapshot.model_copy(
             update={"approved_snapshot": persisted_approved_snapshot}
         )
+        launch_ready_snapshot_id = connection.insert_returning_id(
+            """
+            INSERT INTO launch_ready_canary_snapshots (
+                captured_at,
+                label,
+                approved_snapshot_id,
+                snapshot_json
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                launch_ready_to_persist.captured_at.isoformat(),
+                launch_ready_to_persist.label,
+                launch_ready_to_persist.approved_snapshot.snapshot_id,
+                launch_ready_to_persist.model_dump_json(),
+            ),
+        )
+
+    return LaunchReadyCanarySnapshot.model_validate(
+        {
+            **launch_ready_to_persist.model_dump(mode="python"),
+            "launch_ready_snapshot_id": launch_ready_snapshot_id,
+        }
     )
 
 
