@@ -425,6 +425,15 @@ async def _resolve_api_settings_for_request(request: Request) -> ApiSettings:
     return await _resolve_api_settings_for_app(request.app)
 
 
+def _should_prewarm_execution_journal(settings: ApiSettings) -> bool:
+    """Return whether startup should prewarm the execution journal store."""
+
+    return not (
+        settings.environment == "development"
+        and settings.database_path == "data/carryme.sqlite3"
+    )
+
+
 def _operator_auth_error(status_code: int, detail: str) -> JSONResponse:
     headers = {"WWW-Authenticate": "Bearer"} if status_code == 401 else None
     return JSONResponse(status_code=status_code, content={"detail": detail}, headers=headers)
@@ -4123,11 +4132,12 @@ def create_app() -> FastAPI:
     """Create the FastAPI application."""
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Warm the shared execution journal store before serving live requests."""
 
         settings = await _resolve_api_settings_for_app(app)
-        _execution_journal_store_for_path(settings.database_path).initialize()
+        if _should_prewarm_execution_journal(settings):
+            _execution_journal_store_for_path(settings.database_path).initialize()
         yield
 
     app = FastAPI(title="carryme", version=APP_VERSION, lifespan=lifespan)
