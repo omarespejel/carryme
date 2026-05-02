@@ -131,6 +131,18 @@ Only set `CARRYME_WORKER_STABLE_CANARY_LAUNCH_CLOSE_POSITION=false` after `carry
 2. `CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_SHADOW_MODE=false`
 3. the same live venue credentials as `carryme-stable-launch`
 
+Set `CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_ENABLED=true` and
+`CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_SHADOW_MODE=false` on
+`carryme-stable-launch` too. Those two flags are the launcher-side fail-closed
+gate for unattended hold mode.
+
+Also set the profit-protection thresholds
+`CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MIN_PROFIT_TOTAL_COLLATERAL` and
+`CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_PROFIT_GIVEBACK_RATIO` on
+`carryme-stable-launch` and `carryme-execution-monitor`. Those thresholds control
+profit-protection behavior after a live hedge is open; they are not the same as
+the launcher's hold-mode blocker.
+
 The worker fails closed if hold mode is requested while auto-close is disabled or shadow-only.
 
 ### Venue Secret Ownership

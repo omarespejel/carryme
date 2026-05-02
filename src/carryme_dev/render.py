@@ -57,6 +57,33 @@ REQUIRED_RENDER_SERVICE_SPECS: dict[str, dict[str, str]] = {
     },
 }
 
+REQUIRED_RENDER_SERVICE_ENV_VARS: dict[str, tuple[str, ...]] = {
+    "carryme-stable-launch": (
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_CLOSE_POSITION",
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_TOTAL_LIVE_NOTIONAL",
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_LIVE_NOTIONAL_PER_VENUE",
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_GLOBAL_COOLDOWN_SECONDS",
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_LABEL_COOLDOWN_SECONDS",
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_RECENT_LAUNCH_WINDOW_SECONDS",
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_LAUNCHES_PER_WINDOW",
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_LABEL_LAUNCHES_PER_WINDOW",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_ENABLED",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_SHADOW_MODE",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MIN_PROFIT_TOTAL_COLLATERAL",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_PROFIT_GIVEBACK_RATIO",
+    ),
+    "carryme-execution-monitor": (
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_ENABLED",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_SHADOW_MODE",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MIN_ENTRY_EDGE_RETENTION_RATIO",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_ROUND_TRIP_BREAK_EVEN_HOLD_WINDOWS",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_HOLD_WINDOWS",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MIN_PROFIT_TOTAL_COLLATERAL",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_PROFIT_GIVEBACK_RATIO",
+        "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_TIMEOUT_SECONDS",
+    ),
+}
+
 LIVE_VENUE_ENV_VARS: dict[str, tuple[str, tuple[str, ...]]] = {
     "extended": (
         "CARRYME_API_EXTENDED_LIVE_ENABLED",
@@ -123,14 +150,16 @@ def _load_render_blueprint(blueprint_path: str | Path) -> dict[str, object]:
     return loaded
 
 
-def _parse_render_services(blueprint: Mapping[str, object]) -> dict[str, dict[str, str]]:
+def _parse_render_services(
+    blueprint: Mapping[str, object],
+) -> dict[str, dict[str, object]]:
     """Extract service name, type, and start command from a parsed Render blueprint."""
 
     services_raw = blueprint.get("services")
     if not isinstance(services_raw, list):
         return {}
 
-    services: dict[str, dict[str, str]] = {}
+    services: dict[str, dict[str, object]] = {}
     for service_raw in services_raw:
         if not isinstance(service_raw, Mapping):
             continue
@@ -139,9 +168,19 @@ def _parse_render_services(blueprint: Mapping[str, object]) -> dict[str, dict[st
         start_command = service_raw.get("startCommand", "")
         if not isinstance(name, str) or not isinstance(service_type, str):
             continue
+        env_vars_raw = service_raw.get("envVars", [])
+        env_var_keys: set[str] = set()
+        if isinstance(env_vars_raw, list):
+            for env_var_raw in env_vars_raw:
+                if not isinstance(env_var_raw, Mapping):
+                    continue
+                key = env_var_raw.get("key")
+                if isinstance(key, str):
+                    env_var_keys.add(key)
         services[name] = {
             "type": service_type,
             "start_command": start_command if isinstance(start_command, str) else "",
+            "env_var_keys": env_var_keys,
         }
     return services
 
@@ -205,18 +244,20 @@ def build_render_blueprint_validation_report(
         service = services.get(name)
         if service is None:
             continue
-        if service["type"] != spec["type"]:
+        service_type = service["type"]
+        start_command = service["start_command"]
+        if service_type != spec["type"]:
             invalid_services.append(
                 {
                     "name": name,
                     "field": "type",
                     "expected": spec["type"],
-                    "actual": service["type"],
+                    "actual": str(service_type),
                 }
             )
         if not _command_executes_expected(
             service_type=spec["type"],
-            actual=service["start_command"],
+            actual=str(start_command),
             expected=spec["start_command"],
         ):
             invalid_services.append(
@@ -224,7 +265,21 @@ def build_render_blueprint_validation_report(
                     "name": name,
                     "field": "startCommand",
                     "expected": spec["start_command"],
-                    "actual": service["start_command"],
+                    "actual": str(start_command),
+                }
+            )
+        env_var_keys = service.get("env_var_keys", set())
+        if not isinstance(env_var_keys, set):
+            env_var_keys = set()
+        for env_var in REQUIRED_RENDER_SERVICE_ENV_VARS.get(name, ()):
+            if env_var in env_var_keys:
+                continue
+            invalid_services.append(
+                {
+                    "name": name,
+                    "field": "envVars",
+                    "expected": env_var,
+                    "actual": "missing",
                 }
             )
 

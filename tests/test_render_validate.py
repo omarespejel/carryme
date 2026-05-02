@@ -108,6 +108,74 @@ services:
     } in cast(list[dict[str, str]], report["invalid_services"])
 
 
+def test_render_blueprint_requires_profit_hold_control_envs(tmp_path: Path) -> None:
+    blueprint = tmp_path / "render.yaml"
+    blueprint.write_text(
+        """
+databases:
+  - name: carryme-postgres
+
+services:
+  - type: web
+    name: carryme-api
+    startCommand: sh -c 'uv run alembic upgrade head && uv run carryme-api'
+  - type: worker
+    name: carryme-universe-scan
+    startCommand: uv run carryme-worker --scan-universe-supervise
+  - type: worker
+    name: carryme-approved-canary-scan
+    startCommand: uv run carryme-worker --scan-approved-canary-supervise
+  - type: worker
+    name: carryme-launch-ready-cache
+    startCommand: uv run carryme-worker --cache-launch-ready-canary-supervise
+  - type: worker
+    name: carryme-stable-launch
+    startCommand: uv run carryme-worker --launch-latest-stable-canary-supervise
+  - type: worker
+    name: carryme-system-state
+    startCommand: uv run carryme-worker --observe-system-state-supervise
+  - type: worker
+    name: carryme-execution-monitor
+    startCommand: uv run carryme-worker --observe-executions-supervise
+""".lstrip()
+    )
+
+    report = build_render_blueprint_validation_report(blueprint)
+
+    assert report["status"] == "degraded"
+    invalid_services = cast(list[dict[str, str]], report["invalid_services"])
+    assert {
+        "name": "carryme-stable-launch",
+        "field": "envVars",
+        "expected": "CARRYME_WORKER_STABLE_CANARY_LAUNCH_CLOSE_POSITION",
+        "actual": "missing",
+    } in invalid_services
+    assert {
+        "name": "carryme-stable-launch",
+        "field": "envVars",
+        "expected": "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_ENABLED",
+        "actual": "missing",
+    } in invalid_services
+    assert {
+        "name": "carryme-stable-launch",
+        "field": "envVars",
+        "expected": "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_PROFIT_GIVEBACK_RATIO",
+        "actual": "missing",
+    } in invalid_services
+    assert {
+        "name": "carryme-execution-monitor",
+        "field": "envVars",
+        "expected": "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_ENABLED",
+        "actual": "missing",
+    } in invalid_services
+    assert {
+        "name": "carryme-execution-monitor",
+        "field": "envVars",
+        "expected": "CARRYME_WORKER_EXECUTION_AUTO_PAIR_CLOSE_MAX_PROFIT_GIVEBACK_RATIO",
+        "actual": "missing",
+    } in invalid_services
+
+
 def test_render_validation_skips_blueprint_outside_repo(tmp_path: Path) -> None:
     watchlist_path = Path(__file__).resolve().parents[1] / "config/watchlists/default.json"
     original_cwd = Path.cwd()
