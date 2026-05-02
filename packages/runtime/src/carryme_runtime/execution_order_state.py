@@ -561,9 +561,7 @@ def _extract_hyperliquid_order_update(
 ) -> ExecutionLegOrderState | None:
     if _coerce_int(_string_value(payload, "oid") or "") != oid:
         return None
-    status = _string_value(payload, "status")
-    order = payload.get("order")
-    order_payload = order if isinstance(order, dict) else {}
+    order_payload, status = _hyperliquid_order_payload_and_status(payload)
     remaining_size = _string_value(order_payload, "sz") or _string_value(payload, "sz")
     size = _string_value(order_payload, "origSz") or _string_value(payload, "origSz")
     avg_fill_price = _string_value(order_payload, "avgPx") or _string_value(payload, "avgPx")
@@ -595,9 +593,7 @@ def _build_hyperliquid_order_state(
     observation_source: ObservationSource,
     notes: list[str] | None = None,
 ) -> ExecutionLegOrderState:
-    order = payload.get("order")
-    order_payload = order if isinstance(order, dict) else {}
-    status = _string_value(payload, "status") or _string_value(order_payload, "status")
+    order_payload, status = _hyperliquid_order_payload_and_status(payload)
     remaining_size = _string_value(order_payload, "sz")
     size = _string_value(order_payload, "origSz")
     avg_fill_price = _string_value(order_payload, "avgPx")
@@ -620,6 +616,41 @@ def _build_hyperliquid_order_state(
         raw_response=payload,
         notes=notes or [],
     )
+
+
+def _hyperliquid_order_payload_and_status(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    top_level_status = _string_value(payload, "status")
+    order = payload.get("order")
+    if not isinstance(order, dict):
+        return {}, top_level_status
+
+    nested_order = order.get("order")
+    if isinstance(nested_order, dict):
+        nested_status = _string_value(order, "status")
+        return nested_order, _prefer_hyperliquid_order_status(
+            top_level_status=top_level_status,
+            nested_status=nested_status,
+        )
+
+    nested_status = _string_value(order, "status")
+    return order, _prefer_hyperliquid_order_status(
+        top_level_status=top_level_status,
+        nested_status=nested_status,
+    )
+
+
+def _prefer_hyperliquid_order_status(
+    *,
+    top_level_status: str | None,
+    nested_status: str | None,
+) -> str | None:
+    if top_level_status is None:
+        return nested_status
+    if top_level_status.lower() == "order" and nested_status is not None:
+        return nested_status
+    return top_level_status
 
 
 def _fetch_hyperliquid_order_state(account_address: str, oid: int) -> dict[str, Any]:

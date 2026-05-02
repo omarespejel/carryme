@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -111,6 +112,7 @@ from carryme_runtime.account_preflight import (
     _row_represents_open_position,
 )
 from carryme_runtime.execution_quality import ExecutionQualityService
+from carryme_runtime.paired_live_execution import _observed_fill_state
 from carryme_runtime.route_approvals import (
     scan_exact_canary_candidate_for_approval,
     scan_live_route_candidate_for_approval,
@@ -8916,8 +8918,9 @@ def test_paired_live_execution_coordinator_submits_both_legs() -> None:
             confirmation: PreviewConfirmationEntry,
             executed_at: datetime | None = None,
         ) -> ExecutionJournalEntry:
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter=f"{self.venue}_live",
                 mode="live",
                 status="submitted",
@@ -8939,6 +8942,9 @@ def test_paired_live_execution_coordinator_submits_both_legs() -> None:
                         status="submitted",
                         simulated=False,
                         external_reference=f"{self.venue}-1",
+                        response_payload={
+                            "observed_order_state": {"derived_state": "filled"}
+                        },
                     )
                 ],
             )
@@ -9059,8 +9065,9 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
             executed_at: datetime | None = None,
         ) -> ExecutionJournalEntry:
             seen_venues.append(self.venue)
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter=f"{self.venue}_live",
                 mode="live",
                 status="submitted",
@@ -9082,6 +9089,9 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
                         status="submitted",
                         simulated=False,
                         external_reference=f"{self.venue}-1",
+                        response_payload={
+                            "observed_order_state": {"derived_state": "filled"}
+                        },
                     )
                 ],
             )
@@ -9101,6 +9111,247 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
         assert seen_venues == ["paradex", "extended"]
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("first_leg_state", "expected_status"),
+    [
+        ("unfilled", "partial"),
+        ("partial_fill", "partial"),
+        ("open", "partial"),
+        ("unknown", "partial"),
+        ("missing_observation", "partial"),
+    ],
+)
+def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled(
+    first_leg_state: str,
+    expected_status: str,
+) -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=15,
+        created_at=datetime(2026, 5, 2, 20, 0, tzinfo=UTC),
+        note="candidate accepted",
+        intent=FundingPairTradeIntent(
+            label="zro_paradex_hyperliquid",
+            canonical_symbol="ZRO-USD-PERP",
+            source_recorded_at=datetime(2026, 5, 2, 19, 58, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=250.0,
+            target_notional=100.0,
+            capacity_fraction=0.25,
+            max_target_notional=100.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ZRO-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=100.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="hyperliquid",
+                symbol="ZRO",
+                fee_profile="tier0",
+                side="sell",
+                target_notional=100.0,
+            ),
+        ),
+    )
+    remaining_size = "71.2" if first_leg_state in {"unfilled", "open", "unknown"} else "35.6"
+    avg_fill_price = "" if first_leg_state in {"unfilled", "open", "unknown"} else "1.4007"
+    confirmation = PreviewConfirmationEntry(
+        entry_id=12,
+        confirmed_at=datetime(2026, 5, 2, 20, 1, tzinfo=UTC),
+        paper_trade_id=15,
+        label="zro_paradex_hyperliquid",
+        preview_hash="zro-preview-hash",
+        preview=PaperTradeOrderPreview(
+            paper_trade_id=15,
+            label="zro_paradex_hyperliquid",
+            generated_at=datetime(2026, 5, 2, 20, 0, tzinfo=UTC),
+            slippage_tolerance_bps=10,
+            preview_hash="zro-preview-hash",
+            legs=[
+                VenueOrderPreview(
+                    venue="paradex",
+                    symbol="ZRO-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=100.0,
+                    quantity=71.2,
+                    quantity_text="71.2",
+                    reference_price=1.4007,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=1.4021,
+                    worst_price_text="1.4021",
+                    endpoint_path_hint="/v1/orders",
+                    auth_scheme="main account address + subkey private key",
+                    payload={"market": "ZRO-USD-PERP"},
+                    notes=[],
+                ),
+                VenueOrderPreview(
+                    venue="hyperliquid",
+                    symbol="ZRO",
+                    fee_profile="tier0",
+                    side="sell",
+                    target_notional=100.0,
+                    quantity=71.4,
+                    quantity_text="71.4",
+                    reference_price=1.3992,
+                    reference_price_source="best_bid",
+                    worst_acceptable_price=1.3978,
+                    worst_price_text="1.3978",
+                    endpoint_path_hint="/exchange",
+                    auth_scheme="account address + API wallet private key",
+                    payload={"coin": "ZRO"},
+                    notes=[],
+                ),
+            ],
+        ),
+        note="operator confirmed",
+    )
+
+    class FirstLegNotFilledService:
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            if first_leg_state == "missing_observation":
+                response_payload: dict[str, Any] = {
+                    "id": "zro-paradex-order",
+                    "status": "submitted",
+                }
+            else:
+                response_payload = {
+                    "observed_order_state": {
+                        "derived_state": first_leg_state,
+                        "size": "71.2",
+                        "remaining_size": remaining_size,
+                        "avg_fill_price": avg_fill_price,
+                    },
+                    "attempt_history": [
+                        {
+                            "observed_order_state": {
+                                "derived_state": first_leg_state,
+                                "size": "71.2",
+                                "remaining_size": remaining_size,
+                                "avg_fill_price": avg_fill_price,
+                            }
+                        }
+                    ],
+                }
+            assert executed_at is not None
+            return ExecutionJournalEntry(
+                executed_at=executed_at,
+                adapter="paradex_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue="paradex",
+                        symbol="ZRO-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=100.0,
+                        status="submitted",
+                        simulated=False,
+                        external_reference="zro-paradex-order",
+                        response_payload=response_payload,
+                    )
+                ],
+            )
+
+    class SecondLegShouldNotRunService:
+        async def submit_confirmed_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: PreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            raise AssertionError("second venue must not be submitted without a full first fill")
+
+    async def run() -> None:
+        service = PairedLiveExecutionCoordinator(
+            services={
+                "paradex": FirstLegNotFilledService(),
+                "hyperliquid": SecondLegShouldNotRunService(),
+            }
+        )
+        entry = await service.submit_confirmed_preview(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+        )
+        assert entry.status == expected_status
+        assert entry.adapter == "paired_live:paradex_then_hyperliquid"
+        assert [leg.venue for leg in entry.legs] == ["paradex"]
+        response_payload = entry.legs[0].response_payload
+        assert isinstance(response_payload, dict)
+        if first_leg_state == "missing_observation":
+            assert "observed_order_state" not in response_payload
+        else:
+            observed_order_state = response_payload["observed_order_state"]
+            assert isinstance(observed_order_state, dict)
+            assert observed_order_state["derived_state"] == first_leg_state
+
+    asyncio.run(run())
+
+
+def test_observed_fill_state_logs_unexpected_derived_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="carryme_runtime.paired_live_execution")
+
+    state = _observed_fill_state({"derived_state": "filled_final", "raw": {"status": "done"}})
+
+    assert state == "unknown"
+    assert any(
+        "unexpected observed order derived_state='filled_final'" in record.message
+        for record in caplog.records
+    )
+
+
+def test_observed_fill_state_logs_malformed_payload_shape(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="carryme_runtime.paired_live_execution")
+
+    state = _observed_fill_state(["not", "a", "dict"])
+
+    assert state == "unknown"
+    assert any(
+        "malformed observed order state payload type=list" in record.message
+        for record in caplog.records
+    )
+
+
+def test_leg_observed_fill_state_logs_malformed_attempt_history(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="carryme_runtime.paired_live_execution")
+    leg = ExecutionLegResult(
+        venue="paradex",
+        symbol="ZRO-USD-PERP",
+        fee_profile="pro",
+        side="buy",
+        target_notional=100.0,
+        status="submitted",
+        simulated=False,
+        external_reference="zro-paradex-order",
+        response_payload={"attempt_history": {"bad": "shape"}},
+    )
+
+    state = PairedLiveExecutionCoordinator._leg_observed_fill_state(leg)
+
+    assert state == "unknown"
+    assert any("malformed attempt_history" in record.message for record in caplog.records)
 
 
 def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails() -> None:
@@ -9194,8 +9445,9 @@ def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails()
             confirmation: PreviewConfirmationEntry,
             executed_at: datetime | None = None,
         ) -> ExecutionJournalEntry:
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter="extended_live",
                 mode="live",
                 status="submitted",
@@ -9213,6 +9465,9 @@ def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails()
                         status="submitted",
                         simulated=False,
                         external_reference="extended-1",
+                        response_payload={
+                            "observed_order_state": {"derived_state": "filled"}
+                        },
                     )
                 ],
             )
@@ -9345,8 +9600,9 @@ def test_paired_live_execution_coordinator_supports_hyperliquid_leg() -> None:
             )
             fee_profile = "default" if self.venue == "extended" else "tier0"
             side: Literal["buy", "sell"] = "sell" if self.venue == "extended" else "buy"
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter=f"{self.venue}_live",
                 mode="live",
                 status="submitted",
@@ -9364,6 +9620,9 @@ def test_paired_live_execution_coordinator_supports_hyperliquid_leg() -> None:
                         status="submitted",
                         simulated=False,
                         external_reference=f"{self.venue}-1",
+                        response_payload={
+                            "observed_order_state": {"derived_state": "filled"}
+                        },
                     )
                 ],
             )
@@ -10240,6 +10499,57 @@ def test_hyperliquid_order_state_observer_classifies_filled_order(
         assert state.derived_state == "filled"
         assert state.order_status == "filled"
         assert state.avg_fill_price == "0.0923"
+        assert state.observation_source == "rest_poll"
+
+    asyncio.run(run())
+
+
+def test_hyperliquid_order_state_observer_classifies_nested_rest_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubInfo:
+        def query_order_by_oid(self, address: str, oid: int) -> dict[str, object]:
+            assert address == "0xhyper"
+            assert oid == 407816282189
+            return {
+                "status": "order",
+                "order": {
+                    "status": "filled",
+                    "statusTimestamp": 1770000000000,
+                    "order": {
+                        "coin": "ZRO",
+                        "side": "B",
+                        "limitPx": "1.4007",
+                        "origSz": "71.4",
+                        "sz": "0.0",
+                        "cloid": "0xabc",
+                    },
+                },
+            }
+
+    monkeypatch.setattr(
+        "carryme_runtime.execution_order_state.build_hyperliquid_info",
+        lambda: StubInfo(),
+    )
+
+    async def run() -> None:
+        observer = HyperliquidOrderStateObserver(
+            account_address="0xhyper",
+            websocket_timeout_seconds=0,
+        )
+        state = await observer.observe(
+            {
+                "venue": "hyperliquid",
+                "external_reference": "407816282189",
+                "request_payload": {},
+            }
+        )
+        assert state.supported is True
+        assert state.derived_state == "filled"
+        assert state.order_status == "filled"
+        assert state.remaining_size == "0.0"
+        assert state.size == "71.4"
+        assert state.client_id == "0xabc"
         assert state.observation_source == "rest_poll"
 
     asyncio.run(run())
@@ -14392,6 +14702,88 @@ def test_execution_accounting_service_summarizes_filled_attempt_history(tmp_path
     assert route_summaries[0].total_estimated_fee_paid == pytest.approx(
         summary.total_estimated_fee_paid
     )
+
+
+def test_execution_accounting_service_summarizes_hyperliquid_submission_fill(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+    paper_trade = PaperTradeEntry(
+        entry_id=12,
+        created_at=datetime(2026, 5, 2, 20, 0, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="zro_paradex_hyperliquid",
+            canonical_symbol="ZRO-USD-PERP",
+            source_recorded_at=datetime(2026, 5, 2, 19, 58, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.00055,
+            break_even_days_entry=0.45,
+            capacity_limit_notional=250.0,
+            target_notional=100.0,
+            capacity_fraction=0.25,
+            max_target_notional=100.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="ZRO-USD-PERP",
+                fee_profile="pro",
+                side="buy",
+                target_notional=100.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="hyperliquid",
+                symbol="ZRO",
+                fee_profile="tier0",
+                side="sell",
+                target_notional=100.0,
+            ),
+        ),
+    )
+    entry = ExecutionJournalEntry(
+        executed_at=datetime(2026, 5, 2, 20, 1, tzinfo=UTC),
+        adapter="hyperliquid_live",
+        mode="live",
+        status="submitted",
+        paper_trade_id=12,
+        paper_trade=paper_trade,
+        legs=[
+            ExecutionLegResult(
+                venue="hyperliquid",
+                symbol="ZRO",
+                fee_profile="tier0",
+                side="sell",
+                target_notional=100.0,
+                status="submitted",
+                simulated=False,
+                auth_usage="api_wallet",
+                response_payload={
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [
+                                {
+                                    "filled": {
+                                        "totalSz": "71.4",
+                                        "avgPx": "1.3992",
+                                        "oid": 407816217258,
+                                    }
+                                }
+                            ]
+                        },
+                    },
+                },
+            )
+        ],
+    )
+
+    service = ExecutionAccountingService(journal_store=store)
+    summary = service.summarize_entry(entry)
+
+    assert summary.filled_leg_count == 1
+    assert summary.legs[0].derived_fill_state == "filled"
+    assert summary.legs[0].filled_size == pytest.approx(71.4)
+    assert summary.legs[0].avg_fill_price == pytest.approx(1.3992)
+    assert summary.total_filled_notional == pytest.approx(71.4 * 1.3992)
+    assert summary.total_estimated_fee_paid == pytest.approx((71.4 * 1.3992) * 0.00045)
 
 
 def test_execution_accounting_service_infers_held_hedge_fill_from_observation(
