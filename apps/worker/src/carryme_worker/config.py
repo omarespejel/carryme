@@ -31,10 +31,13 @@ class WorkerSettings(BaseSettings):
     launch_ready_canary_max_backoff_seconds: int = Field(default=120, gt=0)
     stable_canary_launch_interval_seconds: int = Field(default=30, gt=0)
     stable_canary_launch_max_backoff_seconds: int = Field(default=300, gt=0)
+    stable_canary_launch_reservation_ttl_seconds: int = Field(default=300, gt=0)
+    stable_canary_launch_reservation_retention_seconds: int = Field(default=86_400, gt=0)
     # `0` is intentionally fail-closed: any active live execution blocks unattended launch.
     stable_canary_launch_max_active_live_executions: int = Field(default=0, ge=0)
     # Fetch enough rows to decide whether the blocking threshold is exceeded.
     stable_canary_launch_active_execution_limit: int = Field(default=20, gt=0)
+    stable_canary_launch_candidate_scan_limit: int = Field(default=100, gt=0)
     stable_canary_launch_max_total_live_notional: float | None = Field(
         default=None,
         ge=0,
@@ -391,6 +394,20 @@ class WorkerSettings(BaseSettings):
             raise ValueError(
                 "stable_canary_launch_recent_launch_window_seconds is required when "
                 "stable launch rate caps are configured"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_stable_launch_reservation_retention(self) -> "WorkerSettings":
+        """Keep reservation cleanup from deleting leases before they are stale."""
+
+        if (
+            self.stable_canary_launch_reservation_retention_seconds
+            < self.stable_canary_launch_reservation_ttl_seconds
+        ):
+            raise ValueError(
+                "stable_canary_launch_reservation_retention_seconds must be greater than "
+                "or equal to stable_canary_launch_reservation_ttl_seconds"
             )
         return self
 

@@ -7498,6 +7498,28 @@ def test_guarded_pair_close_endpoint_rejects_duplicate_retry(
             "auto_cleanup": "false",
         },
     )
+    original_confirmation = confirmation_store.find_latest_by_preview_hash(
+        paper_trade_id=paper_trade.entry_id or 0,
+        preview_hash="pair-close-hash",
+    )
+    assert original_confirmation is not None
+    with execution_store.database.begin() as connection:
+        connection.execute(
+            """
+            DELETE FROM pair_close_live_submission_reservations
+            WHERE paper_trade_id = ? AND preview_hash = ?
+            """,
+            (paper_trade.entry_id or 0, "pair-close-hash"),
+        )
+    confirmation_store.append(
+        original_confirmation.model_copy(
+            update={
+                "entry_id": None,
+                "confirmed_at": datetime(2026, 3, 29, 13, 11, tzinfo=UTC),
+                "note": "duplicate confirmation from parallel monitor",
+            }
+        )
+    )
     second = client.post(
         f"/v1/executions/live/pair/close/from-paper-trade/{paper_trade.entry_id}",
         params={
@@ -12626,6 +12648,16 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
         preview_hash=existing_cleanup.preview_hash,
         execution_entry_id=existing_cleanup_execution.entry_id,
     )
+    cleanup_confirmation_store.append(
+        CleanupPreviewConfirmationEntry(
+            confirmed_at=datetime(2026, 3, 29, 13, 17, tzinfo=UTC),
+            paper_trade_id=paper_trade.entry_id or 0,
+            label="arb_extended_paradex",
+            preview_hash=existing_cleanup.preview_hash,
+            preview=existing_cleanup.preview,
+            note="parallel monitor duplicate cleanup confirmation",
+        )
+    )
 
     class StubAccountPreflightService:
         def __init__(self) -> None:
@@ -12827,7 +12859,7 @@ def test_guarded_paired_live_execution_endpoint_returns_existing_cleanup_executi
     assert (
         "Existing cleanup execution reused for this confirmation" in payload["pair_status"]["notes"]
     )
-    assert len(cleanup_confirmation_store.list_recent(limit=10)) == 1
+    assert len(cleanup_confirmation_store.list_recent(limit=10)) == 2
     saved_executions = execution_store.list_recent(limit=10)
     assert len(saved_executions) == 2
     cleanup_entries = [
@@ -13055,6 +13087,20 @@ def test_guarded_paired_live_execution_endpoint_rejects_duplicate_retry(
             "poll_interval_seconds": 0,
             "auto_cleanup": "false",
         },
+    )
+    original_confirmation = confirmation_store.find_latest_by_preview_hash(
+        paper_trade_id=paper_trade.entry_id or 0,
+        preview_hash="preview-hash",
+    )
+    assert original_confirmation is not None
+    confirmation_store.append(
+        original_confirmation.model_copy(
+            update={
+                "entry_id": None,
+                "confirmed_at": datetime(2026, 3, 29, 13, 11, tzinfo=UTC),
+                "note": "duplicate confirmation from parallel launcher",
+            }
+        )
     )
     second = client.post(
         f"/v1/executions/live/pair/guarded/from-paper-trade/{paper_trade.entry_id}",

@@ -127,6 +127,35 @@ class LaunchReadyCanaryStore:
         snapshots = self.list_recent(limit=1, label=label)
         return snapshots[0] if snapshots else None
 
+    def list_recent_labels(self, *, limit: int = 50) -> list[str]:
+        """Return recent distinct labels ordered by latest snapshot timestamp."""
+
+        self.initialize()
+        with self.database.begin() as connection:
+            rows = connection.execute(
+                """
+                WITH ranked_snapshots AS (
+                    SELECT
+                        label,
+                        captured_at,
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY label
+                            ORDER BY captured_at DESC, id DESC
+                        ) AS row_number
+                    FROM launch_ready_canary_snapshots
+                )
+                SELECT label, captured_at AS latest_captured_at, id AS latest_id
+                FROM ranked_snapshots
+                WHERE row_number = 1
+                ORDER BY latest_captured_at DESC, latest_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        return [label for label, _, _ in rows]
+
     def delete_label(self, label: str) -> int:
         """Delete all launch-ready canary snapshots for one label."""
 

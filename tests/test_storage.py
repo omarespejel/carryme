@@ -801,6 +801,87 @@ def test_execution_journal_store_allows_same_confirmation_id_for_different_hashe
     )
 
 
+def test_execution_journal_store_reserves_pair_close_submission_once_per_trade(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=11,
+    )
+    assert not store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=12,
+    )
+    assert store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="next-pair-close-hash",
+        confirmation_entry_id=13,
+    )
+    assert store.reserve_pair_close_live_submission(
+        paper_trade_id=8,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=14,
+    )
+
+
+def test_execution_journal_store_reserves_pair_open_submission_once_per_trade(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_pair_open_live_submission(
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        confirmation_entry_id=11,
+    )
+    assert not store.reserve_pair_open_live_submission(
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        confirmation_entry_id=12,
+    )
+    assert store.reserve_pair_open_live_submission(
+        paper_trade_id=7,
+        preview_hash="next-preview-hash",
+        confirmation_entry_id=13,
+    )
+    assert store.reserve_pair_open_live_submission(
+        paper_trade_id=8,
+        preview_hash="preview-hash",
+        confirmation_entry_id=14,
+    )
+
+
+def test_execution_journal_store_reserves_cleanup_submission_once_per_trade(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_cleanup_live_submission(
+        paper_trade_id=7,
+        preview_hash="cleanup-hash",
+        confirmation_entry_id=11,
+    )
+    assert not store.reserve_cleanup_live_submission(
+        paper_trade_id=7,
+        preview_hash="cleanup-hash",
+        confirmation_entry_id=12,
+    )
+    assert store.reserve_cleanup_live_submission(
+        paper_trade_id=7,
+        preview_hash="next-cleanup-hash",
+        confirmation_entry_id=13,
+    )
+    assert store.reserve_cleanup_live_submission(
+        paper_trade_id=8,
+        preview_hash="cleanup-hash",
+        confirmation_entry_id=14,
+    )
+
+
 def test_execution_journal_store_finds_entry_by_confirmation_entry_id(tmp_path: Path) -> None:
     store = ExecutionJournalStore(tmp_path / "history.sqlite3")
     saved = store.append(
@@ -2741,6 +2822,107 @@ def test_launch_ready_canary_store_appends_and_lists_recent(tmp_path: Path) -> N
     assert latest.launch_ready_snapshot_id == results[0].launch_ready_snapshot_id
 
 
+def test_launch_ready_canary_store_lists_recent_labels_by_true_latest_row(
+    tmp_path: Path,
+) -> None:
+    approved_snapshot = ApprovedCanarySnapshot(
+        snapshot_id=7,
+        captured_at=datetime(2026, 3, 29, 14, 10, tzinfo=UTC),
+        label="arb_extended_paradex",
+        candidate=FundingUniverseCanaryCandidate(
+            opportunity=FundingUniverseOpportunity(
+                opportunity=FundingArbOpportunity(
+                    canonical_symbol="ARB-USD-PERP",
+                    long_venue="paradex",
+                    short_venue="extended",
+                    long_fee_profile="pro_fastfills",
+                    short_fee_profile="default",
+                    gross_daily_edge=0.004,
+                    entry_cost_rate=0.00045,
+                    round_trip_cost_rate=0.0009,
+                    one_day_net_edge_after_entry=0.00355,
+                    one_day_net_edge_after_round_trip=0.0031,
+                    break_even_days_entry=0.2,
+                    break_even_days_round_trip=0.3,
+                    capacity=CapacityEstimate(
+                        short_bid_notional=1400.0,
+                        long_ask_notional=900.0,
+                        max_entry_notional=900.0,
+                        limiting_venue="paradex",
+                    ),
+                ),
+                venue_markets={
+                    "extended": FundingUniverseVenueMarket(
+                        venue="extended",
+                        symbol="ARB-USD",
+                    ),
+                    "paradex": FundingUniverseVenueMarket(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                    ),
+                },
+                deployable_notional=900.0,
+                estimated_one_day_pnl_after_round_trip=2.79,
+            ),
+            suggested_canary_notional=11.0,
+        ),
+        approval=RouteApprovalEntry(
+            updated_at=datetime(2026, 3, 29, 14, 9, tzinfo=UTC),
+            label="arb_extended_paradex",
+            canonical_symbol="ARB-USD-PERP",
+            short_venue="extended",
+            long_venue="paradex",
+            short_fee_profile="default",
+            long_fee_profile="pro_fastfills",
+            approved=True,
+            max_live_notional=11.0,
+            note="approved canary",
+        ),
+    )
+    store = LaunchReadyCanaryStore(tmp_path / "history.sqlite3")
+
+    def append(label: str, captured_at: datetime) -> None:
+        store.append(
+            LaunchReadyCanarySnapshot(
+                captured_at=captured_at,
+                label=label,
+                max_snapshot_age_seconds=300,
+                approved_snapshot=approved_snapshot.model_copy(update={"label": label}),
+                system_state=PaperTradeSystemState(
+                    paper_trade_id=0,
+                    label=label,
+                    ready=True,
+                    venues=[
+                        VenueSystemState(
+                            venue="extended",
+                            enabled=True,
+                            checked=False,
+                            healthy=True,
+                            status=None,
+                        ),
+                        VenueSystemState(
+                            venue="paradex",
+                            enabled=True,
+                            checked=True,
+                            healthy=True,
+                            status="ok",
+                        ),
+                    ],
+                    blocking_reasons=[],
+                ),
+            )
+        )
+
+    append("arb_extended_paradex", datetime(2026, 3, 29, 14, 11, tzinfo=UTC))
+    append("bera_extended_paradex", datetime(2026, 3, 29, 14, 11, tzinfo=UTC))
+    append("arb_extended_paradex", datetime(2026, 3, 29, 14, 10, tzinfo=UTC))
+
+    assert store.list_recent_labels(limit=2) == [
+        "bera_extended_paradex",
+        "arb_extended_paradex",
+    ]
+
+
 def test_stable_canary_launch_store_appends_and_filters(tmp_path: Path) -> None:
     store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
     record = store.append(
@@ -2796,6 +2978,133 @@ def test_stable_canary_launch_store_filters_by_status(tmp_path: Path) -> None:
     assert len(results) == 1
     assert results[0].status == "launched"
     assert results[0].launch_ready_snapshot_id == 9
+
+
+def test_stable_canary_launch_store_reserves_snapshot_launch_once(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    first_reserved = store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+    )
+    second_reserved = store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=1),
+    )
+
+    assert first_reserved is True
+    assert second_reserved is False
+
+
+def test_stable_canary_launch_store_reclaims_stale_snapshot_launch_reservation(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+        max_age_seconds=60,
+    )
+    assert not store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=59),
+        max_age_seconds=60,
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=61),
+        max_age_seconds=60,
+    )
+
+
+def test_stable_canary_launch_store_rejects_lost_reservation_owner(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+        max_age_seconds=60,
+        owner_id="worker-a",
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=61),
+        max_age_seconds=60,
+        owner_id="worker-b",
+    )
+
+    assert not store.renew_snapshot_launch_reservation(
+        launch_ready_snapshot_id=9,
+        owner_id="worker-a",
+        reserved_at=reserved_at + timedelta(seconds=62),
+    )
+    assert store.renew_snapshot_launch_reservation(
+        launch_ready_snapshot_id=9,
+        owner_id="worker-b",
+        reserved_at=reserved_at + timedelta(seconds=63),
+    )
+
+
+def test_stable_canary_launch_store_cleans_abandoned_reservations(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+        owner_id="worker-a",
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=10,
+        label="bera_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=10),
+        owner_id="worker-b",
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=11,
+        label="near_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=100),
+        max_age_seconds=30,
+        retention_seconds=60,
+        owner_id="worker-c",
+    )
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=101),
+        owner_id="worker-d",
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=10,
+        label="bera_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=102),
+        owner_id="worker-e",
+    )
+    assert not store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=11,
+        label="near_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=103),
+        owner_id="worker-f",
+    )
 
 
 def test_approved_canary_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:

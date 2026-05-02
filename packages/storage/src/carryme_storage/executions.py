@@ -153,6 +153,60 @@ class ExecutionJournalStore:
                     ON live_submission_reservations(confirmation_entry_id)
                     """
                 )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pair_open_live_submission_reservations (
+                        paper_trade_id INTEGER NOT NULL,
+                        preview_hash TEXT NOT NULL,
+                        confirmation_entry_id INTEGER NOT NULL,
+                        execution_entry_id INTEGER,
+                        PRIMARY KEY (paper_trade_id, preview_hash)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    idx_pair_open_live_submission_reservations_confirmation_entry_id
+                    ON pair_open_live_submission_reservations(confirmation_entry_id)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pair_close_live_submission_reservations (
+                        paper_trade_id INTEGER NOT NULL,
+                        preview_hash TEXT NOT NULL,
+                        confirmation_entry_id INTEGER NOT NULL,
+                        execution_entry_id INTEGER,
+                        PRIMARY KEY (paper_trade_id, preview_hash)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    idx_pair_close_live_submission_reservations_confirmation_entry_id
+                    ON pair_close_live_submission_reservations(confirmation_entry_id)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cleanup_live_submission_reservations (
+                        paper_trade_id INTEGER NOT NULL,
+                        preview_hash TEXT NOT NULL,
+                        confirmation_entry_id INTEGER NOT NULL,
+                        execution_entry_id INTEGER,
+                        PRIMARY KEY (paper_trade_id, preview_hash)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    idx_cleanup_live_submission_reservations_confirmation_entry_id
+                    ON cleanup_live_submission_reservations(confirmation_entry_id)
+                    """
+                )
             self._initialized = True
 
     def append(self, entry: ExecutionJournalEntry) -> ExecutionJournalEntry:
@@ -260,6 +314,218 @@ class ExecutionJournalStore:
                 """,
                 (execution_entry_id, confirmation_entry_id, normalized_preview_hash),
             )
+
+    def reserve_pair_open_live_submission(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+        confirmation_entry_id: int,
+    ) -> bool:
+        """Reserve a paired-open live submission for one trade and preview hash."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        if confirmation_entry_id < 1:
+            raise ValueError("confirmation_entry_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        with self.database.begin() as connection:
+            result = connection.execute(
+                """
+                INSERT INTO pair_open_live_submission_reservations (
+                    paper_trade_id,
+                    preview_hash,
+                    confirmation_entry_id
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(paper_trade_id, preview_hash) DO NOTHING
+                """,
+                (paper_trade_id, normalized_preview_hash, confirmation_entry_id),
+            )
+        rowcount = getattr(result, "rowcount", None)
+        return isinstance(rowcount, int) and rowcount > 0
+
+    def mark_pair_open_live_submission_completed(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+        execution_entry_id: int,
+    ) -> None:
+        """Attach the execution journal id to a paired-open live submission reservation."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        if execution_entry_id < 1:
+            raise ValueError("execution_entry_id must be positive")
+        with self.database.begin() as connection:
+            connection.execute(
+                """
+                UPDATE pair_open_live_submission_reservations
+                SET execution_entry_id = ?
+                WHERE paper_trade_id = ? AND preview_hash = ?
+                """,
+                (execution_entry_id, paper_trade_id, normalized_preview_hash),
+            )
+
+    def reserve_pair_close_live_submission(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+        confirmation_entry_id: int,
+    ) -> bool:
+        """Reserve a pair-close live submission for one trade and preview hash."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        if confirmation_entry_id < 1:
+            raise ValueError("confirmation_entry_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        with self.database.begin() as connection:
+            result = connection.execute(
+                """
+                INSERT INTO pair_close_live_submission_reservations (
+                    paper_trade_id,
+                    preview_hash,
+                    confirmation_entry_id
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(paper_trade_id, preview_hash) DO NOTHING
+                """,
+                (paper_trade_id, normalized_preview_hash, confirmation_entry_id),
+            )
+        rowcount = getattr(result, "rowcount", None)
+        return isinstance(rowcount, int) and rowcount > 0
+
+    def mark_pair_close_live_submission_completed(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+        execution_entry_id: int,
+    ) -> None:
+        """Attach the execution journal id to a pair-close live submission reservation."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        if execution_entry_id < 1:
+            raise ValueError("execution_entry_id must be positive")
+        with self.database.begin() as connection:
+            connection.execute(
+                """
+                UPDATE pair_close_live_submission_reservations
+                SET execution_entry_id = ?
+                WHERE paper_trade_id = ? AND preview_hash = ?
+                """,
+                (execution_entry_id, paper_trade_id, normalized_preview_hash),
+            )
+
+    def reserve_cleanup_live_submission(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+        confirmation_entry_id: int,
+    ) -> bool:
+        """Reserve a cleanup live submission for one trade and preview hash."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        if confirmation_entry_id < 1:
+            raise ValueError("confirmation_entry_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        with self.database.begin() as connection:
+            result = connection.execute(
+                """
+                INSERT INTO cleanup_live_submission_reservations (
+                    paper_trade_id,
+                    preview_hash,
+                    confirmation_entry_id
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(paper_trade_id, preview_hash) DO NOTHING
+                """,
+                (paper_trade_id, normalized_preview_hash, confirmation_entry_id),
+            )
+        rowcount = getattr(result, "rowcount", None)
+        return isinstance(rowcount, int) and rowcount > 0
+
+    def mark_cleanup_live_submission_completed(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+        execution_entry_id: int,
+    ) -> None:
+        """Attach the execution journal id to a cleanup live submission reservation."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        if execution_entry_id < 1:
+            raise ValueError("execution_entry_id must be positive")
+        with self.database.begin() as connection:
+            connection.execute(
+                """
+                UPDATE cleanup_live_submission_reservations
+                SET execution_entry_id = ?
+                WHERE paper_trade_id = ? AND preview_hash = ?
+                """,
+                (execution_entry_id, paper_trade_id, normalized_preview_hash),
+            )
+
+    def find_by_paper_trade_preview_hash(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+    ) -> ExecutionJournalEntry | None:
+        """Return the most recent execution for one paper trade and preview hash."""
+
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        self.initialize()
+        with self.database.begin() as connection:
+            row = connection.execute(
+                """
+                SELECT id, entry_json
+                FROM execution_journal_entries
+                WHERE paper_trade_id = ? AND preview_hash = ?
+                ORDER BY executed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (paper_trade_id, normalized_preview_hash),
+            ).fetchone()
+        if row is None:
+            return None
+        stored_id, entry_json = row
+        return ExecutionJournalEntry.model_validate(
+            {
+                **json.loads(entry_json),
+                "entry_id": stored_id,
+            }
+        )
 
     def find_by_confirmation(
         self,
