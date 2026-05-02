@@ -3251,14 +3251,12 @@ def _list_recent_live_executions_for_automation_readiness(
     selected: list[ExecutionJournalEntry] = []
 
     while len(selected) < limit:
-        batch = execution_store.list_recent(limit=page_size, offset=offset)
+        batch = execution_store.list_recent_active_live(limit=page_size, offset=offset)
         if not batch:
             break
         offset += len(batch)
 
         for execution in batch:
-            if execution.mode != "live" or execution.status not in {"submitted", "partial"}:
-                continue
             age_seconds = (now - execution.executed_at).total_seconds()
             if age_seconds > max_age_seconds and not _execution_requires_continued_monitoring(
                 observation_store,

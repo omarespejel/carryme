@@ -7852,6 +7852,17 @@ def test_launch_latest_stable_canary_once_counts_beyond_active_execution_scan_li
         )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
+        def reject_full_journal_scan(
+            self: ExecutionJournalStore,
+            *,
+            limit: int = 50,
+            label: str | None = None,
+            offset: int = 0,
+        ) -> list[ExecutionJournalEntry]:
+            del self, limit, label, offset
+            raise AssertionError("stable launch must not scan the full journal")
+
+        monkeypatch.setattr(ExecutionJournalStore, "list_recent", reject_full_journal_scan)
         monkeypatch.setattr(
             "carryme_worker.poller._build_launch_ready_canary_stability",
             lambda **_: (_ for _ in ()).throw(

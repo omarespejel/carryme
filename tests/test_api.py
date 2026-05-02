@@ -2499,6 +2499,18 @@ def test_production_automation_readiness_endpoint_counts_beyond_scan_window(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "readiness-scan-window.sqlite3"
+
+    class ActiveLiveOnlyExecutionJournalStore(ExecutionJournalStore):
+        def list_recent(
+            self,
+            *,
+            limit: int = 50,
+            label: str | None = None,
+            offset: int = 0,
+        ) -> list[ExecutionJournalEntry]:
+            del limit, label, offset
+            raise AssertionError("automation readiness must not scan the full journal")
+
     approved_store = ApprovedCanaryStore(database_path)
     launch_ready_store = LaunchReadyCanaryStore(database_path)
     stable_launch_store = StableCanaryLaunchStore(database_path)
@@ -2617,7 +2629,9 @@ def test_production_automation_readiness_endpoint_counts_beyond_scan_window(
     app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
     app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
     app.dependency_overrides[get_stable_canary_launch_store] = lambda: stable_launch_store
-    app.dependency_overrides[get_execution_journal_store] = lambda: execution_store
+    app.dependency_overrides[get_execution_journal_store] = (
+        lambda: ActiveLiveOnlyExecutionJournalStore(database_path)
+    )
     app.dependency_overrides[get_execution_observation_store] = lambda: observation_store
     app.dependency_overrides[get_automation_readiness_checked_at] = (
         lambda: datetime(2026, 3, 29, 16, 1, 10, tzinfo=UTC)
