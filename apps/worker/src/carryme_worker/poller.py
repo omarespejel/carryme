@@ -1310,24 +1310,62 @@ def _launch_ready_snapshot_payload_changed(
 def _normalized_launch_ready_snapshot_payload(
     snapshot: LaunchReadyCanarySnapshot,
 ) -> dict[str, object]:
-    """Return a stable, order-insensitive payload for one launch-ready snapshot."""
+    """Return the stable launch envelope for one launch-ready snapshot.
 
-    payload = snapshot.model_dump(
-        mode="python",
-        exclude={
-            "launch_ready_snapshot_id": True,
-            "captured_at": True,
-            "approved_snapshot": {"snapshot_id", "captured_at"},
+    The approved snapshot is repriced every scan. Stability should reset when the
+    route, live-readiness, or notional envelope changes, not when normal market
+    edge/PnL fields move inside a snapshot that has already passed launch-ready
+    gates.
+    """
+
+    approved_snapshot = snapshot.approved_snapshot
+    candidate = approved_snapshot.candidate
+    opportunity = candidate.opportunity.opportunity
+    approval = approved_snapshot.approval
+    venue_markets = candidate.opportunity.venue_markets
+    return {
+        "label": snapshot.label,
+        "max_snapshot_age_seconds": snapshot.max_snapshot_age_seconds,
+        "suggested_canary_notional": candidate.suggested_canary_notional,
+        "route": {
+            "canonical_symbol": opportunity.canonical_symbol,
+            "long_venue": opportunity.long_venue,
+            "short_venue": opportunity.short_venue,
+            "long_fee_profile": opportunity.long_fee_profile,
+            "short_fee_profile": opportunity.short_fee_profile,
+            "venue_markets": tuple(
+                sorted(
+                    (venue, market.symbol)
+                    for venue, market in venue_markets.items()
+                )
+            ),
         },
-    )
-    system_state = cast(dict[str, object] | None, payload.get("system_state"))
-    if isinstance(system_state, dict):
-        venues = system_state.get("venues")
-        if isinstance(venues, list):
-            system_state["venues"] = sorted(
-                venues,
-                key=lambda venue: str(cast(dict[str, object], venue)["venue"]),
-            )
+        "approval": {
+            "label": approval.label,
+            "canonical_symbol": approval.canonical_symbol,
+            "short_venue": approval.short_venue,
+            "long_venue": approval.long_venue,
+            "short_fee_profile": approval.short_fee_profile,
+            "long_fee_profile": approval.long_fee_profile,
+            "approved": approval.approved,
+            "max_live_notional": approval.max_live_notional,
+        },
+        "system_state": _normalized_launch_ready_system_state_payload(snapshot.system_state),
+    }
+
+
+def _normalized_launch_ready_system_state_payload(
+    system_state: PaperTradeSystemState,
+) -> dict[str, object]:
+    """Return an order-insensitive system-state payload for stability checks."""
+
+    payload = system_state.model_dump(mode="python")
+    venues = payload.get("venues")
+    if isinstance(venues, list):
+        payload["venues"] = sorted(
+            venues,
+            key=lambda venue: str(cast(dict[str, object], venue)["venue"]),
+        )
     return payload
 
 

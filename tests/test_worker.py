@@ -5009,6 +5009,68 @@ def test_list_ranked_stable_launch_ready_stabilities_uses_distinct_label_scan_li
     }
 
 
+def test_list_ranked_stable_launch_ready_stabilities_tolerates_repriced_same_route(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    _, _, first_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="s_extended_paradex",
+        canonical_symbol="S-USD-PERP",
+        short_symbol="S-USD",
+        long_symbol="S-USD-PERP",
+        approved_snapshot_id=18215,
+        estimated_one_day_pnl_after_round_trip=0.2863,
+    )
+    _, _, second_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="s_extended_paradex",
+        canonical_symbol="S-USD-PERP",
+        short_symbol="S-USD",
+        long_symbol="S-USD-PERP",
+        approved_snapshot_id=18219,
+        estimated_one_day_pnl_after_round_trip=0.2851,
+    )
+    second_snapshot.approved_snapshot.candidate.opportunity.opportunity.one_day_net_edge_after_round_trip = (  # noqa: E501
+        0.00305
+    )
+    first_approved = approved_store.append(first_snapshot.approved_snapshot)
+    second_approved = approved_store.append(second_snapshot.approved_snapshot)
+    launch_ready_store.append(
+        first_snapshot.model_copy(
+            update={
+                "launch_ready_snapshot_id": None,
+                "captured_at": datetime(2026, 5, 2, 1, 25, 55, tzinfo=UTC),
+                "approved_snapshot": first_approved,
+            }
+        )
+    )
+    latest = launch_ready_store.append(
+        second_snapshot.model_copy(
+            update={
+                "launch_ready_snapshot_id": None,
+                "captured_at": datetime(2026, 5, 2, 1, 26, 35, tzinfo=UTC),
+                "approved_snapshot": second_approved,
+            }
+        )
+    )
+
+    stabilities, detail = _list_ranked_stable_launch_ready_stabilities(
+        store=launch_ready_store,
+        max_snapshot_age_seconds=300,
+        min_snapshot_count=2,
+        min_stable_seconds=30.0,
+        now=datetime(2026, 5, 2, 1, 26, 45, tzinfo=UTC),
+        scan_limit=2,
+    )
+
+    assert detail is None
+    assert len(stabilities) == 1
+    assert stabilities[0].snapshot.launch_ready_snapshot_id == latest.launch_ready_snapshot_id
+    assert stabilities[0].consecutive_snapshots == 2
+    assert stabilities[0].stable_seconds == 40.0
+
+
 def test_launch_latest_stable_canary_once_honors_candidate_scan_limit(
     tmp_path: Path,
 ) -> None:
