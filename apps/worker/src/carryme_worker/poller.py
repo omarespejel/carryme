@@ -4464,6 +4464,7 @@ async def observe_live_executions_once(
         limit=settings.execution_observation_limit,
         now=timestamp,
         max_age_seconds=settings.execution_observation_max_age_seconds,
+        unobserved_requires_monitoring=True,
     )
 
     scanned_executions = 0
