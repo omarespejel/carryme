@@ -2679,6 +2679,31 @@ def test_execution_observation_store_filters_by_paper_trade_id(tmp_path: Path) -
     assert latest_for_trade.entry_id == latest.entry_id
 
 
+def test_execution_observation_store_initializes_latest_lookup_index(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionObservationStore(tmp_path / "history.sqlite3")
+
+    store.initialize()
+
+    with store.database.begin() as connection:
+        rows = connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = ? AND name = ?
+            """,
+            (
+                "index",
+                "idx_execution_observation_entries_paper_trade_latest",
+            ),
+        ).fetchall()
+
+    assert [str(row[0]) for row in rows] == [
+        "idx_execution_observation_entries_paper_trade_latest"
+    ]
+
+
 def test_execution_observation_store_latest_with_pair_status_for_paper_trade(
     tmp_path: Path,
 ) -> None:
