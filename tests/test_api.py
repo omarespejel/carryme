@@ -1753,6 +1753,13 @@ def test_latest_stable_launch_ready_canary_snapshot_endpoint_returns_stability(
         ),
     )
     store = LaunchReadyCanaryStore(tmp_path / "history.sqlite3")
+    repriced_approved_snapshot = approved_snapshot.model_copy(deep=True)
+    repriced_approved_snapshot.snapshot_id = 5
+    repriced_approved_snapshot.captured_at = datetime(2026, 3, 29, 16, 7, tzinfo=UTC)
+    repriced_approved_snapshot.candidate.opportunity.estimated_one_day_pnl_after_round_trip = 2.65
+    repriced_approved_snapshot.candidate.opportunity.opportunity.one_day_net_edge_after_round_trip = (  # noqa: E501
+        0.0029
+    )
     store.append(
         LaunchReadyCanarySnapshot(
             captured_at=datetime(2026, 3, 29, 16, 7, tzinfo=UTC),
@@ -1788,7 +1795,7 @@ def test_latest_stable_launch_ready_canary_snapshot_endpoint_returns_stability(
             captured_at=datetime(2026, 3, 29, 16, 8, tzinfo=UTC),
             label="arb_extended_paradex",
             max_snapshot_age_seconds=100000000,
-            approved_snapshot=approved_snapshot,
+            approved_snapshot=repriced_approved_snapshot,
             system_state=PaperTradeSystemState(
                 paper_trade_id=0,
                 label="arb_extended_paradex",
