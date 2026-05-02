@@ -403,6 +403,7 @@ def _list_blocking_live_executions_for_stable_launch(
         limit=scan_limit,
         now=now,
         max_age_seconds=settings.execution_observation_max_age_seconds,
+        unobserved_requires_monitoring=True,
     )
     for execution in recent_live_executions:
         paper_trade_id = execution.paper_trade_id
@@ -4464,6 +4465,7 @@ async def observe_live_executions_once(
         limit=settings.execution_observation_limit,
         now=timestamp,
         max_age_seconds=settings.execution_observation_max_age_seconds,
+        unobserved_requires_monitoring=True,
     )
 
     scanned_executions = 0
