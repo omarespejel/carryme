@@ -69,7 +69,6 @@ from carryme_storage import (
     SystemStateAlertStore,
 )
 from carryme_storage.db import DatabaseConnection, redact_database_url
-from carryme_storage.launch_ready_canaries import MAX_RECENT_LABEL_LIMIT
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
     build_approved_canary_scan_loop_payload,
@@ -358,7 +357,6 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.execution_auto_pair_close_timeout_seconds == 30.0
     assert settings.stable_canary_launch_shadow_mode is False
     assert settings.stable_canary_launch_close_position is True
-    assert settings.stable_canary_launch_reservation_retention_seconds == 86_400
     assert settings.stable_launch_ready_min_edge_retention_ratio == 0.7
     assert settings.stable_launch_ready_max_entry_break_even_funding_windows == 6.0
     assert settings.stable_launch_ready_max_round_trip_break_even_funding_windows == 12.0
@@ -392,19 +390,6 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.database_path == "data/carryme.sqlite3"
     assert Path(settings.watchlist_path).is_file()
     assert settings.watchlist_path.endswith("config/watchlists/default.json")
-
-
-def test_worker_rejects_stable_canary_launch_candidate_scan_limit_above_max(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_worker_env(monkeypatch)
-    monkeypatch.setenv(
-        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_CANDIDATE_SCAN_LIMIT",
-        str(MAX_RECENT_LABEL_LIMIT + 1),
-    )
-
-    with pytest.raises(ValidationError, match="stable_canary_launch_candidate_scan_limit"):
-        WorkerSettings()
 
 
 def test_worker_env_can_disable_stable_launch_immediate_close(
@@ -4588,6 +4573,33 @@ def _build_stable_launch_test_snapshot(
     return approval, candidate, snapshot, stability
 
 
+def _append_stable_launch_ready_pair(
+    store: LaunchReadyCanaryStore,
+    snapshot: LaunchReadyCanarySnapshot,
+    approved_snapshot: ApprovedCanarySnapshot,
+    first_captured_at: datetime,
+    second_captured_at: datetime,
+) -> LaunchReadyCanarySnapshot:
+    store.append(
+        snapshot.model_copy(
+            update={
+                "launch_ready_snapshot_id": None,
+                "captured_at": first_captured_at,
+                "approved_snapshot": approved_snapshot,
+            }
+        )
+    )
+    return store.append(
+        snapshot.model_copy(
+            update={
+                "launch_ready_snapshot_id": None,
+                "captured_at": second_captured_at,
+                "approved_snapshot": approved_snapshot,
+            }
+        )
+    )
+
+
 def test_launch_latest_stable_canary_once_skips_when_no_stable_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -4626,38 +4638,15 @@ def test_launch_latest_stable_canary_once_ranks_stable_labels_independently(
     route_approval_store.upsert(low_approval)
     route_approval_store.upsert(high_approval)
 
-    def append_launch_ready_pair(
-        snapshot: LaunchReadyCanarySnapshot,
-        approved_snapshot: ApprovedCanarySnapshot,
-        first_captured_at: datetime,
-        second_captured_at: datetime,
-    ) -> LaunchReadyCanarySnapshot:
-        launch_ready_store.append(
-            snapshot.model_copy(
-                update={
-                    "launch_ready_snapshot_id": None,
-                    "captured_at": first_captured_at,
-                    "approved_snapshot": approved_snapshot,
-                }
-            )
-        )
-        return launch_ready_store.append(
-            snapshot.model_copy(
-                update={
-                    "launch_ready_snapshot_id": None,
-                    "captured_at": second_captured_at,
-                    "approved_snapshot": approved_snapshot,
-                }
-            )
-        )
-
-    high_launch_ready = append_launch_ready_pair(
+    high_launch_ready = _append_stable_launch_ready_pair(
+        launch_ready_store,
         high_snapshot,
         high_approved,
         datetime(2026, 4, 4, 10, 0, 0, tzinfo=UTC),
         datetime(2026, 4, 4, 10, 1, 0, tzinfo=UTC),
     )
-    latest_low = append_launch_ready_pair(
+    latest_low = _append_stable_launch_ready_pair(
+        launch_ready_store,
         low_snapshot,
         low_approved,
         datetime(2026, 4, 4, 10, 0, 10, tzinfo=UTC),
@@ -5275,6 +5264,162 @@ def test_launch_latest_stable_canary_once_skips_when_selected_snapshot_lacks_rev
     )
 
 
+def test_launch_latest_stable_canary_once_falls_through_label_cooldown(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_label_cooldown_seconds=300,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    high_approval, _, high_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="bera_extended_paradex",
+        canonical_symbol="BERA-USD-PERP",
+        short_symbol="BERA-USD",
+        long_symbol="BERA-USD-PERP",
+        launch_ready_snapshot_id=29,
+        approved_snapshot_id=28,
+        estimated_one_day_pnl_after_round_trip=3.0,
+    )
+    fallback_approval, _, fallback_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        short_symbol="ARB-USD",
+        long_symbol="ARB-USD-PERP",
+        launch_ready_snapshot_id=39,
+        approved_snapshot_id=38,
+        estimated_one_day_pnl_after_round_trip=1.5,
+    )
+    high_approved = approved_store.append(high_snapshot.approved_snapshot)
+    fallback_approved = approved_store.append(fallback_snapshot.approved_snapshot)
+    route_approval_store.upsert(high_approval)
+    route_approval_store.upsert(fallback_approval)
+    latest_high = _append_stable_launch_ready_pair(
+        launch_ready_store,
+        high_snapshot,
+        high_approved,
+        datetime(2026, 4, 4, 10, 0, 0, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 1, 0, tzinfo=UTC),
+    )
+    latest_fallback = _append_stable_launch_ready_pair(
+        launch_ready_store,
+        fallback_snapshot,
+        fallback_approved,
+        datetime(2026, 4, 4, 10, 0, 10, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 1, 10, tzinfo=UTC),
+    )
+    launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+            status="launched",
+            label="bera_extended_paradex",
+            launch_ready_snapshot_id=latest_high.launch_ready_snapshot_id or 0,
+            approved_snapshot_id=high_approved.snapshot_id or 0,
+            paper_trade_id=88,
+            final_pair_state="closed",
+        )
+    )
+    captured_labels: list[str] = []
+
+    class StubLifecycleResult:
+        def __init__(self, label: str) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=47,
+                created_at=datetime(2026, 4, 4, 10, 1, 20, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label=label,
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00355,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=900.0,
+                    target_notional=20.0,
+                    capacity_fraction=20.0 / 900.0,
+                    max_target_notional=20.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=20.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=20.0,
+                    ),
+                ),
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=41,
+                paper_trade_id=47,
+                preview_hash="preview",
+                derived_state="closed",
+                recommended_action="no_action",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=41,
+                    paper_trade_id=47,
+                    preview_hash="preview",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=41,
+                    paper_trade_id=47,
+                    preview_hash="preview",
+                    status="accepted",
+                    recommended_action="no_action",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        captured_labels.append(approval.label)
+        return StubLifecycleResult(approval.label)
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                launch_store=launch_store,
+                approved_store=approved_store,
+                now=datetime(2026, 4, 4, 10, 1, 30, tzinfo=UTC),
+            )
+        )
+
+    assert latest_fallback.label == "arb_extended_paradex"
+    assert summary.status == "launched"
+    assert summary.label == "arb_extended_paradex"
+    assert summary.launch_ready_snapshot_id == latest_fallback.launch_ready_snapshot_id
+    assert captured_labels == ["arb_extended_paradex"]
+
+
 def test_launch_latest_stable_canary_once_falls_through_reserved_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -5396,6 +5541,230 @@ def test_launch_latest_stable_canary_once_falls_through_reserved_snapshot(
     assert summary.label == "arb_extended_paradex"
     assert summary.launch_ready_snapshot_id == fallback_snapshot.launch_ready_snapshot_id
     assert captured_labels == ["arb_extended_paradex"]
+
+
+def test_launch_latest_stable_canary_once_falls_through_lifecycle_404(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    high_approval, _, high_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="bera_extended_paradex",
+        canonical_symbol="BERA-USD-PERP",
+        short_symbol="BERA-USD",
+        long_symbol="BERA-USD-PERP",
+        launch_ready_snapshot_id=51,
+        approved_snapshot_id=50,
+        estimated_one_day_pnl_after_round_trip=3.0,
+    )
+    fallback_approval, _, fallback_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        short_symbol="ARB-USD",
+        long_symbol="ARB-USD-PERP",
+        launch_ready_snapshot_id=61,
+        approved_snapshot_id=60,
+        estimated_one_day_pnl_after_round_trip=1.5,
+    )
+    high_approved = approved_store.append(high_snapshot.approved_snapshot)
+    fallback_approved = approved_store.append(fallback_snapshot.approved_snapshot)
+    route_approval_store.upsert(high_approval)
+    route_approval_store.upsert(fallback_approval)
+    latest_high = _append_stable_launch_ready_pair(
+        launch_ready_store,
+        high_snapshot,
+        high_approved,
+        datetime(2026, 4, 4, 10, 0, 0, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 1, 0, tzinfo=UTC),
+    )
+    latest_fallback = _append_stable_launch_ready_pair(
+        launch_ready_store,
+        fallback_snapshot,
+        fallback_approved,
+        datetime(2026, 4, 4, 10, 0, 10, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 1, 10, tzinfo=UTC),
+    )
+    captured_labels: list[str] = []
+
+    class StubLifecycleResult:
+        def __init__(self, label: str) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=57,
+                created_at=datetime(2026, 4, 4, 10, 1, 20, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label=label,
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00355,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=900.0,
+                    target_notional=20.0,
+                    capacity_fraction=20.0 / 900.0,
+                    max_target_notional=20.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=20.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=20.0,
+                    ),
+                ),
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=51,
+                paper_trade_id=57,
+                preview_hash="preview-404-fallback",
+                derived_state="closed",
+                recommended_action="no_action",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=51,
+                    paper_trade_id=57,
+                    preview_hash="preview-404-fallback",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=51,
+                    paper_trade_id=57,
+                    preview_hash="preview-404-fallback",
+                    status="accepted",
+                    recommended_action="no_action",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        captured_labels.append(approval.label)
+        if approval.label == "bera_extended_paradex":
+            raise HTTPException(status_code=404, detail="top candidate invalidated during launch")
+        return StubLifecycleResult(approval.label)
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                approved_store=approved_store,
+                now=datetime(2026, 4, 4, 10, 1, 30, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.label == "arb_extended_paradex"
+    assert summary.launch_ready_snapshot_id == latest_fallback.launch_ready_snapshot_id
+    assert captured_labels == ["bera_extended_paradex", "arb_extended_paradex"]
+    assert latest_high.label == "bera_extended_paradex"
+
+
+def test_launch_latest_stable_canary_once_stops_after_lifecycle_409(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    high_approval, _, high_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="bera_extended_paradex",
+        canonical_symbol="BERA-USD-PERP",
+        short_symbol="BERA-USD",
+        long_symbol="BERA-USD-PERP",
+        launch_ready_snapshot_id=71,
+        approved_snapshot_id=70,
+        estimated_one_day_pnl_after_round_trip=3.0,
+    )
+    fallback_approval, _, fallback_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        canonical_symbol="ARB-USD-PERP",
+        short_symbol="ARB-USD",
+        long_symbol="ARB-USD-PERP",
+        launch_ready_snapshot_id=81,
+        approved_snapshot_id=80,
+        estimated_one_day_pnl_after_round_trip=1.5,
+    )
+    high_approved = approved_store.append(high_snapshot.approved_snapshot)
+    fallback_approved = approved_store.append(fallback_snapshot.approved_snapshot)
+    route_approval_store.upsert(high_approval)
+    route_approval_store.upsert(fallback_approval)
+    latest_high = _append_stable_launch_ready_pair(
+        launch_ready_store,
+        high_snapshot,
+        high_approved,
+        datetime(2026, 4, 4, 10, 0, 0, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 1, 0, tzinfo=UTC),
+    )
+    _append_stable_launch_ready_pair(
+        launch_ready_store,
+        fallback_snapshot,
+        fallback_approved,
+        datetime(2026, 4, 4, 10, 0, 10, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 1, 10, tzinfo=UTC),
+    )
+    captured_labels: list[str] = []
+
+    async def run_stub_lifecycle(**kwargs: object) -> Any:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        captured_labels.append(approval.label)
+        raise HTTPException(status_code=409, detail="top candidate reserved conflicting artifacts")
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                approved_store=approved_store,
+                now=datetime(2026, 4, 4, 10, 1, 30, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.label == "bera_extended_paradex"
+    assert summary.launch_ready_snapshot_id == latest_high.launch_ready_snapshot_id
+    assert summary.detail == "top candidate reserved conflicting artifacts"
+    assert captured_labels == ["bera_extended_paradex"]
 
 
 def test_launch_latest_stable_canary_once_skips_when_global_cooldown_active(
@@ -6959,56 +7328,6 @@ def test_launch_latest_stable_canary_once_skips_when_recent_live_trade_is_unobse
         "Active live executions still require monitoring before unattended launch "
         "(max_allowed=0, current=1): "
         "paper_trade_id=32 label=jup_extended_paradex "
-        "state=pending_initial_monitoring"
-    )
-
-
-def test_launch_latest_stable_canary_once_blocks_stale_unobserved_live_trade(
-    tmp_path: Path,
-) -> None:
-    settings = WorkerSettings(
-        database_path=str(tmp_path / "history.sqlite3"),
-        execution_observation_max_age_seconds=600,
-    )
-    execution_store = ExecutionJournalStore(settings.database_path)
-    execution_store.append(
-        ExecutionJournalEntry(
-            executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
-            adapter="paired_live:extended_then_paradex",
-            mode="live",
-            status="submitted",
-            paper_trade_id=33,
-            preview_hash="stale-unobserved-live-preview",
-            confirmation_entry_id=43,
-            paper_trade=_build_auto_close_paper_trade(
-                entry_id=33,
-                created_at=datetime(2026, 4, 4, 9, 58, tzinfo=UTC),
-                label="jup_extended_paradex",
-                canonical_symbol="JUP-USD-PERP",
-            ),
-            legs=[_build_auto_close_execution_leg()],
-        )
-    )
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(
-            "carryme_worker.poller._build_launch_ready_canary_stability",
-            lambda **_: (_ for _ in ()).throw(
-                AssertionError("stale unobserved live submissions must block launch")
-            ),
-        )
-        summary = asyncio.run(
-            launch_latest_stable_canary_once(
-                settings,
-                now=datetime(2026, 4, 4, 10, 20, 1, tzinfo=UTC),
-            )
-        )
-
-    assert summary.status == "skipped"
-    assert summary.detail == (
-        "Active live executions still require monitoring before unattended launch "
-        "(max_allowed=0, current=1): "
-        "paper_trade_id=33 label=jup_extended_paradex "
         "state=pending_initial_monitoring"
     )
 
@@ -8960,196 +9279,6 @@ def test_launch_latest_stable_canary_once_returns_launched_summary(
     assert launch_records[0].launch_ready_snapshot_id == 9
 
 
-def test_launch_latest_stable_canary_once_reclaims_stale_snapshot_reservation(
-    tmp_path: Path,
-) -> None:
-    settings = WorkerSettings(
-        database_path=str(tmp_path / "history.sqlite3"),
-        stable_canary_launch_reservation_ttl_seconds=60,
-        extended_live_enabled=True,
-        extended_api_key="extended-key",
-        extended_stark_private_key="extended-secret",
-        paradex_live_enabled=True,
-        paradex_account_address="0x123",
-        paradex_private_key="0x456",
-    )
-    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
-        label="arb_extended_paradex",
-        launch_ready_snapshot_id=9,
-        approved_snapshot_id=8,
-        suggested_canary_notional=11.0,
-    )
-    approved_store = ApprovedCanaryStore(settings.database_path)
-    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
-    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
-    stability = stability.model_copy(update={"snapshot": snapshot})
-    launch_store = StableCanaryLaunchStore(settings.database_path)
-    now = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
-    assert launch_store.reserve_snapshot_launch(
-        launch_ready_snapshot_id=9,
-        label="arb_extended_paradex",
-        reserved_at=now - timedelta(seconds=61),
-        max_age_seconds=60,
-    )
-
-    class StubLifecycleResult:
-        def __init__(self) -> None:
-            self.paper_trade = PaperTradeEntry(
-                entry_id=17,
-                created_at=now,
-                intent=FundingPairTradeIntent(
-                    label="arb_extended_paradex",
-                    canonical_symbol="ARB-USD-PERP",
-                    source_recorded_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
-                    one_day_net_edge_after_entry=0.00355,
-                    break_even_days_entry=0.2,
-                    capacity_limit_notional=900.0,
-                    target_notional=11.0,
-                    capacity_fraction=11.0 / 900.0,
-                    max_target_notional=11.0,
-                    long_leg=TradeLegIntent(
-                        venue="paradex",
-                        symbol="ARB-USD-PERP",
-                        fee_profile="pro_fastfills",
-                        side="buy",
-                        target_notional=11.0,
-                    ),
-                    short_leg=TradeLegIntent(
-                        venue="extended",
-                        symbol="ARB-USD",
-                        fee_profile="default",
-                        side="sell",
-                        target_notional=11.0,
-                    ),
-                ),
-                note="worker launch",
-            )
-            self.final_pair_status = ExecutionPairStatus(
-                execution_entry_id=31,
-                paper_trade_id=17,
-                preview_hash="preview",
-                derived_state="closed",
-                recommended_action="no_action",
-                order_state=ExecutionOrderState(
-                    execution_entry_id=31,
-                    paper_trade_id=17,
-                    preview_hash="preview",
-                    legs=[],
-                    notes=[],
-                ),
-                reconciliation=ExecutionReconciliation(
-                    execution_entry_id=31,
-                    paper_trade_id=17,
-                    preview_hash="preview",
-                    status="accepted",
-                    recommended_action="no_action",
-                    matched_all_leg_symbols=True,
-                    venues=[],
-                    notes=[],
-                ),
-                notes=[],
-            )
-
-    async def run_stub_lifecycle(**_: object) -> StubLifecycleResult:
-        return StubLifecycleResult()
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(
-            "carryme_worker.poller._build_launch_ready_canary_stability",
-            lambda **_: stability,
-        )
-        monkeypatch.setattr(
-            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
-            lambda **_: (snapshot, candidate, approval),
-        )
-        monkeypatch.setattr(
-            "carryme_worker.poller._run_guarded_canary_lifecycle",
-            run_stub_lifecycle,
-        )
-        summary = asyncio.run(
-            launch_latest_stable_canary_once(
-                settings,
-                launch_store=launch_store,
-                approved_store=approved_store,
-                now=now,
-            )
-        )
-
-    assert summary.status == "launched"
-    assert summary.label == "arb_extended_paradex"
-    assert summary.launch_ready_snapshot_id == 9
-    assert summary.paper_trade_id == 17
-
-
-def test_launch_latest_stable_canary_once_aborts_when_reservation_owner_is_lost(
-    tmp_path: Path,
-) -> None:
-    settings = WorkerSettings(
-        database_path=str(tmp_path / "history.sqlite3"),
-        stable_canary_launch_reservation_ttl_seconds=60,
-        extended_live_enabled=True,
-        extended_api_key="extended-key",
-        extended_stark_private_key="extended-secret",
-        paradex_live_enabled=True,
-        paradex_account_address="0x123",
-        paradex_private_key="0x456",
-    )
-    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
-        label="arb_extended_paradex",
-        launch_ready_snapshot_id=9,
-        approved_snapshot_id=8,
-        suggested_canary_notional=11.0,
-    )
-    approved_store = ApprovedCanaryStore(settings.database_path)
-    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
-    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
-    stability = stability.model_copy(update={"snapshot": snapshot})
-    launch_store = StableCanaryLaunchStore(settings.database_path)
-    now = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
-
-    async def run_stub_lifecycle(**kwargs: object) -> object:
-        before_open_submission = cast(Any, kwargs["before_open_submission"])
-        assert launch_store.reserve_snapshot_launch(
-            launch_ready_snapshot_id=9,
-            label="arb_extended_paradex",
-            reserved_at=now + timedelta(seconds=61),
-            max_age_seconds=60,
-            owner_id="stealing-worker",
-        )
-        await before_open_submission()
-        pytest.fail("lost reservation ownership must block before live submission")
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(
-            "carryme_worker.poller._build_launch_ready_canary_stability",
-            lambda **_: stability,
-        )
-        monkeypatch.setattr(
-            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
-            lambda **_: (snapshot, candidate, approval),
-        )
-        monkeypatch.setattr(
-            "carryme_worker.poller._run_guarded_canary_lifecycle",
-            run_stub_lifecycle,
-        )
-        summary = asyncio.run(
-            launch_latest_stable_canary_once(
-                settings,
-                launch_store=launch_store,
-                approved_store=approved_store,
-                now=now,
-            )
-        )
-
-    assert summary.status == "skipped"
-    assert summary.label == "arb_extended_paradex"
-    assert summary.launch_ready_snapshot_id == 9
-    assert summary.detail == (
-        "Stable launch reservation ownership was lost before live submission"
-    )
-    assert launch_store.list_recent(limit=10) == []
-
-
 @pytest.mark.parametrize(
     ("settings_kwargs", "expected_detail"),
     (
@@ -9165,45 +9294,6 @@ def test_launch_latest_stable_canary_once_aborts_when_reservation_owner_is_lost(
             },
             "Stable launch hold mode is blocked because "
             "execution_auto_pair_close_shadow_mode is true",
-        ),
-        (
-            {
-                "execution_auto_pair_close_enabled": True,
-                "execution_auto_pair_close_shadow_mode": False,
-            },
-            "Stable launch hold mode is blocked because "
-            "execution_auto_pair_close_min_profit_total_collateral is unset",
-        ),
-        (
-            {
-                "execution_auto_pair_close_enabled": True,
-                "execution_auto_pair_close_shadow_mode": False,
-                "execution_auto_pair_close_min_profit_total_collateral": 0.5,
-            },
-            "Stable launch hold mode is blocked because "
-            "execution_auto_pair_close_max_profit_giveback_ratio is unset",
-        ),
-        (
-            {
-                "execution_auto_pair_close_enabled": True,
-                "execution_auto_pair_close_shadow_mode": False,
-                "execution_auto_pair_close_min_profit_total_collateral": 0.5,
-                "execution_auto_pair_close_max_profit_giveback_ratio": 0.4,
-                "execution_balance_checkpoint_enabled": False,
-            },
-            "Stable launch hold mode is blocked because "
-            "execution_balance_checkpoint_enabled is false",
-        ),
-        (
-            {
-                "execution_auto_pair_close_enabled": True,
-                "execution_auto_pair_close_shadow_mode": False,
-                "execution_auto_pair_close_min_profit_total_collateral": 0.5,
-                "execution_auto_pair_close_max_profit_giveback_ratio": 1.0,
-                "execution_balance_checkpoint_enabled": True,
-            },
-            "Stable launch hold mode is blocked because "
-            "execution_auto_pair_close_max_profit_giveback_ratio must satisfy 0 < ratio < 1",
         ),
     ),
 )
@@ -9261,8 +9351,6 @@ def test_launch_latest_stable_canary_once_can_hold_when_auto_close_is_live(
         stable_canary_launch_close_position=False,
         execution_auto_pair_close_enabled=True,
         execution_auto_pair_close_shadow_mode=False,
-        execution_auto_pair_close_min_profit_total_collateral=0.5,
-        execution_auto_pair_close_max_profit_giveback_ratio=0.4,
         extended_live_enabled=True,
         extended_api_key="extended-key",
         extended_stark_private_key="extended-secret",
@@ -11706,152 +11794,6 @@ def test_maybe_auto_close_open_hedged_execution_skips_when_stale_snapshot_cannot
         )
 
     assert result is None
-
-
-def test_maybe_auto_close_open_hedged_execution_uses_stale_snapshot_for_max_hold(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    settings = WorkerSettings(
-        database_path=str(tmp_path / "history.sqlite3"),
-        execution_auto_pair_close_shadow_mode=True,
-        execution_auto_pair_close_max_snapshot_age_seconds=300,
-        execution_auto_pair_close_max_hold_windows=0.01,
-    )
-    approval_store = ApprovedCanaryStore(settings.database_path)
-    approval_store.append(
-        _build_auto_close_snapshot(
-            captured_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
-            round_trip_edge=0.0009,
-        )
-    )
-    execution = ExecutionJournalEntry(
-        executed_at=datetime(2026, 4, 4, 9, 0, tzinfo=UTC),
-        adapter="paired_live:extended_then_paradex",
-        mode="live",
-        status="submitted",
-        paper_trade_id=27,
-        preview_hash="stale-max-hold-preview",
-        confirmation_entry_id=27,
-        paper_trade=_build_auto_close_paper_trade(
-            entry_id=27,
-            created_at=datetime(2026, 4, 4, 8, 58, tzinfo=UTC),
-        ),
-        legs=[_build_auto_close_execution_leg()],
-    )
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        async def missing_live_revalidation(
-            **_: object,
-        ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
-            return None, 0
-
-        monkeypatch.setattr(
-            "carryme_worker.poller.scan_live_route_candidate_for_approval",
-            missing_live_revalidation,
-        )
-        monkeypatch.setattr(
-            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
-            lambda **_: (_ for _ in ()).throw(
-                AssertionError("shadow mode should not build a close context")
-            ),
-        )
-        caplog.set_level(logging.INFO)
-        result = asyncio.run(
-            _maybe_auto_close_open_hedged_execution(
-                settings=settings,
-                execution=execution,
-                pair_status=_build_auto_close_pair_status(execution=execution),
-                approved_store=approval_store,
-                execution_store=ExecutionJournalStore(settings.database_path),
-                observation_store=ExecutionObservationStore(settings.database_path),
-                account_service=cast(AccountPreflightService, object()),
-                order_state_service=cast(ExecutionOrderStateService, object()),
-                approval_service=RouteApprovalService(
-                    store=RouteApprovalStore(settings.database_path)
-                ),
-                scanner=cast(Any, object()),
-                logger=logging.getLogger("carryme.worker"),
-                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
-            )
-        )
-
-    assert result is None
-    assert "shadow auto-close for paper_trade_id=27" in caplog.text
-    assert "hold age windows" in caplog.text
-    assert "source=stale_approved_snapshot" in caplog.text
-
-
-def test_maybe_auto_close_open_hedged_execution_does_not_use_stale_edge_decay(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    settings = WorkerSettings(
-        database_path=str(tmp_path / "history.sqlite3"),
-        execution_auto_pair_close_shadow_mode=True,
-        execution_auto_pair_close_max_snapshot_age_seconds=300,
-        execution_auto_pair_close_max_hold_windows=10.0,
-    )
-    approval_store = ApprovedCanaryStore(settings.database_path)
-    approval_store.append(
-        _build_auto_close_snapshot(
-            captured_at=datetime(2026, 4, 4, 8, 0, tzinfo=UTC),
-            round_trip_edge=-0.0001,
-        )
-    )
-    execution = ExecutionJournalEntry(
-        executed_at=datetime(2026, 4, 4, 9, 55, tzinfo=UTC),
-        adapter="paired_live:extended_then_paradex",
-        mode="live",
-        status="submitted",
-        paper_trade_id=28,
-        preview_hash="stale-edge-preview",
-        confirmation_entry_id=28,
-        paper_trade=_build_auto_close_paper_trade(
-            entry_id=28,
-            created_at=datetime(2026, 4, 4, 9, 54, tzinfo=UTC),
-        ),
-        legs=[_build_auto_close_execution_leg()],
-    )
-
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        async def missing_live_revalidation(
-            **_: object,
-        ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
-            return None, 0
-
-        monkeypatch.setattr(
-            "carryme_worker.poller.scan_live_route_candidate_for_approval",
-            missing_live_revalidation,
-        )
-        monkeypatch.setattr(
-            "carryme_worker.poller._build_pair_close_context_for_paper_trade",
-            lambda **_: (_ for _ in ()).throw(
-                AssertionError("stale edge data must not build a close context")
-            ),
-        )
-        caplog.set_level(logging.INFO)
-        result = asyncio.run(
-            _maybe_auto_close_open_hedged_execution(
-                settings=settings,
-                execution=execution,
-                pair_status=_build_auto_close_pair_status(execution=execution),
-                approved_store=approval_store,
-                execution_store=ExecutionJournalStore(settings.database_path),
-                observation_store=ExecutionObservationStore(settings.database_path),
-                account_service=cast(AccountPreflightService, object()),
-                order_state_service=cast(ExecutionOrderStateService, object()),
-                approval_service=RouteApprovalService(
-                    store=RouteApprovalStore(settings.database_path)
-                ),
-                scanner=cast(Any, object()),
-                logger=logging.getLogger("carryme.worker"),
-                now=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
-            )
-        )
-
-    assert result is None
-    assert "shadow auto-close for paper_trade_id=28" not in caplog.text
 
 
 def test_maybe_auto_close_open_hedged_execution_revalidates_without_active_approval(
