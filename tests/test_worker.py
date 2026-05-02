@@ -15,7 +15,9 @@ from carryme_models import (
     ApprovedCanarySnapshot,
     CandidateAlertEvent,
     CapacityEstimate,
+    CleanupPreviewConfirmationEntry,
     ExecutionAlertEvent,
+    ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionLegOrderState,
     ExecutionLegResult,
@@ -45,6 +47,7 @@ from carryme_models import (
     TradeLegIntent,
     VenueAccountPreflight,
     VenueBalanceSnapshot,
+    VenueOrderPreview,
     VenueSystemState,
 )
 from carryme_runtime import (
@@ -58,6 +61,7 @@ from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
     BalanceSnapshotStore,
+    CleanupPreviewConfirmationStore,
     ExecutionAlertStore,
     ExecutionJournalStore,
     ExecutionObservationStore,
@@ -128,6 +132,7 @@ from carryme_worker.poller import (
     _build_stable_launch_loss_circuit_breaker_reason,
     _execution_requires_continued_monitoring,
     _list_ranked_stable_launch_ready_stabilities,
+    _maybe_auto_cleanup_partial_fill_execution,
     _maybe_auto_close_open_hedged_execution,
     _probe_candidate_system_state,
     _with_current_execution_quality,
@@ -11315,6 +11320,420 @@ def _build_auto_close_execution_leg() -> ExecutionLegResult:
         simulated=False,
         external_reference="ext-order-auto-close",
     )
+
+
+def _build_partial_fill_cleanup_execution() -> ExecutionJournalEntry:
+    paper_trade = _build_auto_close_paper_trade(
+        entry_id=31,
+        created_at=datetime(2026, 4, 5, 10, 0, tzinfo=UTC),
+    )
+    return ExecutionJournalEntry(
+        entry_id=101,
+        executed_at=datetime(2026, 4, 5, 10, 1, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=31,
+        preview_hash="partial-entry-preview",
+        confirmation_entry_id=31,
+        paper_trade=paper_trade,
+        legs=[
+            ExecutionLegResult(
+                venue="extended",
+                symbol="JUP-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="extended-entry",
+            ),
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="JUP-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+                external_reference="paradex-entry",
+            ),
+        ],
+    )
+
+
+def _build_partial_fill_cleanup_pair_status(
+    execution: ExecutionJournalEntry,
+) -> ExecutionPairStatus:
+    return ExecutionPairStatus(
+        execution_entry_id=execution.entry_id,
+        paper_trade_id=execution.paper_trade_id,
+        preview_hash=execution.preview_hash,
+        derived_state="cleanup_needed",
+        recommended_action="manual_review_required",
+        order_state=ExecutionOrderState(
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=execution.paper_trade_id,
+            preview_hash=execution.preview_hash,
+            legs=[
+                ExecutionLegOrderState(
+                    venue="extended",
+                    supported=True,
+                    derived_state="filled",
+                    external_reference="extended-entry",
+                ),
+                ExecutionLegOrderState(
+                    venue="paradex",
+                    supported=True,
+                    derived_state="partial_fill",
+                    external_reference="paradex-entry",
+                ),
+            ],
+            notes=[],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=execution.paper_trade_id,
+            preview_hash=execution.preview_hash,
+            status="submitted",
+            recommended_action="monitor_open_hedge",
+            matched_all_leg_symbols=True,
+            venues=[
+                ExecutionVenueReconciliation(
+                    venue="extended",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=["JUP-USD"],
+                    matched_leg_symbols=["JUP-USD"],
+                    unmatched_leg_symbols=[],
+                ),
+                ExecutionVenueReconciliation(
+                    venue="paradex",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=["JUP-USD-PERP"],
+                    matched_leg_symbols=["JUP-USD-PERP"],
+                    unmatched_leg_symbols=[],
+                ),
+            ],
+            notes=[],
+        ),
+        notes=["At least one leg is partially filled; do not assume the pair is hedged."],
+    )
+
+
+def test_maybe_auto_cleanup_partial_fill_execution_flattens_each_open_route_leg(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=True,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    confirmation_store = CleanupPreviewConfirmationStore(settings.database_path)
+    execution = execution_store.append(_build_partial_fill_cleanup_execution())
+    pair_status = _build_partial_fill_cleanup_pair_status(execution)
+    submitted_venues: list[str] = []
+    now = datetime(2026, 4, 5, 10, 2, tzinfo=UTC)
+
+    class FakeCleanupPreviewRouter:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int,
+        ) -> ExecutionCleanupPreview:
+            _ = slippage_tolerance_bps
+            open_venues = [
+                venue
+                for venue in pair_status.reconciliation.venues
+                if venue.position_symbols
+            ]
+            assert len(open_venues) == 1
+            target_venue = open_venues[0].venue
+            target_leg = next(leg for leg in entry.legs if leg.venue == target_venue)
+            target_notional = 70.0 if target_venue == "extended" else 25.0
+            side = "buy" if target_leg.side == "sell" else "sell"
+            return ExecutionCleanupPreview(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                generated_at=datetime(2026, 4, 5, 10, 2, tzinfo=UTC),
+                preview_hash=f"{target_venue}-cleanup-preview",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue=target_venue,
+                    symbol=target_leg.symbol,
+                    fee_profile=target_leg.fee_profile,
+                    side=cast(Literal["buy", "sell"], side),
+                    target_notional=target_notional,
+                    effective_notional=target_notional,
+                    quantity=1.0,
+                    quantity_text="1",
+                    reference_price=1.0,
+                    reference_price_source="best_ask" if side == "buy" else "best_bid",
+                    worst_acceptable_price=1.0,
+                    worst_price_text="1",
+                    reduce_only=True,
+                    endpoint_path_hint="/orders",
+                    auth_scheme="test",
+                    payload={"reduce_only": True},
+                ),
+            )
+
+    class FakeCleanupLiveRouter:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            _ = executed_at
+            leg = confirmation.preview.leg
+            submitted_venues.append(leg.venue)
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 4, 5, 10, 3, tzinfo=UTC),
+                adapter=f"{leg.venue}_cleanup_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue=leg.venue,
+                        symbol=leg.symbol,
+                        fee_profile=leg.fee_profile,
+                        side=leg.side,
+                        target_notional=leg.target_notional,
+                        status="submitted",
+                        simulated=False,
+                        external_reference=f"{leg.venue}-cleanup-order",
+                        request_payload=leg.payload,
+                    )
+                ],
+            )
+
+    async def fake_resolve_snapshot(**_: object) -> tuple[ApprovedCanarySnapshot, str]:
+        return (
+            _build_auto_close_snapshot(captured_at=datetime(2026, 4, 5, 10, 1, tzinfo=UTC)),
+            "approved_snapshot",
+        )
+
+    async def fake_observe_pair_status(**_: object) -> ExecutionPairStatus:
+        return pair_status
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._resolve_auto_close_snapshot",
+            fake_resolve_snapshot,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_preview_router_for_candidate",
+            lambda *args, **kwargs: FakeCleanupPreviewRouter(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_live_execution_router_for_candidate",
+            lambda *args, **kwargs: FakeCleanupLiveRouter(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._observe_pair_status_for_execution",
+            fake_observe_pair_status,
+        )
+        result = asyncio.run(
+            _maybe_auto_cleanup_partial_fill_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=pair_status,
+                approved_store=ApprovedCanaryStore(settings.database_path),
+                execution_store=execution_store,
+                observation_store=observation_store,
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                logger=logging.getLogger("test"),
+                now=now,
+            )
+        )
+
+    assert [entry.legs[0].venue for entry in result] == ["extended", "paradex"]
+    assert submitted_venues == ["extended", "paradex"]
+    assert [entry.adapter for entry in result] == [
+        "extended_cleanup_live",
+        "paradex_cleanup_live",
+    ]
+    assert all(entry.entry_id is not None for entry in result)
+    assert all(entry.confirmation_entry_id is not None for entry in result)
+    confirmations = confirmation_store.list_recent(paper_trade_id=31)
+    assert len(confirmations) == 2
+    assert {entry.confirmed_at for entry in confirmations} == {now}
+
+
+def test_maybe_auto_cleanup_partial_fill_execution_skips_pending_reservation(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=True,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    confirmation_store = CleanupPreviewConfirmationStore(settings.database_path)
+    execution = execution_store.append(_build_partial_fill_cleanup_execution())
+    pair_status = _build_partial_fill_cleanup_pair_status(execution).model_copy(
+        update={
+            "reconciliation": _build_partial_fill_cleanup_pair_status(
+                execution
+            ).reconciliation.model_copy(
+                update={
+                    "venues": [
+                        ExecutionVenueReconciliation(
+                            venue="extended",
+                            authenticated=True,
+                            ready=True,
+                            position_symbols=["JUP-PERP"],
+                            matched_leg_symbols=["JUP-USD"],
+                            unmatched_leg_symbols=[],
+                        ),
+                        ExecutionVenueReconciliation(
+                            venue="paradex",
+                            authenticated=True,
+                            ready=True,
+                            position_symbols=[],
+                            matched_leg_symbols=[],
+                            unmatched_leg_symbols=["JUP-USD-PERP"],
+                        ),
+                    ]
+                }
+            )
+        }
+    )
+    execution_store.reserve_cleanup_live_submission(
+        paper_trade_id=31,
+        preview_hash="extended-cleanup-preview",
+        confirmation_entry_id=99,
+    )
+
+    class FakeCleanupPreviewRouter:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int,
+        ) -> ExecutionCleanupPreview:
+            _ = pair_status, slippage_tolerance_bps
+            leg = next(result for result in entry.legs if result.venue == "extended")
+            return ExecutionCleanupPreview(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                generated_at=datetime(2026, 4, 5, 10, 2, tzinfo=UTC),
+                preview_hash="extended-cleanup-preview",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue="extended",
+                    symbol=leg.symbol,
+                    fee_profile=leg.fee_profile,
+                    side="buy",
+                    target_notional=70.0,
+                    effective_notional=70.0,
+                    quantity=1.0,
+                    quantity_text="1",
+                    reference_price=1.0,
+                    reference_price_source="best_ask",
+                    worst_acceptable_price=1.0,
+                    worst_price_text="1",
+                    reduce_only=True,
+                    endpoint_path_hint="/orders",
+                    auth_scheme="test",
+                    payload={"reduce_only": True},
+                ),
+            )
+
+    async def fake_resolve_snapshot(**_: object) -> tuple[ApprovedCanarySnapshot, str]:
+        return (
+            _build_auto_close_snapshot(captured_at=datetime(2026, 4, 5, 10, 1, tzinfo=UTC)),
+            "approved_snapshot",
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._resolve_auto_close_snapshot",
+            fake_resolve_snapshot,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_preview_router_for_candidate",
+            lambda *args, **kwargs: FakeCleanupPreviewRouter(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_live_execution_router_for_candidate",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("pending reservation must block live cleanup submission")
+            ),
+        )
+        caplog.set_level(logging.WARNING)
+        result = asyncio.run(
+            _maybe_auto_cleanup_partial_fill_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=pair_status,
+                approved_store=ApprovedCanaryStore(settings.database_path),
+                execution_store=execution_store,
+                observation_store=observation_store,
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                logger=logging.getLogger("test"),
+                now=datetime(2026, 4, 5, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert result == []
+    assert confirmation_store.list_recent(paper_trade_id=31) == []
+    assert "reserved but not journaled" in caplog.text
+
+
+def test_maybe_auto_cleanup_partial_fill_execution_shadow_mode_does_not_submit(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=False,
+        execution_auto_pair_close_shadow_mode=True,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution = execution_store.append(_build_partial_fill_cleanup_execution())
+    pair_status = _build_partial_fill_cleanup_pair_status(execution)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_live_execution_router_for_candidate",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("shadow partial-fill cleanup must not submit live orders")
+            ),
+        )
+        caplog.set_level(logging.INFO)
+        result = asyncio.run(
+            _maybe_auto_cleanup_partial_fill_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=pair_status,
+                approved_store=ApprovedCanaryStore(settings.database_path),
+                execution_store=execution_store,
+                observation_store=observation_store,
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                logger=logging.getLogger("test"),
+                now=datetime(2026, 4, 5, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert result == []
+    assert "shadow partial-fill cleanup for paper_trade_id=31" in caplog.text
 
 
 def test_launch_latest_stable_canary_once_shadow_mode_skips_live_submission(

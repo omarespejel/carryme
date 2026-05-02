@@ -23,6 +23,10 @@ from carryme_api.app import (
     _build_pair_close_preview_service_for_candidate,
     _build_paired_live_execution_coordinator_for_candidate,
     _execute_guarded_pair_close_from_confirmation,
+    _mark_cleanup_live_submission_completed,
+    _observe_pair_status_for_execution,
+    _release_cleanup_live_submission_reservations,
+    _reserve_cleanup_live_submission_or_existing,
     _run_guarded_canary_lifecycle,
     _select_latest_launch_ready_canary_snapshot,
 )
@@ -35,7 +39,9 @@ from carryme_models import (
     ApprovedCanarySnapshot,
     CanaryLifecycleResult,
     CandidateAlertEvent,
+    CleanupPreviewConfirmationEntry,
     ExecutionAlertEvent,
+    ExecutionCleanupPreview,
     ExecutionJournalEntry,
     ExecutionObservationEntry,
     ExecutionPairStatus,
@@ -2018,6 +2024,286 @@ def _maybe_capture_open_hedge_funding_checkpoint(
             hold_window_hours=hold_window_hours,
         ),
     )
+
+
+def _route_position_venues_for_cleanup(
+    *,
+    execution: ExecutionJournalEntry,
+    pair_status: ExecutionPairStatus,
+) -> list[str]:
+    """Return route venues that currently show an open position."""
+
+    route_legs = [
+        execution.paper_trade.intent.long_leg,
+        execution.paper_trade.intent.short_leg,
+    ]
+    matched_symbols_by_venue: dict[str, set[str]] = {}
+    for venue in pair_status.reconciliation.venues:
+        # Reconciliation is the source of truth when present. Fall back to exact
+        # raw symbols only for legacy/partial observations that did not populate
+        # matched or unmatched route-leg symbols.
+        if venue.matched_leg_symbols or venue.unmatched_leg_symbols:
+            matched_symbols_by_venue[venue.venue] = set(venue.matched_leg_symbols)
+        else:
+            matched_symbols_by_venue[venue.venue] = set(venue.position_symbols)
+    venues: list[str] = []
+    for leg in route_legs:
+        if leg.venue in venues:
+            continue
+        venue_matches = matched_symbols_by_venue.get(leg.venue, set())
+        if leg.symbol in venue_matches:
+            venues.append(leg.venue)
+    return venues
+
+
+def _scoped_pair_status_for_cleanup_venue(
+    pair_status: ExecutionPairStatus,
+    *,
+    venue_name: str,
+) -> ExecutionPairStatus:
+    """Scope a multi-position partial-fill status to one venue cleanup preview."""
+
+    scoped_venues = []
+    for venue in pair_status.reconciliation.venues:
+        keep_venue = venue.venue == venue_name
+        scoped_venues.append(
+            venue.model_copy(
+                update={
+                    "position_symbols": venue.position_symbols if keep_venue else [],
+                    "matched_leg_symbols": venue.matched_leg_symbols if keep_venue else [],
+                    "unmatched_leg_symbols": [],
+                }
+            )
+        )
+    reconciliation = pair_status.reconciliation.model_copy(
+        update={
+            "recommended_action": "close_open_leg",
+            "venues": scoped_venues,
+        }
+    )
+    return pair_status.model_copy(
+        update={
+            "recommended_action": "close_open_leg",
+            "reconciliation": reconciliation,
+        }
+    )
+
+
+async def _maybe_auto_cleanup_partial_fill_execution(
+    *,
+    settings: WorkerSettings,
+    execution: ExecutionJournalEntry,
+    pair_status: ExecutionPairStatus,
+    approved_store: ApprovedCanaryStore,
+    execution_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    account_service: AccountPreflightService,
+    order_state_service: ExecutionOrderStateService,
+    approval_service: RouteApprovalService | None = None,
+    scanner: OpportunityUniverseService | None = None,
+    logger: logging.Logger,
+    now: datetime,
+) -> list[ExecutionJournalEntry]:
+    """Flatten live route exposure after a partial fill makes the hedge unsafe."""
+
+    if (
+        not settings.execution_auto_pair_close_enabled
+        and not settings.execution_auto_pair_close_shadow_mode
+    ):
+        return []
+    if pair_status.derived_state != "cleanup_needed":
+        return []
+    if not any(leg.derived_state == "partial_fill" for leg in pair_status.order_state.legs):
+        return []
+
+    paper_trade = execution.paper_trade
+    if paper_trade is None or paper_trade.entry_id is None:
+        return []
+
+    cleanup_venues = _route_position_venues_for_cleanup(
+        execution=execution,
+        pair_status=pair_status,
+    )
+    if not cleanup_venues:
+        return []
+
+    if settings.execution_auto_pair_close_shadow_mode:
+        logger.info(
+            "shadow partial-fill cleanup for paper_trade_id=%s venues=%s",
+            paper_trade.entry_id,
+            ",".join(cleanup_venues),
+        )
+        return []
+
+    latest_snapshot, snapshot_source = await _resolve_auto_close_snapshot(
+        settings=settings,
+        execution=execution,
+        approved_store=approved_store,
+        approval_service=approval_service,
+        scanner=scanner,
+        logger=logger,
+        now=now,
+    )
+    if latest_snapshot is None:
+        logger.warning(
+            "skipping partial-fill cleanup for paper_trade_id=%s because no route snapshot "
+            "could be resolved",
+            paper_trade.entry_id,
+        )
+        return []
+
+    api_settings = _build_api_settings_from_worker_settings(settings)
+    cleanup_preview_service = _build_cleanup_preview_router_for_candidate(
+        api_settings,
+        latest_snapshot.candidate,
+    )
+    confirmation_store = CleanupPreviewConfirmationStore(api_settings.database_path)
+
+    cleanup_previews: list[ExecutionCleanupPreview] = []
+    for venue_name in cleanup_venues:
+        try:
+            async with asyncio.timeout(settings.execution_auto_pair_close_timeout_seconds):
+                cleanup_previews.append(
+                    await cleanup_preview_service.preview_from_execution(
+                        entry=execution,
+                        pair_status=_scoped_pair_status_for_cleanup_venue(
+                            pair_status,
+                            venue_name=venue_name,
+                        ),
+                        slippage_tolerance_bps=25,
+                    )
+                )
+        except TimeoutError:
+            logger.warning(
+                (
+                    "timed out building partial-fill cleanup preview for paper_trade_id=%s "
+                    "venue=%s after %.1f seconds"
+                ),
+                paper_trade.entry_id,
+                venue_name,
+                settings.execution_auto_pair_close_timeout_seconds,
+            )
+            continue
+    # If a later cleanup fails, closing the largest leg first leaves less net exposure.
+    cleanup_previews.sort(key=lambda preview: preview.leg.target_notional, reverse=True)
+
+    saved_entries: list[ExecutionJournalEntry] = []
+    cleanup_live_router = None
+    for cleanup_preview in cleanup_previews:
+        existing_entry = execution_store.find_by_paper_trade_preview_hash(
+            paper_trade_id=paper_trade.entry_id,
+            preview_hash=cleanup_preview.preview_hash,
+        )
+        if existing_entry is not None:
+            saved_entries.append(existing_entry)
+            continue
+        if execution_store.has_pending_cleanup_live_submission(
+            paper_trade_id=paper_trade.entry_id,
+            preview_hash=cleanup_preview.preview_hash,
+        ):
+            logger.warning(
+                (
+                    "skipping partial-fill cleanup for paper_trade_id=%s preview_hash=%s "
+                    "because a cleanup submission is reserved but not journaled; "
+                    "manual reconciliation is required"
+                ),
+                paper_trade.entry_id,
+                cleanup_preview.preview_hash,
+            )
+            return saved_entries
+        confirmation = confirmation_store.append(
+            CleanupPreviewConfirmationEntry(
+                confirmed_at=now,
+                paper_trade_id=paper_trade.entry_id,
+                label=paper_trade.intent.label,
+                preview_hash=cleanup_preview.preview_hash,
+                preview=cleanup_preview,
+                note=(
+                    "worker partial-fill auto-cleanup "
+                    f"[{snapshot_source or 'unknown'}]"
+                ),
+            )
+        )
+        existing_entry = _reserve_cleanup_live_submission_or_existing(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
+        )
+        if existing_entry is not None:
+            saved_entries.append(existing_entry)
+            continue
+        if cleanup_live_router is None:
+            cleanup_live_router = _build_cleanup_live_execution_router_for_candidate(
+                api_settings,
+                latest_snapshot.candidate,
+            )
+        try:
+            async with asyncio.timeout(settings.execution_auto_pair_close_timeout_seconds):
+                journal_entry = await cleanup_live_router.submit_confirmed_cleanup_preview(
+                    paper_trade=paper_trade,
+                    confirmation=confirmation,
+                )
+        except TimeoutError:
+            logger.warning(
+                (
+                    "timed out submitting partial-fill cleanup for paper_trade_id=%s "
+                    "preview_hash=%s after %.1f seconds; keeping submission reservation "
+                    "for manual reconciliation before retry"
+                ),
+                paper_trade.entry_id,
+                confirmation.preview_hash,
+                settings.execution_auto_pair_close_timeout_seconds,
+            )
+            return saved_entries
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError, ValueError):
+            _release_cleanup_live_submission_reservations(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+                execution_store=execution_store,
+            )
+            raise
+        saved_entry = execution_store.append(journal_entry)
+        if saved_entry.entry_id is None:
+            raise RuntimeError("Cleanup execution journal append did not return an id")
+        _mark_cleanup_live_submission_completed(
+            paper_trade=paper_trade,
+            confirmation=confirmation,
+            execution_store=execution_store,
+            execution_entry_id=saved_entry.entry_id,
+        )
+        saved_entries.append(saved_entry)
+        try:
+            latest_status = await _observe_pair_status_for_execution(
+                paper_trade=paper_trade,
+                execution=saved_entry,
+                settings=api_settings,
+                account_service=account_service,
+                order_state_service=order_state_service,
+                observation_store=observation_store,
+                observation_context="worker_partial_fill_cleanup_poll",
+                poll_attempts=3,
+                poll_interval_seconds=1.0,
+            )
+            if latest_status.derived_state == "closed":
+                break
+        except Exception:
+            logger.warning(
+                "partial-fill cleanup observation failed for paper_trade_id=%s "
+                "execution_entry_id=%s",
+                paper_trade.entry_id,
+                saved_entry.entry_id,
+                exc_info=True,
+            )
+
+    if saved_entries:
+        logger.info(
+            "partial-fill auto-cleanup submitted %s cleanup executions for "
+            "paper_trade_id=%s venues=%s",
+            len(saved_entries),
+            paper_trade.entry_id,
+            ",".join(entry.legs[0].venue for entry in saved_entries if entry.legs),
+        )
+    return saved_entries
 
 
 async def _maybe_auto_close_open_hedged_execution(
@@ -4790,6 +5076,30 @@ async def observe_live_executions_once(
         except Exception:
             loop_logger.warning(
                 "Failed to capture funding checkpoint for execution entry_id=%s paper_trade_id=%s",
+                execution.entry_id,
+                execution.paper_trade_id,
+                exc_info=True,
+            )
+        try:
+            cleanup_entries = await _maybe_auto_cleanup_partial_fill_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=pair_status,
+                approved_store=approved_snapshot_store,
+                execution_store=journal_store,
+                observation_store=history_store,
+                account_service=account_probe_service,
+                order_state_service=state_service,
+                approval_service=auto_close_approval_service,
+                scanner=auto_close_scanner,
+                logger=loop_logger,
+                now=timestamp,
+            )
+            if cleanup_entries:
+                continue
+        except Exception:
+            loop_logger.warning(
+                "Failed to auto-cleanup partial-fill execution entry_id=%s paper_trade_id=%s",
                 execution.entry_id,
                 execution.paper_trade_id,
                 exc_info=True,
