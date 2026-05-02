@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -111,6 +112,7 @@ from carryme_runtime.account_preflight import (
     _row_represents_open_position,
 )
 from carryme_runtime.execution_quality import ExecutionQualityService
+from carryme_runtime.paired_live_execution import _observed_fill_state
 from carryme_runtime.route_approvals import (
     scan_exact_canary_candidate_for_approval,
     scan_live_route_candidate_for_approval,
@@ -9114,8 +9116,8 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
     [
         ("unfilled", "rejected"),
         ("partial_fill", "partial"),
-        ("open", "rejected"),
-        ("unknown", "rejected"),
+        ("open", "partial"),
+        ("unknown", "partial"),
     ],
 )
 def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled(
@@ -9286,6 +9288,20 @@ def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled
         assert observed_order_state["derived_state"] == first_leg_state
 
     asyncio.run(run())
+
+
+def test_observed_fill_state_logs_unexpected_derived_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="carryme_runtime.paired_live_execution")
+
+    state = _observed_fill_state({"derived_state": "filled_final", "raw": {"status": "done"}})
+
+    assert state == "unknown"
+    assert any(
+        "unexpected observed order derived_state='filled_final'" in record.message
+        for record in caplog.records
+    )
 
 
 def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails() -> None:

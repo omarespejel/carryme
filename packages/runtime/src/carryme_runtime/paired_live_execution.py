@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
@@ -16,6 +17,7 @@ from carryme_models import (
 )
 
 ObservedFillState = Literal["filled", "partial_fill", "unfilled", "open", "unknown"]
+logger = logging.getLogger(__name__)
 
 
 class SingleVenueLiveExecutionService(Protocol):
@@ -89,7 +91,7 @@ class PairedLiveExecutionCoordinator:
         first_fill_state = self._submission_observed_fill_state(first_result)
         if first_fill_state != "filled":
             guarded_status: Literal["rejected", "partial"] = (
-                "partial" if first_fill_state == "partial_fill" else "rejected"
+                "rejected" if first_fill_state == "unfilled" else "partial"
             )
             return ExecutionJournalEntry(
                 executed_at=timestamp,
@@ -246,4 +248,10 @@ def _observed_fill_state(value: Any) -> ObservedFillState:
         return "unfilled"
     if derived_state == "open":
         return "open"
+    if derived_state is not None:
+        logger.warning(
+            "unexpected observed order derived_state=%r in payload=%r",
+            derived_state,
+            value,
+        )
     return "unknown"
