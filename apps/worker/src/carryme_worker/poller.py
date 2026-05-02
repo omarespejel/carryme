@@ -88,6 +88,7 @@ from carryme_runtime import (
 )
 from carryme_runtime.balance_accounting import FUNDING_WINDOW_CHECKPOINT_STAGE
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
+from carryme_runtime.execution_quality import execution_quality_route_key
 from carryme_runtime.route_approvals import (
     scan_exact_canary_candidate_for_approval,
     scan_live_route_candidate_for_approval,
@@ -846,7 +847,7 @@ def _with_current_execution_quality(
 
     opportunity = candidate.opportunity.opportunity
     current_quality = execution_quality_index.get(
-        (
+        execution_quality_route_key(
             opportunity.canonical_symbol,
             opportunity.short_venue,
             opportunity.long_venue,
@@ -3083,10 +3084,13 @@ async def launch_latest_stable_canary_once(
     observation_store = ExecutionObservationStore(runtime_settings.database_path)
     execution_quality_index: dict[tuple[str, str, str], ExecutionQualitySummary] = {}
     if _stable_launch_needs_current_execution_quality(settings):
-        execution_quality_index = ExecutionQualityService(
+        execution_quality_service = ExecutionQualityService(
             journal_store=execution_store,
             observation_store=observation_store,
-        ).build_index()
+        )
+        execution_quality_index = await asyncio.to_thread(
+            execution_quality_service.build_index
+        )
     balance_service = BalanceAccountingService(
         store=BalanceSnapshotStore(runtime_settings.database_path)
     )

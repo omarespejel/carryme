@@ -129,6 +129,7 @@ from carryme_worker.poller import (
     _list_ranked_stable_launch_ready_stabilities,
     _maybe_auto_close_open_hedged_execution,
     _probe_candidate_system_state,
+    _with_current_execution_quality,
     cache_launch_ready_canaries_once,
     install_signal_handlers,
     launch_latest_stable_canary_once,
@@ -7243,6 +7244,43 @@ def test_launch_latest_stable_canary_once_allows_launch_when_execution_maturity_
     assert summary.status == "launched"
 
 
+def test_stable_launch_current_execution_quality_lookup_normalizes_route_key() -> None:
+    _approval, candidate, _snapshot, _stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        execution_quality=None,
+    )
+    raw_opportunity = candidate.opportunity.opportunity.model_copy(
+        update={
+            "canonical_symbol": " arb-usd-perp ",
+            "short_venue": " Extended ",
+            "long_venue": " Paradex ",
+        }
+    )
+    candidate = candidate.model_copy(
+        update={
+            "opportunity": candidate.opportunity.model_copy(
+                update={"opportunity": raw_opportunity}
+            )
+        }
+    )
+    quality = ExecutionQualitySummary(
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        sample_size=2,
+        weighted_score=0.72,
+        latest_outcome="closed",
+        closed_count=2,
+    )
+
+    updated = _with_current_execution_quality(
+        candidate=candidate,
+        execution_quality_index={("ARB-USD-PERP", "extended", "paradex"): quality},
+    )
+
+    assert updated.opportunity.execution_quality == quality
+
+
 def test_launch_latest_stable_canary_once_uses_latest_execution_quality_for_maturity(
     tmp_path: Path,
 ) -> None:
@@ -7382,6 +7420,13 @@ def test_launch_latest_stable_canary_once_uses_latest_execution_quality_for_matu
     async def run_stub_lifecycle(**_: object) -> StubLifecycleResult:
         return StubLifecycleResult()
 
+    to_thread_calls = 0
+
+    async def fake_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal to_thread_calls
+        to_thread_calls += 1
+        return func(*args, **kwargs)
+
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
             "carryme_worker.poller._build_launch_ready_canary_stability",
@@ -7395,6 +7440,7 @@ def test_launch_latest_stable_canary_once_uses_latest_execution_quality_for_matu
             "carryme_worker.poller._run_guarded_canary_lifecycle",
             run_stub_lifecycle,
         )
+        monkeypatch.setattr("carryme_worker.poller.asyncio.to_thread", fake_to_thread)
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
@@ -7403,6 +7449,7 @@ def test_launch_latest_stable_canary_once_uses_latest_execution_quality_for_matu
             )
         )
 
+    assert to_thread_calls == 1
     assert summary.status == "launched"
 
 
