@@ -69,6 +69,7 @@ from carryme_storage import (
     SystemStateAlertStore,
 )
 from carryme_storage.db import DatabaseConnection, redact_database_url
+from carryme_storage.launch_ready_canaries import MAX_RECENT_LABEL_LIMIT
 from carryme_worker.config import WorkerSettings
 from carryme_worker.main import (
     build_approved_canary_scan_loop_payload,
@@ -391,6 +392,19 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.database_path == "data/carryme.sqlite3"
     assert Path(settings.watchlist_path).is_file()
     assert settings.watchlist_path.endswith("config/watchlists/default.json")
+
+
+def test_worker_rejects_stable_canary_launch_candidate_scan_limit_above_max(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_worker_env(monkeypatch)
+    monkeypatch.setenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_CANDIDATE_SCAN_LIMIT",
+        str(MAX_RECENT_LABEL_LIMIT + 1),
+    )
+
+    with pytest.raises(ValidationError, match="stable_canary_launch_candidate_scan_limit"):
+        WorkerSettings()
 
 
 def test_worker_env_can_disable_stable_launch_immediate_close(
