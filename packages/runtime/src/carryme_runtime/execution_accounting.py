@@ -339,6 +339,9 @@ class ExecutionAccountingService:
             ]
             if events:
                 return events
+        response_events = self._extract_hyperliquid_submission_fill_events(payload)
+        if response_events:
+            return response_events
         observed = payload.get("observed_order_state")
         if isinstance(observed, dict):
             event = self._fill_event_from_state(observed)
@@ -353,6 +356,43 @@ class ExecutionAccountingService:
             return []
         event = self._fill_event_from_state(observed)
         return [event] if event is not None else []
+
+    def _extract_hyperliquid_submission_fill_events(
+        self,
+        payload: dict[str, Any],
+    ) -> list[dict[str, float]]:
+        response = payload.get("response")
+        if not isinstance(response, dict):
+            return []
+        data = response.get("data")
+        if not isinstance(data, dict):
+            return []
+        statuses = data.get("statuses")
+        if not isinstance(statuses, list):
+            return []
+
+        events: list[dict[str, float]] = []
+        for status in statuses:
+            if not isinstance(status, dict):
+                continue
+            filled = status.get("filled")
+            if not isinstance(filled, dict):
+                continue
+            filled_size = parse_float(filled.get("totalSz"))
+            if filled_size is None:
+                filled_size = parse_float(filled.get("sz"))
+            avg_fill_price = parse_float(filled.get("avgPx"))
+            if filled_size is None or filled_size <= 0:
+                continue
+            if avg_fill_price is None:
+                continue
+            events.append(
+                {
+                    "filled_size": filled_size,
+                    "filled_notional": filled_size * avg_fill_price,
+                }
+            )
+        return events
 
     def _fill_event_from_state(self, state: dict[str, Any]) -> dict[str, float] | None:
         derived_state = state.get("derived_state")
