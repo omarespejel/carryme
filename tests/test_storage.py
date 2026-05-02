@@ -828,7 +828,6 @@ def test_execution_journal_store_reserves_pair_close_submission_once_per_trade(
         confirmation_entry_id=14,
     )
 
-
 def test_execution_journal_store_releases_uncompleted_pair_close_submission(
     tmp_path: Path,
 ) -> None:
@@ -900,8 +899,6 @@ def test_execution_journal_store_does_not_release_pair_close_submission_for_mism
         preview_hash="pair-close-hash",
         confirmation_entry_id=13,
     )
-
-
 def test_execution_journal_store_reserves_pair_open_submission_once_per_trade(
     tmp_path: Path,
 ) -> None:
@@ -926,6 +923,30 @@ def test_execution_journal_store_reserves_pair_open_submission_once_per_trade(
         paper_trade_id=8,
         preview_hash="preview-hash",
         confirmation_entry_id=14,
+    )
+
+
+def test_execution_journal_store_rolls_back_pair_open_when_live_reservation_conflicts(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_live_submission(
+        confirmation_entry_id=11,
+        preview_hash="preview-hash",
+    )
+    assert (
+        store.reserve_pair_open_and_live_submission(
+            paper_trade_id=7,
+            preview_hash="preview-hash",
+            confirmation_entry_id=11,
+        )
+        == "live_conflict"
+    )
+    assert store.reserve_pair_open_live_submission(
+        paper_trade_id=7,
+        preview_hash="preview-hash",
+        confirmation_entry_id=12,
     )
 
 

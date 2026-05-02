@@ -3754,11 +3754,12 @@ def _reserve_pair_open_live_submission_or_existing(
     )
     if existing_entry is not None:
         return existing_entry
-    if not execution_store.reserve_pair_open_live_submission(
+    reservation_result = execution_store.reserve_pair_open_and_live_submission(
         paper_trade_id=paper_trade_id,
         preview_hash=confirmation.preview_hash,
         confirmation_entry_id=confirmation.entry_id,
-    ):
+    )
+    if reservation_result == "pair_open_conflict":
         existing_entry = execution_store.find_by_paper_trade_preview_hash(
             paper_trade_id=paper_trade_id,
             preview_hash=confirmation.preview_hash,
@@ -3772,10 +3773,7 @@ def _reserve_pair_open_live_submission_or_existing(
                 "and preview hash; manual reconciliation is required before retrying"
             ),
         )
-    if not execution_store.reserve_live_submission(
-        confirmation_entry_id=confirmation.entry_id,
-        preview_hash=confirmation.preview_hash,
-    ):
+    if reservation_result == "live_conflict":
         existing_entry = execution_store.find_by_confirmation(
             confirmation_entry_id=confirmation.entry_id,
             preview_hash=confirmation.preview_hash,
