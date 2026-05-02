@@ -6,6 +6,7 @@ from typing import Literal
 from carryme_models import SUPPORTED_UNIVERSE_VENUES
 from carryme_normalizers import get_fee_profile
 from carryme_storage.db import redact_database_url
+from carryme_storage.launch_ready_canaries import MAX_RECENT_LABEL_LIMIT
 from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -35,7 +36,11 @@ class WorkerSettings(BaseSettings):
     stable_canary_launch_max_active_live_executions: int = Field(default=0, ge=0)
     # Fetch enough rows to decide whether the blocking threshold is exceeded.
     stable_canary_launch_active_execution_limit: int = Field(default=20, gt=0)
-    stable_canary_launch_candidate_scan_limit: int = Field(default=100, gt=0)
+    stable_canary_launch_candidate_scan_limit: int = Field(
+        default=100,
+        gt=0,
+        le=MAX_RECENT_LABEL_LIMIT,
+    )
     stable_canary_launch_max_total_live_notional: float | None = Field(
         default=None,
         ge=0,

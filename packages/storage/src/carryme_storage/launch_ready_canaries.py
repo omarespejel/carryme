@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,9 @@ from carryme_models import LaunchReadyCanarySnapshot
 
 from carryme_storage.db import Database
 
+logger = logging.getLogger(__name__)
 MAX_RECENT_LABEL_LIMIT = 250
+MAX_RECENT_LABEL_SCAN_ROWS = MAX_RECENT_LABEL_LIMIT * 20
 
 
 class LaunchReadyCanaryStore:
@@ -138,15 +141,20 @@ class LaunchReadyCanaryStore:
     def list_recent_labels(self, *, limit: int = 50) -> list[str]:
         """Return recent distinct labels ordered by latest snapshot timestamp."""
 
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        if limit > MAX_RECENT_LABEL_LIMIT:
+            raise ValueError(f"limit must be at most {MAX_RECENT_LABEL_LIMIT}")
+
         self.initialize()
-        bounded_limit = max(1, min(limit, MAX_RECENT_LABEL_LIMIT))
         labels: list[str] = []
         seen_labels: set[str] = set()
-        batch_size = min(max(bounded_limit * 4, 50), MAX_RECENT_LABEL_LIMIT * 4)
+        batch_size = min(max(limit * 4, 50), MAX_RECENT_LABEL_LIMIT * 4)
         cursor: tuple[str, int] | None = None
+        scanned_rows = 0
 
         with self.database.begin() as connection:
-            while len(labels) < bounded_limit:
+            while len(labels) < limit and scanned_rows < MAX_RECENT_LABEL_SCAN_ROWS:
                 if cursor is None:
                     rows = connection.execute(
                         """
@@ -171,18 +179,29 @@ class LaunchReadyCanaryStore:
 
                 if not rows:
                     break
+                scanned_rows += len(rows)
 
                 for label, _captured_at, _row_id in rows:
                     if label in seen_labels:
                         continue
                     seen_labels.add(label)
                     labels.append(label)
-                    if len(labels) >= bounded_limit:
+                    if len(labels) >= limit:
                         break
 
                 last_label, last_captured_at, last_row_id = rows[-1]
                 _ = last_label
                 cursor = (last_captured_at, last_row_id)
+
+        if len(labels) < limit and scanned_rows >= MAX_RECENT_LABEL_SCAN_ROWS:
+            logger.warning(
+                "list_recent_labels scan capped before collecting requested labels: "
+                "requested_limit=%s collected_labels=%s scanned_rows=%s scan_row_cap=%s",
+                limit,
+                len(labels),
+                scanned_rows,
+                MAX_RECENT_LABEL_SCAN_ROWS,
+            )
 
         return labels
 

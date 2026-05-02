@@ -2948,7 +2948,7 @@ def test_launch_ready_canary_store_list_recent_labels_paginates_duplicate_rows(
     ]
 
 
-def test_launch_ready_canary_store_list_recent_labels_enforces_hard_max(
+def test_launch_ready_canary_store_list_recent_labels_rejects_invalid_limits(
     tmp_path: Path,
 ) -> None:
     approved_snapshot = ApprovedCanarySnapshot(
@@ -3040,11 +3040,11 @@ def test_launch_ready_canary_store_list_recent_labels_enforces_hard_max(
             )
         )
 
-    labels = store.list_recent_labels(limit=MAX_RECENT_LABEL_LIMIT + 25)
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        store.list_recent_labels(limit=0)
 
-    assert len(labels) == MAX_RECENT_LABEL_LIMIT
-    assert labels[0] == "label-000"
-    assert labels[-1] == f"label-{MAX_RECENT_LABEL_LIMIT - 1:03d}"
+    with pytest.raises(ValueError, match=f"limit must be at most {MAX_RECENT_LABEL_LIMIT}"):
+        store.list_recent_labels(limit=MAX_RECENT_LABEL_LIMIT + 25)
 
 
 def test_stable_canary_launch_store_appends_and_filters(tmp_path: Path) -> None:
