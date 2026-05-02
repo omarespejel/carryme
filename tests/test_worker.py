@@ -8110,6 +8110,45 @@ def test_launch_latest_stable_canary_once_returns_launched_summary(
             "Stable launch hold mode is blocked because "
             "execution_auto_pair_close_shadow_mode is true",
         ),
+        (
+            {
+                "execution_auto_pair_close_enabled": True,
+                "execution_auto_pair_close_shadow_mode": False,
+            },
+            "Stable launch hold mode is blocked because "
+            "execution_auto_pair_close_min_profit_total_collateral is unset",
+        ),
+        (
+            {
+                "execution_auto_pair_close_enabled": True,
+                "execution_auto_pair_close_shadow_mode": False,
+                "execution_auto_pair_close_min_profit_total_collateral": 0.5,
+            },
+            "Stable launch hold mode is blocked because "
+            "execution_auto_pair_close_max_profit_giveback_ratio is unset",
+        ),
+        (
+            {
+                "execution_auto_pair_close_enabled": True,
+                "execution_auto_pair_close_shadow_mode": False,
+                "execution_auto_pair_close_min_profit_total_collateral": 0.5,
+                "execution_auto_pair_close_max_profit_giveback_ratio": 0.4,
+                "execution_balance_checkpoint_enabled": False,
+            },
+            "Stable launch hold mode is blocked because "
+            "execution_balance_checkpoint_enabled is false",
+        ),
+        (
+            {
+                "execution_auto_pair_close_enabled": True,
+                "execution_auto_pair_close_shadow_mode": False,
+                "execution_auto_pair_close_min_profit_total_collateral": 0.5,
+                "execution_auto_pair_close_max_profit_giveback_ratio": 1.0,
+                "execution_balance_checkpoint_enabled": True,
+            },
+            "Stable launch hold mode is blocked because "
+            "execution_auto_pair_close_max_profit_giveback_ratio must satisfy 0 < ratio < 1",
+        ),
     ),
 )
 def test_launch_latest_stable_canary_once_blocks_hold_mode_without_live_auto_close(
@@ -8166,6 +8205,8 @@ def test_launch_latest_stable_canary_once_can_hold_when_auto_close_is_live(
         stable_canary_launch_close_position=False,
         execution_auto_pair_close_enabled=True,
         execution_auto_pair_close_shadow_mode=False,
+        execution_auto_pair_close_min_profit_total_collateral=0.5,
+        execution_auto_pair_close_max_profit_giveback_ratio=0.4,
         extended_live_enabled=True,
         extended_api_key="extended-key",
         extended_stark_private_key="extended-secret",
