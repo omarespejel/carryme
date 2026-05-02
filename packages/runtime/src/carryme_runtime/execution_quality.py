@@ -34,6 +34,20 @@ _Outcome = Literal[
 ]
 
 
+def execution_quality_route_key(
+    canonical_symbol: str,
+    short_venue: str,
+    long_venue: str,
+) -> tuple[str, str, str]:
+    """Return the normalized key used for execution-quality route buckets."""
+
+    return (
+        canonical_symbol.strip().upper(),
+        short_venue.strip().lower(),
+        long_venue.strip().lower(),
+    )
+
+
 @dataclass
 class _ExecutionQualityBucket:
     sample_size: int = 0
@@ -93,11 +107,13 @@ class ExecutionQualityService:
             entry = entries_by_paper_trade.get(paper_trade_id)
             if entry is None:
                 continue
+            if entry.mode != "live":
+                continue
             pair_status = observation.pair_status
             if pair_status is None:
                 continue
             intent = entry.paper_trade.intent
-            key = (
+            key = execution_quality_route_key(
                 intent.canonical_symbol,
                 intent.short_leg.venue,
                 intent.long_leg.venue,

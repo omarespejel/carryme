@@ -1954,6 +1954,141 @@ def test_execution_quality_service_summarizes_latest_outcomes(tmp_path: Path) ->
     assert summary.weighted_score == pytest.approx(0.6)
 
 
+def test_execution_quality_service_ignores_mock_and_normalizes_route_keys(
+    tmp_path: Path,
+) -> None:
+    journal_store = ExecutionJournalStore(tmp_path / "quality-normalized.sqlite3")
+    observation_store = ExecutionObservationStore(tmp_path / "quality-normalized.sqlite3")
+
+    def paper_trade(
+        paper_trade_id: int,
+        *,
+        canonical_symbol: str,
+        short_venue: str,
+        long_venue: str,
+    ) -> PaperTradeEntry:
+        return PaperTradeEntry(
+            entry_id=paper_trade_id,
+            created_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+            intent=FundingPairTradeIntent(
+                label=f"arb_{paper_trade_id}",
+                canonical_symbol=canonical_symbol,
+                source_recorded_at=datetime(2026, 3, 29, 11, 59, tzinfo=UTC),
+                one_day_net_edge_after_entry=0.001,
+                break_even_days_entry=0.2,
+                capacity_limit_notional=500.0,
+                target_notional=11.0,
+                capacity_fraction=0.1,
+                max_target_notional=100.0,
+                long_leg=TradeLegIntent(
+                    venue=long_venue,
+                    symbol="ARB-USD-PERP",
+                    fee_profile="pro",
+                    side="buy",
+                    target_notional=11.0,
+                ),
+                short_leg=TradeLegIntent(
+                    venue=short_venue,
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=11.0,
+                ),
+            ),
+        )
+
+    for paper_trade_id, mode, outcome in [
+        (1, "mock", "hedged"),
+        (2, "live", "closed"),
+    ]:
+        execution = journal_store.append(
+            ExecutionJournalEntry(
+                executed_at=datetime(2026, 3, 29, 12, paper_trade_id, tzinfo=UTC),
+                adapter="paired_live:test",
+                mode=cast(Literal["mock", "live"], mode),
+                status="submitted",
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"hash-{paper_trade_id}",
+                confirmation_entry_id=paper_trade_id,
+                paper_trade=paper_trade(
+                    paper_trade_id,
+                    canonical_symbol=" arb-usd-perp ",
+                    short_venue=" Extended ",
+                    long_venue=" Paradex ",
+                ),
+                legs=[
+                    ExecutionLegResult(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=11.0,
+                        status="submitted",
+                        simulated=(mode != "live"),
+                    )
+                ],
+            )
+        )
+        order_state = ExecutionOrderState(
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=paper_trade_id,
+            preview_hash=execution.preview_hash,
+            legs=[],
+            notes=[],
+        )
+        observation_store.append(
+            ExecutionObservationEntry(
+                observed_at=datetime(2026, 3, 29, 12, 10 + paper_trade_id, tzinfo=UTC),
+                context="guarded_pair_poll",
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=execution.preview_hash,
+                order_state=order_state,
+                pair_status=ExecutionPairStatus(
+                    execution_entry_id=execution.entry_id,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=execution.preview_hash,
+                    derived_state=cast(
+                        Literal[
+                            "hedged",
+                            "pending",
+                            "unfilled",
+                            "closed",
+                            "cleanup_needed",
+                            "review_required",
+                        ],
+                        outcome,
+                    ),
+                    recommended_action="no_action",
+                    order_state=order_state,
+                    reconciliation=ExecutionReconciliation(
+                        execution_entry_id=execution.entry_id,
+                        paper_trade_id=paper_trade_id,
+                        preview_hash=execution.preview_hash,
+                        status="submitted",
+                        recommended_action="observe",
+                        matched_all_leg_symbols=True,
+                        venues=[],
+                        notes=[],
+                    ),
+                    notes=[],
+                ),
+            )
+        )
+
+    index = ExecutionQualityService(
+        journal_store=journal_store,
+        observation_store=observation_store,
+    ).build_index()
+
+    assert set(index) == {("ARB-USD-PERP", "extended", "paradex")}
+    summary = index[("ARB-USD-PERP", "extended", "paradex")]
+    assert summary.sample_size == 1
+    assert summary.latest_outcome == "closed"
+    assert summary.closed_count == 1
+    assert summary.hedged_count == 0
+
+
 def test_execution_quality_service_caps_after_latest_per_trade(tmp_path: Path) -> None:
     journal_store = ExecutionJournalStore(tmp_path / "quality-window.sqlite3")
     observation_store = ExecutionObservationStore(tmp_path / "quality-window.sqlite3")
@@ -3776,6 +3911,59 @@ def test_scan_exact_canary_candidate_for_approval_skips_route_stability_index(
 
     assert captured["include_symbols"] == ["NEAR-USD-PERP"]
     assert captured["use_execution_quality"] is False
+    assert captured["use_route_stability"] is False
+
+
+def test_scan_exact_canary_candidate_for_approval_keeps_execution_quality_when_required(
+    tmp_path: Path,
+) -> None:
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        label="near_extended_paradex",
+        canonical_symbol="NEAR-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=25.0,
+        note="approved canary",
+    )
+    captured: dict[str, object] = {}
+
+    class StubScanner:
+        async def scan_canary_candidates(self, **kwargs: object) -> list[object]:
+            captured.update(kwargs)
+            return []
+
+    async def run() -> None:
+        await scan_exact_canary_candidate_for_approval(
+            scanner=cast(Any, StubScanner()),
+            approval_service=RouteApprovalService(
+                store=RouteApprovalStore(tmp_path / "approvals.sqlite3")
+            ),
+            approval=approval,
+            venues=["extended", "paradex"],
+            target_notional=5_000.0,
+            canary_max_notional=25.0,
+            min_capacity_notional=0.0,
+            min_daily_volume=0.0,
+            min_open_interest=0.0,
+            min_roundtrip_edge=0.0,
+            min_execution_quality_score=0.7,
+            min_execution_samples=0,
+            min_route_stability_weight=0.0,
+            min_route_presence_ratio=0.0,
+            min_route_samples=0,
+            include_symbols=None,
+            exclude_symbols=None,
+            exclude_tags=None,
+            limit=5,
+        )
+
+    asyncio.run(run())
+
+    assert captured["use_execution_quality"] is True
     assert captured["use_route_stability"] is False
 
 
