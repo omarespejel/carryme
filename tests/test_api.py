@@ -809,6 +809,95 @@ def test_funding_universe_endpoint_passes_route_stability_filters() -> None:
     assert captured["min_route_samples"] == 4
 
 
+def test_bounded_universe_scan_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app_module, "UNIVERSE_SCAN_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(app_module, "_UNIVERSE_SCAN_SEMAPHORE", asyncio.Semaphore(1))
+
+    async def slow_scan() -> list[object]:
+        await asyncio.sleep(1)
+        return []
+
+    async def run() -> None:
+        with pytest.raises(HTTPException) as exc_info:
+            await app_module._run_bounded_universe_scan("test scan", slow_scan)
+        assert exc_info.value.status_code == 504
+        assert exc_info.value.detail == "test scan exceeded 0.1s timeout"
+        await asyncio.wait_for(app_module._UNIVERSE_SCAN_SEMAPHORE.acquire(), timeout=0.1)
+        app_module._UNIVERSE_SCAN_SEMAPHORE.release()
+
+    asyncio.run(run())
+
+
+def test_bounded_universe_scan_rejects_concurrent_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    semaphore = asyncio.Semaphore(1)
+    monkeypatch.setattr(app_module, "_UNIVERSE_SCAN_SEMAPHORE", semaphore)
+    monkeypatch.setattr(app_module, "UNIVERSE_SCAN_ACQUIRE_TIMEOUT_SECONDS", 0.01)
+
+    async def fast_scan() -> list[object]:
+        return []
+
+    async def run() -> None:
+        await semaphore.acquire()
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                await app_module._run_bounded_universe_scan("test scan", fast_scan)
+        finally:
+            semaphore.release()
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.detail == "test scan is already running; retry shortly"
+
+    asyncio.run(run())
+
+
+def test_approved_canary_basket_endpoint_uses_bounded_scan_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    class StubUniverseService:
+        def resolve_fee_profiles(
+            self,
+            *,
+            venues: list[str],
+            fee_profile_overrides: dict[str, str] | None = None,
+        ) -> dict[str, str]:
+            return {
+                venue: (fee_profile_overrides or {}).get(venue, "default")
+                for venue in venues
+            }
+
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            nonlocal called
+            called = True
+            return []
+
+    monkeypatch.setattr(app_module, "_UNIVERSE_SCAN_SEMAPHORE", asyncio.Semaphore(0))
+    monkeypatch.setattr(app_module, "UNIVERSE_SCAN_ACQUIRE_TIMEOUT_SECONDS", 0.01)
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: object()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approved-basket",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == (
+        "funding universe approved basket scan is already running; retry shortly"
+    )
+    assert called is False
+
+
 def test_funding_universe_canary_endpoint_uses_policy_defaults() -> None:
     captured: dict[str, object] = {}
 

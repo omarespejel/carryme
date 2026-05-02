@@ -183,8 +183,40 @@ AUTOMATION_READINESS_MAX_ACTIVE_LIVE_EXECUTIONS = 0
 AUTOMATION_READINESS_ACTIVE_EXECUTION_SCAN_LIMIT = 200
 AUTOMATION_READINESS_MAX_OBSERVATION_AGE_SECONDS = 1800
 PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
+UNIVERSE_SCAN_TIMEOUT_SECONDS = 20.0
+UNIVERSE_SCAN_ACQUIRE_TIMEOUT_SECONDS = 0.25
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 logger = logging.getLogger(__name__)
+_UNIVERSE_SCAN_SEMAPHORE = asyncio.Semaphore(1)
+
+
+async def _run_bounded_universe_scan[UniverseScanResultT](
+    name: str,
+    call: Callable[[], Awaitable[UniverseScanResultT]],
+) -> UniverseScanResultT:
+    """Run one expensive live-universe scan without starving normal API traffic."""
+
+    acquired = False
+    try:
+        await asyncio.wait_for(
+            _UNIVERSE_SCAN_SEMAPHORE.acquire(),
+            timeout=UNIVERSE_SCAN_ACQUIRE_TIMEOUT_SECONDS,
+        )
+        acquired = True
+        return await asyncio.wait_for(call(), timeout=UNIVERSE_SCAN_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        if not acquired:
+            raise HTTPException(
+                status_code=429,
+                detail=f"{name} is already running; retry shortly",
+            ) from exc
+        raise HTTPException(
+            status_code=504,
+            detail=f"{name} exceeded {UNIVERSE_SCAN_TIMEOUT_SECONDS:g}s timeout",
+        ) from exc
+    finally:
+        if acquired:
+            _UNIVERSE_SCAN_SEMAPHORE.release()
 
 
 def _rank_approved_canary_candidate(
@@ -2589,24 +2621,27 @@ async def _select_approved_canary_candidate(
             status_code=404,
             detail="No approved canary candidate matched the requested filters",
         )
-    candidates = await universe_service.scan_canary_candidates(
-        venues=selected_venues,
-        fee_profile_overrides=fee_profile_overrides,
-        target_notional=target_notional,
-        canary_max_notional=canary_max_notional,
-        min_capacity_notional=min_capacity_notional,
-        min_daily_volume=min_daily_volume,
-        min_open_interest=min_open_interest,
-        min_roundtrip_edge=min_roundtrip_edge,
-        min_execution_quality_score=min_execution_quality_score,
-        min_execution_samples=min_execution_samples,
-        min_route_stability_weight=min_route_stability_weight,
-        min_route_presence_ratio=min_route_presence_ratio,
-        min_route_samples=min_route_samples,
-        include_symbols=include_symbols,
-        exclude_symbols=exclude_symbols,
-        exclude_tags=exclude_tags,
-        limit=limit,
+    candidates = await _run_bounded_universe_scan(
+        "approved canary candidate scan",
+        lambda: universe_service.scan_canary_candidates(
+            venues=selected_venues,
+            fee_profile_overrides=fee_profile_overrides,
+            target_notional=target_notional,
+            canary_max_notional=canary_max_notional,
+            min_capacity_notional=min_capacity_notional,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+            min_execution_quality_score=min_execution_quality_score,
+            min_execution_samples=min_execution_samples,
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+            include_symbols=include_symbols,
+            exclude_symbols=exclude_symbols,
+            exclude_tags=exclude_tags,
+            limit=limit,
+        ),
     )
     approved_candidates = approval_service.filter_approved_canary_candidates(candidates)
     if label is not None:
@@ -2675,24 +2710,27 @@ async def _scan_approved_canary_basket_plan(
         fee_profile_overrides=fee_profile_overrides,
     )
     resolved_venues = list(resolved_fee_profiles)
-    candidates = await universe_service.scan_canary_candidates(
-        venues=resolved_venues,
-        fee_profile_overrides=fee_profile_overrides or None,
-        target_notional=target_notional,
-        canary_max_notional=canary_max_notional,
-        min_capacity_notional=min_capacity_notional,
-        min_daily_volume=min_daily_volume,
-        min_open_interest=min_open_interest,
-        min_roundtrip_edge=min_roundtrip_edge,
-        min_execution_quality_score=min_execution_quality_score,
-        min_execution_samples=min_execution_samples,
-        min_route_stability_weight=min_route_stability_weight,
-        min_route_presence_ratio=min_route_presence_ratio,
-        min_route_samples=min_route_samples,
-        include_symbols=include_symbols,
-        exclude_symbols=exclude_symbols,
-        exclude_tags=exclude_tags,
-        limit=limit,
+    candidates = await _run_bounded_universe_scan(
+        "funding universe approved basket scan",
+        lambda: universe_service.scan_canary_candidates(
+            venues=resolved_venues,
+            fee_profile_overrides=fee_profile_overrides or None,
+            target_notional=target_notional,
+            canary_max_notional=canary_max_notional,
+            min_capacity_notional=min_capacity_notional,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+            min_execution_quality_score=min_execution_quality_score,
+            min_execution_samples=min_execution_samples,
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+            include_symbols=include_symbols,
+            exclude_symbols=exclude_symbols,
+            exclude_tags=exclude_tags,
+            limit=limit,
+        ),
     )
     return approval_service.build_approved_canary_basket_plan(
         candidates=candidates,
@@ -4988,28 +5026,31 @@ def create_app() -> FastAPI:
         limit: int = 10,
     ) -> PaperTradeEntry:
         selected_venues = venues or ["extended", "paradex", "hyperliquid"]
-        candidates = await universe_service.scan_canary_candidates(
-            venues=selected_venues,
-            fee_profile_overrides=_build_fee_profile_overrides(
-                extended_fee_profile=extended_fee_profile,
-                paradex_fee_profile=paradex_fee_profile,
-                hyperliquid_fee_profile=hyperliquid_fee_profile,
+        candidates = await _run_bounded_universe_scan(
+            "paper trade approved canary scan",
+            lambda: universe_service.scan_canary_candidates(
+                venues=selected_venues,
+                fee_profile_overrides=_build_fee_profile_overrides(
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                ),
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+                limit=limit,
             ),
-            target_notional=target_notional,
-            canary_max_notional=canary_max_notional,
-            min_capacity_notional=min_capacity_notional,
-            min_daily_volume=min_daily_volume,
-            min_open_interest=min_open_interest,
-            min_roundtrip_edge=min_roundtrip_edge,
-            min_execution_quality_score=min_execution_quality_score,
-            min_execution_samples=min_execution_samples,
-            min_route_stability_weight=min_route_stability_weight,
-            min_route_presence_ratio=min_route_presence_ratio,
-            min_route_samples=min_route_samples,
-            include_symbols=include_symbols,
-            exclude_symbols=exclude_symbols,
-            exclude_tags=exclude_tags,
-            limit=limit,
         )
         approved_candidates = approval_service.filter_approved_canary_candidates(candidates)
         if label is not None:
@@ -6783,28 +6824,31 @@ def create_app() -> FastAPI:
                 min_route_presence_ratio=min_route_presence_ratio,
                 min_route_samples=min_route_samples,
             )
-            return await service.scan(
-                venues=selected_venues,
-                ranking=ranking,  # type: ignore[arg-type]
-                fee_profile_overrides=_build_fee_profile_overrides(
-                    extended_fee_profile=extended_fee_profile,
-                    paradex_fee_profile=paradex_fee_profile,
-                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+            return await _run_bounded_universe_scan(
+                "funding universe scan",
+                lambda: service.scan(
+                    venues=selected_venues,
+                    ranking=ranking,  # type: ignore[arg-type]
+                    fee_profile_overrides=_build_fee_profile_overrides(
+                        extended_fee_profile=extended_fee_profile,
+                        paradex_fee_profile=paradex_fee_profile,
+                        hyperliquid_fee_profile=hyperliquid_fee_profile,
+                    ),
+                    target_notional=target_notional,
+                    min_capacity_notional=min_capacity_notional,
+                    min_daily_volume=min_daily_volume,
+                    min_open_interest=min_open_interest,
+                    min_roundtrip_edge=min_roundtrip_edge,
+                    min_execution_quality_score=min_execution_quality_score,
+                    min_execution_samples=min_execution_samples,
+                    min_route_stability_weight=min_route_stability_weight,
+                    min_route_presence_ratio=min_route_presence_ratio,
+                    min_route_samples=min_route_samples,
+                    include_symbols=include_symbols,
+                    exclude_symbols=exclude_symbols,
+                    exclude_tags=exclude_tags,
+                    limit=limit,
                 ),
-                target_notional=target_notional,
-                min_capacity_notional=min_capacity_notional,
-                min_daily_volume=min_daily_volume,
-                min_open_interest=min_open_interest,
-                min_roundtrip_edge=min_roundtrip_edge,
-                min_execution_quality_score=min_execution_quality_score,
-                min_execution_samples=min_execution_samples,
-                min_route_stability_weight=min_route_stability_weight,
-                min_route_presence_ratio=min_route_presence_ratio,
-                min_route_samples=min_route_samples,
-                include_symbols=include_symbols,
-                exclude_symbols=exclude_symbols,
-                exclude_tags=exclude_tags,
-                limit=limit,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -6845,28 +6889,31 @@ def create_app() -> FastAPI:
         try:
             limit = _validated_history_limit("limit", limit)
             selected_venues = venues or ["extended", "paradex", "hyperliquid"]
-            candidates = await service.scan_canary_candidates(
-                venues=selected_venues,
-                fee_profile_overrides=_build_fee_profile_overrides(
-                    extended_fee_profile=extended_fee_profile,
-                    paradex_fee_profile=paradex_fee_profile,
-                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+            candidates = await _run_bounded_universe_scan(
+                "funding universe canary scan",
+                lambda: service.scan_canary_candidates(
+                    venues=selected_venues,
+                    fee_profile_overrides=_build_fee_profile_overrides(
+                        extended_fee_profile=extended_fee_profile,
+                        paradex_fee_profile=paradex_fee_profile,
+                        hyperliquid_fee_profile=hyperliquid_fee_profile,
+                    ),
+                    target_notional=target_notional,
+                    canary_max_notional=canary_max_notional,
+                    min_capacity_notional=min_capacity_notional,
+                    min_daily_volume=min_daily_volume,
+                    min_open_interest=min_open_interest,
+                    min_roundtrip_edge=min_roundtrip_edge,
+                    min_execution_quality_score=min_execution_quality_score,
+                    min_execution_samples=min_execution_samples,
+                    min_route_stability_weight=min_route_stability_weight,
+                    min_route_presence_ratio=min_route_presence_ratio,
+                    min_route_samples=min_route_samples,
+                    include_symbols=include_symbols,
+                    exclude_symbols=exclude_symbols,
+                    exclude_tags=exclude_tags,
+                    limit=limit,
                 ),
-                target_notional=target_notional,
-                canary_max_notional=canary_max_notional,
-                min_capacity_notional=min_capacity_notional,
-                min_daily_volume=min_daily_volume,
-                min_open_interest=min_open_interest,
-                min_roundtrip_edge=min_roundtrip_edge,
-                min_execution_quality_score=min_execution_quality_score,
-                min_execution_samples=min_execution_samples,
-                min_route_stability_weight=min_route_stability_weight,
-                min_route_presence_ratio=min_route_presence_ratio,
-                min_route_samples=min_route_samples,
-                include_symbols=include_symbols,
-                exclude_symbols=exclude_symbols,
-                exclude_tags=exclude_tags,
-                limit=limit,
             )
             if approved_only:
                 return approval_service.filter_approved_canary_candidates(candidates)[:limit]
@@ -6915,29 +6962,32 @@ def create_app() -> FastAPI:
             )
             selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
             generated_at = datetime.now(UTC)
-            candidates = await service.scan_canary_candidates(
-                venues=selected_venues,
-                fee_profile_overrides=_build_fee_profile_overrides(
-                    extended_fee_profile=extended_fee_profile,
-                    paradex_fee_profile=paradex_fee_profile,
-                    hyperliquid_fee_profile=hyperliquid_fee_profile,
-                    selected_venues=selected_venues,
+            candidates = await _run_bounded_universe_scan(
+                "funding universe canary approval proposal scan",
+                lambda: service.scan_canary_candidates(
+                    venues=selected_venues,
+                    fee_profile_overrides=_build_fee_profile_overrides(
+                        extended_fee_profile=extended_fee_profile,
+                        paradex_fee_profile=paradex_fee_profile,
+                        hyperliquid_fee_profile=hyperliquid_fee_profile,
+                        selected_venues=selected_venues,
+                    ),
+                    target_notional=target_notional,
+                    canary_max_notional=canary_max_notional,
+                    min_capacity_notional=min_capacity_notional,
+                    min_daily_volume=min_daily_volume,
+                    min_open_interest=min_open_interest,
+                    min_roundtrip_edge=min_roundtrip_edge,
+                    min_execution_quality_score=min_execution_quality_score,
+                    min_execution_samples=min_execution_samples,
+                    min_route_stability_weight=min_route_stability_weight,
+                    min_route_presence_ratio=min_route_presence_ratio,
+                    min_route_samples=min_route_samples,
+                    include_symbols=include_symbols,
+                    exclude_symbols=exclude_symbols,
+                    exclude_tags=exclude_tags,
+                    limit=candidate_sample,
                 ),
-                target_notional=target_notional,
-                canary_max_notional=canary_max_notional,
-                min_capacity_notional=min_capacity_notional,
-                min_daily_volume=min_daily_volume,
-                min_open_interest=min_open_interest,
-                min_roundtrip_edge=min_roundtrip_edge,
-                min_execution_quality_score=min_execution_quality_score,
-                min_execution_samples=min_execution_samples,
-                min_route_stability_weight=min_route_stability_weight,
-                min_route_presence_ratio=min_route_presence_ratio,
-                min_route_samples=min_route_samples,
-                include_symbols=include_symbols,
-                exclude_symbols=exclude_symbols,
-                exclude_tags=exclude_tags,
-                limit=candidate_sample,
             )
             proposals = approval_service.propose_canary_route_approvals(
                 candidates,
@@ -7960,28 +8010,31 @@ def create_app() -> FastAPI:
                 min_route_presence_ratio=min_route_presence_ratio,
                 min_route_samples=min_route_samples,
             )
-            scan = await service.scan(
-                venues=selected_venues,
-                ranking=ranking,  # type: ignore[arg-type]
-                fee_profile_overrides=_build_fee_profile_overrides(
-                    extended_fee_profile=extended_fee_profile,
-                    paradex_fee_profile=paradex_fee_profile,
-                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+            scan = await _run_bounded_universe_scan(
+                "funding universe portfolio scan",
+                lambda: service.scan(
+                    venues=selected_venues,
+                    ranking=ranking,  # type: ignore[arg-type]
+                    fee_profile_overrides=_build_fee_profile_overrides(
+                        extended_fee_profile=extended_fee_profile,
+                        paradex_fee_profile=paradex_fee_profile,
+                        hyperliquid_fee_profile=hyperliquid_fee_profile,
+                    ),
+                    target_notional=target_notional,
+                    min_capacity_notional=min_capacity_notional,
+                    min_daily_volume=min_daily_volume,
+                    min_open_interest=min_open_interest,
+                    min_roundtrip_edge=min_roundtrip_edge,
+                    min_execution_quality_score=min_execution_quality_score,
+                    min_execution_samples=min_execution_samples,
+                    min_route_stability_weight=min_route_stability_weight,
+                    min_route_presence_ratio=min_route_presence_ratio,
+                    min_route_samples=min_route_samples,
+                    include_symbols=include_symbols,
+                    exclude_symbols=exclude_symbols,
+                    exclude_tags=exclude_tags,
+                    limit=max_positions * 5,
                 ),
-                target_notional=target_notional,
-                min_capacity_notional=min_capacity_notional,
-                min_daily_volume=min_daily_volume,
-                min_open_interest=min_open_interest,
-                min_roundtrip_edge=min_roundtrip_edge,
-                min_execution_quality_score=min_execution_quality_score,
-                min_execution_samples=min_execution_samples,
-                min_route_stability_weight=min_route_stability_weight,
-                min_route_presence_ratio=min_route_presence_ratio,
-                min_route_samples=min_route_samples,
-                include_symbols=include_symbols,
-                exclude_symbols=exclude_symbols,
-                exclude_tags=exclude_tags,
-                limit=max_positions * 5,
             )
             return build_portfolio_plan(
                 scan,
