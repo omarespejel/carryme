@@ -8,7 +8,8 @@ import logging
 import math
 import os
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -4115,7 +4116,15 @@ async def _execute_guarded_pair_close_from_confirmation(
 def create_app() -> FastAPI:
     """Create the FastAPI application."""
 
-    app = FastAPI(title="carryme", version=APP_VERSION)
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        """Warm the shared execution journal store before serving live requests."""
+
+        settings = get_api_settings()
+        _execution_journal_store_for_path(settings.database_path).initialize()
+        yield
+
+    app = FastAPI(title="carryme", version=APP_VERSION, lifespan=lifespan)
 
     @app.middleware("http")
     async def require_operator_auth_for_mutations(
