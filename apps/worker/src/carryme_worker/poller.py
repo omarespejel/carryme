@@ -2037,16 +2037,21 @@ def _route_position_venues_for_cleanup(
         execution.paper_trade.intent.long_leg,
         execution.paper_trade.intent.short_leg,
     ]
-    position_symbols_by_venue = {
-        venue.venue: set(venue.position_symbols)
-        for venue in pair_status.reconciliation.venues
-    }
+    matched_symbols_by_venue: dict[str, set[str]] = {}
+    for venue in pair_status.reconciliation.venues:
+        # Reconciliation is the source of truth when present. Fall back to exact
+        # raw symbols only for legacy/partial observations that did not populate
+        # matched or unmatched route-leg symbols.
+        if venue.matched_leg_symbols or venue.unmatched_leg_symbols:
+            matched_symbols_by_venue[venue.venue] = set(venue.matched_leg_symbols)
+        else:
+            matched_symbols_by_venue[venue.venue] = set(venue.position_symbols)
     venues: list[str] = []
     for leg in route_legs:
         if leg.venue in venues:
             continue
-        venue_positions = position_symbols_by_venue.get(leg.venue, set())
-        if leg.symbol in venue_positions:
+        venue_matches = matched_symbols_by_venue.get(leg.venue, set())
+        if leg.symbol in venue_matches:
             venues.append(leg.venue)
     return venues
 
@@ -2152,32 +2157,63 @@ async def _maybe_auto_cleanup_partial_fill_execution(
         api_settings,
         latest_snapshot.candidate,
     )
-    cleanup_live_router = _build_cleanup_live_execution_router_for_candidate(
-        api_settings,
-        latest_snapshot.candidate,
-    )
     confirmation_store = CleanupPreviewConfirmationStore(api_settings.database_path)
 
     cleanup_previews: list[ExecutionCleanupPreview] = []
     for venue_name in cleanup_venues:
-        cleanup_previews.append(
-            await cleanup_preview_service.preview_from_execution(
-                entry=execution,
-                pair_status=_scoped_pair_status_for_cleanup_venue(
-                    pair_status,
-                    venue_name=venue_name,
+        try:
+            async with asyncio.timeout(settings.execution_auto_pair_close_timeout_seconds):
+                cleanup_previews.append(
+                    await cleanup_preview_service.preview_from_execution(
+                        entry=execution,
+                        pair_status=_scoped_pair_status_for_cleanup_venue(
+                            pair_status,
+                            venue_name=venue_name,
+                        ),
+                        slippage_tolerance_bps=25,
+                    )
+                )
+        except TimeoutError:
+            logger.warning(
+                (
+                    "timed out building partial-fill cleanup preview for paper_trade_id=%s "
+                    "venue=%s after %.1f seconds"
                 ),
-                slippage_tolerance_bps=25,
+                paper_trade.entry_id,
+                venue_name,
+                settings.execution_auto_pair_close_timeout_seconds,
             )
-        )
+            continue
     # If a later cleanup fails, closing the largest leg first leaves less net exposure.
     cleanup_previews.sort(key=lambda preview: preview.leg.target_notional, reverse=True)
 
     saved_entries: list[ExecutionJournalEntry] = []
+    cleanup_live_router = None
     for cleanup_preview in cleanup_previews:
+        existing_entry = execution_store.find_by_paper_trade_preview_hash(
+            paper_trade_id=paper_trade.entry_id,
+            preview_hash=cleanup_preview.preview_hash,
+        )
+        if existing_entry is not None:
+            saved_entries.append(existing_entry)
+            continue
+        if execution_store.has_pending_cleanup_live_submission(
+            paper_trade_id=paper_trade.entry_id,
+            preview_hash=cleanup_preview.preview_hash,
+        ):
+            logger.warning(
+                (
+                    "skipping partial-fill cleanup for paper_trade_id=%s preview_hash=%s "
+                    "because a cleanup submission is reserved but not journaled; "
+                    "manual reconciliation is required"
+                ),
+                paper_trade.entry_id,
+                cleanup_preview.preview_hash,
+            )
+            return saved_entries
         confirmation = confirmation_store.append(
             CleanupPreviewConfirmationEntry(
-                confirmed_at=datetime.now(UTC),
+                confirmed_at=now,
                 paper_trade_id=paper_trade.entry_id,
                 label=paper_trade.intent.label,
                 preview_hash=cleanup_preview.preview_hash,
@@ -2196,11 +2232,29 @@ async def _maybe_auto_cleanup_partial_fill_execution(
         if existing_entry is not None:
             saved_entries.append(existing_entry)
             continue
-        try:
-            journal_entry = await cleanup_live_router.submit_confirmed_cleanup_preview(
-                paper_trade=paper_trade,
-                confirmation=confirmation,
+        if cleanup_live_router is None:
+            cleanup_live_router = _build_cleanup_live_execution_router_for_candidate(
+                api_settings,
+                latest_snapshot.candidate,
             )
+        try:
+            async with asyncio.timeout(settings.execution_auto_pair_close_timeout_seconds):
+                journal_entry = await cleanup_live_router.submit_confirmed_cleanup_preview(
+                    paper_trade=paper_trade,
+                    confirmation=confirmation,
+                )
+        except TimeoutError:
+            logger.warning(
+                (
+                    "timed out submitting partial-fill cleanup for paper_trade_id=%s "
+                    "preview_hash=%s after %.1f seconds; keeping submission reservation "
+                    "for manual reconciliation before retry"
+                ),
+                paper_trade.entry_id,
+                confirmation.preview_hash,
+                settings.execution_auto_pair_close_timeout_seconds,
+            )
+            return saved_entries
         except (ConnectorError, UpstreamDataError, httpx.HTTPError, ValueError):
             _release_cleanup_live_submission_reservations(
                 paper_trade=paper_trade,

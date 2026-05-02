@@ -654,6 +654,34 @@ class ExecutionJournalStore:
         rowcount = getattr(result, "rowcount", None)
         return isinstance(rowcount, int) and rowcount > 0
 
+    def has_pending_cleanup_live_submission(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+    ) -> bool:
+        """Return whether one cleanup submission is reserved but not journaled."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        with self.database.begin() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM cleanup_live_submission_reservations
+                WHERE paper_trade_id = ?
+                  AND preview_hash = ?
+                  AND execution_entry_id IS NULL
+                LIMIT 1
+                """,
+                (paper_trade_id, normalized_preview_hash),
+            ).fetchone()
+        return row is not None
+
     def find_by_paper_trade_preview_hash(
         self,
         *,
