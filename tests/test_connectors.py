@@ -237,7 +237,7 @@ def test_hyperliquid_connector_parses_stats_and_top_of_book() -> None:
             return httpx.Response(
                 200,
                 json=[
-                    {"universe": [{"name": "SOL"}, {"name": "STRK"}]},
+                    {"universe": [{"name": "SOL"}, {"name": "STRK", "szDecimals": 0}]},
                     [
                         {},
                         {
@@ -269,7 +269,13 @@ def test_hyperliquid_connector_parses_stats_and_top_of_book() -> None:
         assert stats.funding_rate == pytest.approx(-0.0000418197)
         assert stats.open_interest == pytest.approx(85274675.599999994)
         assert stats.daily_volume == pytest.approx(296593.6985990002)
-        assert isinstance(stats.raw, list)
+        assert stats.raw == {
+            "markPx": "0.03451",
+            "funding": "-0.0000418197",
+            "openInterest": "85274675.599999994",
+            "dayNtlVlm": "296593.6985990002",
+            "szDecimals": 0,
+        }
         assert book.best_bid_price == pytest.approx(0.03452)
         assert book.best_bid_size == pytest.approx(129958.3)
         assert book.best_ask_price == pytest.approx(0.03454)

@@ -71,7 +71,7 @@ class HyperliquidPublicConnector(BaseHttpConnector):
             funding_rate=parse_float(row.get("funding")),
             open_interest=parse_float(row.get("openInterest")),
             daily_volume=parse_float(row.get("dayNtlVlm")),
-            raw=payload,
+            raw=row,
         )
 
     async def fetch_top_of_book(self, symbol: str) -> TopOfBook:
