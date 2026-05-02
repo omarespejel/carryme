@@ -75,6 +75,12 @@ class StableCanaryLaunchStore:
                 ON stable_canary_launch_reservations(label)
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_stable_canary_launch_reservations_reserved_at
+                ON stable_canary_launch_reservations(reserved_at)
+                """
+            )
 
     def append(self, record: StableCanaryLaunchRecord) -> StableCanaryLaunchRecord:
         """Append one stable canary launch record."""
@@ -250,6 +256,7 @@ class StableCanaryLaunchStore:
         launch_ready_snapshot_id: int,
         owner_id: str,
         reserved_at: datetime,
+        max_age_seconds: int | None = None,
     ) -> bool:
         """Renew one snapshot reservation only if the caller still owns its lease."""
 
@@ -261,21 +268,45 @@ class StableCanaryLaunchStore:
             raise ValueError("owner_id must be non-empty")
         if reserved_at.tzinfo is None or reserved_at.utcoffset() is None:
             raise ValueError("reserved_at must be timezone-aware")
+        if max_age_seconds is not None and max_age_seconds <= 0:
+            raise ValueError("max_age_seconds must be positive")
 
         normalized_reserved_at = reserved_at.astimezone(UTC)
+        stale_before = (
+            normalized_reserved_at - timedelta(seconds=max_age_seconds)
+            if max_age_seconds is not None
+            else None
+        )
         with self.database.begin() as connection:
-            result = connection.execute(
-                """
-                UPDATE stable_canary_launch_reservations
-                SET reserved_at = ?
-                WHERE launch_ready_snapshot_id = ? AND owner_id = ?
-                """,
-                (
-                    normalized_reserved_at.isoformat(),
-                    launch_ready_snapshot_id,
-                    normalized_owner_id,
-                ),
-            )
+            if stale_before is None:
+                result = connection.execute(
+                    """
+                    UPDATE stable_canary_launch_reservations
+                    SET reserved_at = ?
+                    WHERE launch_ready_snapshot_id = ? AND owner_id = ?
+                    """,
+                    (
+                        normalized_reserved_at.isoformat(),
+                        launch_ready_snapshot_id,
+                        normalized_owner_id,
+                    ),
+                )
+            else:
+                result = connection.execute(
+                    """
+                    UPDATE stable_canary_launch_reservations
+                    SET reserved_at = ?
+                    WHERE launch_ready_snapshot_id = ?
+                      AND owner_id = ?
+                      AND reserved_at > ?
+                    """,
+                    (
+                        normalized_reserved_at.isoformat(),
+                        launch_ready_snapshot_id,
+                        normalized_owner_id,
+                        stale_before.isoformat(),
+                    ),
+                )
 
         rowcount = getattr(result, "rowcount", None)
         return isinstance(rowcount, int) and rowcount > 0
