@@ -616,6 +616,150 @@ async def _scan_current_approved_canary_snapshot_for_promoted_proposal(
     )
 
 
+async def _generate_canary_approval_proposal_summaries(
+    *,
+    universe_service: OpportunityUniverseService,
+    approval_service: RouteApprovalService,
+    history_store: OpportunityHistoryStore,
+    current_time: datetime,
+    venues: list[str] | None,
+    extended_fee_profile: str | None,
+    paradex_fee_profile: str | None,
+    hyperliquid_fee_profile: str | None,
+    target_notional: float,
+    canary_max_notional: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+    include_symbols: list[str] | None,
+    exclude_symbols: list[str] | None,
+    exclude_tags: list[str] | None,
+    limit: int,
+    candidate_sample: int,
+    use_history_shortlist: bool,
+    history_shortlist_sample: int,
+    history_shortlist_limit: int,
+    history_shortlist_max_age_seconds: int,
+) -> list[FundingUniverseCanaryApprovalProposalSummary]:
+    """Return current canary approval proposal summaries using production scan gates."""
+
+    limit = _validated_history_limit("limit", limit)
+    candidate_sample = max(
+        limit,
+        _validated_history_limit("candidate_sample", candidate_sample),
+    )
+    history_shortlist_sample = _validated_history_limit(
+        "history_shortlist_sample",
+        history_shortlist_sample,
+    )
+    history_shortlist_limit = max(
+        limit,
+        _validated_history_limit("history_shortlist_limit", history_shortlist_limit),
+    )
+    history_shortlist_sample = max(
+        history_shortlist_sample,
+        history_shortlist_limit,
+    )
+    if history_shortlist_max_age_seconds < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="history_shortlist_max_age_seconds must be at least 1",
+        )
+    if history_shortlist_max_age_seconds > MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "history_shortlist_max_age_seconds must be at most "
+                f"{MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS}"
+            ),
+        )
+    selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
+    effective_exclude_tags = DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags
+    effective_include_symbols = include_symbols
+    used_history_shortlist = False
+    if use_history_shortlist and include_symbols is None:
+        try:
+            shortlisted_symbols = await asyncio.to_thread(
+                _select_canary_reprice_symbols_from_history,
+                history_store,
+                sample=history_shortlist_sample,
+                limit=history_shortlist_limit,
+                now=current_time,
+                max_age_seconds=history_shortlist_max_age_seconds,
+                venues=selected_venues,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=effective_exclude_tags,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+            )
+        except Exception:
+            logger.exception("failed to build history shortlist for canary approval proposals")
+            shortlisted_symbols = []
+        if shortlisted_symbols:
+            effective_include_symbols = shortlisted_symbols
+            used_history_shortlist = True
+
+    async def _scan_candidates(
+        include_symbols_override: list[str] | None,
+        scan_limit: int,
+    ) -> list[FundingUniverseCanaryCandidate]:
+        return await _run_bounded_universe_scan(
+            "funding universe canary approval proposal scan",
+            lambda: universe_service.scan_canary_candidates(
+                venues=selected_venues,
+                fee_profile_overrides=_build_fee_profile_overrides(
+                    extended_fee_profile=extended_fee_profile,
+                    paradex_fee_profile=paradex_fee_profile,
+                    hyperliquid_fee_profile=hyperliquid_fee_profile,
+                    selected_venues=selected_venues,
+                ),
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols_override,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=effective_exclude_tags,
+                limit=scan_limit,
+            ),
+        )
+
+    candidates = await _scan_candidates(effective_include_symbols, candidate_sample)
+    if used_history_shortlist and len(candidates) < limit:
+        broad_candidates = await _scan_candidates(None, limit)
+        candidates = _merge_canary_candidates(
+            candidates,
+            broad_candidates,
+            limit=limit,
+        )
+    proposals = approval_service.propose_canary_route_approvals(
+        candidates,
+        limit=limit,
+    )
+    return [
+        _summarize_canary_approval_proposal(
+            proposal,
+            generated_at=current_time,
+        )
+        for proposal in proposals
+    ]
+
+
 def get_app_environment() -> str:
     """Return the runtime environment exposed by the API health endpoints."""
 
@@ -3578,6 +3722,213 @@ async def _build_launch_ready_snapshot_for_approved_snapshot(
         max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
         approved_snapshot=refreshed_snapshot,
         system_state=system_state,
+    )
+
+
+async def _approve_refresh_and_cache_launch_ready_canary_proposal(
+    *,
+    label: str,
+    universe_service: OpportunityUniverseService,
+    approval_service: RouteApprovalService,
+    approved_store: ApprovedCanaryStore,
+    launch_ready_store: LaunchReadyCanaryStore,
+    system_state_service: SystemStateService,
+    settings: ApiSettings,
+    payload: FundingUniverseCanaryApprovalProposalSummary,
+    current_time: datetime,
+    max_proposal_age_seconds: int,
+    target_notional: float,
+    canary_max_notional: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+    exclude_tags: list[str] | None,
+) -> LaunchReadyCanarySnapshot:
+    """Promote one current proposal and cache it only if launch-ready gates pass."""
+
+    approval_payload = _build_approved_route_payload_from_canary_proposal(
+        label=label,
+        proposal=payload,
+        current_time=current_time,
+        max_proposal_age_seconds=max_proposal_age_seconds,
+    )
+    candidate_approval = RouteApprovalEntry(
+        updated_at=current_time,
+        label=label,
+        canonical_symbol=approval_payload.canonical_symbol,
+        short_venue=approval_payload.short_venue,
+        long_venue=approval_payload.long_venue,
+        short_fee_profile=approval_payload.short_fee_profile,
+        long_fee_profile=approval_payload.long_fee_profile,
+        approved=True,
+        max_live_notional=approval_payload.max_live_notional,
+        note=approval_payload.note,
+    )
+    snapshot = await _scan_current_approved_canary_snapshot_for_promoted_proposal(
+        universe_service=universe_service,
+        approval=candidate_approval,
+        now=current_time,
+        target_notional=target_notional,
+        canary_max_notional=canary_max_notional,
+        min_capacity_notional=min_capacity_notional,
+        min_daily_volume=min_daily_volume,
+        min_open_interest=min_open_interest,
+        min_roundtrip_edge=min_roundtrip_edge,
+        min_execution_quality_score=min_execution_quality_score,
+        min_execution_samples=min_execution_samples,
+        min_route_stability_weight=min_route_stability_weight,
+        min_route_presence_ratio=min_route_presence_ratio,
+        min_route_samples=min_route_samples,
+        exclude_tags=DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags,
+    )
+    launch_ready_snapshot = await _build_launch_ready_snapshot_for_approved_snapshot(
+        settings=settings,
+        approved_store=approved_store,
+        system_state_service=system_state_service,
+        snapshot=snapshot,
+        now=current_time,
+    )
+    return _persist_launch_ready_promotion_atomically(
+        approval_service=approval_service,
+        approved_store=approved_store,
+        launch_ready_store=launch_ready_store,
+        approval_payload=approval_payload,
+        snapshot=snapshot,
+        launch_ready_snapshot=launch_ready_snapshot,
+    )
+
+
+def _persist_launch_ready_promotion_atomically(
+    *,
+    approval_service: RouteApprovalService,
+    approved_store: ApprovedCanaryStore,
+    launch_ready_store: LaunchReadyCanaryStore,
+    approval_payload: RouteApprovalUpsert,
+    snapshot: ApprovedCanarySnapshot,
+    launch_ready_snapshot: LaunchReadyCanarySnapshot,
+) -> LaunchReadyCanarySnapshot:
+    """Persist approval, approved snapshot, and launch-ready snapshot in one transaction."""
+
+    database_urls = {
+        approval_service.store.database.url,
+        approved_store.database.url,
+        launch_ready_store.database.url,
+    }
+    if len(database_urls) != 1:
+        raise RuntimeError("launch-ready promotion stores must share one database target")
+
+    approval_service.store.initialize()
+    approved_store.initialize()
+    launch_ready_store.initialize()
+
+    approval_entry = RouteApprovalEntry(
+        label=snapshot.label,
+        updated_at=datetime.now(UTC),
+        canonical_symbol=approval_payload.canonical_symbol,
+        short_venue=approval_payload.short_venue,
+        long_venue=approval_payload.long_venue,
+        short_fee_profile=approval_payload.short_fee_profile,
+        long_fee_profile=approval_payload.long_fee_profile,
+        approved=approval_payload.approved,
+        max_live_notional=approval_payload.max_live_notional,
+        note=approval_payload.note,
+    )
+    approved_snapshot_to_persist = snapshot.model_copy(
+        update={"approval": approval_entry}
+    )
+
+    with approval_service.store.database.begin() as connection:
+        connection.execute(
+            """
+            INSERT INTO route_approval_entries (
+                updated_at,
+                label,
+                canonical_symbol,
+                short_venue,
+                long_venue,
+                short_fee_profile,
+                long_fee_profile,
+                approved,
+                max_live_notional,
+                entry_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (
+                label,
+                canonical_symbol,
+                short_venue,
+                long_venue,
+                short_fee_profile,
+                long_fee_profile
+            ) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                approved = excluded.approved,
+                max_live_notional = excluded.max_live_notional,
+                entry_json = excluded.entry_json
+            """,
+            (
+                approval_entry.updated_at.isoformat(),
+                approval_entry.label,
+                approval_entry.canonical_symbol,
+                approval_entry.short_venue,
+                approval_entry.long_venue,
+                approval_entry.short_fee_profile,
+                approval_entry.long_fee_profile,
+                int(approval_entry.approved),
+                approval_entry.max_live_notional,
+                approval_entry.model_dump_json(),
+            ),
+        )
+        approved_snapshot_id = connection.insert_returning_id(
+            """
+            INSERT INTO approved_canary_snapshots (
+                captured_at,
+                label,
+                snapshot_json
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                approved_snapshot_to_persist.captured_at.isoformat(),
+                approved_snapshot_to_persist.label,
+                approved_snapshot_to_persist.model_dump_json(),
+            ),
+        )
+        persisted_approved_snapshot = ApprovedCanarySnapshot.model_validate(
+            {
+                **approved_snapshot_to_persist.model_dump(mode="json"),
+                "snapshot_id": approved_snapshot_id,
+            }
+        )
+        launch_ready_to_persist = launch_ready_snapshot.model_copy(
+            update={"approved_snapshot": persisted_approved_snapshot}
+        )
+        launch_ready_snapshot_id = connection.insert_returning_id(
+            """
+            INSERT INTO launch_ready_canary_snapshots (
+                captured_at,
+                label,
+                approved_snapshot_id,
+                snapshot_json
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                launch_ready_to_persist.captured_at.isoformat(),
+                launch_ready_to_persist.label,
+                launch_ready_to_persist.approved_snapshot.snapshot_id,
+                launch_ready_to_persist.model_dump_json(),
+            ),
+        )
+
+    return LaunchReadyCanarySnapshot.model_validate(
+        {
+            **launch_ready_to_persist.model_dump(mode="python"),
+            "launch_ready_snapshot_id": launch_ready_snapshot_id,
+        }
     )
 
 
@@ -7506,121 +7857,36 @@ def create_app() -> FastAPI:
         history_shortlist_max_age_seconds: int = DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS,
     ) -> list[FundingUniverseCanaryApprovalProposalSummary]:
         try:
-            limit = _validated_history_limit("limit", limit)
-            candidate_sample = max(
-                limit,
-                _validated_history_limit("candidate_sample", candidate_sample),
-            )
-            history_shortlist_sample = _validated_history_limit(
-                "history_shortlist_sample",
-                history_shortlist_sample,
-            )
-            history_shortlist_limit = max(
-                limit,
-                _validated_history_limit("history_shortlist_limit", history_shortlist_limit),
-            )
-            history_shortlist_sample = max(
-                history_shortlist_sample,
-                history_shortlist_limit,
-            )
-            if history_shortlist_max_age_seconds < 1:
-                raise HTTPException(
-                    status_code=400,
-                    detail="history_shortlist_max_age_seconds must be at least 1",
-                )
-            if history_shortlist_max_age_seconds > MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "history_shortlist_max_age_seconds must be at most "
-                        f"{MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS}"
-                    ),
-                )
-            selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
-            effective_exclude_tags = (
-                DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags
-            )
-            effective_include_symbols = include_symbols
-            used_history_shortlist = False
-            if use_history_shortlist and include_symbols is None:
-                try:
-                    shortlisted_symbols = await asyncio.to_thread(
-                        _select_canary_reprice_symbols_from_history,
-                        history_store,
-                        sample=history_shortlist_sample,
-                        limit=history_shortlist_limit,
-                        now=current_time,
-                        max_age_seconds=history_shortlist_max_age_seconds,
-                        venues=selected_venues,
-                        exclude_symbols=exclude_symbols,
-                        exclude_tags=effective_exclude_tags,
-                        min_roundtrip_edge=min_roundtrip_edge,
-                        min_capacity_notional=min_capacity_notional,
-                        min_daily_volume=min_daily_volume,
-                        min_open_interest=min_open_interest,
-                    )
-                except Exception:
-                    logger.exception(
-                        "failed to build history shortlist for canary approval proposals"
-                    )
-                    shortlisted_symbols = []
-                if shortlisted_symbols:
-                    effective_include_symbols = shortlisted_symbols
-                    used_history_shortlist = True
-            generated_at = current_time
-
-            async def _scan_candidates(
-                include_symbols_override: list[str] | None,
-                scan_limit: int,
-            ) -> list[FundingUniverseCanaryCandidate]:
-                return await _run_bounded_universe_scan(
-                    "funding universe canary approval proposal scan",
-                    lambda: service.scan_canary_candidates(
-                        venues=selected_venues,
-                        fee_profile_overrides=_build_fee_profile_overrides(
-                            extended_fee_profile=extended_fee_profile,
-                            paradex_fee_profile=paradex_fee_profile,
-                            hyperliquid_fee_profile=hyperliquid_fee_profile,
-                            selected_venues=selected_venues,
-                        ),
-                        target_notional=target_notional,
-                        canary_max_notional=canary_max_notional,
-                        min_capacity_notional=min_capacity_notional,
-                        min_daily_volume=min_daily_volume,
-                        min_open_interest=min_open_interest,
-                        min_roundtrip_edge=min_roundtrip_edge,
-                        min_execution_quality_score=min_execution_quality_score,
-                        min_execution_samples=min_execution_samples,
-                        min_route_stability_weight=min_route_stability_weight,
-                        min_route_presence_ratio=min_route_presence_ratio,
-                        min_route_samples=min_route_samples,
-                        include_symbols=include_symbols_override,
-                        exclude_symbols=exclude_symbols,
-                        exclude_tags=effective_exclude_tags,
-                        limit=scan_limit,
-                    ),
-                )
-
-            candidates = await _scan_candidates(effective_include_symbols, candidate_sample)
-            if used_history_shortlist and len(candidates) < limit:
-                remaining_candidate_slots = max(1, limit - len(candidates))
-                broad_candidates = await _scan_candidates(None, remaining_candidate_slots)
-                candidates = _merge_canary_candidates(
-                    candidates,
-                    broad_candidates,
-                    limit=limit,
-                )
-            proposals = approval_service.propose_canary_route_approvals(
-                candidates,
+            return await _generate_canary_approval_proposal_summaries(
+                universe_service=service,
+                approval_service=approval_service,
+                history_store=history_store,
+                current_time=current_time,
+                venues=venues,
+                extended_fee_profile=extended_fee_profile,
+                paradex_fee_profile=paradex_fee_profile,
+                hyperliquid_fee_profile=hyperliquid_fee_profile,
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
                 limit=limit,
+                candidate_sample=candidate_sample,
+                use_history_shortlist=use_history_shortlist,
+                history_shortlist_sample=history_shortlist_sample,
+                history_shortlist_limit=history_shortlist_limit,
+                history_shortlist_max_age_seconds=history_shortlist_max_age_seconds,
             )
-            return [
-                _summarize_canary_approval_proposal(
-                    proposal,
-                    generated_at=generated_at,
-                )
-                for proposal in proposals
-            ]
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
@@ -7762,28 +8028,17 @@ def create_app() -> FastAPI:
         min_route_samples: int = 2,
         exclude_tags: Annotated[list[str] | None, Query()] = None,
     ) -> LaunchReadyCanarySnapshot:
-        approval_payload = _build_approved_route_payload_from_canary_proposal(
+        return await _approve_refresh_and_cache_launch_ready_canary_proposal(
             label=label,
-            proposal=payload,
+            universe_service=universe_service,
+            approval_service=approval_service,
+            approved_store=approved_store,
+            launch_ready_store=launch_ready_store,
+            system_state_service=system_state_service,
+            settings=settings,
+            payload=payload,
             current_time=current_time,
             max_proposal_age_seconds=max_proposal_age_seconds,
-        )
-        candidate_approval = RouteApprovalEntry(
-            updated_at=current_time,
-            label=label,
-            canonical_symbol=approval_payload.canonical_symbol,
-            short_venue=approval_payload.short_venue,
-            long_venue=approval_payload.long_venue,
-            short_fee_profile=approval_payload.short_fee_profile,
-            long_fee_profile=approval_payload.long_fee_profile,
-            approved=True,
-            max_live_notional=approval_payload.max_live_notional,
-            note=approval_payload.note,
-        )
-        snapshot = await _scan_current_approved_canary_snapshot_for_promoted_proposal(
-            universe_service=universe_service,
-            approval=candidate_approval,
-            now=current_time,
             target_notional=target_notional,
             canary_max_notional=canary_max_notional,
             min_capacity_notional=min_capacity_notional,
@@ -7795,24 +8050,128 @@ def create_app() -> FastAPI:
             min_route_stability_weight=min_route_stability_weight,
             min_route_presence_ratio=min_route_presence_ratio,
             min_route_samples=min_route_samples,
-            exclude_tags=DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags,
+            exclude_tags=exclude_tags,
         )
-        launch_ready_snapshot = await _build_launch_ready_snapshot_for_approved_snapshot(
-            settings=settings,
-            approved_store=approved_store,
-            system_state_service=system_state_service,
-            snapshot=snapshot,
-            now=current_time,
-        )
-        persisted_approval = approval_service.upsert(label=label, payload=approval_payload)
-        persisted_approved_snapshot = approved_store.append(
-            snapshot.model_copy(update={"approval": persisted_approval})
-        )
-        return launch_ready_store.append(
-            launch_ready_snapshot.model_copy(
-                update={"approved_snapshot": persisted_approved_snapshot}
+
+    @app.post(
+        "/v1/opportunities/funding-universe/canary/approval-proposals/"
+        "approve-best-launch-ready",
+        response_model=LaunchReadyCanarySnapshot,
+    )
+    async def approve_best_launch_ready_canary_approval_proposal(
+        universe_service: Annotated[
+            OpportunityUniverseService,
+            Depends(get_opportunity_universe_service),
+        ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        approved_store: Annotated[
+            ApprovedCanaryStore,
+            Depends(get_approved_canary_store),
+        ],
+        launch_ready_store: Annotated[
+            LaunchReadyCanaryStore,
+            Depends(get_launch_ready_canary_store),
+        ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
+        history_store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        current_time: Annotated[datetime, Depends(get_current_utc_time)],
+        venues: Annotated[list[str] | None, Query()] = None,
+        extended_fee_profile: str | None = None,
+        paradex_fee_profile: str | None = "pro_fastfills",
+        hyperliquid_fee_profile: str | None = None,
+        max_proposal_age_seconds: int = DEFAULT_APPROVAL_PROPOSAL_MAX_AGE_SECONDS,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.10,
+        min_route_presence_ratio: float = 0.15,
+        min_route_samples: int = 2,
+        include_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_symbols: Annotated[list[str] | None, Query()] = None,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+        candidate_sample: int = 50,
+        use_history_shortlist: bool = True,
+        history_shortlist_sample: int = 500,
+        history_shortlist_limit: int = 50,
+        history_shortlist_max_age_seconds: int = DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS,
+    ) -> LaunchReadyCanarySnapshot:
+        try:
+            proposals = await _generate_canary_approval_proposal_summaries(
+                universe_service=universe_service,
+                approval_service=approval_service,
+                history_store=history_store,
+                current_time=current_time,
+                venues=venues or ["extended", "paradex"],
+                extended_fee_profile=extended_fee_profile,
+                paradex_fee_profile=paradex_fee_profile,
+                hyperliquid_fee_profile=hyperliquid_fee_profile,
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                include_symbols=include_symbols,
+                exclude_symbols=exclude_symbols,
+                exclude_tags=exclude_tags,
+                limit=1,
+                candidate_sample=candidate_sample,
+                use_history_shortlist=use_history_shortlist,
+                history_shortlist_sample=history_shortlist_sample,
+                history_shortlist_limit=history_shortlist_limit,
+                history_shortlist_max_age_seconds=history_shortlist_max_age_seconds,
             )
-        )
+            if not proposals:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No current canary approval proposal found",
+                )
+            proposal = proposals[0]
+            return await _approve_refresh_and_cache_launch_ready_canary_proposal(
+                label=proposal.label,
+                universe_service=universe_service,
+                approval_service=approval_service,
+                approved_store=approved_store,
+                launch_ready_store=launch_ready_store,
+                system_state_service=system_state_service,
+                settings=settings,
+                payload=proposal,
+                current_time=current_time,
+                max_proposal_age_seconds=max_proposal_age_seconds,
+                target_notional=target_notional,
+                canary_max_notional=canary_max_notional,
+                min_capacity_notional=min_capacity_notional,
+                min_daily_volume=min_daily_volume,
+                min_open_interest=min_open_interest,
+                min_roundtrip_edge=min_roundtrip_edge,
+                min_execution_quality_score=min_execution_quality_score,
+                min_execution_samples=min_execution_samples,
+                min_route_stability_weight=min_route_stability_weight,
+                min_route_presence_ratio=min_route_presence_ratio,
+                min_route_samples=min_route_samples,
+                exclude_tags=exclude_tags,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post(
         "/v1/executions/live/canary-cycle/approved-basket",
