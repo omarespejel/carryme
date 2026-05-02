@@ -1307,6 +1307,82 @@ def test_opportunity_universe_service_orders_unbounded_scans_with_market_stats()
     asyncio.run(run())
 
 
+def test_opportunity_universe_service_canary_candidates_force_snapshot_shortlist() -> None:
+    symbol_lists = {
+        "extended": ["TOP-USD", "MID-USD", "LOW-USD"],
+        "paradex": ["TOP-USD-PERP", "MID-USD-PERP", "LOW-USD-PERP"],
+    }
+    summary_snapshots = {
+        ("extended", "TOP-USD"): _snapshot(
+            "extended", "TOP-USD", 0.0005, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("paradex", "TOP-USD-PERP"): _snapshot(
+            "paradex", "TOP-USD-PERP", -0.0005, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("extended", "MID-USD"): _snapshot(
+            "extended", "MID-USD", 0.0003, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("paradex", "MID-USD-PERP"): _snapshot(
+            "paradex", "MID-USD-PERP", -0.0002, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("extended", "LOW-USD"): _snapshot(
+            "extended", "LOW-USD", 0.00001, 1.0, 10_000, 1.001, 10_000
+        ),
+        ("paradex", "LOW-USD-PERP"): _snapshot(
+            "paradex", "LOW-USD-PERP", 0.0, 1.0, 10_000, 1.001, 10_000
+        ),
+    }
+    full_snapshots = {
+        ("extended", "TOP-USD"): summary_snapshots[("extended", "TOP-USD")],
+        ("paradex", "TOP-USD-PERP"): summary_snapshots[("paradex", "TOP-USD-PERP")],
+    }
+    fetched_full_snapshots: list[tuple[str, str]] = []
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_market_stats(venue: str, symbol: str) -> MarketStats:
+        return summary_snapshots[(venue, symbol)].market.model_copy(
+            update={"top_of_book": None}
+        )
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        fetched_full_snapshots.append((venue, symbol))
+        try:
+            return full_snapshots[(venue, symbol)]
+        except KeyError as exc:
+            raise AssertionError(
+                f"unexpected full canary snapshot for non-shortlisted symbol: {(venue, symbol)}"
+            ) from exc
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_market_stats=fetch_market_stats,
+            fetch_snapshot=fetch_snapshot,
+            snapshot_shortlist_min_overlaps=1,
+            snapshot_shortlist_multiplier=1,
+        )
+        candidates = await service.scan_canary_candidates(
+            venues=["extended", "paradex"],
+            min_execution_quality_score=0.0,
+            min_route_stability_weight=0.0,
+            min_route_presence_ratio=0.0,
+            min_route_samples=0,
+            limit=1,
+        )
+
+        assert [item.opportunity.opportunity.canonical_symbol for item in candidates] == [
+            "TOP-USD-PERP"
+        ]
+        assert set(fetched_full_snapshots) == {
+            ("extended", "TOP-USD"),
+            ("paradex", "TOP-USD-PERP"),
+        }
+
+    asyncio.run(run())
+
+
 def test_opportunity_universe_service_preserves_non_edge_ranking_correctness() -> None:
     symbol_lists = {
         "extended": ["HIGHEDGE-USD", "BIG-USD"],

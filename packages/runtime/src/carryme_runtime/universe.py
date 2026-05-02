@@ -210,6 +210,7 @@ class OpportunityUniverseService:
             limit=limit,
             use_execution_quality=use_execution_quality,
             use_route_stability=use_route_stability,
+            force_snapshot_shortlist=True,
         )
         candidates: list[FundingUniverseCanaryCandidate] = []
         for opportunity in scan.opportunities:
@@ -249,6 +250,7 @@ class OpportunityUniverseService:
         limit: int = 20,
         use_execution_quality: bool = True,
         use_route_stability: bool = True,
+        force_snapshot_shortlist: bool = False,
     ) -> FundingUniverseScan:
         normalized_venues = _normalize_venues(venues)
         normalized_ranking = _normalize_ranking(ranking)
@@ -276,6 +278,7 @@ class OpportunityUniverseService:
             min_daily_volume=min_daily_volume,
             min_open_interest=min_open_interest,
             min_roundtrip_edge=min_roundtrip_edge,
+            force_snapshot_shortlist=force_snapshot_shortlist,
         )
         snapshots = await self._fetch_overlapping_snapshots(snapshot_overlaps)
         needs_execution_quality = (
@@ -469,6 +472,7 @@ class OpportunityUniverseService:
         min_daily_volume: float,
         min_open_interest: float,
         min_roundtrip_edge: float,
+        force_snapshot_shortlist: bool = False,
     ) -> list[FundingUniverseOverlap]:
         """Use lightweight market stats to choose which overlaps need full orderbooks."""
 
@@ -525,7 +529,10 @@ class OpportunityUniverseService:
         ranked = sorted(scored, key=lambda item: item[0], reverse=True)
         ordered = [overlap for _score, overlap in ranked]
         ordered.extend(unscored)
-        if shortlist_size <= 0 or ranking not in SHORTLIST_CAPPED_RANKINGS:
+        if (
+            shortlist_size <= 0
+            or (ranking not in SHORTLIST_CAPPED_RANKINGS and not force_snapshot_shortlist)
+        ):
             return ordered
         return ordered[:shortlist_size]
 
