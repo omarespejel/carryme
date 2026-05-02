@@ -2478,6 +2478,98 @@ def _select_trade_intent_records(
     return rank_history_records(candidates, limit=limit)
 
 
+def _record_capacity_notional(record: OpportunityRecord) -> float:
+    """Return the saved max entry capacity as a sortable/filterable number."""
+
+    capacity = record.opportunity.capacity
+    if capacity is None or capacity.max_entry_notional is None:
+        return 0.0
+    return capacity.max_entry_notional
+
+
+def _min_saved_liquidity_values(short_value: float | None, long_value: float | None) -> float:
+    """Return the weaker saved venue metric for volume/OI filters."""
+
+    values = [value for value in (short_value, long_value) if value is not None]
+    if not values:
+        return 0.0
+    return min(values)
+
+
+def _select_canary_reprice_symbols_from_history(
+    store: OpportunityHistoryStore,
+    *,
+    sample: int,
+    limit: int,
+    venues: list[str],
+    exclude_symbols: list[str] | None,
+    exclude_tags: list[str] | None,
+    min_roundtrip_edge: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+) -> list[str]:
+    """Select saved symbols worth live repricing before approval proposal generation."""
+
+    selected_venues = {venue.strip().lower() for venue in venues if venue.strip()}
+    records = store.list_recent(limit=sample)
+    latest = latest_records_by_label(records, limit=len(records))
+    candidates: list[OpportunityRecord] = []
+    for record in latest:
+        opportunity = record.opportunity
+        route_venues = {
+            opportunity.short_venue.strip().lower(),
+            opportunity.long_venue.strip().lower(),
+        }
+        if not route_venues.issubset(selected_venues):
+            continue
+        if not passes_symbol_policy(
+            opportunity.canonical_symbol,
+            exclude_symbols=exclude_symbols,
+            exclude_tags=exclude_tags,
+        ):
+            continue
+        if opportunity.one_day_net_edge_after_round_trip < min_roundtrip_edge:
+            continue
+        if _record_capacity_notional(record) < min_capacity_notional:
+            continue
+        saved_daily_volume = _min_saved_liquidity_values(
+            opportunity.short_daily_volume,
+            opportunity.long_daily_volume,
+        )
+        if saved_daily_volume < min_daily_volume:
+            continue
+        saved_open_interest = _min_saved_liquidity_values(
+            opportunity.short_open_interest,
+            opportunity.long_open_interest,
+        )
+        if saved_open_interest < min_open_interest:
+            continue
+        candidates.append(record)
+
+    ranked = sorted(
+        candidates,
+        key=lambda record: (
+            record.opportunity.one_day_net_edge_after_round_trip,
+            record.opportunity.one_day_net_edge_after_entry,
+            _record_capacity_notional(record),
+            record.recorded_at.timestamp(),
+        ),
+        reverse=True,
+    )
+    symbols: list[str] = []
+    seen_symbols: set[str] = set()
+    for record in ranked:
+        symbol = record.opportunity.canonical_symbol
+        if symbol in seen_symbols:
+            continue
+        symbols.append(symbol)
+        seen_symbols.add(symbol)
+        if len(symbols) >= limit:
+            break
+    return symbols
+
+
 def _build_trade_intent_candidates(
     store: OpportunityHistoryStore,
     *,
@@ -6931,6 +7023,7 @@ def create_app() -> FastAPI:
             RouteApprovalService,
             Depends(get_route_approval_service),
         ],
+        history_store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
         venues: Annotated[list[str] | None, Query()] = None,
         extended_fee_profile: str | None = None,
         paradex_fee_profile: str | None = "pro_fastfills",
@@ -6951,6 +7044,9 @@ def create_app() -> FastAPI:
         exclude_tags: Annotated[list[str] | None, Query()] = None,
         limit: int = 10,
         candidate_sample: int = 50,
+        use_history_shortlist: bool = True,
+        history_shortlist_sample: int = 500,
+        history_shortlist_limit: int = 50,
     ) -> list[FundingUniverseCanaryApprovalProposalSummary]:
         try:
             limit = _validated_history_limit("limit", limit)
@@ -6958,7 +7054,32 @@ def create_app() -> FastAPI:
                 limit,
                 _validated_history_limit("candidate_sample", candidate_sample),
             )
+            history_shortlist_sample = _validated_history_limit(
+                "history_shortlist_sample",
+                history_shortlist_sample,
+            )
+            history_shortlist_limit = max(
+                limit,
+                _validated_history_limit("history_shortlist_limit", history_shortlist_limit),
+            )
             selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
+            effective_include_symbols = include_symbols
+            if use_history_shortlist and include_symbols is None:
+                shortlisted_symbols = _select_canary_reprice_symbols_from_history(
+                    history_store,
+                    sample=history_shortlist_sample,
+                    limit=history_shortlist_limit,
+                    venues=selected_venues,
+                    exclude_symbols=exclude_symbols,
+                    exclude_tags=exclude_tags,
+                    min_roundtrip_edge=min_roundtrip_edge,
+                    min_capacity_notional=min_capacity_notional,
+                    min_daily_volume=min_daily_volume,
+                    min_open_interest=min_open_interest,
+                )
+                if shortlisted_symbols:
+                    effective_include_symbols = shortlisted_symbols
+                    candidate_sample = min(candidate_sample, len(shortlisted_symbols))
             generated_at = datetime.now(UTC)
             candidates = await _run_bounded_universe_scan(
                 "funding universe canary approval proposal scan",
@@ -6981,7 +7102,7 @@ def create_app() -> FastAPI:
                     min_route_stability_weight=min_route_stability_weight,
                     min_route_presence_ratio=min_route_presence_ratio,
                     min_route_samples=min_route_samples,
-                    include_symbols=include_symbols,
+                    include_symbols=effective_include_symbols,
                     exclude_symbols=exclude_symbols,
                     exclude_tags=exclude_tags,
                     limit=candidate_sample,
