@@ -406,6 +406,20 @@ class WorkerSettings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_stable_launch_multi_route_active_cap(self) -> "WorkerSettings":
+        """Require an explicit active-execution cap before enabling multi-route launch."""
+
+        if (
+            self.stable_canary_launch_max_routes_per_cycle > 1
+            and self.stable_canary_launch_max_active_live_executions <= 0
+        ):
+            raise ValueError(
+                "stable_canary_launch_max_active_live_executions must be positive when "
+                "stable_canary_launch_max_routes_per_cycle is greater than 1"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_stable_launch_reservation_retention(self) -> "WorkerSettings":
         """Keep reservation cleanup from deleting leases before they are stale."""
 

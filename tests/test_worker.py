@@ -439,6 +439,17 @@ def test_stable_launch_route_limit_fails_closed_at_active_cap(tmp_path: Path) ->
     )
 
 
+def test_worker_rejects_multi_route_stable_launch_without_active_cap(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValidationError,
+        match="stable_canary_launch_max_active_live_executions must be positive",
+    ):
+        WorkerSettings(
+            database_path=str(tmp_path / "history.sqlite3"),
+            stable_canary_launch_max_routes_per_cycle=2,
+        )
+
+
 def test_worker_env_can_disable_stable_launch_immediate_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -635,7 +646,7 @@ def test_worker_automation_mode_payload_is_redacted_and_shows_hold_controls() ->
         environment="production",
         database_path="postgresql+psycopg://user:secret@db.example.com/carryme",
         stable_canary_launch_close_position=False,
-        stable_canary_launch_max_active_live_executions=0,
+        stable_canary_launch_max_active_live_executions=2,
         stable_canary_launch_max_routes_per_cycle=2,
         stable_canary_launch_max_total_live_notional=25.0,
         stable_canary_launch_max_live_notional_per_venue=20.0,
@@ -656,7 +667,7 @@ def test_worker_automation_mode_payload_is_redacted_and_shows_hold_controls() ->
     assert "secret" not in json.dumps(payload)
     assert payload["stable_canary_launch_close_position"] is False
     assert payload["stable_canary_launch_hold_mode"] is True
-    assert payload["stable_canary_launch_max_active_live_executions"] == 0
+    assert payload["stable_canary_launch_max_active_live_executions"] == 2
     assert payload["stable_canary_launch_max_routes_per_cycle"] == 2
     assert payload["stable_canary_launch_max_total_live_notional"] == 25.0
     assert payload["stable_canary_launch_max_live_notional_per_venue"] == 20.0
