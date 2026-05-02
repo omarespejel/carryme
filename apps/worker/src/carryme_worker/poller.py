@@ -384,6 +384,16 @@ class StableCanaryLaunchLoopSummary:
     database_path: str
 
 
+def _utc_now() -> datetime:
+    """Return the current UTC timestamp.
+
+    Kept as a tiny seam so tests can model slow production cycles without
+    sleeping or monkeypatching the datetime type.
+    """
+
+    return datetime.now(UTC)
+
+
 def _list_blocking_live_executions_for_stable_launch(
     *,
     settings: WorkerSettings,
@@ -3040,7 +3050,7 @@ async def launch_latest_stable_canary_once(
     route_approval_service = RouteApprovalService(
         store=RouteApprovalStore(runtime_settings.database_path)
     )
-    timestamp = now or datetime.now(UTC)
+    timestamp = now or _utc_now()
 
     blocking_live_executions = _list_blocking_live_executions_for_stable_launch(
         settings=settings,
@@ -3124,12 +3134,17 @@ async def launch_latest_stable_canary_once(
             ),
         )
 
+    # Some production pre-checks intentionally touch live execution and balance
+    # history. Use a fresh timestamp for market-snapshot freshness so a slow
+    # pre-check cannot make a newly captured stable snapshot look future-dated.
+    snapshot_selection_timestamp = now or _utc_now()
+
     stable_candidates, no_candidate_detail = _list_ranked_stable_launch_ready_stabilities(
         store=launch_ready_store,
         max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
         min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
         min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
-        now=timestamp,
+        now=snapshot_selection_timestamp,
         scan_limit=settings.stable_canary_launch_candidate_scan_limit,
     )
     if not stable_candidates:
@@ -3150,7 +3165,7 @@ async def launch_latest_stable_canary_once(
                     approval_service=route_approval_service,
                     label=candidate_stability.snapshot.label,
                     max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
-                    now=timestamp,
+                    now=snapshot_selection_timestamp,
                 )
             )
         except HTTPException as exc:
@@ -3199,7 +3214,7 @@ async def launch_latest_stable_canary_once(
         label_cooldown_reason = _build_stable_launch_cooldown_reason(
             settings=settings,
             launch_store=stable_launch_store,
-            now=timestamp,
+            now=snapshot_selection_timestamp,
             label=candidate_snapshot.label,
         )
         if label_cooldown_reason is not None:
@@ -3216,7 +3231,7 @@ async def launch_latest_stable_canary_once(
         label_rate_cap_reason = _build_stable_launch_rate_cap_reason(
             settings=settings,
             launch_store=stable_launch_store,
-            now=timestamp,
+            now=snapshot_selection_timestamp,
             label=candidate_snapshot.label,
         )
         if label_rate_cap_reason is not None:
