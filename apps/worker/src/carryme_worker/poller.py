@@ -39,6 +39,7 @@ from carryme_models import (
     ExecutionJournalEntry,
     ExecutionObservationEntry,
     ExecutionPairStatus,
+    ExecutionQualitySummary,
     FundingArbOpportunity,
     FundingUniverseCanaryCandidate,
     FundingUniverseScan,
@@ -824,6 +825,42 @@ def _build_stable_launch_execution_maturity_reason(
         )
 
     return None
+
+
+def _stable_launch_needs_current_execution_quality(settings: WorkerSettings) -> bool:
+    """Return whether launch guards need current execution-quality history."""
+
+    return (
+        settings.stable_canary_launch_min_execution_quality_score is not None
+        or settings.stable_canary_launch_min_execution_samples is not None
+        or settings.stable_canary_launch_block_adverse_latest_outcome
+    )
+
+
+def _with_current_execution_quality(
+    *,
+    candidate: FundingUniverseCanaryCandidate,
+    execution_quality_index: dict[tuple[str, str, str], ExecutionQualitySummary],
+) -> FundingUniverseCanaryCandidate:
+    """Overlay latest observed route quality onto a candidate before launch guards run."""
+
+    opportunity = candidate.opportunity.opportunity
+    current_quality = execution_quality_index.get(
+        (
+            opportunity.canonical_symbol,
+            opportunity.short_venue,
+            opportunity.long_venue,
+        )
+    )
+    if current_quality is None:
+        return candidate
+    return candidate.model_copy(
+        update={
+            "opportunity": candidate.opportunity.model_copy(
+                update={"execution_quality": current_quality}
+            )
+        }
+    )
 
 
 def _build_stable_launch_latest_outcome_reason(
@@ -3044,6 +3081,12 @@ async def launch_latest_stable_canary_once(
     source_approved_store = approved_store or ApprovedCanaryStore(runtime_settings.database_path)
     execution_store = ExecutionJournalStore(runtime_settings.database_path)
     observation_store = ExecutionObservationStore(runtime_settings.database_path)
+    execution_quality_index: dict[tuple[str, str, str], ExecutionQualitySummary] = {}
+    if _stable_launch_needs_current_execution_quality(settings):
+        execution_quality_index = ExecutionQualityService(
+            journal_store=execution_store,
+            observation_store=observation_store,
+        ).build_index()
     balance_service = BalanceAccountingService(
         store=BalanceSnapshotStore(runtime_settings.database_path)
     )
@@ -3326,9 +3369,14 @@ async def launch_latest_stable_canary_once(
             )
             continue
 
+        guard_candidate = _with_current_execution_quality(
+            candidate=candidate_selected,
+            execution_quality_index=execution_quality_index,
+        )
+
         execution_maturity_reason = _build_stable_launch_execution_maturity_reason(
             settings=settings,
-            candidate=latest_approved_snapshot.candidate,
+            candidate=guard_candidate,
         )
         if execution_maturity_reason is not None:
             if settings.stable_canary_launch_shadow_mode:
@@ -3349,7 +3397,7 @@ async def launch_latest_stable_canary_once(
 
         latest_outcome_reason = _build_stable_launch_latest_outcome_reason(
             settings=settings,
-            candidate=latest_approved_snapshot.candidate,
+            candidate=guard_candidate,
         )
         if latest_outcome_reason is not None:
             if settings.stable_canary_launch_shadow_mode:

@@ -349,7 +349,9 @@ async def scan_exact_canary_candidate_for_approval(
         exclude_symbols=exclude_symbols,
         exclude_tags=exclude_tags,
         limit=max(1, limit),
-        use_execution_quality=False,
+        use_execution_quality=(
+            min_execution_quality_score > 0.0 or min_execution_samples > 0
+        ),
         use_route_stability=False,
     )
 

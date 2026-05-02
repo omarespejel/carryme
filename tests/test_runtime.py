@@ -3779,6 +3779,59 @@ def test_scan_exact_canary_candidate_for_approval_skips_route_stability_index(
     assert captured["use_route_stability"] is False
 
 
+def test_scan_exact_canary_candidate_for_approval_keeps_execution_quality_when_required(
+    tmp_path: Path,
+) -> None:
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        label="near_extended_paradex",
+        canonical_symbol="NEAR-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=25.0,
+        note="approved canary",
+    )
+    captured: dict[str, object] = {}
+
+    class StubScanner:
+        async def scan_canary_candidates(self, **kwargs: object) -> list[object]:
+            captured.update(kwargs)
+            return []
+
+    async def run() -> None:
+        await scan_exact_canary_candidate_for_approval(
+            scanner=cast(Any, StubScanner()),
+            approval_service=RouteApprovalService(
+                store=RouteApprovalStore(tmp_path / "approvals.sqlite3")
+            ),
+            approval=approval,
+            venues=["extended", "paradex"],
+            target_notional=5_000.0,
+            canary_max_notional=25.0,
+            min_capacity_notional=0.0,
+            min_daily_volume=0.0,
+            min_open_interest=0.0,
+            min_roundtrip_edge=0.0,
+            min_execution_quality_score=0.7,
+            min_execution_samples=0,
+            min_route_stability_weight=0.0,
+            min_route_presence_ratio=0.0,
+            min_route_samples=0,
+            include_symbols=None,
+            exclude_symbols=None,
+            exclude_tags=None,
+            limit=5,
+        )
+
+    asyncio.run(run())
+
+    assert captured["use_execution_quality"] is True
+    assert captured["use_route_stability"] is False
+
+
 def test_scan_live_route_candidate_for_approval_returns_negative_edge_route() -> None:
     approval = RouteApprovalEntry(
         updated_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
