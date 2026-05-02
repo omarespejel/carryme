@@ -2106,10 +2106,9 @@ def _evaluate_latest_launch_ready_stability(
         return None, f"label={label}: no launch-ready canary snapshot found"
 
     latest_snapshot = snapshots[0]
-    snapshot_age_seconds = max(
-        0.0,
-        (now - latest_snapshot.captured_at).total_seconds(),
-    )
+    snapshot_age_seconds = (now - latest_snapshot.captured_at).total_seconds()
+    if snapshot_age_seconds < 0:
+        return None, f"label={label}: snapshot timestamp is in the future"
     effective_max_age_seconds = min(
         max_snapshot_age_seconds,
         latest_snapshot.max_snapshot_age_seconds,
@@ -2992,6 +2991,44 @@ async def launch_latest_stable_canary_once(
                 continue
             raise
 
+        try:
+            revalidated_stability = _build_launch_ready_canary_stability(
+                store=launch_ready_store,
+                label=candidate_snapshot.label,
+                max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+                min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
+                min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
+                now=timestamp,
+            )
+        except HTTPException as exc:
+            detail = str(exc.detail) or (
+                "Launch-ready canary snapshot no longer satisfies stability requirements"
+            )
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=detail,
+            )
+            if summary is not None:
+                return summary
+            candidate_skip_details.append(f"{candidate_snapshot.label}: {detail}")
+            continue
+        if (
+            revalidated_stability.snapshot.launch_ready_snapshot_id
+            != candidate_snapshot.launch_ready_snapshot_id
+        ):
+            detail = (
+                "Launch-ready canary snapshot changed before stability could be revalidated"
+            )
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=detail,
+            )
+            if summary is not None:
+                return summary
+            candidate_skip_details.append(f"{candidate_snapshot.label}: {detail}")
+            continue
+        candidate_stability = revalidated_stability
+
         label_cooldown_reason = _build_stable_launch_cooldown_reason(
             settings=settings,
             launch_store=stable_launch_store,
@@ -3316,7 +3353,7 @@ async def launch_latest_stable_canary_once(
             note="worker stable launch-ready canary",
             lifecycle_note=(
                 "Launched by carryme-worker from stable launch-ready snapshot "
-                f"{stability.snapshot.launch_ready_snapshot_id} after "
+                f"{snapshot.launch_ready_snapshot_id} after "
                 f"{stability.consecutive_snapshots} stable snapshots over "
                 f"{stability.stable_seconds:.1f}s."
             ),

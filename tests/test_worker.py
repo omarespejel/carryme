@@ -4649,35 +4649,43 @@ def test_launch_latest_stable_canary_once_ranks_stable_labels_independently(
         datetime(2026, 4, 4, 10, 1, 10, tzinfo=UTC),
     )
     captured_labels: list[str] = []
+    captured_leg_symbols: list[tuple[str, str]] = []
 
     class StubLifecycleResult:
-        def __init__(self, label: str) -> None:
+        def __init__(
+            self,
+            approval: RouteApprovalEntry,
+            candidate: FundingUniverseCanaryCandidate,
+        ) -> None:
+            route = candidate.opportunity.opportunity
+            venue_markets = candidate.opportunity.venue_markets
+            target_notional = candidate.suggested_canary_notional
             self.paper_trade = PaperTradeEntry(
                 entry_id=17,
                 created_at=datetime(2026, 4, 4, 10, 1, 20, tzinfo=UTC),
                 intent=FundingPairTradeIntent(
-                    label=label,
-                    canonical_symbol="BERA-USD-PERP",
+                    label=approval.label,
+                    canonical_symbol=approval.canonical_symbol,
                     source_recorded_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
                     one_day_net_edge_after_entry=0.00355,
                     break_even_days_entry=0.2,
                     capacity_limit_notional=900.0,
-                    target_notional=20.0,
-                    capacity_fraction=20.0 / 900.0,
-                    max_target_notional=20.0,
+                    target_notional=target_notional,
+                    capacity_fraction=target_notional / 900.0,
+                    max_target_notional=target_notional,
                     long_leg=TradeLegIntent(
-                        venue="paradex",
-                        symbol="BERA-USD-PERP",
-                        fee_profile="pro_fastfills",
+                        venue=approval.long_venue,
+                        symbol=venue_markets[route.long_venue].symbol,
+                        fee_profile=approval.long_fee_profile,
                         side="buy",
-                        target_notional=20.0,
+                        target_notional=target_notional,
                     ),
                     short_leg=TradeLegIntent(
-                        venue="extended",
-                        symbol="BERA-USD",
-                        fee_profile="default",
+                        venue=approval.short_venue,
+                        symbol=venue_markets[route.short_venue].symbol,
+                        fee_profile=approval.short_fee_profile,
                         side="sell",
-                        target_notional=20.0,
+                        target_notional=target_notional,
                     ),
                 ),
                 note="worker launch",
@@ -4710,8 +4718,16 @@ def test_launch_latest_stable_canary_once_ranks_stable_labels_independently(
 
     async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
         approval = cast(RouteApprovalEntry, kwargs["approval"])
+        candidate = cast(FundingUniverseCanaryCandidate, kwargs["candidate"])
         captured_labels.append(approval.label)
-        return StubLifecycleResult(approval.label)
+        result = StubLifecycleResult(approval, candidate)
+        captured_leg_symbols.append(
+            (
+                result.paper_trade.intent.long_leg.symbol,
+                result.paper_trade.intent.short_leg.symbol,
+            )
+        )
+        return result
 
     api_settings = ApiSettings(
         database_path=settings.database_path,
@@ -4744,6 +4760,7 @@ def test_launch_latest_stable_canary_once_ranks_stable_labels_independently(
     assert summary.launch_ready_snapshot_id == high_launch_ready.launch_ready_snapshot_id
     assert summary.approved_snapshot_id == high_approved.snapshot_id
     assert captured_labels == ["bera_extended_paradex"]
+    assert captured_leg_symbols == [("BERA-USD-PERP", "BERA-USD")]
 
 
 def test_launch_latest_stable_canary_once_falls_through_blocked_top_candidate(
@@ -4988,6 +5005,107 @@ def test_list_ranked_stable_launch_ready_stabilities_uses_distinct_label_scan_li
     }
 
 
+def test_launch_latest_stable_canary_once_honors_candidate_scan_limit(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_label_cooldown_seconds=300,
+        stable_canary_launch_candidate_scan_limit=1,
+    )
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    stable_launch_store = StableCanaryLaunchStore(settings.database_path)
+
+    top_approval, _, top_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="bera_extended_paradex",
+        canonical_symbol="BERA-USD-PERP",
+        short_symbol="BERA-USD",
+        long_symbol="BERA-USD-PERP",
+        launch_ready_snapshot_id=40,
+        approved_snapshot_id=39,
+        suggested_canary_notional=20.0,
+        estimated_one_day_pnl_after_round_trip=3.0,
+    )
+    fallback_approval, _, fallback_snapshot, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        launch_ready_snapshot_id=20,
+        approved_snapshot_id=19,
+        estimated_one_day_pnl_after_round_trip=1.0,
+    )
+    top_approved = approved_store.append(top_snapshot.approved_snapshot)
+    fallback_approved = approved_store.append(fallback_snapshot.approved_snapshot)
+    route_approval_store.upsert(top_approval)
+    route_approval_store.upsert(fallback_approval)
+
+    def append_launch_ready_pair(
+        snapshot: LaunchReadyCanarySnapshot,
+        approved_snapshot: ApprovedCanarySnapshot,
+        first_captured_at: datetime,
+        second_captured_at: datetime,
+    ) -> LaunchReadyCanarySnapshot:
+        launch_ready_store.append(
+            snapshot.model_copy(
+                update={
+                    "launch_ready_snapshot_id": None,
+                    "captured_at": first_captured_at,
+                    "approved_snapshot": approved_snapshot,
+                }
+            )
+        )
+        return launch_ready_store.append(
+            snapshot.model_copy(
+                update={
+                    "launch_ready_snapshot_id": None,
+                    "captured_at": second_captured_at,
+                    "approved_snapshot": approved_snapshot,
+                }
+            )
+        )
+
+    top_launch_ready = append_launch_ready_pair(
+        top_snapshot,
+        top_approved,
+        datetime(2026, 4, 4, 10, 0, 0, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 1, 0, tzinfo=UTC),
+    )
+    append_launch_ready_pair(
+        fallback_snapshot,
+        fallback_approved,
+        datetime(2026, 4, 4, 10, 0, 10, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 0, 50, tzinfo=UTC),
+    )
+    stable_launch_store.append(
+        StableCanaryLaunchRecord(
+            launched_at=datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+            status="launched",
+            label=top_launch_ready.label,
+            launch_ready_snapshot_id=top_launch_ready.launch_ready_snapshot_id or 0,
+            approved_snapshot_id=top_approved.snapshot_id or 0,
+            paper_trade_id=77,
+            final_pair_state="closed",
+        )
+    )
+
+    summary = asyncio.run(
+        launch_latest_stable_canary_once(
+            settings,
+            launch_store=stable_launch_store,
+            approved_store=approved_store,
+            now=datetime(2026, 4, 4, 10, 1, 20, tzinfo=UTC),
+        )
+    )
+
+    assert summary.status == "skipped"
+    assert summary.label == "bera_extended_paradex"
+    assert summary.launch_ready_snapshot_id == top_launch_ready.launch_ready_snapshot_id
+    assert summary.detail == (
+        "Stable launch label cooldown active: "
+        "label=bera_extended_paradex remaining_seconds=250"
+    )
+
+
 def test_build_latest_launch_ready_stability_handles_empty_snapshot_chain() -> None:
     class EmptyChainStore:
         def list_recent(
@@ -5042,6 +5160,104 @@ def test_list_ranked_stable_launch_ready_stabilities_reports_failure_detail_when
     assert detail is not None
     assert "arb_extended_paradex" in detail
     assert "stale" in detail
+
+
+def test_list_ranked_stable_launch_ready_stabilities_reports_future_snapshot_detail(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    _, _, snapshot, _ = _build_stable_launch_test_snapshot(label="arb_extended_paradex")
+    approved_snapshot = approved_store.append(snapshot.approved_snapshot)
+    launch_ready_store.append(
+        snapshot.model_copy(
+            update={
+                "launch_ready_snapshot_id": None,
+                "captured_at": datetime(2026, 4, 4, 10, 2, 0, tzinfo=UTC),
+                "approved_snapshot": approved_snapshot,
+            }
+        )
+    )
+
+    stabilities, detail = _list_ranked_stable_launch_ready_stabilities(
+        store=launch_ready_store,
+        max_snapshot_age_seconds=300,
+        min_snapshot_count=2,
+        min_stable_seconds=20.0,
+        now=datetime(2026, 4, 4, 10, 1, 50, tzinfo=UTC),
+        scan_limit=2,
+    )
+
+    assert stabilities == []
+    assert detail is not None
+    assert "future" in detail
+
+
+def test_launch_latest_stable_canary_once_skips_when_selected_snapshot_lacks_revalidated_stability(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    approval, candidate, snapshot, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        launch_ready_snapshot_id=9,
+        approved_snapshot_id=8,
+    )
+    approved_snapshot = approved_store.append(snapshot.approved_snapshot)
+    route_approval_store.upsert(approval)
+    stable_snapshot = launch_ready_store.append(
+        snapshot.model_copy(
+            update={
+                "launch_ready_snapshot_id": None,
+                "captured_at": datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+                "approved_snapshot": approved_snapshot,
+            }
+        )
+    )
+    launch_ready_store.append(
+        snapshot.model_copy(
+            update={
+                "launch_ready_snapshot_id": None,
+                "captured_at": datetime(2026, 4, 4, 10, 1, 0, tzinfo=UTC),
+                "approved_snapshot": approved_snapshot,
+            }
+        )
+    )
+    selected_snapshot = stable_snapshot.model_copy(
+        update={
+            "launch_ready_snapshot_id": 999,
+            "captured_at": datetime(2026, 4, 4, 10, 1, 20, tzinfo=UTC),
+        }
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (selected_snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            lambda **_: (_ for _ in ()).throw(
+                AssertionError("launch should skip before lifecycle when stability changed")
+            ),
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                approved_store=approved_store,
+                now=datetime(2026, 4, 4, 10, 1, 40, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.label == "arb_extended_paradex"
+    assert summary.launch_ready_snapshot_id == 999
+    assert summary.detail == (
+        "Launch-ready canary snapshot changed before stability could be revalidated"
+    )
 
 
 def test_launch_latest_stable_canary_once_skips_when_global_cooldown_active(

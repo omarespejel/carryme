@@ -134,9 +134,20 @@ class LaunchReadyCanaryStore:
         with self.database.begin() as connection:
             rows = connection.execute(
                 """
-                SELECT label, MAX(captured_at) AS latest_captured_at, MAX(id) AS latest_id
-                FROM launch_ready_canary_snapshots
-                GROUP BY label
+                WITH ranked_snapshots AS (
+                    SELECT
+                        label,
+                        captured_at,
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY label
+                            ORDER BY captured_at DESC, id DESC
+                        ) AS row_number
+                    FROM launch_ready_canary_snapshots
+                )
+                SELECT label, captured_at AS latest_captured_at, id AS latest_id
+                FROM ranked_snapshots
+                WHERE row_number = 1
                 ORDER BY latest_captured_at DESC, latest_id DESC
                 LIMIT ?
                 """,
