@@ -298,6 +298,116 @@ def test_opportunity_universe_service_ranks_by_deployable_round_trip_pnl() -> No
     asyncio.run(run())
 
 
+def test_opportunity_universe_service_cancels_pending_market_stat_tasks() -> None:
+    symbol_lists = {
+        "extended": ["AAA-USD", "BBB-USD"],
+        "paradex": ["AAA-USD-PERP", "BBB-USD-PERP"],
+    }
+    started = 0
+    cancelled = 0
+    all_started: asyncio.Event | None = None
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_market_stats(venue: str, symbol: str) -> MarketStats:
+        nonlocal started, cancelled
+        started += 1
+        if started == 4:
+            assert all_started is not None
+            all_started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled += 1
+            raise
+        raise AssertionError(f"market stat task was not cancelled: {venue}:{symbol}")
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        raise AssertionError(f"snapshot task should not start: {venue}:{symbol}")
+
+    async def run() -> None:
+        nonlocal all_started
+        all_started = asyncio.Event()
+        service = OpportunityUniverseService(
+            list_symbols=cast(Any, list_symbols),
+            fetch_market_stats=cast(Any, fetch_market_stats),
+            fetch_snapshot=cast(Any, fetch_snapshot),
+            snapshot_batch_size=4,
+            snapshot_retry_attempts=1,
+        )
+        task = asyncio.create_task(
+            service.scan(
+                venues=["extended", "paradex"],
+                ranking="roundtrip_edge",
+                limit=1,
+            )
+        )
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def run_and_assert() -> None:
+        await run()
+        assert cancelled == 4
+
+    asyncio.run(run_and_assert())
+
+
+def test_opportunity_universe_service_cancels_pending_snapshot_tasks() -> None:
+    symbol_lists = {
+        "extended": ["AAA-USD"],
+        "paradex": ["AAA-USD-PERP"],
+    }
+    started = 0
+    cancelled = 0
+    all_started: asyncio.Event | None = None
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        nonlocal started, cancelled
+        started += 1
+        if started == 2:
+            assert all_started is not None
+            all_started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled += 1
+            raise
+        raise AssertionError(f"snapshot task was not cancelled: {venue}:{symbol}")
+
+    async def run() -> None:
+        nonlocal all_started
+        all_started = asyncio.Event()
+        service = OpportunityUniverseService(
+            list_symbols=cast(Any, list_symbols),
+            fetch_snapshot=cast(Any, fetch_snapshot),
+            snapshot_batch_size=2,
+            snapshot_retry_attempts=1,
+        )
+        task = asyncio.create_task(
+            service.scan(
+                venues=["extended", "paradex"],
+                ranking="roundtrip_edge",
+                limit=1,
+            )
+        )
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def run_and_assert() -> None:
+        await run()
+        assert cancelled == 2
+
+    asyncio.run(run_and_assert())
+
+
 def test_opportunity_universe_service_filters_thin_markets_for_quality_scan() -> None:
     symbol_lists = {
         "extended": ["MON-USD", "ZEN-USD", "LIT-USD"],

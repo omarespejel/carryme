@@ -6,6 +6,7 @@ import asyncio
 import itertools
 import math
 import random
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol
@@ -101,6 +102,16 @@ UNIVERSE_RANKINGS: tuple[UniverseRanking, ...] = (
     "route_adjusted_quality_pnl",
 )
 SHORTLIST_CAPPED_RANKINGS = frozenset({"roundtrip_edge", "entry_edge"})
+
+
+async def _cancel_pending_snapshot_tasks(
+    tasks: Iterable[asyncio.Task[NormalizedMarketSnapshot]],
+) -> None:
+    pending = [task for task in tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _default_universe_fee_profiles() -> dict[str, str]:
@@ -566,17 +577,20 @@ class OpportunityUniverseService:
                 )
                 for venue, symbol in batch
             }
-            for key, task in tasks.items():
-                try:
-                    snapshots[key] = await task
-                except (
-                    ValueError,
-                    NormalizationError,
-                    UpstreamDataError,
-                    ConnectorError,
-                    httpx.HTTPError,
-                ):
-                    continue
+            try:
+                for key, task in tasks.items():
+                    try:
+                        snapshots[key] = await task
+                    except (
+                        ValueError,
+                        NormalizationError,
+                        UpstreamDataError,
+                        ConnectorError,
+                        httpx.HTTPError,
+                    ):
+                        continue
+            finally:
+                await _cancel_pending_snapshot_tasks(tasks.values())
         return snapshots
 
     async def _fetch_overlapping_snapshots(
@@ -606,11 +620,14 @@ class OpportunityUniverseService:
                 )
                 for venue, symbol in batch
             }
-            for key, task in tasks.items():
-                try:
-                    snapshots[key] = await task
-                except (ValueError, UpstreamDataError, ConnectorError, httpx.HTTPError):
-                    continue
+            try:
+                for key, task in tasks.items():
+                    try:
+                        snapshots[key] = await task
+                    except (ValueError, UpstreamDataError, ConnectorError, httpx.HTTPError):
+                        continue
+            finally:
+                await _cancel_pending_snapshot_tasks(tasks.values())
         return snapshots
 
     def _effective_snapshot_batch_size(self) -> int:
