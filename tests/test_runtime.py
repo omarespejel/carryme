@@ -8939,6 +8939,9 @@ def test_paired_live_execution_coordinator_submits_both_legs() -> None:
                         status="submitted",
                         simulated=False,
                         external_reference=f"{self.venue}-1",
+                        response_payload={
+                            "observed_order_state": {"derived_state": "filled"}
+                        },
                     )
                 ],
             )
@@ -9082,6 +9085,9 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
                         status="submitted",
                         simulated=False,
                         external_reference=f"{self.venue}-1",
+                        response_payload={
+                            "observed_order_state": {"derived_state": "filled"}
+                        },
                     )
                 ],
             )
@@ -9108,6 +9114,8 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
     [
         ("unfilled", "rejected"),
         ("partial_fill", "partial"),
+        ("open", "rejected"),
+        ("unknown", "rejected"),
     ],
 )
 def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled(
@@ -9144,8 +9152,8 @@ def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled
             ),
         ),
     )
-    remaining_size = "71.2" if first_leg_state == "unfilled" else "35.6"
-    avg_fill_price = "" if first_leg_state == "unfilled" else "1.4007"
+    remaining_size = "71.2" if first_leg_state in {"unfilled", "open", "unknown"} else "35.6"
+    avg_fill_price = "" if first_leg_state in {"unfilled", "open", "unknown"} else "1.4007"
     confirmation = PreviewConfirmationEntry(
         entry_id=12,
         confirmed_at=datetime(2026, 5, 2, 20, 1, tzinfo=UTC),
@@ -9390,6 +9398,9 @@ def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails()
                         status="submitted",
                         simulated=False,
                         external_reference="extended-1",
+                        response_payload={
+                            "observed_order_state": {"derived_state": "filled"}
+                        },
                     )
                 ],
             )
@@ -9541,6 +9552,9 @@ def test_paired_live_execution_coordinator_supports_hyperliquid_leg() -> None:
                         status="submitted",
                         simulated=False,
                         external_reference=f"{self.venue}-1",
+                        response_payload={
+                            "observed_order_state": {"derived_state": "filled"}
+                        },
                     )
                 ],
             )

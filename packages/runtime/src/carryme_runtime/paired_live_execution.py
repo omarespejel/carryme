@@ -15,7 +15,7 @@ from carryme_models import (
     PreviewConfirmationEntry,
 )
 
-ObservedFillState = Literal["filled", "partial_fill", "unfilled", "unknown"]
+ObservedFillState = Literal["filled", "partial_fill", "unfilled", "open", "unknown"]
 
 
 class SingleVenueLiveExecutionService(Protocol):
@@ -87,7 +87,7 @@ class PairedLiveExecutionCoordinator:
                 legs=legs,
             )
         first_fill_state = self._submission_observed_fill_state(first_result)
-        if first_fill_state in {"unfilled", "partial_fill"}:
+        if first_fill_state != "filled":
             guarded_status: Literal["rejected", "partial"] = (
                 "partial" if first_fill_state == "partial_fill" else "rejected"
             )
@@ -203,6 +203,8 @@ class PairedLiveExecutionCoordinator:
             return "unknown"
         if any(state == "partial_fill" for state in concrete_states):
             return "partial_fill"
+        if any(state == "open" for state in concrete_states):
+            return "open"
         has_filled = any(state == "filled" for state in concrete_states)
         has_unfilled = any(state == "unfilled" for state in concrete_states)
         if has_filled and has_unfilled:
@@ -242,4 +244,6 @@ def _observed_fill_state(value: Any) -> ObservedFillState:
         return "partial_fill"
     if derived_state == "unfilled":
         return "unfilled"
+    if derived_state == "open":
+        return "open"
     return "unknown"
