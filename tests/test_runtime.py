@@ -6295,8 +6295,20 @@ def test_hyperliquid_account_probe_reads_unified_account_spot_collateral(
             return {
                 "balances": [
                     {
-                        "coin": "USDC",
+                        "coin": "PURR",
                         "token": 0,
+                        "total": "999.0",
+                        "hold": "0.0",
+                    },
+                    {
+                        "coin": "USDC",
+                        "token": 1,
+                        "total": "888.0",
+                        "hold": "0.0",
+                    },
+                    {
+                        "coin": "USDC",
+                        "token": "0",
                         "total": "124.72",
                         "hold": "4.72",
                         "entryNtl": "0.0",
@@ -6329,6 +6341,73 @@ def test_hyperliquid_account_probe_reads_unified_account_spot_collateral(
         assert result.free_collateral == 120.0
         assert result.balance_assets == ["USDC"]
         assert any("unified account mode" in note for note in result.notes)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("spot_state", "expected_fragment"),
+    [
+        (
+            {"balances": [{"coin": "PURR", "token": 0, "total": "999.0", "hold": "0.0"}]},
+            "did not contain a USDC balance",
+        ),
+        (
+            {"balances": "not-a-list"},
+            "field 'balances' must be a list",
+        ),
+    ],
+)
+def test_hyperliquid_account_probe_rejects_malformed_unified_spot_collateral(
+    monkeypatch: pytest.MonkeyPatch,
+    spot_state: dict[str, object],
+    expected_fragment: str,
+) -> None:
+    class StubInfo:
+        def user_state(self, address: str) -> dict[str, object]:
+            assert address == "0xhyper"
+            return {
+                "marginSummary": {
+                    "accountValue": "0.0",
+                    "totalRawUsd": "0.0",
+                },
+                "withdrawable": "0.0",
+                "assetPositions": [],
+            }
+
+        def open_orders(self, address: str) -> list[dict[str, object]]:
+            assert address == "0xhyper"
+            return []
+
+        def post(self, path: str, payload: dict[str, object]) -> str:
+            assert path == "/info"
+            assert payload == {"type": "userAbstraction", "user": "0xhyper"}
+            return "unifiedAccount"
+
+        def spot_user_state(self, address: str) -> dict[str, object]:
+            assert address == "0xhyper"
+            return spot_state
+
+    monkeypatch.setattr(
+        "carryme_runtime.account_preflight.build_hyperliquid_info",
+        lambda *, base_url, timeout=15.0: StubInfo(),
+    )
+
+    async def run() -> None:
+        probe = HyperliquidAccountProbe()
+        result = await probe.probe(
+            {
+                "enabled": True,
+                "credentials": {
+                    "account_address": "0xhyper",
+                    "api_wallet_private_key": "0xwallet",
+                },
+            }
+        )
+        assert result.venue == "hyperliquid"
+        assert result.authenticated is False
+        assert result.ready is False
+        assert any(expected_fragment in reason for reason in result.blocking_reasons)
 
     asyncio.run(run())
 

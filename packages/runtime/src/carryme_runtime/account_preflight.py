@@ -926,9 +926,7 @@ def _pick_hyperliquid_usdc_spot_balance(
     for row in balances:
         if not isinstance(row, dict):
             continue
-        coin = row.get("coin")
-        token = row.get("token")
-        if coin != "USDC" and token != 0:
+        if not _hyperliquid_spot_balance_is_usdc(row):
             continue
         total = _pick_float(
             row,
@@ -944,6 +942,16 @@ def _pick_hyperliquid_usdc_spot_balance(
     raise UpstreamDataError(
         "hyperliquid spotClearinghouseState payload did not contain a USDC balance"
     )
+
+
+def _hyperliquid_spot_balance_is_usdc(row: dict[str, Any]) -> bool:
+    token = row.get("token")
+    token_is_zero = False
+    if isinstance(token, str):
+        token_is_zero = token.strip() == "0"
+    elif not isinstance(token, bool) and isinstance(token, int):
+        token_is_zero = token == 0
+    return row.get("coin") == "USDC" and token_is_zero
 
 
 def _extract_hyperliquid_position_symbols(positions: list[Any]) -> list[str]:
