@@ -128,6 +128,37 @@ class ExecutionObservationStore:
             }
         )
 
+    def latest_with_pair_status_for_paper_trade(
+        self,
+        paper_trade_id: int,
+    ) -> ExecutionObservationEntry | None:
+        """Return the newest observation with a concrete pair status for one paper trade."""
+
+        self.initialize()
+        with self.database.begin() as connection:
+            row = connection.execute(
+                """
+                SELECT id, entry_json
+                FROM execution_observation_entries
+                WHERE paper_trade_id = ?
+                  AND entry_json LIKE ?
+                  AND entry_json NOT LIKE ?
+                ORDER BY observed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (paper_trade_id, '%"pair_status":%', '%"pair_status":null%'),
+            ).fetchone()
+
+        if row is None:
+            return None
+        stored_id, entry_json = row
+        return ExecutionObservationEntry.model_validate(
+            {
+                **json.loads(entry_json),
+                "entry_id": stored_id,
+            }
+        )
+
     def list_recent(
         self,
         *,

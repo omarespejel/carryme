@@ -5338,12 +5338,12 @@ def _execution_requires_continued_monitoring(
         return unobserved_requires_monitoring
     pair_status = latest.pair_status
     if pair_status is None:
-        for observation in observation_store.list_recent(limit=None, paper_trade_id=paper_trade_id):
-            if observation.pair_status is not None:
-                pair_status = observation.pair_status
-                break
-        else:
+        latest_with_pair_status = observation_store.latest_with_pair_status_for_paper_trade(
+            paper_trade_id
+        )
+        if latest_with_pair_status is None or latest_with_pair_status.pair_status is None:
             return True
+        pair_status = latest_with_pair_status.pair_status
     if (
         pair_status.derived_state == "review_required"
         and not review_required_pair_requires_continued_monitoring(pair_status)
