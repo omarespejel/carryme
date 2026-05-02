@@ -3349,7 +3349,6 @@ def test_stable_canary_launch_store_reserves_snapshot_launch_once(
     assert first_reserved is True
     assert second_reserved is False
 
-
 def test_stable_canary_launch_store_prunes_expired_snapshot_reservations(
     tmp_path: Path,
 ) -> None:
@@ -3380,8 +3379,6 @@ def test_stable_canary_launch_store_prunes_expired_snapshot_reservations(
         ).fetchall()
 
     assert [int(row[0]) for row in rows] == [10]
-
-
 def test_stable_canary_launch_store_reclaims_stale_snapshot_launch_reservation(
     tmp_path: Path,
 ) -> None:
@@ -3398,6 +3395,12 @@ def test_stable_canary_launch_store_reclaims_stale_snapshot_launch_reservation(
         launch_ready_snapshot_id=9,
         label="arb_extended_paradex",
         reserved_at=reserved_at + timedelta(seconds=59),
+        max_age_seconds=60,
+    )
+    assert not store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=60),
         max_age_seconds=60,
     )
     assert store.reserve_snapshot_launch(
@@ -3433,11 +3436,35 @@ def test_stable_canary_launch_store_rejects_lost_reservation_owner(
         launch_ready_snapshot_id=9,
         owner_id="worker-a",
         reserved_at=reserved_at + timedelta(seconds=62),
+        max_age_seconds=60,
     )
     assert store.renew_snapshot_launch_reservation(
         launch_ready_snapshot_id=9,
         owner_id="worker-b",
         reserved_at=reserved_at + timedelta(seconds=63),
+        max_age_seconds=60,
+    )
+
+
+def test_stable_canary_launch_store_rejects_expired_self_renewal(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+        max_age_seconds=60,
+        owner_id="worker-a",
+    )
+
+    assert not store.renew_snapshot_launch_reservation(
+        launch_ready_snapshot_id=9,
+        owner_id="worker-a",
+        reserved_at=reserved_at + timedelta(seconds=61),
+        max_age_seconds=60,
     )
 
 

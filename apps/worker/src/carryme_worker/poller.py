@@ -3574,6 +3574,7 @@ async def launch_latest_stable_canary_once(
                 launch_ready_snapshot_id=launch_ready_snapshot_id,
                 owner_id=owner_id,
                 reserved_at=datetime.now(UTC),
+                max_age_seconds=settings.stable_canary_launch_reservation_ttl_seconds,
             )
             if not renewed:
                 raise HTTPException(
