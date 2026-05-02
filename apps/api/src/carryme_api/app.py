@@ -189,6 +189,7 @@ MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 DEFAULT_CANARY_EXCLUDE_TAGS = ["meme", "political"]
 DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS = 3600
 MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+MIN_AWARE_UTC_DATETIME = datetime.min.replace(tzinfo=UTC)
 logger = logging.getLogger(__name__)
 _UNIVERSE_SCAN_SEMAPHORE = asyncio.Semaphore(1)
 
@@ -2496,12 +2497,87 @@ def _record_capacity_notional(record: OpportunityRecord) -> float:
     return capacity.max_entry_notional
 
 
+def _opportunity_spread_penalty(opportunity: FundingArbOpportunity) -> float:
+    """Return a sortable penalty for wide or missing saved spreads."""
+
+    penalty = 0.0
+    for spread_rate in (opportunity.short_spread_rate, opportunity.long_spread_rate):
+        if spread_rate is None:
+            penalty += 0.01
+        else:
+            penalty += spread_rate
+    return penalty
+
+
+def _opportunity_stale_book_penalty(opportunity: FundingArbOpportunity) -> float:
+    """Return a sortable penalty for stale saved order books."""
+
+    penalty = 0.0
+    if opportunity.short_stale_book:
+        penalty += 1.0
+    if opportunity.long_stale_book:
+        penalty += 1.0
+    return penalty
+
+
 def _min_saved_liquidity_values(short_value: float | None, long_value: float | None) -> float:
     """Return the weaker saved metric, failing closed when either side is missing."""
 
     if short_value is None or long_value is None:
         return 0.0
     return min(short_value, long_value)
+
+
+def _opportunity_liquidity_score(opportunity: FundingArbOpportunity) -> float:
+    """Return a small sortable bonus for weaker-side saved liquidity."""
+
+    min_daily_volume = _min_saved_liquidity_values(
+        opportunity.short_daily_volume,
+        opportunity.long_daily_volume,
+    )
+    min_open_interest = _min_saved_liquidity_values(
+        opportunity.short_open_interest,
+        opportunity.long_open_interest,
+    )
+    return math.log10(1.0 + min_daily_volume) * 1e-6 + math.log10(
+        1.0 + min_open_interest
+    ) * 1e-6
+
+
+def _ensure_aware_utc(value: datetime) -> datetime:
+    """Normalize persisted datetimes before freshness comparisons."""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _safe_aware_utc(value: datetime) -> datetime:
+    """Normalize datetimes without letting malformed persisted values abort ranking."""
+
+    try:
+        return _ensure_aware_utc(value)
+    except (OSError, OverflowError, ValueError):
+        return MIN_AWARE_UTC_DATETIME
+
+
+def _opportunity_quality_key(
+    opportunity: FundingArbOpportunity,
+    *,
+    capacity_notional: float,
+    recency: datetime,
+) -> tuple[float, float, float, float, float, float, datetime]:
+    """Rank by edge while demoting poor execution quality and stale saved data."""
+
+    return (
+        opportunity.one_day_net_edge_after_round_trip,
+        -_opportunity_spread_penalty(opportunity),
+        _opportunity_liquidity_score(opportunity),
+        -_opportunity_stale_book_penalty(opportunity),
+        opportunity.one_day_net_edge_after_entry,
+        capacity_notional,
+        recency,
+    )
 
 
 def _canary_candidate_identity(candidate: FundingUniverseCanaryCandidate) -> tuple[str, ...]:
@@ -2521,6 +2597,24 @@ def _canary_candidate_identity(candidate: FundingUniverseCanaryCandidate) -> tup
     )
 
 
+def _canary_candidate_quality_key(
+    candidate: FundingUniverseCanaryCandidate,
+) -> tuple[float, float, float, float, float, float, datetime]:
+    """Return the same execution-aware key used for history shortlist ranking."""
+
+    opportunity = candidate.opportunity.opportunity
+    capacity_notional = 0.0
+    if candidate.opportunity.deployable_notional is not None:
+        capacity_notional = candidate.opportunity.deployable_notional
+    elif opportunity.capacity is not None and opportunity.capacity.max_entry_notional is not None:
+        capacity_notional = opportunity.capacity.max_entry_notional
+    return _opportunity_quality_key(
+        opportunity,
+        capacity_notional=capacity_notional,
+        recency=MIN_AWARE_UTC_DATETIME,
+    )
+
+
 def _merge_canary_candidates(
     first: list[FundingUniverseCanaryCandidate],
     second: list[FundingUniverseCanaryCandidate],
@@ -2537,17 +2631,7 @@ def _merge_canary_candidates(
             continue
         merged.append(candidate)
         seen.add(identity)
-        if len(merged) >= limit:
-            break
-    return merged
-
-
-def _ensure_aware_utc(value: datetime) -> datetime:
-    """Normalize persisted datetimes before freshness comparisons."""
-
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
+    return sorted(merged, key=_canary_candidate_quality_key, reverse=True)[:limit]
 
 
 def _select_canary_reprice_symbols_from_history(
@@ -2577,7 +2661,7 @@ def _select_canary_reprice_symbols_from_history(
     records = [
         record
         for record in store.list_recent(limit=sample)
-        if _ensure_aware_utc(record.recorded_at) >= cutoff
+        if _safe_aware_utc(record.recorded_at) >= cutoff
     ]
     if not records:
         return []
@@ -2617,11 +2701,10 @@ def _select_canary_reprice_symbols_from_history(
 
     ranked = sorted(
         candidates,
-        key=lambda record: (
-            record.opportunity.one_day_net_edge_after_round_trip,
-            record.opportunity.one_day_net_edge_after_entry,
-            _record_capacity_notional(record),
-            _ensure_aware_utc(record.recorded_at).timestamp(),
+        key=lambda record: _opportunity_quality_key(
+            record.opportunity,
+            capacity_notional=_record_capacity_notional(record),
+            recency=_safe_aware_utc(record.recorded_at),
         ),
         reverse=True,
     )

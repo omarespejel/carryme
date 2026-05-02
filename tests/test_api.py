@@ -1202,16 +1202,71 @@ def test_funding_universe_canary_approval_proposals_rejects_unbounded_history_sh
     assert called is False
 
 
+def test_funding_universe_canary_approval_proposals_rejects_zero_history_shortlist_age(
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **_: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            nonlocal called
+            called = True
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == []
+            assert limit == 1
+            return []
+
+    history_store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    app.dependency_overrides[get_history_store] = lambda: history_store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params={
+                "limit": "1",
+                "history_shortlist_max_age_seconds": "0",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"] == "history_shortlist_max_age_seconds must be at least 1"
+    )
+    assert called is False
+
+
 def test_funding_universe_canary_approval_proposals_uses_history_shortlist(
     tmp_path: Path,
 ) -> None:
     store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
     now = FIXED_APPROVAL_PROPOSAL_NOW
-    for label, symbol, roundtrip_edge, capacity in (
-        ("ton_extended_paradex", "TON-USD-PERP", 0.003, 2_500.0),
-        ("zro_extended_paradex", "ZRO-USD-PERP", 0.002, 1_500.0),
-        ("jup_extended_paradex", "JUP-USD-PERP", -0.001, 4_000.0),
-        ("near_extended_hyperliquid", "NEAR-USD-PERP", 0.004, 3_000.0),
+    for label, symbol, roundtrip_edge, capacity, spread_rate, liquidity in (
+        ("ton_extended_paradex", "TON-USD-PERP", 0.003, 2_500.0, 0.020, 100_000.0),
+        ("zro_extended_paradex", "ZRO-USD-PERP", 0.003, 1_500.0, 0.001, 2_000_000.0),
+        ("jup_extended_paradex", "JUP-USD-PERP", -0.001, 4_000.0, 0.001, 5_000_000.0),
+        (
+            "near_extended_hyperliquid",
+            "NEAR-USD-PERP",
+            0.004,
+            3_000.0,
+            0.001,
+            2_000_000.0,
+        ),
     ):
         right_venue = "hyperliquid" if "hyperliquid" in label else "paradex"
         store.append(
@@ -1243,6 +1298,12 @@ def test_funding_universe_canary_approval_proposals_uses_history_shortlist(
                     one_day_net_edge_after_round_trip=roundtrip_edge,
                     break_even_days_entry=0.2,
                     break_even_days_round_trip=0.4,
+                    short_spread_rate=spread_rate,
+                    long_spread_rate=spread_rate,
+                    short_daily_volume=liquidity,
+                    long_daily_volume=liquidity,
+                    short_open_interest=liquidity,
+                    long_open_interest=liquidity,
                     capacity=CapacityEstimate(
                         short_bid_notional=capacity + 100.0,
                         long_ask_notional=capacity,
@@ -1329,7 +1390,7 @@ def test_funding_universe_canary_approval_proposals_uses_history_shortlist(
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
-    assert captured["include_symbols"] == ["TON-USD-PERP", "ZRO-USD-PERP"]
+    assert captured["include_symbols"] == ["ZRO-USD-PERP", "TON-USD-PERP"]
     assert captured["limit"] == 50
 
 
@@ -1441,7 +1502,8 @@ def test_funding_universe_canary_approval_proposals_ignores_stale_history_shortl
     store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
     store.append(
         OpportunityRecord(
-            recorded_at=FIXED_APPROVAL_PROPOSAL_NOW - timedelta(hours=2),
+            recorded_at=FIXED_APPROVAL_PROPOSAL_NOW
+            - timedelta(seconds=app_module.DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS + 1),
             pair=FundingPairSpec(
                 label="ton_extended_paradex",
                 left_venue="extended",
