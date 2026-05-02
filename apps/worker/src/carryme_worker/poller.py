@@ -2968,6 +2968,7 @@ async def launch_latest_stable_canary_once(
     snapshot: LaunchReadyCanarySnapshot | None = None
     selected: FundingUniverseCanaryCandidate | None = None
     approval: RouteApprovalEntry | None = None
+    reservation_owner_id: str | None = None
     candidate_skip_details: list[str] = []
     single_candidate = len(stable_candidates) == 1
 
@@ -3298,10 +3299,103 @@ async def launch_latest_stable_canary_once(
             )
             continue
 
+        if settings.stable_canary_launch_shadow_mode:
+            logging.getLogger("carryme.worker").info(
+                "shadow launch for label=%s from launch_ready_snapshot_id=%s",
+                candidate_snapshot.label,
+                candidate_snapshot.launch_ready_snapshot_id,
+            )
+            stable_launch_store.append(
+                StableCanaryLaunchRecord(
+                    launched_at=timestamp,
+                    status="shadowed",
+                    label=candidate_snapshot.label,
+                    launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id or 0,
+                    approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id or 0,
+                    paper_trade_id=0,
+                    final_pair_state="shadowed",
+                    detail="Shadow mode launch marker",
+                )
+            )
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_target,
+                label=candidate_snapshot.label,
+                launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                detail=(
+                    "Shadow mode: would launch stable canary from launch-ready snapshot "
+                    f"{candidate_snapshot.launch_ready_snapshot_id}"
+                ),
+            )
+
+        hold_mode_blocker = _build_stable_launch_hold_mode_blocker(settings)
+        if hold_mode_blocker is not None:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_target,
+                label=candidate_snapshot.label,
+                launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                detail=hold_mode_blocker,
+            )
+
+        execution_preflight = _build_candidate_live_execution_preflight(
+            settings=runtime_settings,
+            candidate=candidate_selected,
+            label=candidate_snapshot.label,
+        )
+        if not execution_preflight.ready:
+            try:
+                launch_ready_store.delete_label(candidate_snapshot.label)
+            except Exception:
+                logging.getLogger("carryme.worker").exception(
+                    "failed to invalidate launch-ready snapshots for label=%s "
+                    "during stable launch preflight",
+                    candidate_snapshot.label,
+                )
+            detail = (
+                "Latest launch-ready snapshot no longer satisfies live execution "
+                f"readiness: {'; '.join(execution_preflight.blocking_reasons)}"
+            )
+            summary = _single_candidate_skip(
+                candidate_snapshot=candidate_snapshot,
+                detail=detail,
+            )
+            if summary is not None:
+                return summary
+            candidate_skip_details.append(f"{candidate_snapshot.label}: {detail}")
+            continue
+
+        candidate_reservation_owner_id: str | None = None
+        if candidate_snapshot.launch_ready_snapshot_id is not None:
+            candidate_reservation_owner_id = uuid.uuid4().hex
+            reserved = stable_launch_store.reserve_snapshot_launch(
+                launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                label=candidate_snapshot.label,
+                reserved_at=timestamp,
+                max_age_seconds=settings.stable_canary_launch_reservation_ttl_seconds,
+                retention_seconds=(
+                    settings.stable_canary_launch_reservation_retention_seconds
+                ),
+                owner_id=candidate_reservation_owner_id,
+            )
+            if not reserved:
+                detail = "Launch-ready canary snapshot is already reserved for launch by worker"
+                summary = _single_candidate_skip(
+                    candidate_snapshot=candidate_snapshot,
+                    detail=detail,
+                )
+                if summary is not None:
+                    return summary
+                candidate_skip_details.append(f"{candidate_snapshot.label}: {detail}")
+                continue
+
         stability = candidate_stability
         snapshot = candidate_snapshot
         selected = candidate_selected
         approval = candidate_approval
+        reservation_owner_id = candidate_reservation_owner_id
         break
 
     if stability is None or snapshot is None or selected is None or approval is None:
@@ -3315,97 +3409,10 @@ async def launch_latest_stable_canary_once(
             database_path=settings.database_target,
             detail=detail,
         )
-    if settings.stable_canary_launch_shadow_mode:
-        logging.getLogger("carryme.worker").info(
-            "shadow launch for label=%s from launch_ready_snapshot_id=%s",
-            snapshot.label,
-            snapshot.launch_ready_snapshot_id,
-        )
-        stable_launch_store.append(
-            StableCanaryLaunchRecord(
-                launched_at=timestamp,
-                status="shadowed",
-                label=snapshot.label,
-                launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id or 0,
-                approved_snapshot_id=snapshot.approved_snapshot.snapshot_id or 0,
-                paper_trade_id=0,
-                final_pair_state="shadowed",
-                detail="Shadow mode launch marker",
-            )
-        )
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=(
-                "Shadow mode: would launch stable canary from launch-ready snapshot "
-                f"{snapshot.launch_ready_snapshot_id}"
-            ),
-        )
-
-    hold_mode_blocker = _build_stable_launch_hold_mode_blocker(settings)
-    if hold_mode_blocker is not None:
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=hold_mode_blocker,
-        )
-
-    execution_preflight = _build_candidate_live_execution_preflight(
-        settings=runtime_settings,
-        candidate=selected,
-        label=snapshot.label,
-    )
-    if not execution_preflight.ready:
-        try:
-            launch_ready_store.delete_label(snapshot.label)
-        except Exception:
-            logging.getLogger("carryme.worker").exception(
-                "failed to invalidate launch-ready snapshots for label=%s "
-                "during stable launch preflight",
-                snapshot.label,
-            )
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=(
-                "Latest launch-ready snapshot no longer satisfies live execution "
-                f"readiness: {'; '.join(execution_preflight.blocking_reasons)}"
-            ),
-        )
-
-    if snapshot.launch_ready_snapshot_id is not None:
-        reservation_owner_id = uuid.uuid4().hex
-        reserved = stable_launch_store.reserve_snapshot_launch(
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            label=snapshot.label,
-            reserved_at=timestamp,
-            max_age_seconds=settings.stable_canary_launch_reservation_ttl_seconds,
-            retention_seconds=settings.stable_canary_launch_reservation_retention_seconds,
-            owner_id=reservation_owner_id,
-        )
-        if not reserved:
-            return StableCanaryLaunchSummary(
-                status="skipped",
-                database_path=settings.database_target,
-                label=snapshot.label,
-                launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-                approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-                detail="Launch-ready canary snapshot is already reserved for launch by worker",
-            )
-    else:
-        reservation_owner_id = None
+    reservation_launch_ready_snapshot_id = snapshot.launch_ready_snapshot_id
 
     async def renew_stable_launch_reservation_before_open(
-        launch_ready_snapshot_id: int | None = snapshot.launch_ready_snapshot_id,
+        launch_ready_snapshot_id: int | None = reservation_launch_ready_snapshot_id,
         owner_id: str | None = reservation_owner_id,
     ) -> None:
         if launch_ready_snapshot_id is None or owner_id is None:

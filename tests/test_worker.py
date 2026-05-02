@@ -5331,6 +5331,15 @@ def test_launch_latest_stable_canary_once_falls_through_reserved_snapshot(
         label = cast(str, kwargs["label"])
         return selected_by_label[label]
 
+    stability_by_label = {
+        high_snapshot.label: high_stability,
+        fallback_snapshot.label: fallback_stability,
+    }
+
+    def stability_stub(**kwargs: object) -> LaunchReadyCanaryStability:
+        label = cast(str, kwargs["label"])
+        return stability_by_label[label]
+
     api_settings = ApiSettings(
         database_path=settings.database_path,
         watchlist_path=settings.watchlist_path,
@@ -5345,11 +5354,15 @@ def test_launch_latest_stable_canary_once_falls_through_reserved_snapshot(
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
             "carryme_worker.poller._list_ranked_stable_launch_ready_stabilities",
-            lambda **_: [high_stability, fallback_stability],
+            lambda **_: ([high_stability, fallback_stability], None),
         )
         monkeypatch.setattr(
             "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
             select_stub,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            stability_stub,
         )
         monkeypatch.setattr(
             "carryme_worker.poller._run_guarded_canary_lifecycle",
