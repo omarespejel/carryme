@@ -32,6 +32,16 @@ AUTH_READ_RETRY_ATTEMPTS = 3
 AUTH_READ_RETRY_BACKOFF_SECONDS = 0.25
 
 
+@dataclass(frozen=True)
+class HyperliquidAccountState:
+    """Raw account reads needed to classify Hyperliquid live collateral."""
+
+    state: dict[str, Any]
+    open_orders: list[dict[str, Any]]
+    abstraction_mode: str | None = None
+    spot_state: dict[str, Any] | None = None
+
+
 class VenueAccountConfig(TypedDict):
     """Configured authenticated-read credentials for one venue."""
 
@@ -510,7 +520,7 @@ class HyperliquidAccountProbe:
             )
 
         try:
-            state, open_orders = await asyncio.wait_for(
+            account_state = await asyncio.wait_for(
                 asyncio.to_thread(
                     _fetch_hyperliquid_account_state,
                     cast(str, account_address),
@@ -551,6 +561,8 @@ class HyperliquidAccountProbe:
             )
 
         try:
+            state = account_state.state
+            open_orders = account_state.open_orders
             margin_summary = state.get("marginSummary")
             if not isinstance(margin_summary, dict):
                 margin_summary = {}
@@ -569,6 +581,38 @@ class HyperliquidAccountProbe:
                 context="hyperliquid account collateral",
             )
             total_collateral = margin_collateral if margin_collateral is not None else withdrawable
+            available_to_trade = withdrawable
+            free_collateral = withdrawable
+            balance_assets = ["USDC"] if total_collateral is not None else []
+            account_status = account_state.abstraction_mode
+            notes = [
+                (
+                    "Hyperliquid account preflight completed using the official SDK "
+                    "Info.user_state/open_orders flow. Account reads are address-based; the "
+                    "API wallet private key remains required for live submission."
+                ),
+                (
+                    "If this account is a subaccount or vault, live actions may also require "
+                    "CARRYME_API_HYPERLIQUID_VAULT_ADDRESS to target the correct account."
+                ),
+                f"Observed {len(open_orders)} currently open Hyperliquid orders.",
+            ]
+            if _hyperliquid_uses_unified_spot_collateral(account_state.abstraction_mode):
+                spot_total, spot_hold = _pick_hyperliquid_usdc_spot_balance(
+                    account_state.spot_state,
+                )
+                total_collateral = spot_total
+                available_to_trade = max(spot_total - spot_hold, 0.0)
+                free_collateral = available_to_trade
+                balance_assets = ["USDC"]
+                notes.insert(
+                    1,
+                    (
+                        "Hyperliquid account is in unified account mode; collateral is read "
+                        "from spotClearinghouseState because per-dex clearinghouseState "
+                        "collateral is not meaningful in this mode."
+                    ),
+                )
             return VenueAccountPreflight(
                 venue=self.venue,
                 enabled=enabled,
@@ -576,25 +620,15 @@ class HyperliquidAccountProbe:
                 ready=True,
                 credential_mode="api_wallet",
                 account_identifier=account_address,
+                account_status=account_status,
                 total_collateral=total_collateral,
-                available_to_trade=withdrawable,
-                free_collateral=withdrawable,
+                available_to_trade=available_to_trade,
+                free_collateral=free_collateral,
                 balance_count=1 if total_collateral is not None else 0,
                 position_count=len([item for item in positions if isinstance(item, dict)]),
-                balance_assets=["USDC"] if total_collateral is not None else [],
+                balance_assets=balance_assets,
                 position_symbols=_extract_hyperliquid_position_symbols(positions),
-                notes=[
-                    (
-                        "Hyperliquid account preflight completed using the official SDK "
-                        "Info.user_state/open_orders flow. Account reads are address-based; the "
-                        "API wallet private key remains required for live submission."
-                    ),
-                    (
-                        "If this account is a subaccount or vault, live actions may also require "
-                        "CARRYME_API_HYPERLIQUID_VAULT_ADDRESS to target the correct account."
-                    ),
-                    f"Observed {len(open_orders)} currently open Hyperliquid orders.",
-                ],
+                notes=notes,
             )
         except (UpstreamDataError, ValidationError) as exc:
             return VenueAccountPreflight(
@@ -840,7 +874,7 @@ def _pick_float(data: dict[str, Any], *keys: str, context: str) -> float | None:
 
 def _fetch_hyperliquid_account_state(
     account_address: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> HyperliquidAccountState:
     info = build_hyperliquid_info(base_url=ACCOUNT_CONNECTOR_BASE_URLS["hyperliquid"])
     state = info.user_state(account_address)
     open_orders = info.open_orders(account_address)
@@ -848,7 +882,76 @@ def _fetch_hyperliquid_account_state(
         raise ConnectorError("Hyperliquid user_state payload must be an object")
     if not isinstance(open_orders, list):
         raise ConnectorError("Hyperliquid open_orders payload must be a list")
-    return state, [item for item in open_orders if isinstance(item, dict)]
+    abstraction_mode = _fetch_hyperliquid_abstraction_mode(info, account_address)
+    spot_state = None
+    if _hyperliquid_uses_unified_spot_collateral(abstraction_mode):
+        spot_state = info.spot_user_state(account_address)
+        if not isinstance(spot_state, dict):
+            raise ConnectorError("Hyperliquid spot_user_state payload must be an object")
+    return HyperliquidAccountState(
+        state=state,
+        open_orders=[item for item in open_orders if isinstance(item, dict)],
+        abstraction_mode=abstraction_mode,
+        spot_state=spot_state,
+    )
+
+
+def _fetch_hyperliquid_abstraction_mode(info: Any, account_address: str) -> str | None:
+    payload = info.post("/info", {"type": "userAbstraction", "user": account_address})
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        normalized = payload.strip()
+        return normalized or None
+    raise ConnectorError("Hyperliquid userAbstraction payload must be a string or null")
+
+
+def _hyperliquid_uses_unified_spot_collateral(abstraction_mode: str | None) -> bool:
+    normalized = (abstraction_mode or "").strip()
+    return normalized in {"unifiedAccount", "portfolio"}
+
+
+def _pick_hyperliquid_usdc_spot_balance(
+    spot_state: dict[str, Any] | None,
+) -> tuple[float, float]:
+    if spot_state is None:
+        raise UpstreamDataError(
+            "hyperliquid unified account collateral requires spotClearinghouseState"
+        )
+    balances = spot_state.get("balances")
+    if not isinstance(balances, list):
+        raise UpstreamDataError(
+            "hyperliquid spotClearinghouseState payload field 'balances' must be a list"
+        )
+    for row in balances:
+        if not isinstance(row, dict):
+            continue
+        if not _hyperliquid_spot_balance_is_usdc(row):
+            continue
+        total = _pick_float(
+            row,
+            "total",
+            context="hyperliquid unified USDC balance",
+        )
+        hold = _pick_float(
+            row,
+            "hold",
+            context="hyperliquid unified USDC hold",
+        )
+        return total or 0.0, hold or 0.0
+    raise UpstreamDataError(
+        "hyperliquid spotClearinghouseState payload did not contain a USDC balance"
+    )
+
+
+def _hyperliquid_spot_balance_is_usdc(row: dict[str, Any]) -> bool:
+    token = row.get("token")
+    token_is_zero = False
+    if isinstance(token, str):
+        token_is_zero = token.strip() == "0"
+    elif not isinstance(token, bool) and isinstance(token, int):
+        token_is_zero = token == 0
+    return row.get("coin") == "USDC" and token_is_zero
 
 
 def _extract_hyperliquid_position_symbols(positions: list[Any]) -> list[str]:
