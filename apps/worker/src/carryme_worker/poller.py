@@ -3117,27 +3117,28 @@ async def launch_latest_stable_canary_once(
 
     for candidate_stability in stable_candidates:
         candidate_snapshot = candidate_stability.snapshot
-        loss_circuit_breaker_reason = _build_stable_launch_loss_circuit_breaker_reason(
-            settings=settings,
-            execution_store=execution_store,
-            observation_store=observation_store,
-            balance_service=balance_service,
-            now=timestamp,
-            candidate_label=candidate_snapshot.label,
-            recent_outcomes=recent_closed_trade_outcomes,
-        )
-        if loss_circuit_breaker_reason is not None:
-            skipped_candidates.append(
-                _StableCanaryCandidateSkip(
-                    label=candidate_snapshot.label,
-                    launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-                    approved_snapshot_id=(
-                        candidate_snapshot.approved_snapshot.snapshot_id
-                    ),
-                    detail=loss_circuit_breaker_reason,
-                )
+        if settings.stable_canary_launch_consecutive_loss_scope == "label":
+            loss_circuit_breaker_reason = _build_stable_launch_loss_circuit_breaker_reason(
+                settings=settings,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                balance_service=balance_service,
+                now=timestamp,
+                candidate_label=candidate_snapshot.label,
+                recent_outcomes=recent_closed_trade_outcomes,
             )
-            continue
+            if loss_circuit_breaker_reason is not None:
+                skipped_candidates.append(
+                    _StableCanaryCandidateSkip(
+                        label=candidate_snapshot.label,
+                        launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                        approved_snapshot_id=(
+                            candidate_snapshot.approved_snapshot.snapshot_id
+                        ),
+                        detail=loss_circuit_breaker_reason,
+                    )
+                )
+                continue
         try:
             latest_launch_ready_snapshot, candidate_selected, candidate_approval = (
                 _select_latest_launch_ready_canary_snapshot(
