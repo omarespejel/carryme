@@ -10,6 +10,8 @@ from carryme_models import LaunchReadyCanarySnapshot
 
 from carryme_storage.db import Database
 
+MAX_RECENT_LABEL_LIMIT = 250
+
 
 class LaunchReadyCanaryStore:
     """Persist and query launch-ready canary snapshots."""
@@ -137,13 +139,14 @@ class LaunchReadyCanaryStore:
         """Return recent distinct labels ordered by latest snapshot timestamp."""
 
         self.initialize()
+        bounded_limit = max(1, min(limit, MAX_RECENT_LABEL_LIMIT))
         labels: list[str] = []
         seen_labels: set[str] = set()
-        batch_size = max(limit * 4, 50)
+        batch_size = min(max(bounded_limit * 4, 50), MAX_RECENT_LABEL_LIMIT * 4)
         cursor: tuple[str, int] | None = None
 
         with self.database.begin() as connection:
-            while len(labels) < limit:
+            while len(labels) < bounded_limit:
                 if cursor is None:
                     rows = connection.execute(
                         """
@@ -174,7 +177,7 @@ class LaunchReadyCanaryStore:
                         continue
                     seen_labels.add(label)
                     labels.append(label)
-                    if len(labels) >= limit:
+                    if len(labels) >= bounded_limit:
                         break
 
                 last_label, last_captured_at, last_row_id = rows[-1]
