@@ -15268,6 +15268,134 @@ def test_execution_requires_continued_monitoring_uses_latest_non_null_pair_statu
     )
 
 
+def test_execution_requires_continued_monitoring_ignores_flat_review_required() -> None:
+    paper_trade = PaperTradeEntry(
+        entry_id=10,
+        created_at=datetime(2026, 4, 3, 22, 26, tzinfo=UTC),
+        intent=FundingPairTradeIntent(
+            label="jup_extended_paradex",
+            canonical_symbol="JUP-USD-PERP",
+            source_recorded_at=datetime(2026, 4, 3, 22, 25, tzinfo=UTC),
+            one_day_net_edge_after_entry=0.0017,
+            break_even_days_entry=0.18,
+            capacity_limit_notional=294.9,
+            target_notional=25.0,
+            capacity_fraction=0.1,
+            max_target_notional=25.0,
+            long_leg=TradeLegIntent(
+                venue="paradex",
+                symbol="JUP-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+            ),
+            short_leg=TradeLegIntent(
+                venue="extended",
+                symbol="JUP-USD",
+                fee_profile="default",
+                side="sell",
+                target_notional=25.0,
+            ),
+        ),
+    )
+    execution = ExecutionJournalEntry(
+        entry_id=20,
+        executed_at=datetime(2026, 4, 3, 22, 26, 34, tzinfo=UTC),
+        adapter="paired_live:paradex_then_extended",
+        mode="live",
+        status="submitted",
+        paper_trade_id=10,
+        preview_hash="preview-10",
+        paper_trade=paper_trade,
+        legs=[
+            ExecutionLegResult(
+                venue="paradex",
+                symbol="JUP-USD-PERP",
+                fee_profile="pro_fastfills",
+                side="buy",
+                target_notional=25.0,
+                status="submitted",
+                simulated=False,
+            )
+        ],
+    )
+    order_state = ExecutionOrderState(
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview-10",
+        legs=[
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="paradex-order",
+                client_id="carryme-pt10-paradex-buy",
+                derived_state="filled",
+                order_status="CLOSED",
+                remaining_size="0",
+                size="152",
+            ),
+            ExecutionLegOrderState(
+                venue="extended",
+                supported=True,
+                external_reference="carryme-pt10-extended-sell",
+                client_id="carryme-pt10-extended-sell",
+                derived_state="unknown",
+                raw_response={"orders": []},
+            ),
+        ],
+        notes=[],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview-10",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                unmatched_leg_symbols=["JUP-USD-PERP"],
+            ),
+            ExecutionVenueReconciliation(
+                venue="extended",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                unmatched_leg_symbols=["JUP-USD"],
+            ),
+        ],
+        notes=[],
+    )
+    observation = ExecutionObservationEntry(
+        observed_at=datetime(2026, 5, 2, 1, 39, tzinfo=UTC),
+        context="worker_execution_monitor",
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview-10",
+        order_state=order_state,
+        pair_status=ExecutionPairStatus(
+            execution_entry_id=20,
+            paper_trade_id=10,
+            preview_hash="preview-10",
+            derived_state="review_required",
+            recommended_action="manual_review_required",
+            order_state=order_state,
+            reconciliation=reconciliation,
+            notes=[],
+        ),
+    )
+
+    assert not _execution_requires_continued_monitoring(
+        cast(ExecutionObservationStore, object()),
+        execution=execution,
+        latest_observation=observation,
+    )
+
+
 def test_execution_requires_continued_monitoring_keeps_unknown_pair_status_history(
     tmp_path: Path,
 ) -> None:

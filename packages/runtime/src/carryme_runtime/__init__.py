@@ -25,7 +25,10 @@ from carryme_runtime.execution_order_state import (
     HyperliquidOrderStateObserver,
     ParadexOrderStateObserver,
 )
-from carryme_runtime.execution_pair_status import build_execution_pair_status
+from carryme_runtime.execution_pair_status import (
+    build_execution_pair_status,
+    review_required_pair_requires_continued_monitoring,
+)
 from carryme_runtime.execution_quality import ExecutionQualityService
 from carryme_runtime.execution_reconciliation import reconcile_execution
 from carryme_runtime.extended_cleanup_preview import ExtendedCleanupPreviewService
@@ -82,6 +85,7 @@ __all__ = [
     "ExecutionQualityService",
     "ExecutionOrderStateService",
     "build_execution_pair_status",
+    "review_required_pair_requires_continued_monitoring",
     "ExtendedCleanupPreviewService",
     "ExtendedOrderStateObserver",
     "ExtendedLiveExecutionService",

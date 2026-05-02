@@ -133,6 +133,33 @@ def build_execution_pair_status(
     )
 
 
+def review_required_pair_requires_continued_monitoring(
+    pair_status: ExecutionPairStatus,
+) -> bool:
+    """Return whether a review-required pair still has possible live exposure.
+
+    Some venues only expose open orders. After the observation window has elapsed,
+    a historic filled/unknown order-state combination should not block new
+    unattended launches if authenticated account reads show no route positions and
+    no venue reports an open or partially filled order.
+    """
+
+    if pair_status.derived_state != "review_required":
+        return True
+    reconciliation = pair_status.reconciliation
+    if any(
+        (not venue.authenticated) or (not venue.ready)
+        for venue in reconciliation.venues
+    ):
+        return True
+    if any(venue.position_symbols for venue in reconciliation.venues):
+        return True
+    return any(
+        leg.derived_state in {"open", "partial_fill"}
+        for leg in pair_status.order_state.legs
+    )
+
+
 def _position_presence_by_route(
     entry: ExecutionJournalEntry,
     reconciliation: ExecutionReconciliation,
