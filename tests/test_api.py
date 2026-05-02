@@ -132,6 +132,112 @@ def test_versioned_health_endpoint() -> None:
     assert response.json()["status"] == "ok"
 
 
+def test_app_startup_prewarms_execution_store_with_overridden_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class StubExecutionStore:
+        def initialize(self) -> None:
+            seen["initialized"] = True
+
+    async def override_settings() -> ApiSettings:
+        return ApiSettings(database_path=str(tmp_path / "override.sqlite3"))
+
+    def build_store(database_path: str) -> StubExecutionStore:
+        seen["database_path"] = database_path
+        return StubExecutionStore()
+
+    monkeypatch.setattr(app_module, "_execution_journal_store_for_path", build_store)
+    app.dependency_overrides[get_api_settings] = override_settings
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        app.dependency_overrides.clear()
+
+    assert seen == {
+        "database_path": str(tmp_path / "override.sqlite3"),
+        "initialized": True,
+    }
+
+
+def test_app_startup_skips_prewarm_for_default_development_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class StubExecutionStore:
+        def initialize(self) -> None:
+            seen["initialized"] = True
+
+    def build_store(database_path: str) -> StubExecutionStore:
+        seen["database_path"] = database_path
+        return StubExecutionStore()
+
+    get_api_settings.cache_clear()
+    monkeypatch.setattr(app_module, "_execution_journal_store_for_path", build_store)
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        get_api_settings.cache_clear()
+
+    assert seen == {}
+
+
+def test_app_startup_skips_prewarm_for_equivalent_default_development_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class StubExecutionStore:
+        def initialize(self) -> None:
+            seen["initialized"] = True
+
+    async def override_settings() -> ApiSettings:
+        return ApiSettings(database_path="./data/carryme.sqlite3")
+
+    def build_store(database_path: str) -> StubExecutionStore:
+        seen["database_path"] = database_path
+        return StubExecutionStore()
+
+    monkeypatch.setattr(app_module, "_execution_journal_store_for_path", build_store)
+    app.dependency_overrides[get_api_settings] = override_settings
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        app.dependency_overrides.clear()
+
+    assert seen == {}
+
+
+def test_app_startup_fails_closed_when_execution_store_prewarm_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def override_settings() -> ApiSettings:
+        return ApiSettings(database_path=str(tmp_path / "blocked.sqlite3"))
+
+    class FailingExecutionStore:
+        def initialize(self) -> None:
+            raise RuntimeError("prewarm failed")
+
+    monkeypatch.setattr(
+        app_module,
+        "_execution_journal_store_for_path",
+        lambda database_path: FailingExecutionStore(),
+    )
+    app.dependency_overrides[get_api_settings] = override_settings
+    try:
+        with pytest.raises(RuntimeError, match="prewarm failed"), TestClient(app):
+            pass
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_operator_auth_does_not_gate_get_requests(tmp_path: Path) -> None:
     app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
         database_path=str(tmp_path / "history.sqlite3"),

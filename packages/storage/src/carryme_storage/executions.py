@@ -107,6 +107,17 @@ class ExecutionJournalStore:
                 )
                 connection.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_execution_journal_entries_paper_trade_preview
+                    ON execution_journal_entries(
+                        paper_trade_id,
+                        preview_hash,
+                        executed_at DESC,
+                        id DESC
+                    )
+                    """
+                )
+                connection.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS live_submission_reservations (
                         confirmation_entry_id INTEGER NOT NULL,
                         preview_hash TEXT NOT NULL,
