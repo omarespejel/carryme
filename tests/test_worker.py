@@ -5260,7 +5260,7 @@ def test_list_ranked_stable_launch_ready_stabilities_reports_future_snapshot_det
     assert "future" in detail
 
 
-def test_launch_latest_stable_canary_once_skips_when_selected_snapshot_lacks_revalidated_stability(
+def test_launch_latest_stable_canary_once_uses_proven_stable_snapshot_when_latest_reprices(
     tmp_path: Path,
 ) -> None:
     settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
@@ -5274,7 +5274,7 @@ def test_launch_latest_stable_canary_once_skips_when_selected_snapshot_lacks_rev
     )
     approved_snapshot = approved_store.append(snapshot.approved_snapshot)
     route_approval_store.upsert(approval)
-    stable_snapshot = launch_ready_store.append(
+    launch_ready_store.append(
         snapshot.model_copy(
             update={
                 "launch_ready_snapshot_id": None,
@@ -5283,7 +5283,7 @@ def test_launch_latest_stable_canary_once_skips_when_selected_snapshot_lacks_rev
             }
         )
     )
-    launch_ready_store.append(
+    stable_snapshot = launch_ready_store.append(
         snapshot.model_copy(
             update={
                 "launch_ready_snapshot_id": None,
@@ -5298,6 +5298,83 @@ def test_launch_latest_stable_canary_once_skips_when_selected_snapshot_lacks_rev
             "captured_at": datetime(2026, 4, 4, 10, 1, 20, tzinfo=UTC),
         }
     )
+    launched_snapshot_ids: list[int | None] = []
+
+    class StubLifecycleResult:
+        def __init__(self) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=17,
+                created_at=datetime(2026, 4, 4, 10, 1, 40, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00355,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=900.0,
+                    target_notional=20.0,
+                    capacity_fraction=20.0 / 900.0,
+                    max_target_notional=20.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=20.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=20.0,
+                    ),
+                ),
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=31,
+                paper_trade_id=17,
+                preview_hash="preview",
+                derived_state="closed",
+                recommended_action="no_action",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=31,
+                    paper_trade_id=17,
+                    preview_hash="preview",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=31,
+                    paper_trade_id=17,
+                    preview_hash="preview",
+                    status="accepted",
+                    recommended_action="no_action",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        lifecycle_note = cast(str, kwargs["lifecycle_note"])
+        assert f"snapshot {stable_snapshot.launch_ready_snapshot_id}" in lifecycle_note
+        launched_snapshot_ids.append(stable_snapshot.launch_ready_snapshot_id)
+        return StubLifecycleResult()
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
@@ -5306,24 +5383,165 @@ def test_launch_latest_stable_canary_once_skips_when_selected_snapshot_lacks_rev
         )
         monkeypatch.setattr(
             "carryme_worker.poller._run_guarded_canary_lifecycle",
-            lambda **_: (_ for _ in ()).throw(
-                AssertionError("launch should skip before lifecycle when stability changed")
-            ),
+            run_stub_lifecycle,
         )
         summary = asyncio.run(
             launch_latest_stable_canary_once(
                 settings,
+                api_settings=api_settings,
                 approved_store=approved_store,
                 now=datetime(2026, 4, 4, 10, 1, 40, tzinfo=UTC),
             )
         )
 
-    assert summary.status == "skipped"
+    assert summary.status == "launched"
     assert summary.label == "arb_extended_paradex"
-    assert summary.launch_ready_snapshot_id == 999
-    assert summary.detail == (
-        "Launch-ready canary snapshot changed before stability could be revalidated"
+    assert summary.launch_ready_snapshot_id == stable_snapshot.launch_ready_snapshot_id
+    assert summary.approved_snapshot_id == approved_snapshot.snapshot_id
+    assert summary.paper_trade_id == 17
+    assert launched_snapshot_ids == [stable_snapshot.launch_ready_snapshot_id]
+
+
+def test_launch_latest_stable_canary_once_uses_latest_equivalent_approved_snapshot(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    approval, candidate, snapshot, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        launch_ready_snapshot_id=9,
+        approved_snapshot_id=8,
     )
+    stable_approved = approved_store.append(snapshot.approved_snapshot)
+    route_approval_store.upsert(approval)
+    stable_snapshot = _append_stable_launch_ready_pair(
+        launch_ready_store,
+        snapshot,
+        stable_approved,
+        datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 1, 0, tzinfo=UTC),
+    )
+    repriced_route = candidate.opportunity.opportunity.model_copy(
+        update={
+            "gross_daily_edge": 0.005,
+            "one_day_net_edge_after_entry": 0.00455,
+            "one_day_net_edge_after_round_trip": 0.0041,
+        }
+    )
+    repriced_opportunity = candidate.opportunity.model_copy(
+        update={
+            "opportunity": repriced_route,
+            "estimated_one_day_pnl_after_round_trip": 3.69,
+        }
+    )
+    repriced_candidate = candidate.model_copy(update={"opportunity": repriced_opportunity})
+    latest_approved = approved_store.append(
+        snapshot.approved_snapshot.model_copy(
+            update={
+                "snapshot_id": None,
+                "captured_at": datetime(2026, 4, 4, 10, 1, 25, tzinfo=UTC),
+                "candidate": repriced_candidate,
+            }
+        )
+    )
+    captured_edges: list[float] = []
+
+    class StubLifecycleResult:
+        def __init__(self) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=17,
+                created_at=datetime(2026, 4, 4, 10, 1, 40, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label="arb_extended_paradex",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00455,
+                    break_even_days_entry=0.2,
+                    capacity_limit_notional=900.0,
+                    target_notional=20.0,
+                    capacity_fraction=20.0 / 900.0,
+                    max_target_notional=20.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro_fastfills",
+                        side="buy",
+                        target_notional=20.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=20.0,
+                    ),
+                ),
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=31,
+                paper_trade_id=17,
+                preview_hash="preview",
+                derived_state="closed",
+                recommended_action="no_action",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=31,
+                    paper_trade_id=17,
+                    preview_hash="preview",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=31,
+                    paper_trade_id=17,
+                    preview_hash="preview",
+                    status="accepted",
+                    recommended_action="no_action",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        launched_candidate = cast(FundingUniverseCanaryCandidate, kwargs["candidate"])
+        captured_edges.append(
+            launched_candidate.opportunity.opportunity.one_day_net_edge_after_round_trip
+        )
+        return StubLifecycleResult()
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                approved_store=approved_store,
+                now=datetime(2026, 4, 4, 10, 1, 40, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.launch_ready_snapshot_id == stable_snapshot.launch_ready_snapshot_id
+    assert summary.approved_snapshot_id == latest_approved.snapshot_id
+    assert captured_edges == [0.0041]
 
 
 def test_launch_latest_stable_canary_once_falls_through_label_cooldown(
@@ -9100,6 +9318,9 @@ def test_launch_latest_stable_canary_once_skips_stale_latest_approved_snapshot(
             update={
                 "snapshot_id": None,
                 "captured_at": datetime(2026, 3, 29, 20, 1, tzinfo=UTC),
+                "candidate": older_snapshot.candidate.model_copy(
+                    update={"suggested_canary_notional": 20.0}
+                ),
             }
         )
     )
@@ -11987,6 +12208,7 @@ def test_maybe_auto_close_open_hedged_execution_revalidates_without_active_appro
 
 def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
@@ -12034,6 +12256,7 @@ def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
             "carryme_worker.poller.launch_latest_stable_canary_once",
             fake_launch_latest_stable_canary_once,
         )
+        caplog.set_level(logging.INFO, logger="carryme.worker")
         summary = asyncio.run(
             run_supervised_stable_canary_launch_loop(
                 settings,
@@ -12049,6 +12272,9 @@ def test_run_supervised_stable_canary_launch_loop_honors_max_iterations(
     assert summary.launched == 1
     assert summary.skipped == 1
     assert sleeps == [6]
+    assert "label=arb_extended_paradex" in caplog.text
+    assert "paper_trade_id=17" in caplog.text
+    assert "detail=No launch-ready canary snapshot found" in caplog.text
 
 
 def test_run_production_supervisor_cycle_once_orders_stages(
