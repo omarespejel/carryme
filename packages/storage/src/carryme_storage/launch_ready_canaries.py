@@ -43,6 +43,12 @@ class LaunchReadyCanaryStore:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_launch_ready_canary_snapshots_captured_at_id
+                ON launch_ready_canary_snapshots(captured_at DESC, id DESC)
+                """
+            )
+            connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_launch_ready_canary_snapshots_label
                 ON launch_ready_canary_snapshots(label)
                 """
@@ -131,30 +137,51 @@ class LaunchReadyCanaryStore:
         """Return recent distinct labels ordered by latest snapshot timestamp."""
 
         self.initialize()
-        with self.database.begin() as connection:
-            rows = connection.execute(
-                """
-                WITH ranked_snapshots AS (
-                    SELECT
-                        label,
-                        captured_at,
-                        id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY label
-                            ORDER BY captured_at DESC, id DESC
-                        ) AS row_number
-                    FROM launch_ready_canary_snapshots
-                )
-                SELECT label, captured_at AS latest_captured_at, id AS latest_id
-                FROM ranked_snapshots
-                WHERE row_number = 1
-                ORDER BY latest_captured_at DESC, latest_id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+        labels: list[str] = []
+        seen_labels: set[str] = set()
+        batch_size = max(limit * 4, 50)
+        cursor: tuple[str, int] | None = None
 
-        return [label for label, _, _ in rows]
+        with self.database.begin() as connection:
+            while len(labels) < limit:
+                if cursor is None:
+                    rows = connection.execute(
+                        """
+                        SELECT label, captured_at, id
+                        FROM launch_ready_canary_snapshots
+                        ORDER BY captured_at DESC, id DESC
+                        LIMIT ?
+                        """,
+                        (batch_size,),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT label, captured_at, id
+                        FROM launch_ready_canary_snapshots
+                        WHERE captured_at < ? OR (captured_at = ? AND id < ?)
+                        ORDER BY captured_at DESC, id DESC
+                        LIMIT ?
+                        """,
+                        (cursor[0], cursor[0], cursor[1], batch_size),
+                    ).fetchall()
+
+                if not rows:
+                    break
+
+                for label, _captured_at, _row_id in rows:
+                    if label in seen_labels:
+                        continue
+                    seen_labels.add(label)
+                    labels.append(label)
+                    if len(labels) >= limit:
+                        break
+
+                last_label, last_captured_at, last_row_id = rows[-1]
+                _ = last_label
+                cursor = (last_captured_at, last_row_id)
+
+        return labels
 
     def delete_label(self, label: str) -> int:
         """Delete all launch-ready canary snapshots for one label."""
