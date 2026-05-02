@@ -829,6 +829,79 @@ def test_execution_journal_store_reserves_pair_close_submission_once_per_trade(
     )
 
 
+def test_execution_journal_store_releases_uncompleted_pair_close_submission(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=11,
+    )
+    assert store.release_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=11,
+    )
+    assert store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=12,
+    )
+
+
+def test_execution_journal_store_does_not_release_completed_pair_close_submission(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=11,
+    )
+    store.mark_pair_close_live_submission_completed(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        execution_entry_id=99,
+    )
+
+    assert not store.release_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=11,
+    )
+    assert not store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=12,
+    )
+
+
+def test_execution_journal_store_does_not_release_pair_close_submission_for_mismatched_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = ExecutionJournalStore(tmp_path / "history.sqlite3")
+
+    assert store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=11,
+    )
+
+    assert not store.release_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=12,
+    )
+    assert not store.reserve_pair_close_live_submission(
+        paper_trade_id=7,
+        preview_hash="pair-close-hash",
+        confirmation_entry_id=13,
+    )
+
+
 def test_execution_journal_store_reserves_pair_open_submission_once_per_trade(
     tmp_path: Path,
 ) -> None:
