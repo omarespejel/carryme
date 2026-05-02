@@ -7215,6 +7215,10 @@ def create_app() -> FastAPI:
                 limit,
                 _validated_history_limit("history_shortlist_limit", history_shortlist_limit),
             )
+            history_shortlist_sample = max(
+                history_shortlist_sample,
+                history_shortlist_limit,
+            )
             if history_shortlist_max_age_seconds < 1:
                 raise HTTPException(
                     status_code=400,
@@ -7234,7 +7238,6 @@ def create_app() -> FastAPI:
             )
             effective_include_symbols = include_symbols
             used_history_shortlist = False
-            broad_candidate_sample = candidate_sample
             if use_history_shortlist and include_symbols is None:
                 try:
                     shortlisted_symbols = await asyncio.to_thread(
@@ -7296,11 +7299,12 @@ def create_app() -> FastAPI:
 
             candidates = await _scan_candidates(effective_include_symbols, candidate_sample)
             if used_history_shortlist and len(candidates) < limit:
-                broad_candidates = await _scan_candidates(None, broad_candidate_sample)
+                remaining_candidate_slots = max(1, limit - len(candidates))
+                broad_candidates = await _scan_candidates(None, remaining_candidate_slots)
                 candidates = _merge_canary_candidates(
                     candidates,
                     broad_candidates,
-                    limit=broad_candidate_sample,
+                    limit=limit,
                 )
             proposals = approval_service.propose_canary_route_approvals(
                 candidates,

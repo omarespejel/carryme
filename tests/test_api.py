@@ -1155,6 +1155,7 @@ def test_funding_universe_canary_approval_proposals_rejects_unbounded_history_sh
     tmp_path: Path,
 ) -> None:
     called = False
+    proposal_called = False
 
     class StubUniverseService:
         async def scan_canary_candidates(
@@ -1171,6 +1172,8 @@ def test_funding_universe_canary_approval_proposals_rejects_unbounded_history_sh
             *,
             limit: int,
         ) -> list[FundingUniverseCanaryApprovalProposal]:
+            nonlocal proposal_called
+            proposal_called = True
             assert candidates == []
             assert limit == 1
             return []
@@ -1200,12 +1203,14 @@ def test_funding_universe_canary_approval_proposals_rejects_unbounded_history_sh
         f"{app_module.MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS}"
     )
     assert called is False
+    assert proposal_called is False
 
 
 def test_funding_universe_canary_approval_proposals_rejects_zero_history_shortlist_age(
     tmp_path: Path,
 ) -> None:
     called = False
+    proposal_called = False
 
     class StubUniverseService:
         async def scan_canary_candidates(
@@ -1222,6 +1227,8 @@ def test_funding_universe_canary_approval_proposals_rejects_zero_history_shortli
             *,
             limit: int,
         ) -> list[FundingUniverseCanaryApprovalProposal]:
+            nonlocal proposal_called
+            proposal_called = True
             assert candidates == []
             assert limit == 1
             return []
@@ -1248,6 +1255,7 @@ def test_funding_universe_canary_approval_proposals_rejects_zero_history_shortli
         response.json()["detail"] == "history_shortlist_max_age_seconds must be at least 1"
     )
     assert called is False
+    assert proposal_called is False
 
 
 def test_funding_universe_canary_approval_proposals_uses_history_shortlist(
@@ -1707,6 +1715,7 @@ def test_funding_universe_canary_approval_proposals_falls_back_when_shortlist_mi
 
     assert response.status_code == 200
     assert [call["include_symbols"] for call in calls] == [["TON-USD-PERP"], None]
+    assert [call["limit"] for call in calls] == [50, 2]
 
 
 def test_funding_universe_canary_approval_proposals_preserves_explicit_symbols(
@@ -1786,6 +1795,95 @@ def test_funding_universe_canary_approval_proposals_preserves_explicit_symbols(
 
     assert response.status_code == 200
     assert captured["include_symbols"] == ["S-USD-PERP"]
+
+
+def test_funding_universe_canary_approval_proposals_can_bypass_history_shortlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=FIXED_APPROVAL_PROPOSAL_NOW,
+            pair=FundingPairSpec(
+                label="ton_extended_paradex",
+                left_venue="extended",
+                left_symbol="TON-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="TON-USD-PERP",
+                right_fee_profile="pro_fastfills",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="TON-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0037,
+                one_day_net_edge_after_round_trip=0.0034,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.4,
+                capacity=CapacityEstimate(
+                    short_bid_notional=2_500.0,
+                    long_ask_notional=2_000.0,
+                    max_entry_notional=2_000.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+    selector_calls: list[dict[str, Any]] = []
+
+    def spy_selector(*_: Any, **kwargs: Any) -> list[str]:
+        selector_calls.append(dict(kwargs))
+        return ["TON-USD-PERP"]
+
+    monkeypatch.setattr(app_module, "_select_canary_reprice_symbols_from_history", spy_selector)
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == []
+            assert limit == 2
+            return []
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("limit", "2"),
+                ("use_history_shortlist", "false"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert selector_calls == []
+    assert captured["include_symbols"] is None
 
 
 def test_funding_universe_canary_approval_proposals_filters_fee_overrides_to_selected_venues(
