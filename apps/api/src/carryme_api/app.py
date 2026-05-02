@@ -3857,11 +3857,25 @@ async def _execute_guarded_pair_close_from_confirmation(
     poll_interval_seconds: float,
     auto_cleanup: bool,
 ) -> GuardedPairExecutionResult:
-    paper_trade_id = paper_trade.entry_id or 0
     if confirmation.entry_id is None:
         raise HTTPException(
             status_code=500,
             detail="Pair-close confirmation entry_id is required before live submission",
+        )
+    paper_trade_id = paper_trade.entry_id or confirmation.paper_trade_id
+    if paper_trade_id < 1:
+        raise HTTPException(
+            status_code=500,
+            detail="paper_trade_id is required before pair-close live submission",
+        )
+    existing_entry = execution_store.find_by_paper_trade_preview_hash(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+    )
+    if existing_entry is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=existing_entry.model_dump(mode="json"),
         )
     for venue in {leg.venue for leg in confirmation.preview.legs}:
         try:

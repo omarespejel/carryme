@@ -7503,6 +7503,14 @@ def test_guarded_pair_close_endpoint_rejects_duplicate_retry(
         preview_hash="pair-close-hash",
     )
     assert original_confirmation is not None
+    with execution_store.database.begin() as connection:
+        connection.execute(
+            """
+            DELETE FROM pair_close_live_submission_reservations
+            WHERE paper_trade_id = ? AND preview_hash = ?
+            """,
+            (paper_trade.entry_id or 0, "pair-close-hash"),
+        )
     confirmation_store.append(
         original_confirmation.model_copy(
             update={
