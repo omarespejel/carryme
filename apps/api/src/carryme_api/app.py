@@ -409,14 +409,20 @@ def get_automation_readiness_checked_at() -> datetime:
     return datetime.now(UTC)
 
 
-async def _resolve_api_settings_for_request(request: Request) -> ApiSettings:
-    """Resolve API settings while honoring FastAPI dependency overrides in tests."""
+async def _resolve_api_settings_for_app(app: FastAPI) -> ApiSettings:
+    """Resolve API settings while honoring FastAPI dependency overrides."""
 
-    resolver = request.app.dependency_overrides.get(get_api_settings) or get_api_settings
+    resolver = app.dependency_overrides.get(get_api_settings) or get_api_settings
     settings = resolver()
     if inspect.isawaitable(settings):
         settings = await cast(Awaitable[ApiSettings], settings)
     return cast(ApiSettings, settings)
+
+
+async def _resolve_api_settings_for_request(request: Request) -> ApiSettings:
+    """Resolve API settings while honoring FastAPI dependency overrides in tests."""
+
+    return await _resolve_api_settings_for_app(request.app)
 
 
 def _operator_auth_error(status_code: int, detail: str) -> JSONResponse:
@@ -4120,7 +4126,7 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         """Warm the shared execution journal store before serving live requests."""
 
-        settings = get_api_settings()
+        settings = await _resolve_api_settings_for_app(app)
         _execution_journal_store_for_path(settings.database_path).initialize()
         yield
 
