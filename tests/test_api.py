@@ -84,6 +84,7 @@ from carryme_models import (
     VenueSystemState,
 )
 from carryme_runtime.pair_close_preview import _pair_close_hash
+from carryme_runtime.route_approvals import RouteApprovalService
 from carryme_storage import (
     ApprovedCanaryAlertStore,
     ApprovedCanaryStore,
@@ -98,6 +99,7 @@ from carryme_storage import (
     PairClosePreviewConfirmationStore,
     PaperTradeStore,
     PreviewConfirmationStore,
+    RouteApprovalStore,
     StableCanaryLaunchStore,
     StableLaunchReadyAlertStore,
     SystemStateAlertStore,
@@ -1678,6 +1680,174 @@ def test_approve_refresh_and_cache_launch_ready_canary_proposal_rejects_missing_
         detail["blocking_reasons"]
     )
     assert upsert_called is False
+    assert approved_store.latest(label="arb_extended_paradex") is None
+    assert launch_ready_store.latest(label="arb_extended_paradex") is None
+
+
+def test_approve_best_launch_ready_canary_proposal_saves_top_ready_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    approval_service = RouteApprovalService(store=RouteApprovalStore(database_path))
+    approved_store = ApprovedCanaryStore(database_path)
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+    history_store = OpportunityHistoryStore(database_path)
+    captured_candidate_scan: dict[str, object] = {}
+    captured_refresh_scan: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self,
+            **kwargs: object,
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured_candidate_scan.update(kwargs)
+            return [_arb_extended_paradex_canary_candidate()]
+
+    class StubSystemStateService:
+        async def probe_venues(
+            self,
+            configs: dict[str, dict[str, bool]],
+        ) -> list[VenueSystemState]:
+            _ = configs
+            return [
+                VenueSystemState(
+                    venue="extended",
+                    enabled=True,
+                    checked=False,
+                    healthy=True,
+                    status=None,
+                ),
+                VenueSystemState(
+                    venue="paradex",
+                    enabled=True,
+                    checked=True,
+                    healthy=True,
+                    status="ok",
+                ),
+            ]
+
+    async def fake_scan_live_route_candidate_for_approval(
+        **kwargs: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        captured_refresh_scan.update(kwargs)
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        assert approval.label == "arb_extended_paradex"
+        assert approval.approved is True
+        return _arb_extended_paradex_canary_candidate(suggested_canary_notional=25.0), 1
+
+    monkeypatch.setattr(
+        "carryme_api.app.scan_live_route_candidate_for_approval",
+        fake_scan_live_route_candidate_for_approval,
+    )
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(database_path),
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="0x123",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="0xdef",
+    )
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: approval_service
+    app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
+    app.dependency_overrides[get_history_store] = lambda: history_store
+    app.dependency_overrides[get_system_state_service] = lambda: StubSystemStateService()
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/v1/opportunities/funding-universe/canary/approval-proposals/"
+            "approve-best-launch-ready",
+            params={"use_history_shortlist": "false", "candidate_sample": "10"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured_candidate_scan["limit"] == 10
+    assert captured_candidate_scan["venues"] == ["extended", "paradex"]
+    assert captured_refresh_scan["venues"] == ["extended", "paradex"]
+    payload = response.json()
+    assert payload["launch_ready_snapshot_id"] == 1
+    assert payload["label"] == "arb_extended_paradex"
+    assert payload["approved_snapshot"]["approval"]["approved"] is True
+    assert payload["approved_snapshot"]["approval"]["max_live_notional"] == 25.0
+    assert approval_service.list_recent(label="arb_extended_paradex")[0].approved is True
+    assert approved_store.latest(label="arb_extended_paradex") is not None
+    assert launch_ready_store.latest(label="arb_extended_paradex") is not None
+
+
+def test_approve_best_launch_ready_canary_proposal_rejects_missing_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+    approval_service = RouteApprovalService(store=RouteApprovalStore(database_path))
+    approved_store = ApprovedCanaryStore(database_path)
+    launch_ready_store = LaunchReadyCanaryStore(database_path)
+    history_store = OpportunityHistoryStore(database_path)
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self,
+            **_: object,
+        ) -> list[FundingUniverseCanaryCandidate]:
+            return [_arb_extended_paradex_canary_candidate()]
+
+    class FailingSystemStateService:
+        async def probe_venues(
+            self,
+            configs: dict[str, dict[str, bool]],
+        ) -> list[VenueSystemState]:
+            _ = configs
+            raise AssertionError("system-state probe should not run before credential gate")
+
+    async def fake_scan_live_route_candidate_for_approval(
+        **_: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        return _arb_extended_paradex_canary_candidate(), 1
+
+    monkeypatch.setattr(
+        "carryme_api.app.scan_live_route_candidate_for_approval",
+        fake_scan_live_route_candidate_for_approval,
+    )
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_api_settings] = lambda: ApiSettings(
+        database_path=str(database_path),
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        paradex_live_enabled=True,
+        paradex_account_address="0xabc",
+        paradex_private_key="0xdef",
+    )
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: approval_service
+    app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
+    app.dependency_overrides[get_launch_ready_canary_store] = lambda: launch_ready_store
+    app.dependency_overrides[get_history_store] = lambda: history_store
+    app.dependency_overrides[get_system_state_service] = lambda: FailingSystemStateService()
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/v1/opportunities/funding-universe/canary/approval-proposals/"
+            "approve-best-launch-ready",
+            params={"use_history_shortlist": "false"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["message"] == (
+        "Approved canary snapshot live execution preflight is not ready"
+    )
+    assert "CARRYME_API_EXTENDED_STARK_PRIVATE_KEY" in " ".join(
+        detail["blocking_reasons"]
+    )
+    assert approval_service.list_recent(label="arb_extended_paradex") == []
     assert approved_store.latest(label="arb_extended_paradex") is None
     assert launch_ready_store.latest(label="arb_extended_paradex") is None
 
