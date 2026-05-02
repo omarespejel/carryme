@@ -9112,6 +9112,20 @@ def test_stable_launch_label_loss_scope_ignores_other_label_loss_streak(
 
     assert reason is None
 
+    missing_label_reason = _build_stable_launch_loss_circuit_breaker_reason(
+        settings=settings,
+        execution_store=ExecutionJournalStore(settings.database_path),
+        observation_store=ExecutionObservationStore(settings.database_path),
+        balance_service=BalanceAccountingService(
+            store=BalanceSnapshotStore(settings.database_path)
+        ),
+        now=datetime(2026, 4, 4, 10, 10, tzinfo=UTC),
+    )
+
+    assert missing_label_reason == (
+        "Stable launch consecutive losing trades scope=label requires candidate label"
+    )
+
 
 def test_stable_launch_label_loss_scope_blocks_same_label_loss_streak(
     tmp_path: Path,
