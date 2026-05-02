@@ -118,6 +118,7 @@ from carryme_worker.poller import (
     PollLoopSummary,
     ProductionSupervisorCycleSummary,
     ProductionSupervisorLoopSummary,
+    StableCanaryLaunchedRoute,
     StableCanaryLaunchLoopSummary,
     StableCanaryLaunchSummary,
     SystemStateObservationLoopSummary,
@@ -249,6 +250,10 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
         raising=False,
     )
     monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_ROUTES_PER_CYCLE",
+        raising=False,
+    )
+    monkeypatch.delenv(
         "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MAX_TOTAL_LIVE_NOTIONAL",
         raising=False,
     )
@@ -344,6 +349,7 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_max_active_live_executions == 0
     assert settings.stable_canary_launch_active_execution_limit == 20
     assert settings.stable_canary_launch_candidate_scan_limit == 100
+    assert settings.stable_canary_launch_max_routes_per_cycle == 1
     assert settings.stable_canary_launch_max_total_live_notional is None
     assert settings.stable_canary_launch_max_live_notional_per_venue is None
     assert settings.stable_canary_launch_recent_closed_trade_limit == 10
@@ -606,6 +612,7 @@ def test_worker_automation_mode_payload_is_redacted_and_shows_hold_controls() ->
         database_path="postgresql+psycopg://user:secret@db.example.com/carryme",
         stable_canary_launch_close_position=False,
         stable_canary_launch_max_active_live_executions=0,
+        stable_canary_launch_max_routes_per_cycle=2,
         stable_canary_launch_max_total_live_notional=25.0,
         stable_canary_launch_max_live_notional_per_venue=20.0,
         execution_auto_pair_close_enabled=True,
@@ -626,6 +633,7 @@ def test_worker_automation_mode_payload_is_redacted_and_shows_hold_controls() ->
     assert payload["stable_canary_launch_close_position"] is False
     assert payload["stable_canary_launch_hold_mode"] is True
     assert payload["stable_canary_launch_max_active_live_executions"] == 0
+    assert payload["stable_canary_launch_max_routes_per_cycle"] == 2
     assert payload["stable_canary_launch_max_total_live_notional"] == 25.0
     assert payload["stable_canary_launch_max_live_notional_per_venue"] == 20.0
     assert payload["execution_auto_pair_close_enabled"] is True
@@ -919,6 +927,17 @@ def test_worker_stable_canary_launch_payload() -> None:
             approved_snapshot_id=5,
             paper_trade_id=11,
             final_pair_state="closed",
+            launched_count=1,
+            launched_routes=[
+                StableCanaryLaunchedRoute(
+                    label="arb_extended_paradex",
+                    launch_ready_snapshot_id=7,
+                    approved_snapshot_id=5,
+                    paper_trade_id=11,
+                    final_pair_state="closed",
+                    selected_notional=20.0,
+                )
+            ],
             detail=None,
             database_path="tmp/history.sqlite3",
         )
@@ -931,6 +950,17 @@ def test_worker_stable_canary_launch_payload() -> None:
         "approved_snapshot_id": 5,
         "paper_trade_id": 11,
         "final_pair_state": "closed",
+        "launched_count": 1,
+        "launched_routes": [
+            {
+                "label": "arb_extended_paradex",
+                "launch_ready_snapshot_id": 7,
+                "approved_snapshot_id": 5,
+                "paper_trade_id": 11,
+                "final_pair_state": "closed",
+                "selected_notional": 20.0,
+            }
+        ],
         "detail": None,
         "database_path": "tmp/history.sqlite3",
     }
@@ -5845,6 +5875,303 @@ def test_launch_latest_stable_canary_once_falls_through_label_cooldown(
     assert summary.label == "arb_extended_paradex"
     assert summary.launch_ready_snapshot_id == latest_fallback.launch_ready_snapshot_id
     assert captured_labels == ["arb_extended_paradex"]
+
+
+def test_launch_latest_stable_canary_once_launches_multiple_routes_per_cycle(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_routes_per_cycle=3,
+        stable_canary_launch_max_active_live_executions=3,
+        stable_canary_launch_max_total_live_notional=60.0,
+        stable_canary_launch_max_live_notional_per_venue=60.0,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    latest_snapshots: dict[str, LaunchReadyCanarySnapshot] = {}
+    route_specs = [
+        ("zro_extended_paradex", "ZRO-USD-PERP", "ZRO-USD", "ZRO-USD-PERP", 4.0),
+        ("strk_extended_paradex", "STRK-USD-PERP", "STRK-USD", "STRK-USD-PERP", 3.0),
+        ("op_extended_paradex", "OP-USD-PERP", "OP-USD", "OP-USD-PERP", 2.0),
+    ]
+    for index, (label, canonical_symbol, short_symbol, long_symbol, pnl) in enumerate(
+        route_specs,
+        start=1,
+    ):
+        approval, _, snapshot, _ = _build_stable_launch_test_snapshot(
+            label=label,
+            canonical_symbol=canonical_symbol,
+            short_symbol=short_symbol,
+            long_symbol=long_symbol,
+            launch_ready_snapshot_id=index * 10 + 1,
+            approved_snapshot_id=index * 10,
+            suggested_canary_notional=20.0,
+            estimated_one_day_pnl_after_round_trip=pnl,
+        )
+        approved_snapshot = approved_store.append(snapshot.approved_snapshot)
+        route_approval_store.upsert(approval)
+        latest_snapshots[label] = _append_stable_launch_ready_pair(
+            launch_ready_store,
+            snapshot,
+            approved_snapshot,
+            datetime(2026, 4, 4, 10, 0, index, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 1, index, tzinfo=UTC),
+        )
+
+    captured_labels: list[str] = []
+    captured_notional: list[float] = []
+
+    class StubLifecycleResult:
+        def __init__(
+            self,
+            *,
+            candidate: FundingUniverseCanaryCandidate,
+            label: str,
+            paper_trade_id: int,
+        ) -> None:
+            opportunity = candidate.opportunity.opportunity
+            notional = candidate.suggested_canary_notional
+            capacity_limit = (
+                opportunity.capacity.max_entry_notional
+                if opportunity.capacity is not None
+                and opportunity.capacity.max_entry_notional is not None
+                else notional
+            )
+            self.paper_trade = PaperTradeEntry(
+                entry_id=paper_trade_id,
+                created_at=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+                intent=FundingPairTradeIntent(
+                    label=label,
+                    canonical_symbol=opportunity.canonical_symbol,
+                    source_recorded_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+                    one_day_net_edge_after_entry=opportunity.one_day_net_edge_after_entry,
+                    break_even_days_entry=opportunity.break_even_days_entry,
+                    capacity_limit_notional=capacity_limit,
+                    target_notional=notional,
+                    capacity_fraction=notional / capacity_limit,
+                    max_target_notional=notional,
+                    long_leg=TradeLegIntent(
+                        venue=opportunity.long_venue,
+                        symbol=candidate.opportunity.venue_markets[
+                            opportunity.long_venue
+                        ].symbol,
+                        fee_profile=opportunity.long_fee_profile,
+                        side="buy",
+                        target_notional=notional,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue=opportunity.short_venue,
+                        symbol=candidate.opportunity.venue_markets[
+                            opportunity.short_venue
+                        ].symbol,
+                        fee_profile=opportunity.short_fee_profile,
+                        side="sell",
+                        target_notional=notional,
+                    ),
+                ),
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=paper_trade_id + 100,
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"preview-{paper_trade_id}",
+                derived_state="hedged",
+                recommended_action="monitor_open_hedge",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=paper_trade_id + 100,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-{paper_trade_id}",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=paper_trade_id + 100,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-{paper_trade_id}",
+                    status="accepted",
+                    recommended_action="monitor_open_hedge",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        candidate = cast(FundingUniverseCanaryCandidate, kwargs["candidate"])
+        captured_labels.append(approval.label)
+        captured_notional.append(candidate.suggested_canary_notional)
+        return StubLifecycleResult(
+            candidate=candidate,
+            label=approval.label,
+            paper_trade_id=100 + len(captured_labels),
+        )
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                launch_store=launch_store,
+                approved_store=approved_store,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.launched_count == 3
+    assert captured_labels == [
+        "zro_extended_paradex",
+        "strk_extended_paradex",
+        "op_extended_paradex",
+    ]
+    assert captured_notional == [20.0, 20.0, 20.0]
+    assert [route.label for route in summary.launched_routes] == captured_labels
+    assert [route.selected_notional for route in summary.launched_routes] == [
+        20.0,
+        20.0,
+        20.0,
+    ]
+    assert summary.launch_ready_snapshot_id == (
+        latest_snapshots["zro_extended_paradex"].launch_ready_snapshot_id
+    )
+    launch_records = launch_store.list_recent(limit=10)
+    assert len(launch_records) == 3
+
+
+def test_launch_latest_stable_canary_once_spends_budget_across_cycle_routes(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_routes_per_cycle=3,
+        stable_canary_launch_max_active_live_executions=3,
+        stable_canary_launch_max_total_live_notional=45.0,
+        stable_canary_launch_max_live_notional_per_venue=100.0,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    for index, label in enumerate(
+        ["zro_extended_paradex", "strk_extended_paradex", "op_extended_paradex"],
+        start=1,
+    ):
+        approval, _, snapshot, _ = _build_stable_launch_test_snapshot(
+            label=label,
+            canonical_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD-PERP",
+            short_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD",
+            long_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD-PERP",
+            launch_ready_snapshot_id=index * 10 + 1,
+            approved_snapshot_id=index * 10,
+            suggested_canary_notional=20.0,
+            estimated_one_day_pnl_after_round_trip=float(5 - index),
+        )
+        approved_snapshot = approved_store.append(snapshot.approved_snapshot)
+        route_approval_store.upsert(approval)
+        _append_stable_launch_ready_pair(
+            launch_ready_store,
+            snapshot,
+            approved_snapshot,
+            datetime(2026, 4, 4, 10, 0, index, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 1, index, tzinfo=UTC),
+        )
+
+    captured_labels: list[str] = []
+
+    class StubLifecycleResult:
+        def __init__(self, label: str, paper_trade_id: int) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=paper_trade_id,
+                created_at=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+                intent=_build_auto_close_paper_trade(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+                    label=label,
+                ).intent,
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=paper_trade_id + 100,
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"preview-{paper_trade_id}",
+                derived_state="hedged",
+                recommended_action="monitor_open_hedge",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=paper_trade_id + 100,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-{paper_trade_id}",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=paper_trade_id + 100,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-{paper_trade_id}",
+                    status="accepted",
+                    recommended_action="monitor_open_hedge",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        captured_labels.append(approval.label)
+        return StubLifecycleResult(approval.label, 200 + len(captured_labels))
+
+    api_settings = ApiSettings(
+        database_path=settings.database_path,
+        watchlist_path=settings.watchlist_path,
+        environment=settings.environment,
+        extended_live_enabled=True,
+        extended_api_key="extended-key",
+        extended_stark_private_key="extended-secret",
+        paradex_live_enabled=True,
+        paradex_account_address="0x123",
+        paradex_private_key="0x456",
+    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=api_settings,
+                launch_store=launch_store,
+                approved_store=approved_store,
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.launched_count == 2
+    assert captured_labels == ["zro_extended_paradex", "strk_extended_paradex"]
+    assert [route.label for route in summary.launched_routes] == captured_labels
+    assert len(launch_store.list_recent(limit=10)) == 2
 
 
 def test_launch_latest_stable_canary_once_falls_through_reserved_snapshot(

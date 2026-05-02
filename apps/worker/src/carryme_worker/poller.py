@@ -379,6 +379,18 @@ class LaunchReadyCanaryCacheLoopSummary:
 
 
 @dataclass
+class StableCanaryLaunchedRoute:
+    """One route opened by a stable-canary launch cycle."""
+
+    label: str
+    launch_ready_snapshot_id: int | None
+    approved_snapshot_id: int | None
+    paper_trade_id: int
+    final_pair_state: str
+    selected_notional: float
+
+
+@dataclass
 class StableCanaryLaunchSummary:
     """Summary emitted after attempting to launch the latest stable canary."""
 
@@ -389,6 +401,8 @@ class StableCanaryLaunchSummary:
     approved_snapshot_id: int | None = None
     paper_trade_id: int | None = None
     final_pair_state: str | None = None
+    launched_count: int = 0
+    launched_routes: list[StableCanaryLaunchedRoute] = field(default_factory=list)
     detail: object | None = None
     lifecycle: CanaryLifecycleResult | None = field(default=None, repr=False)
 
@@ -531,13 +545,14 @@ def _summarize_active_live_notional_for_stable_launch(
     return total_active_notional, active_notional_by_venue
 
 
-def _build_stable_launch_risk_budget_reason(
+def _build_stable_launch_risk_budget_reason_from_exposure(
     *,
     settings: WorkerSettings,
-    active_executions: list[ExecutionJournalEntry],
+    total_active_notional: float,
+    active_notional_by_venue: dict[str, float],
     candidate: FundingUniverseCanaryCandidate,
 ) -> str | None:
-    """Return the deterministic reason a proposed unattended launch exceeds budget."""
+    """Return why adding a proposed route would exceed unattended live budgets."""
 
     max_total_live_notional = settings.stable_canary_launch_max_total_live_notional
     max_live_notional_per_venue = settings.stable_canary_launch_max_live_notional_per_venue
@@ -545,9 +560,6 @@ def _build_stable_launch_risk_budget_reason(
         return None
 
     proposed_notional = candidate.suggested_canary_notional
-    total_active_notional, active_notional_by_venue = (
-        _summarize_active_live_notional_for_stable_launch(active_executions)
-    )
     if max_total_live_notional is not None:
         proposed_total_notional = total_active_notional + proposed_notional
         if proposed_total_notional - max_total_live_notional > 1e-9:
@@ -572,6 +584,59 @@ def _build_stable_launch_risk_budget_reason(
             )
 
     return None
+
+
+def _build_stable_launch_risk_budget_reason(
+    *,
+    settings: WorkerSettings,
+    active_executions: list[ExecutionJournalEntry],
+    candidate: FundingUniverseCanaryCandidate,
+) -> str | None:
+    """Return the deterministic reason a proposed unattended launch exceeds budget."""
+
+    total_active_notional, active_notional_by_venue = (
+        _summarize_active_live_notional_for_stable_launch(active_executions)
+    )
+    return _build_stable_launch_risk_budget_reason_from_exposure(
+        settings=settings,
+        total_active_notional=total_active_notional,
+        active_notional_by_venue=active_notional_by_venue,
+        candidate=candidate,
+    )
+
+
+def _add_stable_launch_notional_exposure(
+    *,
+    total_active_notional: float,
+    active_notional_by_venue: dict[str, float],
+    candidate: FundingUniverseCanaryCandidate,
+) -> tuple[float, dict[str, float]]:
+    """Return active exposure after accounting for one newly launched route."""
+
+    selected_notional = candidate.suggested_canary_notional
+    updated_by_venue = dict(active_notional_by_venue)
+    opportunity = candidate.opportunity.opportunity
+    for venue in {opportunity.short_venue, opportunity.long_venue}:
+        updated_by_venue[venue] = updated_by_venue.get(venue, 0.0) + selected_notional
+    return total_active_notional + selected_notional, updated_by_venue
+
+
+def _max_stable_launch_routes_this_cycle(
+    *,
+    settings: WorkerSettings,
+    current_blocking_live_executions: int,
+) -> int:
+    """Return how many new routes this cycle may open under active-execution controls."""
+
+    if settings.stable_canary_launch_max_active_live_executions <= 0:
+        active_budget_remaining = 1
+    else:
+        active_budget_remaining = max(
+            1,
+            settings.stable_canary_launch_max_active_live_executions
+            - current_blocking_live_executions,
+        )
+    return min(settings.stable_canary_launch_max_routes_per_cycle, active_budget_remaining)
 
 
 def _build_stable_launch_hold_mode_blocker(settings: WorkerSettings) -> str | None:
@@ -2677,6 +2742,33 @@ def _build_stable_launch_candidate_skip_summary(
     )
 
 
+def _build_stable_launch_launched_summary(
+    *,
+    database_path: str,
+    launched_routes: list[StableCanaryLaunchedRoute],
+    detail: object | None = None,
+    lifecycle: CanaryLifecycleResult | None = None,
+) -> StableCanaryLaunchSummary:
+    """Return the cycle summary after one or more stable routes launched."""
+
+    if not launched_routes:
+        raise ValueError("launched_routes must not be empty")
+    primary = launched_routes[0]
+    return StableCanaryLaunchSummary(
+        status="launched",
+        database_path=database_path,
+        label=primary.label,
+        launch_ready_snapshot_id=primary.launch_ready_snapshot_id,
+        approved_snapshot_id=primary.approved_snapshot_id,
+        paper_trade_id=primary.paper_trade_id,
+        final_pair_state=primary.final_pair_state,
+        launched_count=len(launched_routes),
+        launched_routes=launched_routes,
+        detail=detail,
+        lifecycle=lifecycle,
+    )
+
+
 async def scan_approved_canary_once(
     settings: WorkerSettings,
     *,
@@ -3378,6 +3470,13 @@ async def launch_latest_stable_canary_once(
                 "stable_canary_launch_active_execution_limit; increase limit"
             ),
         )
+    active_budget_total_notional, active_budget_notional_by_venue = (
+        _summarize_active_live_notional_for_stable_launch(active_executions_for_budget)
+    )
+    launch_route_limit = _max_stable_launch_routes_this_cycle(
+        settings=settings,
+        current_blocking_live_executions=len(blocking_live_executions),
+    )
 
     # Some production pre-checks intentionally touch live execution and balance
     # history. Use a fresh timestamp for market-snapshot freshness so a slow
@@ -3400,8 +3499,51 @@ async def launch_latest_stable_canary_once(
         )
 
     skipped_candidates: list[_StableCanaryCandidateSkip] = []
+    launched_routes: list[StableCanaryLaunchedRoute] = []
+    last_lifecycle: CanaryLifecycleResult | None = None
 
     for candidate_stability in stable_candidates:
+        if launched_routes:
+            if len(launched_routes) >= launch_route_limit:
+                return _build_stable_launch_launched_summary(
+                    database_path=settings.database_target,
+                    launched_routes=launched_routes,
+                    detail=(
+                        "Stable launch reached max routes per cycle: "
+                        f"{launch_route_limit}"
+                    ),
+                    lifecycle=last_lifecycle,
+                )
+            global_cooldown_reason = _build_stable_launch_cooldown_reason(
+                settings=settings,
+                launch_store=stable_launch_store,
+                now=snapshot_selection_timestamp,
+            )
+            if global_cooldown_reason is not None:
+                return _build_stable_launch_launched_summary(
+                    database_path=settings.database_target,
+                    launched_routes=launched_routes,
+                    detail=(
+                        "Stable launch stopped after launched routes because "
+                        f"{global_cooldown_reason}"
+                    ),
+                    lifecycle=last_lifecycle,
+                )
+            global_rate_cap_reason = _build_stable_launch_rate_cap_reason(
+                settings=settings,
+                launch_store=stable_launch_store,
+                now=snapshot_selection_timestamp,
+            )
+            if global_rate_cap_reason is not None:
+                return _build_stable_launch_launched_summary(
+                    database_path=settings.database_target,
+                    launched_routes=launched_routes,
+                    detail=(
+                        "Stable launch stopped after launched routes because "
+                        f"{global_rate_cap_reason}"
+                    ),
+                    lifecycle=last_lifecycle,
+                )
         candidate_snapshot = candidate_stability.snapshot
         if settings.stable_canary_launch_consecutive_loss_scope == "label":
             loss_circuit_breaker_reason = _build_stable_launch_loss_circuit_breaker_reason(
@@ -3734,9 +3876,10 @@ async def launch_latest_stable_canary_once(
                     )
                     continue
 
-        risk_budget_reason = _build_stable_launch_risk_budget_reason(
+        risk_budget_reason = _build_stable_launch_risk_budget_reason_from_exposure(
             settings=settings,
-            active_executions=active_executions_for_budget,
+            total_active_notional=active_budget_total_notional,
+            active_notional_by_venue=active_budget_notional_by_venue,
             candidate=candidate_selected,
         )
         if risk_budget_reason is not None:
@@ -3941,6 +4084,16 @@ async def launch_latest_stable_canary_once(
                         detail=exc.detail,
                     )
                 )
+                if launched_routes:
+                    return _build_stable_launch_launched_summary(
+                        database_path=settings.database_target,
+                        launched_routes=launched_routes,
+                        detail=(
+                            "Stable launch stopped after launched routes because "
+                            f"{exc.detail}"
+                        ),
+                        lifecycle=last_lifecycle,
+                    )
                 if exc.status_code == 404:
                     continue
                 return _build_stable_launch_candidate_skip_summary(
@@ -3966,18 +4119,42 @@ async def launch_latest_stable_canary_once(
                 final_pair_state=lifecycle.final_pair_status.derived_state,
             )
         )
-        return StableCanaryLaunchSummary(
-            status="launched",
-            database_path=settings.database_target,
-            label=candidate_snapshot.label,
-            launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=launch_approved_snapshot_id,
-            paper_trade_id=paper_trade_id,
-            final_pair_state=lifecycle.final_pair_status.derived_state,
-            detail=None,
-            lifecycle=lifecycle,
+        launched_routes.append(
+            StableCanaryLaunchedRoute(
+                label=candidate_snapshot.label,
+                launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                approved_snapshot_id=launch_approved_snapshot_id,
+                paper_trade_id=paper_trade_id,
+                final_pair_state=lifecycle.final_pair_status.derived_state,
+                selected_notional=candidate_selected.suggested_canary_notional,
+            )
         )
+        last_lifecycle = lifecycle
+        active_budget_total_notional, active_budget_notional_by_venue = (
+            _add_stable_launch_notional_exposure(
+                total_active_notional=active_budget_total_notional,
+                active_notional_by_venue=active_budget_notional_by_venue,
+                candidate=candidate_selected,
+            )
+        )
+        if len(launched_routes) >= launch_route_limit:
+            return _build_stable_launch_launched_summary(
+                database_path=settings.database_target,
+                launched_routes=launched_routes,
+                detail=None if len(launched_routes) == 1 else (
+                    "Stable launch reached max routes per cycle: "
+                    f"{launch_route_limit}"
+                ),
+                lifecycle=last_lifecycle,
+            )
 
+    if launched_routes:
+        return _build_stable_launch_launched_summary(
+            database_path=settings.database_target,
+            launched_routes=launched_routes,
+            detail=None,
+            lifecycle=last_lifecycle,
+        )
     return _build_stable_launch_candidate_skip_summary(
         database_path=settings.database_target,
         skipped_candidates=skipped_candidates,
@@ -4017,13 +4194,13 @@ async def run_supervised_stable_canary_launch_loop(
             successful_cycles += 1
             consecutive_failures = 0
             if summary.status == "launched":
-                launched += 1
+                launched += max(1, summary.launched_count)
             else:
                 skipped += 1
             loop_logger.info(
                 "completed supervised stable canary launch cycle %s with status=%s "
                 "label=%s launch_ready_snapshot_id=%s approved_snapshot_id=%s "
-                "paper_trade_id=%s final_pair_state=%s detail=%s",
+                "paper_trade_id=%s final_pair_state=%s launched_count=%s detail=%s",
                 attempts,
                 summary.status,
                 summary.label,
@@ -4031,6 +4208,7 @@ async def run_supervised_stable_canary_launch_loop(
                 summary.approved_snapshot_id,
                 summary.paper_trade_id,
                 summary.final_pair_state,
+                summary.launched_count,
                 summary.detail,
             )
             if max_iterations is not None and attempts >= max_iterations:

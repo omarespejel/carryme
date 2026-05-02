@@ -108,6 +108,9 @@ def build_automation_mode_payload(
         "stable_canary_launch_active_execution_limit": (
             settings.stable_canary_launch_active_execution_limit
         ),
+        "stable_canary_launch_max_routes_per_cycle": (
+            settings.stable_canary_launch_max_routes_per_cycle
+        ),
         "stable_canary_launch_max_total_live_notional": (
             settings.stable_canary_launch_max_total_live_notional
         ),
@@ -286,6 +289,18 @@ def build_stable_canary_launch_payload(
         "approved_snapshot_id": summary.approved_snapshot_id,
         "paper_trade_id": summary.paper_trade_id,
         "final_pair_state": summary.final_pair_state,
+        "launched_count": summary.launched_count,
+        "launched_routes": [
+            {
+                "label": route.label,
+                "launch_ready_snapshot_id": route.launch_ready_snapshot_id,
+                "approved_snapshot_id": route.approved_snapshot_id,
+                "paper_trade_id": route.paper_trade_id,
+                "final_pair_state": route.final_pair_state,
+                "selected_notional": route.selected_notional,
+            }
+            for route in summary.launched_routes
+        ],
         "detail": summary.detail,
         "database_path": summary.database_path,
     }

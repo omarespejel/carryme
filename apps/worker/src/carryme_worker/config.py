@@ -44,6 +44,7 @@ class WorkerSettings(BaseSettings):
         gt=0,
         le=MAX_RECENT_LABEL_LIMIT,
     )
+    stable_canary_launch_max_routes_per_cycle: int = Field(default=1, gt=0)
     stable_canary_launch_max_total_live_notional: float | None = Field(
         default=None,
         ge=0,
