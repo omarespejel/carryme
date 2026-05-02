@@ -117,6 +117,12 @@ def build_automation_mode_payload(
         "stable_canary_launch_max_live_notional_per_venue": (
             settings.stable_canary_launch_max_live_notional_per_venue
         ),
+        "stable_canary_launch_slippage_tolerance_bps": (
+            settings.stable_canary_launch_slippage_tolerance_bps
+        ),
+        "stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl": (
+            settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl
+        ),
         "execution_auto_pair_close_enabled": settings.execution_auto_pair_close_enabled,
         "execution_auto_pair_close_shadow_mode": settings.execution_auto_pair_close_shadow_mode,
         "execution_auto_pair_close_min_entry_edge_retention_ratio": (

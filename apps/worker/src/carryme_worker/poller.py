@@ -162,6 +162,7 @@ from carryme_worker.notifications import (
 
 logger = logging.getLogger(__name__)
 OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
+_STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS = 20
 
 
 def _build_launch_ready_canary_stability(**kwargs: Any) -> LaunchReadyCanaryStability:
@@ -1029,6 +1030,54 @@ def _scaled_stable_launch_round_trip_pnl(candidate: FundingUniverseCanaryCandida
         return 0.0
 
     return raw_pnl * (selected_notional / deployable_notional)
+
+
+def _stable_launch_extra_entry_slippage_cost(
+    *,
+    candidate: FundingUniverseCanaryCandidate,
+    slippage_tolerance_bps: int,
+) -> float:
+    """Estimate extra entry cost versus the historical stable-launch IOC budget."""
+
+    extra_bps = max(
+        slippage_tolerance_bps - _STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS,
+        0,
+    )
+    if extra_bps <= 0:
+        return 0.0
+    # Entry opens two same-notional legs. Budget both legs because either side can need
+    # the extra IOC price room, and fail closed if the route cannot pay for it.
+    return candidate.suggested_canary_notional * (extra_bps / 10_000.0) * 2.0
+
+
+def _build_stable_launch_slippage_adjusted_pnl_reason(
+    *,
+    settings: WorkerSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> str | None:
+    """Block unattended launch when a wider IOC budget would consume expected edge."""
+
+    scaled_round_trip_pnl = _scaled_stable_launch_round_trip_pnl(candidate)
+    extra_slippage_cost = _stable_launch_extra_entry_slippage_cost(
+        candidate=candidate,
+        slippage_tolerance_bps=settings.stable_canary_launch_slippage_tolerance_bps,
+    )
+    adjusted_pnl = scaled_round_trip_pnl - extra_slippage_cost
+    min_adjusted_pnl = (
+        settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl
+    )
+    if adjusted_pnl + 1e-9 >= min_adjusted_pnl:
+        return None
+
+    return (
+        "Stable launch slippage-adjusted expected pnl requirement not met: "
+        f"expected_pnl_after_extra_slippage={adjusted_pnl:.6f} "
+        f"< min={min_adjusted_pnl:.6f}; "
+        f"expected_pnl={scaled_round_trip_pnl:.6f}; "
+        f"extra_slippage_cost={extra_slippage_cost:.6f}; "
+        f"slippage_bps={settings.stable_canary_launch_slippage_tolerance_bps}; "
+        f"baseline_slippage_bps={_STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS}"
+    )
 
 
 def _build_stable_launch_liquidity_and_value_reason(
@@ -3825,6 +3874,27 @@ async def launch_latest_stable_canary_once(
             )
             continue
 
+        slippage_adjusted_pnl_reason = _build_stable_launch_slippage_adjusted_pnl_reason(
+            settings=settings,
+            candidate=candidate_selected,
+        )
+        if slippage_adjusted_pnl_reason is not None:
+            if settings.stable_canary_launch_shadow_mode:
+                logging.getLogger("carryme.worker").info(
+                    "shadow launch slippage budget blocked label=%s because %s",
+                    candidate_snapshot.label,
+                    slippage_adjusted_pnl_reason,
+                )
+            skipped_candidates.append(
+                _StableCanaryCandidateSkip(
+                    label=candidate_snapshot.label,
+                    launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                    approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                    detail=slippage_adjusted_pnl_reason,
+                )
+            )
+            continue
+
         recent_approved_chain = _list_recent_approved_snapshot_chain(
             store=source_approved_store,
             snapshot=latest_approved_snapshot,
@@ -4088,7 +4158,7 @@ async def launch_latest_stable_canary_once(
                     candidate_selected,
                 ),
                 approval_service=route_approval_service,
-                slippage_tolerance_bps=20,
+                slippage_tolerance_bps=settings.stable_canary_launch_slippage_tolerance_bps,
                 open_first_venue="auto",
                 close_first_venue="auto",
                 poll_attempts=5,
