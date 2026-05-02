@@ -550,6 +550,37 @@ class ExecutionJournalStore:
                 (execution_entry_id, paper_trade_id, normalized_preview_hash),
             )
 
+    def release_cleanup_live_submission(
+        self,
+        *,
+        paper_trade_id: int,
+        preview_hash: str,
+        confirmation_entry_id: int,
+    ) -> bool:
+        """Release one cleanup reservation that never reached the journal."""
+
+        self.initialize()
+        if paper_trade_id < 1:
+            raise ValueError("paper_trade_id must be positive")
+        if confirmation_entry_id < 1:
+            raise ValueError("confirmation_entry_id must be positive")
+        normalized_preview_hash = preview_hash.strip()
+        if not normalized_preview_hash:
+            raise ValueError("preview_hash must be non-empty")
+        with self.database.begin() as connection:
+            result = connection.execute(
+                """
+                DELETE FROM cleanup_live_submission_reservations
+                WHERE paper_trade_id = ?
+                  AND preview_hash = ?
+                  AND confirmation_entry_id = ?
+                  AND execution_entry_id IS NULL
+                """,
+                (paper_trade_id, normalized_preview_hash, confirmation_entry_id),
+            )
+        rowcount = getattr(result, "rowcount", None)
+        return isinstance(rowcount, int) and rowcount > 0
+
     def find_by_paper_trade_preview_hash(
         self,
         *,

@@ -2116,6 +2116,34 @@ def _mark_cleanup_live_submission_completed(
     )
 
 
+def _release_cleanup_live_submission_reservations(
+    *,
+    paper_trade: PaperTradeEntry,
+    confirmation: CleanupPreviewConfirmationEntry,
+    execution_store: ExecutionJournalStore,
+) -> None:
+    """Release cleanup reservations only when submission definitely did not happen."""
+
+    if confirmation.entry_id is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Cleanup preview confirmation entry_id is required before live submission",
+        )
+    paper_trade_id = _effective_cleanup_submission_paper_trade_id(
+        paper_trade=paper_trade,
+        confirmation=confirmation,
+    )
+    execution_store.release_live_submission(
+        confirmation_entry_id=confirmation.entry_id,
+        preview_hash=confirmation.preview_hash,
+    )
+    execution_store.release_cleanup_live_submission(
+        paper_trade_id=paper_trade_id,
+        preview_hash=confirmation.preview_hash,
+        confirmation_entry_id=confirmation.entry_id,
+    )
+
+
 async def _observe_pair_status_for_execution(
     *,
     paper_trade: PaperTradeEntry,
@@ -2284,6 +2312,11 @@ async def _run_guarded_auto_cleanup_sequence(
                     )
                 )
             except ValueError as exc:
+                _release_cleanup_live_submission_reservations(
+                    paper_trade=paper_trade,
+                    confirmation=cleanup_confirmation,
+                    execution_store=execution_store,
+                )
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -6000,6 +6033,11 @@ def create_app() -> FastAPI:
                 confirmation=confirmation,
             )
         except ValueError as exc:
+            _release_cleanup_live_submission_reservations(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+                execution_store=execution_store,
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -6092,6 +6130,11 @@ def create_app() -> FastAPI:
                 confirmation=confirmation,
             )
         except ValueError as exc:
+            _release_cleanup_live_submission_reservations(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+                execution_store=execution_store,
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -6184,6 +6227,11 @@ def create_app() -> FastAPI:
                 confirmation=confirmation,
             )
         except ValueError as exc:
+            _release_cleanup_live_submission_reservations(
+                paper_trade=paper_trade,
+                confirmation=confirmation,
+                execution_store=execution_store,
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
