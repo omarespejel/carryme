@@ -133,6 +133,7 @@ from carryme_worker.poller import (
     _build_stable_launch_loss_circuit_breaker_reason,
     _execution_requires_continued_monitoring,
     _list_ranked_stable_launch_ready_stabilities,
+    _max_stable_launch_routes_this_cycle,
     _maybe_auto_cleanup_partial_fill_execution,
     _maybe_auto_close_open_hedged_execution,
     _probe_candidate_system_state,
@@ -413,6 +414,29 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.database_path == "data/carryme.sqlite3"
     assert Path(settings.watchlist_path).is_file()
     assert settings.watchlist_path.endswith("config/watchlists/default.json")
+
+
+def test_stable_launch_route_limit_fails_closed_at_active_cap(tmp_path: Path) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_active_live_executions=2,
+        stable_canary_launch_max_routes_per_cycle=3,
+    )
+
+    assert (
+        _max_stable_launch_routes_this_cycle(
+            settings=settings,
+            current_blocking_live_executions=2,
+        )
+        == 0
+    )
+    assert (
+        _max_stable_launch_routes_this_cycle(
+            settings=settings,
+            current_blocking_live_executions=1,
+        )
+        == 1
+    )
 
 
 def test_worker_env_can_disable_stable_launch_immediate_close(
@@ -5409,6 +5433,9 @@ def test_launch_latest_stable_canary_once_refreshes_snapshot_time_after_precheck
         [
             datetime(2026, 4, 4, 10, 0, 50, tzinfo=UTC),
             datetime(2026, 4, 4, 10, 1, 45, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 1, 45, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 1, 46, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 1, 47, tzinfo=UTC),
         ]
     )
 
@@ -6172,6 +6199,291 @@ def test_launch_latest_stable_canary_once_spends_budget_across_cycle_routes(
     assert captured_labels == ["zro_extended_paradex", "strk_extended_paradex"]
     assert [route.label for route in summary.launched_routes] == captured_labels
     assert len(launch_store.list_recent(limit=10)) == 2
+
+
+def test_launch_latest_stable_canary_once_refreshes_snapshot_time_per_route(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        launch_ready_canary_max_snapshot_age_seconds=60,
+        stable_canary_launch_max_routes_per_cycle=2,
+        stable_canary_launch_max_active_live_executions=2,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    approval_by_label: dict[str, RouteApprovalEntry] = {}
+    latest_snapshot_by_label: dict[str, LaunchReadyCanarySnapshot] = {}
+    for index, label in enumerate(["zro_extended_paradex", "strk_extended_paradex"], start=1):
+        approval, _, snapshot, _ = _build_stable_launch_test_snapshot(
+            label=label,
+            canonical_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD-PERP",
+            short_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD",
+            long_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD-PERP",
+            launch_ready_snapshot_id=index * 10 + 1,
+            approved_snapshot_id=index * 10,
+            estimated_one_day_pnl_after_round_trip=float(3 - index),
+        )
+        approved_snapshot = approved_store.append(snapshot.approved_snapshot)
+        route_approval_store.upsert(approval)
+        approval_by_label[label] = approval
+        latest_snapshot_by_label[label] = _append_stable_launch_ready_pair(
+            launch_ready_store,
+            snapshot,
+            approved_snapshot,
+            datetime(2026, 4, 4, 9, 59, index, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 0, index, tzinfo=UTC),
+        )
+
+    captured_labels: list[str] = []
+
+    class StubLifecycleResult:
+        def __init__(self, label: str, paper_trade_id: int) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=paper_trade_id,
+                created_at=datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+                intent=_build_auto_close_paper_trade(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+                    label=label,
+                ).intent,
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=paper_trade_id + 100,
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"preview-{paper_trade_id}",
+                derived_state="hedged",
+                recommended_action="monitor_open_hedge",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=paper_trade_id + 100,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-{paper_trade_id}",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=paper_trade_id + 100,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-{paper_trade_id}",
+                    status="accepted",
+                    recommended_action="monitor_open_hedge",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        captured_labels.append(approval.label)
+        return StubLifecycleResult(approval.label, 300 + len(captured_labels))
+
+    clock = iter(
+        [
+            datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 0, 31, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 0, 32, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 2, 5, tzinfo=UTC),
+        ]
+    )
+    selection_times: list[datetime] = []
+
+    def fake_select_latest_launch_ready_canary_snapshot(
+        **kwargs: object,
+    ) -> tuple[LaunchReadyCanarySnapshot, FundingUniverseCanaryCandidate, RouteApprovalEntry]:
+        label = cast(str, kwargs["label"])
+        selected_at = cast(datetime, kwargs["now"])
+        selection_times.append(selected_at)
+        if len(selection_times) == 2 and selected_at > datetime(
+            2026, 4, 4, 10, 1, 5, tzinfo=UTC
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Launch-ready canary snapshot is stale in test",
+            )
+        snapshot = latest_snapshot_by_label[label]
+        return snapshot, snapshot.approved_snapshot.candidate, approval_by_label[label]
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("carryme_worker.poller._utc_now", lambda: next(clock))
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            fake_select_latest_launch_ready_canary_snapshot,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=ApiSettings(
+                    database_path=settings.database_path,
+                    watchlist_path=settings.watchlist_path,
+                    environment=settings.environment,
+                    extended_live_enabled=True,
+                    extended_api_key="extended-key",
+                    extended_stark_private_key="extended-secret",
+                    paradex_live_enabled=True,
+                    paradex_account_address="0x123",
+                    paradex_private_key="0x456",
+                ),
+                launch_store=launch_store,
+                approved_store=approved_store,
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.launched_count == 1
+    assert captured_labels == ["zro_extended_paradex"]
+    assert selection_times == [
+        datetime(2026, 4, 4, 10, 0, 30, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 2, 5, tzinfo=UTC),
+    ]
+    assert "Stable launch stopped after launched routes" in cast(str, summary.detail)
+
+
+def test_launch_latest_stable_canary_once_uses_fresh_per_route_timestamps(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_routes_per_cycle=2,
+        stable_canary_launch_max_active_live_executions=2,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    launch_ready_store = LaunchReadyCanaryStore(settings.database_path)
+    launch_store = StableCanaryLaunchStore(settings.database_path)
+    route_approval_store = RouteApprovalStore(settings.database_path)
+    for index, label in enumerate(["zro_extended_paradex", "strk_extended_paradex"], start=1):
+        approval, _, snapshot, _ = _build_stable_launch_test_snapshot(
+            label=label,
+            canonical_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD-PERP",
+            short_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD",
+            long_symbol=f"{label.split('_', maxsplit=1)[0].upper()}-USD-PERP",
+            launch_ready_snapshot_id=index * 10 + 1,
+            approved_snapshot_id=index * 10,
+            estimated_one_day_pnl_after_round_trip=float(3 - index),
+        )
+        approved_snapshot = approved_store.append(snapshot.approved_snapshot)
+        route_approval_store.upsert(approval)
+        _append_stable_launch_ready_pair(
+            launch_ready_store,
+            snapshot,
+            approved_snapshot,
+            datetime(2026, 4, 4, 10, 0, index, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 1, index, tzinfo=UTC),
+        )
+
+    class StubLifecycleResult:
+        def __init__(self, label: str, paper_trade_id: int) -> None:
+            self.paper_trade = PaperTradeEntry(
+                entry_id=paper_trade_id,
+                created_at=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+                intent=_build_auto_close_paper_trade(
+                    entry_id=paper_trade_id,
+                    created_at=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+                    label=label,
+                ).intent,
+                note="worker launch",
+            )
+            self.final_pair_status = ExecutionPairStatus(
+                execution_entry_id=paper_trade_id + 100,
+                paper_trade_id=paper_trade_id,
+                preview_hash=f"preview-{paper_trade_id}",
+                derived_state="hedged",
+                recommended_action="monitor_open_hedge",
+                order_state=ExecutionOrderState(
+                    execution_entry_id=paper_trade_id + 100,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-{paper_trade_id}",
+                    legs=[],
+                    notes=[],
+                ),
+                reconciliation=ExecutionReconciliation(
+                    execution_entry_id=paper_trade_id + 100,
+                    paper_trade_id=paper_trade_id,
+                    preview_hash=f"preview-{paper_trade_id}",
+                    status="accepted",
+                    recommended_action="monitor_open_hedge",
+                    matched_all_leg_symbols=True,
+                    venues=[],
+                    notes=[],
+                ),
+                notes=[],
+            )
+
+    launched_labels: list[str] = []
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        launched_labels.append(approval.label)
+        return StubLifecycleResult(approval.label, 400 + len(launched_labels))
+
+    clock = iter(
+        [
+            datetime(2026, 4, 4, 10, 2, 0, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 2, 0, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 2, 0, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 2, 1, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 2, 2, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 2, 3, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 2, 4, tzinfo=UTC),
+            datetime(2026, 4, 4, 10, 2, 5, tzinfo=UTC),
+        ]
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("carryme_worker.poller._utc_now", lambda: next(clock))
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            run_stub_lifecycle,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=ApiSettings(
+                    database_path=settings.database_path,
+                    watchlist_path=settings.watchlist_path,
+                    environment=settings.environment,
+                    extended_live_enabled=True,
+                    extended_api_key="extended-key",
+                    extended_stark_private_key="extended-secret",
+                    paradex_live_enabled=True,
+                    paradex_account_address="0x123",
+                    paradex_private_key="0x456",
+                ),
+                launch_store=launch_store,
+                approved_store=approved_store,
+            )
+        )
+
+    assert summary.status == "launched"
+    assert summary.launched_count == 2
+    assert launched_labels == ["zro_extended_paradex", "strk_extended_paradex"]
+    launch_records = launch_store.list_recent(limit=10)
+    assert {record.launched_at for record in launch_records} == {
+        datetime(2026, 4, 4, 10, 2, 2, tzinfo=UTC),
+        datetime(2026, 4, 4, 10, 2, 5, tzinfo=UTC),
+    }
+    with launch_store.database.begin() as connection:
+        reservation_rows = connection.execute(
+            """
+            SELECT reserved_at
+            FROM stable_canary_launch_reservations
+            ORDER BY reserved_at
+            """
+        ).fetchall()
+    assert [row[0] for row in reservation_rows] == [
+        "2026-04-04T10:02:01+00:00",
+        "2026-04-04T10:02:04+00:00",
+    ]
 
 
 def test_launch_latest_stable_canary_once_falls_through_reserved_snapshot(
@@ -7099,7 +7411,7 @@ def test_launch_latest_stable_canary_once_allows_launch_when_latest_outcome_is_c
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_block_adverse_latest_outcome=True,
-        stable_canary_launch_max_active_live_executions=1,
+        stable_canary_launch_max_active_live_executions=2,
     )
     approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
         label="arb_extended_paradex",
@@ -7798,7 +8110,7 @@ def test_launch_latest_stable_canary_once_allows_launch_at_exact_maturity_thresh
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_min_execution_quality_score=0.55,
         stable_canary_launch_min_execution_samples=2,
-        stable_canary_launch_max_active_live_executions=1,
+        stable_canary_launch_max_active_live_executions=2,
     )
     approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
         label="arb_extended_paradex",
@@ -8433,7 +8745,7 @@ def test_launch_latest_stable_canary_once_skips_when_total_live_notional_budget_
 ) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
-        stable_canary_launch_max_active_live_executions=1,
+        stable_canary_launch_max_active_live_executions=2,
         stable_canary_launch_max_total_live_notional=40.0,
     )
     execution_store = ExecutionJournalStore(settings.database_path)
@@ -9061,7 +9373,7 @@ def test_launch_latest_stable_canary_once_skips_when_venue_live_notional_budget_
 ) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
-        stable_canary_launch_max_active_live_executions=1,
+        stable_canary_launch_max_active_live_executions=2,
         stable_canary_launch_max_live_notional_per_venue=30.0,
     )
     execution_store = ExecutionJournalStore(settings.database_path)

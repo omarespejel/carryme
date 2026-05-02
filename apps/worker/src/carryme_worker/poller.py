@@ -629,10 +629,10 @@ def _max_stable_launch_routes_this_cycle(
     """Return how many new routes this cycle may open under active-execution controls."""
 
     if settings.stable_canary_launch_max_active_live_executions <= 0:
-        active_budget_remaining = 1
+        active_budget_remaining = 1 if current_blocking_live_executions == 0 else 0
     else:
         active_budget_remaining = max(
-            1,
+            0,
             settings.stable_canary_launch_max_active_live_executions
             - current_blocking_live_executions,
         )
@@ -3477,6 +3477,17 @@ async def launch_latest_stable_canary_once(
         settings=settings,
         current_blocking_live_executions=len(blocking_live_executions),
     )
+    if launch_route_limit <= 0:
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            detail=_build_blocking_live_execution_detail(
+                blocking=blocking_live_executions,
+                max_active_live_executions=(
+                    settings.stable_canary_launch_max_active_live_executions
+                ),
+            ),
+        )
 
     # Some production pre-checks intentionally touch live execution and balance
     # history. Use a fresh timestamp for market-snapshot freshness so a slow
@@ -3503,6 +3514,7 @@ async def launch_latest_stable_canary_once(
     last_lifecycle: CanaryLifecycleResult | None = None
 
     for candidate_stability in stable_candidates:
+        route_selection_timestamp = now or _utc_now()
         if launched_routes:
             if len(launched_routes) >= launch_route_limit:
                 return _build_stable_launch_launched_summary(
@@ -3517,7 +3529,7 @@ async def launch_latest_stable_canary_once(
             global_cooldown_reason = _build_stable_launch_cooldown_reason(
                 settings=settings,
                 launch_store=stable_launch_store,
-                now=snapshot_selection_timestamp,
+                now=route_selection_timestamp,
             )
             if global_cooldown_reason is not None:
                 return _build_stable_launch_launched_summary(
@@ -3532,7 +3544,7 @@ async def launch_latest_stable_canary_once(
             global_rate_cap_reason = _build_stable_launch_rate_cap_reason(
                 settings=settings,
                 launch_store=stable_launch_store,
-                now=snapshot_selection_timestamp,
+                now=route_selection_timestamp,
             )
             if global_rate_cap_reason is not None:
                 return _build_stable_launch_launched_summary(
@@ -3574,7 +3586,7 @@ async def launch_latest_stable_canary_once(
                     approval_service=route_approval_service,
                     label=candidate_stability.snapshot.label,
                     max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
-                    now=snapshot_selection_timestamp,
+                    now=route_selection_timestamp,
                 )
             )
         except HTTPException as exc:
@@ -3591,6 +3603,16 @@ async def launch_latest_stable_canary_once(
                         detail=exc.detail,
                     )
                 )
+                if launched_routes:
+                    return _build_stable_launch_launched_summary(
+                        database_path=settings.database_target,
+                        launched_routes=launched_routes,
+                        detail=(
+                            "Stable launch stopped after launched routes because "
+                            f"{exc.detail}"
+                        ),
+                        lifecycle=last_lifecycle,
+                    )
                 continue
             raise
 
@@ -3623,7 +3645,7 @@ async def launch_latest_stable_canary_once(
         label_cooldown_reason = _build_stable_launch_cooldown_reason(
             settings=settings,
             launch_store=stable_launch_store,
-            now=snapshot_selection_timestamp,
+            now=route_selection_timestamp,
             label=candidate_snapshot.label,
         )
         if label_cooldown_reason is not None:
@@ -3640,7 +3662,7 @@ async def launch_latest_stable_canary_once(
         label_rate_cap_reason = _build_stable_launch_rate_cap_reason(
             settings=settings,
             launch_store=stable_launch_store,
-            now=snapshot_selection_timestamp,
+            now=route_selection_timestamp,
             label=candidate_snapshot.label,
         )
         if label_rate_cap_reason is not None:
@@ -3970,10 +3992,11 @@ async def launch_latest_stable_canary_once(
         candidate_reservation_owner_id: str | None = None
         if candidate_snapshot.launch_ready_snapshot_id is not None:
             candidate_reservation_owner_id = uuid.uuid4().hex
+            route_reservation_timestamp = now or _utc_now()
             reserved = stable_launch_store.reserve_snapshot_launch(
                 launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
                 label=candidate_snapshot.label,
-                reserved_at=timestamp,
+                reserved_at=route_reservation_timestamp,
                 max_age_seconds=settings.stable_canary_launch_reservation_ttl_seconds,
                 retention_seconds=(
                     settings.stable_canary_launch_reservation_retention_seconds
@@ -4003,7 +4026,7 @@ async def launch_latest_stable_canary_once(
             renewed = stable_launch_store.renew_snapshot_launch_reservation(
                 launch_ready_snapshot_id=launch_ready_snapshot_id,
                 owner_id=owner_id,
-                reserved_at=datetime.now(UTC),
+                reserved_at=now or _utc_now(),
                 max_age_seconds=settings.stable_canary_launch_reservation_ttl_seconds,
             )
             if not renewed:
@@ -4108,9 +4131,10 @@ async def launch_latest_stable_canary_once(
                 "stable canary lifecycle returned launched paper trade without entry_id"
             )
 
+        route_launched_at = now or _utc_now()
         stable_launch_store.append(
             StableCanaryLaunchRecord(
-                launched_at=timestamp,
+                launched_at=route_launched_at,
                 status="launched",
                 label=candidate_snapshot.label,
                 launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id or 0,
