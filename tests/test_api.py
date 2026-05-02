@@ -157,6 +157,49 @@ def _canary_approval_proposal_summary_payload(
     }
 
 
+def _arb_extended_paradex_canary_candidate(
+    *,
+    suggested_canary_notional: float = 25.0,
+) -> FundingUniverseCanaryCandidate:
+    return FundingUniverseCanaryCandidate(
+        opportunity=FundingUniverseOpportunity(
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="ARB-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.00045,
+                round_trip_cost_rate=0.0009,
+                one_day_net_edge_after_entry=0.00355,
+                one_day_net_edge_after_round_trip=0.0031,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.3,
+                capacity=CapacityEstimate(
+                    short_bid_notional=1400.0,
+                    long_ask_notional=900.0,
+                    max_entry_notional=900.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+            venue_markets={
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol="ARB-USD",
+                ),
+                "paradex": FundingUniverseVenueMarket(
+                    venue="paradex",
+                    symbol="ARB-USD-PERP",
+                ),
+            },
+            deployable_notional=900.0,
+            estimated_one_day_pnl_after_round_trip=2.79,
+        ),
+        suggested_canary_notional=suggested_canary_notional,
+    )
+
+
 def test_health_endpoint() -> None:
     client = TestClient(app)
 
@@ -1327,6 +1370,125 @@ def test_approve_canary_approval_proposal_rejects_cap_above_proposal() -> None:
         "approval proposal payload max_live_notional exceeds the suggested proposal cap"
     )
     assert called is False
+
+
+def test_approve_and_refresh_canary_approval_proposal_saves_fresh_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved_store = ApprovedCanaryStore(tmp_path / "history.sqlite3")
+    captured_scan: dict[str, object] = {}
+    captured_upsert: dict[str, object] = {}
+
+    class StubUniverseService:
+        pass
+
+    class StubRouteApprovalService:
+        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
+            captured_upsert["label"] = label
+            captured_upsert["payload"] = payload
+            return RouteApprovalEntry(
+                updated_at=FIXED_APPROVAL_PROPOSAL_NOW,
+                label=label,
+                canonical_symbol=payload.canonical_symbol,
+                short_venue=payload.short_venue,
+                long_venue=payload.long_venue,
+                short_fee_profile=payload.short_fee_profile,
+                long_fee_profile=payload.long_fee_profile,
+                approved=payload.approved,
+                max_live_notional=payload.max_live_notional,
+                note=payload.note,
+            )
+
+    async def fake_scan_live_route_candidate_for_approval(
+        **kwargs: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        captured_scan.update(kwargs)
+        approval = cast(RouteApprovalEntry, kwargs["approval"])
+        assert approval.approved is True
+        assert approval.max_live_notional == 11.0
+        assert kwargs["venues"] == ["extended", "paradex"]
+        assert kwargs["include_symbols"] is None
+        assert kwargs["exclude_tags"] == app_module.DEFAULT_CANARY_EXCLUDE_TAGS
+        return _arb_extended_paradex_canary_candidate(suggested_canary_notional=25.0), 1
+
+    monkeypatch.setattr(
+        "carryme_api.app.scan_live_route_candidate_for_approval",
+        fake_scan_live_route_candidate_for_approval,
+    )
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/v1/opportunities/funding-universe/canary/approval-proposals/"
+            "arb_extended_paradex/approve-and-refresh",
+            json=_canary_approval_proposal_summary_payload(
+                approval_payload_overrides={"max_live_notional": 11.0}
+            ),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured_upsert["label"] == "arb_extended_paradex"
+    upsert_payload = cast(RouteApprovalUpsert, captured_upsert["payload"])
+    assert upsert_payload.approved is True
+    payload = response.json()
+    assert payload["snapshot_id"] == 1
+    assert payload["label"] == "arb_extended_paradex"
+    assert payload["candidate"]["suggested_canary_notional"] == 11.0
+    assert payload["approval"]["max_live_notional"] == 11.0
+    assert approved_store.latest(label="arb_extended_paradex") is not None
+
+
+def test_approve_and_refresh_canary_approval_proposal_rejects_decayed_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved_store = ApprovedCanaryStore(tmp_path / "history.sqlite3")
+    upsert_called = False
+
+    class StubUniverseService:
+        pass
+
+    class StubRouteApprovalService:
+        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
+            nonlocal upsert_called
+            upsert_called = True
+            raise AssertionError("decayed route must not be approved or snapshotted")
+
+    async def fake_scan_live_route_candidate_for_approval(
+        **_: object,
+    ) -> tuple[FundingUniverseCanaryCandidate | None, int]:
+        return None, 0
+
+    monkeypatch.setattr(
+        "carryme_api.app.scan_live_route_candidate_for_approval",
+        fake_scan_live_route_candidate_for_approval,
+    )
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    app.dependency_overrides[get_approved_canary_store] = lambda: approved_store
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/v1/opportunities/funding-universe/canary/approval-proposals/"
+            "arb_extended_paradex/approve-and-refresh",
+            json=_canary_approval_proposal_summary_payload(),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "approved proposal no longer matches a current live canary route"
+    )
+    assert upsert_called is False
+    assert approved_store.latest(label="arb_extended_paradex") is None
 
 
 def test_funding_universe_canary_approval_proposals_rejects_unbounded_history_shortlist_age(
