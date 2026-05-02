@@ -131,6 +131,7 @@ from carryme_worker.poller import (
     _build_open_hedge_profit_protection_reason,
     _build_order_state_observers,
     _build_stable_launch_loss_circuit_breaker_reason,
+    _build_stable_launch_slippage_adjusted_pnl_reason,
     _execution_requires_continued_monitoring,
     _list_ranked_stable_launch_ready_stabilities,
     _max_stable_launch_routes_this_cycle,
@@ -295,6 +296,14 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
         raising=False,
     )
     monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_SLIPPAGE_TOLERANCE_BPS",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_MIN_SLIPPAGE_ADJUSTED_ONE_DAY_ROUND_TRIP_PNL",
+        raising=False,
+    )
+    monkeypatch.delenv(
         "CARRYME_WORKER_STABLE_CANARY_LAUNCH_BLOCK_ADVERSE_LATEST_OUTCOME",
         raising=False,
     )
@@ -367,6 +376,8 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_min_daily_volume is None
     assert settings.stable_canary_launch_min_deployable_notional is None
     assert settings.stable_canary_launch_min_expected_one_day_round_trip_pnl is None
+    assert settings.stable_canary_launch_slippage_tolerance_bps == 20
+    assert settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl == 0.0
     assert settings.stable_canary_launch_block_adverse_latest_outcome is False
     assert settings.execution_auto_pair_close_enabled is False
     assert settings.execution_auto_pair_close_shadow_mode is False
@@ -414,6 +425,21 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.database_path == "data/carryme.sqlite3"
     assert Path(settings.watchlist_path).is_file()
     assert settings.watchlist_path.endswith("config/watchlists/default.json")
+
+
+def test_worker_stable_launch_slippage_tolerance_bps_is_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_worker_env(monkeypatch)
+    monkeypatch.setenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_SLIPPAGE_TOLERANCE_BPS",
+        "250",
+    )
+
+    settings = WorkerSettings()
+
+    assert settings.stable_canary_launch_slippage_tolerance_bps == 100
+    assert settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl == 0.0
 
 
 def test_stable_launch_route_limit_fails_closed_at_active_cap(tmp_path: Path) -> None:
@@ -4653,6 +4679,23 @@ def _build_stable_launch_test_snapshot(
         min_stable_seconds=30.0,
     )
     return approval, candidate, snapshot, stability
+
+
+def test_stable_launch_slippage_guard_preserves_baseline_default_behavior() -> None:
+    settings = WorkerSettings(stable_canary_launch_slippage_tolerance_bps=20)
+    _, candidate, _, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        deployable_notional=1_000.0,
+        estimated_one_day_pnl_after_round_trip=-0.5,
+    )
+
+    assert (
+        _build_stable_launch_slippage_adjusted_pnl_reason(
+            settings=settings,
+            candidate=candidate,
+        )
+        is None
+    )
 
 
 def _append_stable_launch_ready_pair(
@@ -10573,7 +10616,10 @@ def test_launch_latest_stable_canary_once_skips_stale_latest_approved_snapshot(
 def test_launch_latest_stable_canary_once_returns_launched_summary(
     tmp_path: Path,
 ) -> None:
-    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_slippage_tolerance_bps=30,
+    )
     approval = RouteApprovalEntry(
         updated_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
         label="arb_extended_paradex",
@@ -10755,7 +10801,12 @@ def test_launch_latest_stable_canary_once_returns_launched_summary(
         paradex_private_key="0x456",
     )
 
-    async def run_stub_lifecycle(**_: object) -> StubLifecycleResult:
+    captured_slippage_bps: list[int] = []
+
+    async def run_stub_lifecycle(**kwargs: object) -> StubLifecycleResult:
+        slippage_tolerance_bps = kwargs["slippage_tolerance_bps"]
+        assert isinstance(slippage_tolerance_bps, int)
+        captured_slippage_bps.append(slippage_tolerance_bps)
         return StubLifecycleResult()
 
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -10789,6 +10840,62 @@ def test_launch_latest_stable_canary_once_returns_launched_summary(
     assert len(launch_records) == 1
     assert launch_records[0].paper_trade_id == 17
     assert launch_records[0].launch_ready_snapshot_id == 9
+    assert captured_slippage_bps == [30]
+
+
+def test_launch_latest_stable_canary_once_skips_when_slippage_budget_consumes_expected_pnl(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_slippage_tolerance_bps=30,
+        stable_canary_launch_min_expected_one_day_round_trip_pnl=0.02,
+    )
+    approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        launch_ready_snapshot_id=9,
+        approved_snapshot_id=8,
+        suggested_canary_notional=20.0,
+        deployable_notional=1_000.0,
+        estimated_one_day_pnl_after_round_trip=2.5,
+    )
+    approved_store = ApprovedCanaryStore(settings.database_path)
+    persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
+    snapshot = snapshot.model_copy(update={"approved_snapshot": persisted_snapshot})
+    stability = stability.model_copy(update={"snapshot": snapshot})
+
+    async def fail_if_called(**_: object) -> object:
+        raise AssertionError("weak slippage-adjusted edge must block live submission")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_launch_ready_canary_stability",
+            lambda **_: stability,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._select_latest_launch_ready_canary_snapshot",
+            lambda **_: (snapshot, candidate, approval),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._run_guarded_canary_lifecycle",
+            fail_if_called,
+        )
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                approved_store=approved_store,
+                now=datetime(2026, 3, 30, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.launch_ready_snapshot_id == 9
+    assert summary.approved_snapshot_id == snapshot.approved_snapshot.snapshot_id
+    assert summary.detail is not None
+    detail = str(summary.detail)
+    assert "Stable launch slippage-adjusted expected pnl requirement not met" in detail
+    assert "slippage_bps=30" in detail
+    assert "min=0.020000" in detail
 
 
 def test_launch_latest_stable_canary_once_reclaims_stale_snapshot_reservation(
