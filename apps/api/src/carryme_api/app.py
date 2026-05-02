@@ -129,7 +129,10 @@ from carryme_runtime import (
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_runtime.pair_close_preview import _pair_close_hash, select_pair_close_preview_venues
-from carryme_runtime.route_approvals import scan_exact_canary_candidate_for_approval
+from carryme_runtime.route_approvals import (
+    scan_exact_canary_candidate_for_approval,
+    scan_live_route_candidate_for_approval,
+)
 from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import (
     ApprovedCanaryAlertStore,
@@ -534,6 +537,77 @@ def _build_approved_route_payload_from_canary_proposal(
             "approved": True,
             "note": note,
         }
+    )
+
+
+async def _scan_current_approved_canary_snapshot_for_promoted_proposal(
+    *,
+    universe_service: OpportunityUniverseService,
+    approval: RouteApprovalEntry,
+    now: datetime,
+    target_notional: float,
+    canary_max_notional: float,
+    min_capacity_notional: float,
+    min_daily_volume: float,
+    min_open_interest: float,
+    min_roundtrip_edge: float,
+    min_execution_quality_score: float,
+    min_execution_samples: int,
+    min_route_stability_weight: float,
+    min_route_presence_ratio: float,
+    min_route_samples: int,
+    exclude_tags: list[str] | None,
+) -> ApprovedCanarySnapshot:
+    """Return a fresh approved canary snapshot for a just-promoted route."""
+
+    _validate_route_stability_filters(
+        min_route_stability_weight=min_route_stability_weight,
+        min_route_presence_ratio=min_route_presence_ratio,
+        min_route_samples=min_route_samples,
+    )
+    candidate, _ = await _run_bounded_universe_scan(
+        "canary approval proposal promotion refresh",
+        lambda: scan_live_route_candidate_for_approval(
+            scanner=universe_service,
+            approval=approval,
+            venues=[approval.short_venue, approval.long_venue],
+            fee_profile_overrides=None,
+            target_notional=target_notional,
+            canary_max_notional=canary_max_notional,
+            min_capacity_notional=min_capacity_notional,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+            min_execution_quality_score=min_execution_quality_score,
+            min_execution_samples=min_execution_samples,
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+            include_symbols=None,
+            exclude_symbols=None,
+            exclude_tags=exclude_tags,
+            limit=1,
+        ),
+    )
+    if candidate is None:
+        raise HTTPException(
+            status_code=409,
+            detail="approved proposal no longer matches a current live canary route",
+        )
+
+    capped_notional = min(candidate.suggested_canary_notional, approval.max_live_notional)
+    if capped_notional <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="approved proposal no longer permits a positive live notional",
+        )
+    return ApprovedCanarySnapshot(
+        captured_at=now,
+        label=approval.label,
+        candidate=candidate.model_copy(
+            update={"suggested_canary_notional": capped_notional}
+        ),
+        approval=approval,
     )
 
 
@@ -7442,6 +7516,79 @@ def create_app() -> FastAPI:
             max_proposal_age_seconds=max_proposal_age_seconds,
         )
         return service.upsert(label=label, payload=approval_payload)
+
+    @app.post(
+        "/v1/opportunities/funding-universe/canary/approval-proposals/"
+        "{label}/approve-and-refresh",
+        response_model=ApprovedCanarySnapshot,
+    )
+    async def approve_and_refresh_funding_universe_canary_approval_proposal(
+        label: str,
+        universe_service: Annotated[
+            OpportunityUniverseService,
+            Depends(get_opportunity_universe_service),
+        ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        approved_store: Annotated[
+            ApprovedCanaryStore,
+            Depends(get_approved_canary_store),
+        ],
+        payload: Annotated[FundingUniverseCanaryApprovalProposalSummary, Body()],
+        current_time: Annotated[datetime, Depends(get_current_utc_time)],
+        max_proposal_age_seconds: int = DEFAULT_APPROVAL_PROPOSAL_MAX_AGE_SECONDS,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.10,
+        min_route_presence_ratio: float = 0.15,
+        min_route_samples: int = 2,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+    ) -> ApprovedCanarySnapshot:
+        approval_payload = _build_approved_route_payload_from_canary_proposal(
+            label=label,
+            proposal=payload,
+            current_time=current_time,
+            max_proposal_age_seconds=max_proposal_age_seconds,
+        )
+        candidate_approval = RouteApprovalEntry(
+            updated_at=current_time,
+            label=label,
+            canonical_symbol=approval_payload.canonical_symbol,
+            short_venue=approval_payload.short_venue,
+            long_venue=approval_payload.long_venue,
+            short_fee_profile=approval_payload.short_fee_profile,
+            long_fee_profile=approval_payload.long_fee_profile,
+            approved=True,
+            max_live_notional=approval_payload.max_live_notional,
+            note=approval_payload.note,
+        )
+        snapshot = await _scan_current_approved_canary_snapshot_for_promoted_proposal(
+            universe_service=universe_service,
+            approval=candidate_approval,
+            now=current_time,
+            target_notional=target_notional,
+            canary_max_notional=canary_max_notional,
+            min_capacity_notional=min_capacity_notional,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+            min_execution_quality_score=min_execution_quality_score,
+            min_execution_samples=min_execution_samples,
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+            exclude_tags=DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags,
+        )
+        persisted_approval = approval_service.upsert(label=label, payload=approval_payload)
+        return approved_store.append(snapshot.model_copy(update={"approval": persisted_approval}))
 
     @app.post(
         "/v1/executions/live/canary-cycle/approved-basket",
