@@ -2574,6 +2574,26 @@ def test_execution_observation_store_latest_with_pair_status_for_paper_trade(
             ),
         )
     )
+    same_time_with_status = store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 3, 29, 13, 6, tzinfo=UTC),
+            context="same-time-with-pair-status",
+            execution_entry_id=12,
+            paper_trade_id=7,
+            preview_hash="preview-hash-7",
+            order_state=order_state,
+            pair_status=ExecutionPairStatus(
+                execution_entry_id=12,
+                paper_trade_id=7,
+                preview_hash="preview-hash-7",
+                derived_state="hedged",
+                recommended_action="monitor_open_hedge",
+                order_state=order_state,
+                reconciliation=reconciliation,
+                notes=[],
+            ),
+        )
+    )
     latest_without_status = store.append(
         ExecutionObservationEntry(
             observed_at=datetime(2026, 3, 29, 13, 7, tzinfo=UTC),
@@ -2592,7 +2612,10 @@ def test_execution_observation_store_latest_with_pair_status_for_paper_trade(
     assert latest.entry_id == latest_without_status.entry_id
     assert latest.pair_status is None
     assert latest_with_pair_status is not None
-    assert latest_with_pair_status.entry_id == older_with_status.entry_id
+    assert older_with_status.entry_id is not None
+    assert same_time_with_status.entry_id is not None
+    assert same_time_with_status.entry_id > older_with_status.entry_id
+    assert latest_with_pair_status.entry_id == same_time_with_status.entry_id
     assert latest_with_pair_status.pair_status is not None
     assert latest_with_pair_status.pair_status.derived_state == "hedged"
     assert store.latest_with_pair_status_for_paper_trade(8) is None
