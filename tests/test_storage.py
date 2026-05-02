@@ -787,6 +787,152 @@ def test_execution_journal_store_lists_latest_for_multiple_paper_trades(
     assert latest_entries[7].entry_id != older_trade_7.entry_id
 
 
+def test_execution_journal_store_lists_recent_active_live_from_legacy_rows(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "history.sqlite3"
+
+    def make_entry(
+        *,
+        paper_trade_id: int,
+        minute: int,
+        mode: Literal["live", "mock"],
+        status: Literal["accepted", "submitted", "partial"],
+    ) -> ExecutionJournalEntry:
+        leg_status: Literal["accepted", "submitted"] = (
+            "submitted" if status == "partial" else status
+        )
+        return ExecutionJournalEntry(
+            executed_at=datetime(2026, 3, 29, 13, minute, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex" if mode == "live" else "mock",
+            mode=mode,
+            status=status,
+            paper_trade_id=paper_trade_id,
+            preview_hash=f"preview-{paper_trade_id}",
+            confirmation_entry_id=paper_trade_id + 100,
+            paper_trade=PaperTradeEntry(
+                entry_id=paper_trade_id,
+                created_at=datetime(2026, 3, 29, 13, 0, tzinfo=UTC),
+                note="active live lookup test",
+                intent=FundingPairTradeIntent(
+                    label=f"pair_{paper_trade_id}",
+                    canonical_symbol="ARB-USD-PERP",
+                    source_recorded_at=datetime(2026, 3, 29, 12, 55, tzinfo=UTC),
+                    one_day_net_edge_after_entry=0.00055,
+                    break_even_days_entry=0.45,
+                    capacity_limit_notional=4500.0,
+                    target_notional=1000.0,
+                    capacity_fraction=0.25,
+                    max_target_notional=1000.0,
+                    long_leg=TradeLegIntent(
+                        venue="paradex",
+                        symbol="ARB-USD-PERP",
+                        fee_profile="pro",
+                        side="buy",
+                        target_notional=1000.0,
+                    ),
+                    short_leg=TradeLegIntent(
+                        venue="extended",
+                        symbol="ARB-USD",
+                        fee_profile="default",
+                        side="sell",
+                        target_notional=1000.0,
+                    ),
+                ),
+            ),
+            legs=[
+                ExecutionLegResult(
+                    venue="extended",
+                    symbol="ARB-USD",
+                    fee_profile="default",
+                    side="sell",
+                    target_notional=1000.0,
+                    status=leg_status,
+                    simulated=mode != "live",
+                )
+            ],
+        )
+
+    live_submitted = make_entry(
+        paper_trade_id=7,
+        minute=5,
+        mode="live",
+        status="submitted",
+    )
+    live_partial = make_entry(
+        paper_trade_id=8,
+        minute=6,
+        mode="live",
+        status="partial",
+    )
+    live_accepted = make_entry(
+        paper_trade_id=9,
+        minute=7,
+        mode="live",
+        status="accepted",
+    )
+    mock_submitted = make_entry(
+        paper_trade_id=10,
+        minute=8,
+        mode="mock",
+        status="submitted",
+    )
+
+    with Database(database_path).begin() as connection:
+        connection.execute(
+            """
+            CREATE TABLE execution_journal_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                executed_at TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                status TEXT NOT NULL,
+                paper_trade_id INTEGER,
+                preview_hash TEXT,
+                confirmation_entry_id INTEGER,
+                label TEXT NOT NULL,
+                entry_json TEXT NOT NULL
+            )
+            """
+        )
+        for entry in (live_submitted, live_partial, live_accepted, mock_submitted):
+            connection.execute(
+                """
+                INSERT INTO execution_journal_entries (
+                    executed_at,
+                    adapter,
+                    status,
+                    paper_trade_id,
+                    preview_hash,
+                    confirmation_entry_id,
+                    label,
+                    entry_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.executed_at.isoformat(),
+                    entry.adapter,
+                    entry.status,
+                    entry.paper_trade_id,
+                    entry.preview_hash,
+                    entry.confirmation_entry_id,
+                    entry.paper_trade.intent.label,
+                    entry.model_dump_json(),
+                ),
+            )
+
+    store = ExecutionJournalStore(database_path)
+    results = store.list_recent_active_live(limit=10)
+    offset_results = store.list_recent_active_live(limit=1, offset=1)
+
+    assert [(entry.paper_trade_id, entry.status) for entry in results] == [
+        (8, "partial"),
+        (7, "submitted"),
+    ]
+    assert [(entry.paper_trade_id, entry.status) for entry in offset_results] == [
+        (7, "submitted")
+    ]
+
+
 def test_execution_journal_store_allows_same_confirmation_id_for_different_hashes(
     tmp_path: Path,
 ) -> None:

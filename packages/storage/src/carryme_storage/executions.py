@@ -89,6 +89,12 @@ class ExecutionJournalStore:
                 )
                 connection.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_execution_journal_entries_active_live
+                    ON execution_journal_entries(status, executed_at DESC, id DESC)
+                    """
+                )
+                connection.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_execution_journal_entries_label
                     ON execution_journal_entries(label)
                     """
@@ -777,6 +783,41 @@ class ExecutionJournalStore:
 
         with self.database.begin() as connection:
             rows = connection.execute(query, params).fetchall()
+
+        return [
+            ExecutionJournalEntry.model_validate(
+                {
+                    **json.loads(entry_json),
+                    "entry_id": stored_id,
+                }
+            )
+            for stored_id, entry_json in rows
+        ]
+
+    def list_recent_active_live(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[ExecutionJournalEntry]:
+        """Return recent live executions that still have an in-flight status."""
+
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        if offset < 0:
+            raise ValueError("offset must be at least 0")
+        self.initialize()
+        with self.database.begin() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, entry_json
+                FROM execution_journal_entries
+                WHERE status IN (?, ?) AND entry_json LIKE ?
+                ORDER BY executed_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                ("submitted", "partial", '%"mode":"live"%', limit, offset),
+            ).fetchall()
 
         return [
             ExecutionJournalEntry.model_validate(
