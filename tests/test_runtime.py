@@ -9116,7 +9116,7 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
 @pytest.mark.parametrize(
     ("first_leg_state", "expected_status"),
     [
-        ("unfilled", "rejected"),
+        ("unfilled", "partial"),
         ("partial_fill", "partial"),
         ("open", "partial"),
         ("unknown", "partial"),
@@ -9316,6 +9316,42 @@ def test_observed_fill_state_logs_unexpected_derived_state(
         "unexpected observed order derived_state='filled_final'" in record.message
         for record in caplog.records
     )
+
+
+def test_observed_fill_state_logs_malformed_payload_shape(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="carryme_runtime.paired_live_execution")
+
+    state = _observed_fill_state(["not", "a", "dict"])
+
+    assert state == "unknown"
+    assert any(
+        "malformed observed order state payload type=list" in record.message
+        for record in caplog.records
+    )
+
+
+def test_leg_observed_fill_state_logs_malformed_attempt_history(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="carryme_runtime.paired_live_execution")
+    leg = ExecutionLegResult(
+        venue="paradex",
+        symbol="ZRO-USD-PERP",
+        fee_profile="pro",
+        side="buy",
+        target_notional=100.0,
+        status="submitted",
+        simulated=False,
+        external_reference="zro-paradex-order",
+        response_payload={"attempt_history": {"bad": "shape"}},
+    )
+
+    state = PairedLiveExecutionCoordinator._leg_observed_fill_state(leg)
+
+    assert state == "unknown"
+    assert any("malformed attempt_history" in record.message for record in caplog.records)
 
 
 def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails() -> None:

@@ -90,14 +90,11 @@ class PairedLiveExecutionCoordinator:
             )
         first_fill_state = self._submission_observed_fill_state(first_result)
         if first_fill_state != "filled":
-            guarded_status: Literal["rejected", "partial"] = (
-                "rejected" if first_fill_state == "unfilled" else "partial"
-            )
             return ExecutionJournalEntry(
                 executed_at=timestamp,
                 adapter=f"paired_live:{normalized_first}_then_{second_venue}",
                 mode="live",
-                status=guarded_status,
+                status="partial",
                 paper_trade_id=paper_trade.entry_id,
                 preview_hash=confirmation.preview_hash,
                 confirmation_entry_id=confirmation.entry_id,
@@ -226,16 +223,32 @@ class PairedLiveExecutionCoordinator:
 
         attempt_history = payload.get("attempt_history")
         if not isinstance(attempt_history, list):
-            logger.warning(
-                "missing observed order state in live execution leg payload venue=%r "
-                "external_reference=%r payload=%r",
-                leg.venue,
-                leg.external_reference,
-                payload,
-            )
+            if attempt_history is None:
+                logger.warning(
+                    "missing observed order state in live execution leg payload venue=%r "
+                    "external_reference=%r payload_keys=%s",
+                    leg.venue,
+                    leg.external_reference,
+                    sorted(str(key) for key in payload),
+                )
+            else:
+                logger.warning(
+                    "malformed attempt_history in live execution leg payload venue=%r "
+                    "external_reference=%r type=%s",
+                    leg.venue,
+                    leg.external_reference,
+                    type(attempt_history).__name__,
+                )
             return "unknown"
         for attempt in reversed(attempt_history):
             if not isinstance(attempt, dict):
+                logger.warning(
+                    "malformed attempt_history entry in live execution leg payload venue=%r "
+                    "external_reference=%r type=%s",
+                    leg.venue,
+                    leg.external_reference,
+                    type(attempt).__name__,
+                )
                 continue
             observed_state = _observed_fill_state(attempt.get("observed_order_state"))
             if observed_state != "unknown":
@@ -245,6 +258,11 @@ class PairedLiveExecutionCoordinator:
 
 def _observed_fill_state(value: Any) -> ObservedFillState:
     if not isinstance(value, dict):
+        if value is not None:
+            logger.warning(
+                "malformed observed order state payload type=%s",
+                type(value).__name__,
+            )
         return "unknown"
     derived_state = value.get("derived_state")
     if derived_state == "filled":
@@ -255,10 +273,12 @@ def _observed_fill_state(value: Any) -> ObservedFillState:
         return "unfilled"
     if derived_state == "open":
         return "open"
+    if derived_state in {"unknown", "unsupported"}:
+        return "unknown"
     if derived_state is not None:
         logger.warning(
-            "unexpected observed order derived_state=%r in payload=%r",
+            "unexpected observed order derived_state=%r payload_keys=%s",
             derived_state,
-            value,
+            sorted(str(key) for key in value),
         )
     return "unknown"
