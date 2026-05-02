@@ -1,7 +1,7 @@
 """Worker configuration models."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from carryme_models import SUPPORTED_UNIVERSE_VENUES
 from carryme_normalizers import get_fee_profile
@@ -12,6 +12,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
 StableCanaryLaunchLossScope = Literal["global", "label"]
+STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS = 20
+STABLE_CANARY_LAUNCH_MAX_SLIPPAGE_TOLERANCE_BPS = 100
 
 
 class WorkerSettings(BaseSettings):
@@ -103,7 +105,11 @@ class WorkerSettings(BaseSettings):
         default=None,
         ge=0,
     )
-    stable_canary_launch_slippage_tolerance_bps: int = Field(default=20, ge=0, le=100)
+    stable_canary_launch_slippage_tolerance_bps: int = Field(
+        default=STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS,
+        ge=0,
+        le=STABLE_CANARY_LAUNCH_MAX_SLIPPAGE_TOLERANCE_BPS,
+    )
     stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl: float = Field(
         default=0.0,
         ge=0,
@@ -358,6 +364,19 @@ class WorkerSettings(BaseSettings):
         venue = field_name.removeprefix("universe_scan_").removesuffix("_fee_profile")
         get_fee_profile(venue, normalized)
         return normalized
+
+    @field_validator("stable_canary_launch_slippage_tolerance_bps", mode="before")
+    @classmethod
+    def cap_stable_launch_slippage_tolerance_bps(cls, value: Any) -> Any:
+        """Cap fat-fingered live IOC budgets without rejecting the whole worker."""
+
+        if value is None:
+            return value
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return value
+        return min(parsed, STABLE_CANARY_LAUNCH_MAX_SLIPPAGE_TOLERANCE_BPS)
 
     @field_validator("watchlist_path")
     @classmethod

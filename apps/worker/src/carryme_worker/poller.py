@@ -151,7 +151,10 @@ from carryme_storage import (
 )
 from fastapi import HTTPException
 
-from carryme_worker.config import WorkerSettings
+from carryme_worker.config import (
+    STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS,
+    WorkerSettings,
+)
 from carryme_worker.notifications import (
     ApprovedCanaryAlertNotifier,
     CompositeExecutionAlertNotifier,
@@ -162,7 +165,6 @@ from carryme_worker.notifications import (
 
 logger = logging.getLogger(__name__)
 OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
-_STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS = 20
 
 
 def _build_launch_ready_canary_stability(**kwargs: Any) -> LaunchReadyCanaryStability:
@@ -1040,7 +1042,7 @@ def _stable_launch_extra_entry_slippage_cost(
     """Estimate extra entry cost versus the historical stable-launch IOC budget."""
 
     extra_bps = max(
-        slippage_tolerance_bps - _STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS,
+        slippage_tolerance_bps - STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS,
         0,
     )
     if extra_bps <= 0:
@@ -1063,8 +1065,9 @@ def _build_stable_launch_slippage_adjusted_pnl_reason(
         slippage_tolerance_bps=settings.stable_canary_launch_slippage_tolerance_bps,
     )
     adjusted_pnl = scaled_round_trip_pnl - extra_slippage_cost
-    min_adjusted_pnl = (
-        settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl
+    min_adjusted_pnl = max(
+        settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl,
+        settings.stable_canary_launch_min_expected_one_day_round_trip_pnl or 0.0,
     )
     if adjusted_pnl + 1e-9 >= min_adjusted_pnl:
         return None
@@ -1076,7 +1079,7 @@ def _build_stable_launch_slippage_adjusted_pnl_reason(
         f"expected_pnl={scaled_round_trip_pnl:.6f}; "
         f"extra_slippage_cost={extra_slippage_cost:.6f}; "
         f"slippage_bps={settings.stable_canary_launch_slippage_tolerance_bps}; "
-        f"baseline_slippage_bps={_STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS}"
+        f"baseline_slippage_bps={STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS}"
     )
 
 

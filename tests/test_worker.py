@@ -426,6 +426,21 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.watchlist_path.endswith("config/watchlists/default.json")
 
 
+def test_worker_stable_launch_slippage_tolerance_bps_is_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_worker_env(monkeypatch)
+    monkeypatch.setenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_SLIPPAGE_TOLERANCE_BPS",
+        "250",
+    )
+
+    settings = WorkerSettings()
+
+    assert settings.stable_canary_launch_slippage_tolerance_bps == 100
+    assert settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl == 0.0
+
+
 def test_stable_launch_route_limit_fails_closed_at_active_cap(tmp_path: Path) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
@@ -10815,7 +10830,8 @@ def test_launch_latest_stable_canary_once_skips_when_slippage_budget_consumes_ex
 ) -> None:
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
-        stable_canary_launch_slippage_tolerance_bps=100,
+        stable_canary_launch_slippage_tolerance_bps=30,
+        stable_canary_launch_min_expected_one_day_round_trip_pnl=0.02,
     )
     approval, candidate, snapshot, stability = _build_stable_launch_test_snapshot(
         label="arb_extended_paradex",
@@ -10823,7 +10839,7 @@ def test_launch_latest_stable_canary_once_skips_when_slippage_budget_consumes_ex
         approved_snapshot_id=8,
         suggested_canary_notional=20.0,
         deployable_notional=1_000.0,
-        estimated_one_day_pnl_after_round_trip=0.10,
+        estimated_one_day_pnl_after_round_trip=2.5,
     )
     approved_store = ApprovedCanaryStore(settings.database_path)
     persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
@@ -10860,7 +10876,8 @@ def test_launch_latest_stable_canary_once_skips_when_slippage_budget_consumes_ex
     assert summary.detail is not None
     detail = str(summary.detail)
     assert "Stable launch slippage-adjusted expected pnl requirement not met" in detail
-    assert "slippage_bps=100" in detail
+    assert "slippage_bps=30" in detail
+    assert "min=0.020000" in detail
 
 
 def test_launch_latest_stable_canary_once_reclaims_stale_snapshot_reservation(
