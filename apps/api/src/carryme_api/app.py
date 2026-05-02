@@ -98,6 +98,7 @@ from carryme_runtime import (
     HyperliquidLiveExecutionService,
     HyperliquidOrderStateObserver,
     InvalidTradeCandidateError,
+    LaunchReadyAutomationGatePolicy,
     MockExecutionAdapter,
     OpportunityService,
     OpportunityUniverseService,
@@ -114,6 +115,8 @@ from carryme_runtime import (
     SystemStateService,
     UpstreamDataError,
     build_account_preflight_configs,
+    build_approved_snapshot_automation_gate_reason,
+    build_candidate_live_execution_preflight,
     build_execution_pair_status,
     build_live_execution_configs,
     build_live_submission_readiness,
@@ -123,6 +126,8 @@ from carryme_runtime import (
     build_portfolio_plan,
     build_trade_intent,
     build_venue_execution_preflights,
+    list_recent_approved_snapshot_chain,
+    probe_candidate_system_state,
     reconcile_execution,
     require_confirmed_cleanup_preview,
     review_required_pair_requires_continued_monitoring,
@@ -3450,6 +3455,129 @@ def _select_latest_launch_ready_canary_snapshot(
             update={"suggested_canary_notional": capped_notional}
         ),
         approval,
+    )
+
+
+def _build_launch_ready_automation_gate_policy(
+    settings: ApiSettings,
+) -> LaunchReadyAutomationGatePolicy:
+    return LaunchReadyAutomationGatePolicy(
+        min_edge_retention_ratio=settings.stable_launch_ready_min_edge_retention_ratio,
+        max_entry_break_even_funding_windows=(
+            settings.stable_launch_ready_max_entry_break_even_funding_windows
+        ),
+        max_round_trip_break_even_funding_windows=(
+            settings.stable_launch_ready_max_round_trip_break_even_funding_windows
+        ),
+    )
+
+
+async def _build_launch_ready_snapshot_for_approved_snapshot(
+    *,
+    settings: ApiSettings,
+    approved_store: ApprovedCanaryStore,
+    system_state_service: SystemStateService,
+    snapshot: ApprovedCanarySnapshot,
+    now: datetime,
+) -> LaunchReadyCanarySnapshot:
+    snapshot_age_seconds = max(0.0, (now - snapshot.captured_at).total_seconds())
+    if snapshot.captured_at > now:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot timestamp is in the future",
+        )
+    if snapshot_age_seconds > settings.launch_ready_canary_max_snapshot_age_seconds:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approved canary snapshot is stale "
+                f"({snapshot_age_seconds:.1f}s > "
+                f"{settings.launch_ready_canary_max_snapshot_age_seconds}s)"
+            ),
+        )
+    if not snapshot.approval.approved:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot is not approved for live execution",
+        )
+
+    capped_notional = min(
+        snapshot.candidate.suggested_canary_notional,
+        snapshot.approval.max_live_notional,
+    )
+    if capped_notional <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Approved canary snapshot no longer permits a positive live notional",
+        )
+
+    refreshed_candidate = snapshot.candidate.model_copy(
+        update={"suggested_canary_notional": capped_notional}
+    )
+    refreshed_snapshot = snapshot.model_copy(
+        update={"candidate": refreshed_candidate}
+    )
+    recent_approved_chain = list_recent_approved_snapshot_chain(
+        recent_snapshots=[
+            refreshed_snapshot,
+            *approved_store.list_recent(limit=20, label=snapshot.label),
+        ],
+        snapshot=refreshed_snapshot,
+        max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+    )
+    automation_gate_reason = build_approved_snapshot_automation_gate_reason(
+        snapshot=refreshed_snapshot,
+        recent_chain=recent_approved_chain or [refreshed_snapshot],
+        policy=_build_launch_ready_automation_gate_policy(settings),
+    )
+    if automation_gate_reason is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approved canary snapshot does not satisfy automated launch gates: "
+                f"{automation_gate_reason}"
+            ),
+        )
+
+    execution_preflight = build_candidate_live_execution_preflight(
+        venue_preflights=build_venue_execution_preflights(
+            build_live_execution_configs(settings)
+        ),
+        candidate=refreshed_candidate,
+        label=snapshot.label,
+    )
+    if not execution_preflight.ready:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Approved canary snapshot live execution preflight is not ready",
+                "blocking_reasons": execution_preflight.blocking_reasons,
+                "execution_preflight": execution_preflight.model_dump(mode="json"),
+            },
+        )
+
+    system_state = await probe_candidate_system_state(
+        service=system_state_service,
+        configs=_build_system_state_configs(settings),
+        candidate=refreshed_candidate,
+        label=snapshot.label,
+    )
+    if not system_state.ready:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Approved canary snapshot system state is not ready",
+                "blocking_reasons": system_state.blocking_reasons,
+                "system_state": system_state.model_dump(mode="json"),
+            },
+        )
+
+    return LaunchReadyCanarySnapshot(
+        captured_at=now,
+        label=snapshot.label,
+        max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+        approved_snapshot=refreshed_snapshot,
+        system_state=system_state,
     )
 
 
@@ -7589,6 +7717,102 @@ def create_app() -> FastAPI:
         )
         persisted_approval = approval_service.upsert(label=label, payload=approval_payload)
         return approved_store.append(snapshot.model_copy(update={"approval": persisted_approval}))
+
+    @app.post(
+        "/v1/opportunities/funding-universe/canary/approval-proposals/"
+        "{label}/approve-refresh-and-cache-launch-ready",
+        response_model=LaunchReadyCanarySnapshot,
+    )
+    async def approve_refresh_and_cache_launch_ready_canary_proposal(
+        label: str,
+        universe_service: Annotated[
+            OpportunityUniverseService,
+            Depends(get_opportunity_universe_service),
+        ],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
+        approved_store: Annotated[
+            ApprovedCanaryStore,
+            Depends(get_approved_canary_store),
+        ],
+        launch_ready_store: Annotated[
+            LaunchReadyCanaryStore,
+            Depends(get_launch_ready_canary_store),
+        ],
+        system_state_service: Annotated[
+            SystemStateService,
+            Depends(get_system_state_service),
+        ],
+        settings: Annotated[ApiSettings, Depends(get_api_settings)],
+        payload: Annotated[FundingUniverseCanaryApprovalProposalSummary, Body()],
+        current_time: Annotated[datetime, Depends(get_current_utc_time)],
+        max_proposal_age_seconds: int = DEFAULT_APPROVAL_PROPOSAL_MAX_AGE_SECONDS,
+        target_notional: float = 5_000.0,
+        canary_max_notional: float = 25.0,
+        min_capacity_notional: float = 25.0,
+        min_daily_volume: float = 0.0,
+        min_open_interest: float = 0.0,
+        min_roundtrip_edge: float = 0.0,
+        min_execution_quality_score: float = 0.5,
+        min_execution_samples: int = 0,
+        min_route_stability_weight: float = 0.10,
+        min_route_presence_ratio: float = 0.15,
+        min_route_samples: int = 2,
+        exclude_tags: Annotated[list[str] | None, Query()] = None,
+    ) -> LaunchReadyCanarySnapshot:
+        approval_payload = _build_approved_route_payload_from_canary_proposal(
+            label=label,
+            proposal=payload,
+            current_time=current_time,
+            max_proposal_age_seconds=max_proposal_age_seconds,
+        )
+        candidate_approval = RouteApprovalEntry(
+            updated_at=current_time,
+            label=label,
+            canonical_symbol=approval_payload.canonical_symbol,
+            short_venue=approval_payload.short_venue,
+            long_venue=approval_payload.long_venue,
+            short_fee_profile=approval_payload.short_fee_profile,
+            long_fee_profile=approval_payload.long_fee_profile,
+            approved=True,
+            max_live_notional=approval_payload.max_live_notional,
+            note=approval_payload.note,
+        )
+        snapshot = await _scan_current_approved_canary_snapshot_for_promoted_proposal(
+            universe_service=universe_service,
+            approval=candidate_approval,
+            now=current_time,
+            target_notional=target_notional,
+            canary_max_notional=canary_max_notional,
+            min_capacity_notional=min_capacity_notional,
+            min_daily_volume=min_daily_volume,
+            min_open_interest=min_open_interest,
+            min_roundtrip_edge=min_roundtrip_edge,
+            min_execution_quality_score=min_execution_quality_score,
+            min_execution_samples=min_execution_samples,
+            min_route_stability_weight=min_route_stability_weight,
+            min_route_presence_ratio=min_route_presence_ratio,
+            min_route_samples=min_route_samples,
+            exclude_tags=DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags,
+        )
+        launch_ready_snapshot = await _build_launch_ready_snapshot_for_approved_snapshot(
+            settings=settings,
+            approved_store=approved_store,
+            system_state_service=system_state_service,
+            snapshot=snapshot,
+            now=current_time,
+        )
+        persisted_approval = approval_service.upsert(label=label, payload=approval_payload)
+        persisted_approved_snapshot = approved_store.append(
+            snapshot.model_copy(update={"approval": persisted_approval})
+        )
+        return launch_ready_store.append(
+            launch_ready_snapshot.model_copy(
+                update={"approved_snapshot": persisted_approved_snapshot}
+            )
+        )
 
     @app.post(
         "/v1/executions/live/canary-cycle/approved-basket",
