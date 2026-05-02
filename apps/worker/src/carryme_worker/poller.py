@@ -7,6 +7,7 @@ import logging
 import math
 import signal
 import sqlite3
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -3382,10 +3383,14 @@ async def launch_latest_stable_canary_once(
         )
 
     if snapshot.launch_ready_snapshot_id is not None:
+        reservation_owner_id = uuid.uuid4().hex
         reserved = stable_launch_store.reserve_snapshot_launch(
             launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
             label=snapshot.label,
             reserved_at=timestamp,
+            max_age_seconds=settings.stable_canary_launch_reservation_ttl_seconds,
+            retention_seconds=settings.stable_canary_launch_reservation_retention_seconds,
+            owner_id=reservation_owner_id,
         )
         if not reserved:
             return StableCanaryLaunchSummary(
@@ -3395,6 +3400,25 @@ async def launch_latest_stable_canary_once(
                 launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
                 approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
                 detail="Launch-ready canary snapshot is already reserved for launch by worker",
+            )
+    else:
+        reservation_owner_id = None
+
+    async def renew_stable_launch_reservation_before_open(
+        launch_ready_snapshot_id: int | None = snapshot.launch_ready_snapshot_id,
+        owner_id: str | None = reservation_owner_id,
+    ) -> None:
+        if launch_ready_snapshot_id is None or owner_id is None:
+            return
+        renewed = stable_launch_store.renew_snapshot_launch_reservation(
+            launch_ready_snapshot_id=launch_ready_snapshot_id,
+            owner_id=owner_id,
+            reserved_at=datetime.now(UTC),
+        )
+        if not renewed:
+            raise HTTPException(
+                status_code=409,
+                detail="Stable launch reservation ownership was lost before live submission",
             )
 
     try:
@@ -3457,6 +3481,7 @@ async def launch_latest_stable_canary_once(
             poll_interval_seconds=2.0,
             auto_cleanup=True,
             close_position=settings.stable_canary_launch_close_position,
+            before_open_submission=renew_stable_launch_reservation_before_open,
         )
     except HTTPException as exc:
         if exc.status_code in {404, 409}:

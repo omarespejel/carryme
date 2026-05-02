@@ -3232,6 +3232,7 @@ async def _run_guarded_canary_lifecycle(
     poll_interval_seconds: float,
     auto_cleanup: bool,
     close_position: bool,
+    before_open_submission: Callable[[], Awaitable[None] | None] | None = None,
 ) -> CanaryLifecycleResult:
     paper_trade = _append_paper_trade_from_canary_candidate(
         candidate=candidate,
@@ -3269,6 +3270,10 @@ async def _run_guarded_canary_lifecycle(
     )
     if not readiness.ready:
         raise HTTPException(status_code=409, detail=readiness.model_dump(mode="json"))
+    if before_open_submission is not None:
+        callback_result = before_open_submission()
+        if inspect.isawaitable(callback_result):
+            await callback_result
     open_execution = await _execute_guarded_pair_from_confirmation(
         paper_trade=paper_trade,
         confirmation=open_confirmation,

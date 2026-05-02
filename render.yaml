@@ -119,6 +119,10 @@ services:
           property: connectionString
       - key: CARRYME_WORKER_ENVIRONMENT
         value: production
+      - key: CARRYME_WORKER_STABLE_CANARY_LAUNCH_RESERVATION_TTL_SECONDS
+        value: 300
+      - key: CARRYME_WORKER_STABLE_CANARY_LAUNCH_RESERVATION_RETENTION_SECONDS
+        value: 86400
       - key: CARRYME_API_EXTENDED_LIVE_ENABLED
         sync: false
       - key: CARRYME_API_EXTENDED_API_KEY

@@ -3001,6 +3001,112 @@ def test_stable_canary_launch_store_reserves_snapshot_launch_once(
     assert second_reserved is False
 
 
+def test_stable_canary_launch_store_reclaims_stale_snapshot_launch_reservation(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+        max_age_seconds=60,
+    )
+    assert not store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=59),
+        max_age_seconds=60,
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=61),
+        max_age_seconds=60,
+    )
+
+
+def test_stable_canary_launch_store_rejects_lost_reservation_owner(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+        max_age_seconds=60,
+        owner_id="worker-a",
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=61),
+        max_age_seconds=60,
+        owner_id="worker-b",
+    )
+
+    assert not store.renew_snapshot_launch_reservation(
+        launch_ready_snapshot_id=9,
+        owner_id="worker-a",
+        reserved_at=reserved_at + timedelta(seconds=62),
+    )
+    assert store.renew_snapshot_launch_reservation(
+        launch_ready_snapshot_id=9,
+        owner_id="worker-b",
+        reserved_at=reserved_at + timedelta(seconds=63),
+    )
+
+
+def test_stable_canary_launch_store_cleans_abandoned_reservations(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    reserved_at = datetime(2026, 4, 4, 10, 2, tzinfo=UTC)
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at,
+        owner_id="worker-a",
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=10,
+        label="bera_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=10),
+        owner_id="worker-b",
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=11,
+        label="near_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=100),
+        max_age_seconds=30,
+        retention_seconds=60,
+        owner_id="worker-c",
+    )
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=101),
+        owner_id="worker-d",
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=10,
+        label="bera_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=102),
+        owner_id="worker-e",
+    )
+    assert not store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=11,
+        label="near_extended_paradex",
+        reserved_at=reserved_at + timedelta(seconds=103),
+        owner_id="worker-f",
+    )
+
+
 def test_approved_canary_alert_store_appends_and_lists_recent(tmp_path: Path) -> None:
     store = ApprovedCanaryAlertStore(tmp_path / "history.sqlite3")
     previous_snapshot = ApprovedCanarySnapshot(
