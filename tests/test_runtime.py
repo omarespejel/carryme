@@ -807,10 +807,20 @@ def test_opportunity_universe_service_can_skip_route_stability_for_exact_canary(
         ) -> dict[tuple[str, str, str, str, str], RouteStabilitySummary]:
             raise AssertionError("exact approved scans should not build route stability")
 
+    class FailingExecutionQualityService:
+        prior_score = 0.65
+
+        def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
+            raise AssertionError("exact approved scans should not build execution quality")
+
     async def run() -> None:
         service = OpportunityUniverseService(
             list_symbols=list_symbols,
             fetch_snapshot=fetch_snapshot,
+            execution_quality_service=cast(
+                ExecutionQualityService,
+                FailingExecutionQualityService(),
+            ),
             route_stability_service=cast(
                 RouteStabilityService,
                 FailingRouteStabilityService(),
@@ -823,6 +833,7 @@ def test_opportunity_universe_service_can_skip_route_stability_for_exact_canary(
             min_route_presence_ratio=0.0,
             min_route_samples=0,
             limit=1,
+            use_execution_quality=False,
             use_route_stability=False,
         )
 
@@ -3491,6 +3502,7 @@ def test_scan_exact_canary_candidate_for_approval_skips_route_stability_index(
     asyncio.run(run())
 
     assert captured["include_symbols"] == ["NEAR-USD-PERP"]
+    assert captured["use_execution_quality"] is False
     assert captured["use_route_stability"] is False
 
 
