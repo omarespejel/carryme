@@ -1387,6 +1387,56 @@ def _approved_snapshot_route_key(
     )
 
 
+def _normalized_approved_snapshot_launch_payload(
+    snapshot: ApprovedCanarySnapshot,
+) -> dict[str, object]:
+    """Return the approved-snapshot fields that must stay fixed for launch safety."""
+
+    candidate = snapshot.candidate
+    opportunity = candidate.opportunity.opportunity
+    approval = snapshot.approval
+    venue_markets = candidate.opportunity.venue_markets
+    return {
+        "label": snapshot.label,
+        "suggested_canary_notional": candidate.suggested_canary_notional,
+        "route": {
+            "canonical_symbol": opportunity.canonical_symbol,
+            "long_venue": opportunity.long_venue,
+            "short_venue": opportunity.short_venue,
+            "long_fee_profile": opportunity.long_fee_profile,
+            "short_fee_profile": opportunity.short_fee_profile,
+            "venue_markets": tuple(
+                sorted(
+                    (venue, market.symbol)
+                    for venue, market in venue_markets.items()
+                )
+            ),
+        },
+        "approval": {
+            "label": approval.label,
+            "canonical_symbol": approval.canonical_symbol,
+            "short_venue": approval.short_venue,
+            "long_venue": approval.long_venue,
+            "short_fee_profile": approval.short_fee_profile,
+            "long_fee_profile": approval.long_fee_profile,
+            "approved": approval.approved,
+            "max_live_notional": approval.max_live_notional,
+        },
+    }
+
+
+def _approved_snapshot_launch_payload_changed(
+    previous_snapshot: ApprovedCanarySnapshot,
+    current_snapshot: ApprovedCanarySnapshot,
+) -> bool:
+    """Return whether a newer approved snapshot invalidates stable launch evidence."""
+
+    return (
+        _normalized_approved_snapshot_launch_payload(previous_snapshot)
+        != _normalized_approved_snapshot_launch_payload(current_snapshot)
+    )
+
+
 def _effective_funding_window_hours(snapshot: ApprovedCanarySnapshot) -> float:
     """Return the fastest relevant funding interval across the route venues."""
 
@@ -3092,8 +3142,9 @@ async def launch_latest_stable_canary_once(
     skipped_candidates: list[_StableCanaryCandidateSkip] = []
 
     for candidate_stability in stable_candidates:
+        candidate_snapshot = candidate_stability.snapshot
         try:
-            candidate_snapshot, candidate_selected, candidate_approval = (
+            latest_launch_ready_snapshot, candidate_selected, candidate_approval = (
                 _select_latest_launch_ready_canary_snapshot(
                     store=launch_ready_store,
                     approval_service=route_approval_service,
@@ -3119,31 +3170,13 @@ async def launch_latest_stable_canary_once(
                 continue
             raise
 
-        try:
-            revalidated_stability = _build_launch_ready_canary_stability(
-                store=launch_ready_store,
-                label=candidate_snapshot.label,
-                max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
-                min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
-                min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
-                now=timestamp,
-            )
-        except HTTPException as exc:
-            detail = str(exc.detail) or (
-                "Launch-ready canary snapshot no longer satisfies stability requirements"
-            )
-            skipped_candidates.append(
-                _StableCanaryCandidateSkip(
-                    label=candidate_snapshot.label,
-                    launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-                    approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
-                    detail=detail,
-                )
-            )
-            continue
         if (
-            revalidated_stability.snapshot.launch_ready_snapshot_id
+            latest_launch_ready_snapshot.launch_ready_snapshot_id
             != candidate_snapshot.launch_ready_snapshot_id
+            and _launch_ready_snapshot_payload_changed(
+                candidate_snapshot,
+                latest_launch_ready_snapshot,
+            )
         ):
             skipped_candidates.append(
                 _StableCanaryCandidateSkip(
@@ -3151,11 +3184,17 @@ async def launch_latest_stable_canary_once(
                     launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
                     approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
                     detail=(
-                        "Launch-ready canary snapshot changed before stability could be revalidated"
+                        "Latest launch-ready canary snapshot changed route or readiness "
+                        "after stable evidence was collected"
                     ),
                 )
             )
             continue
+
+        launch_approved_snapshot_id = (
+            latest_launch_ready_snapshot.approved_snapshot.snapshot_id
+            or candidate_snapshot.approved_snapshot.snapshot_id
+        )
 
         label_cooldown_reason = _build_stable_launch_cooldown_reason(
             settings=settings,
@@ -3203,6 +3242,62 @@ async def launch_latest_stable_canary_once(
             )
             continue
         if latest_approved_snapshot.snapshot_id != candidate_snapshot.approved_snapshot.snapshot_id:
+            if _approved_snapshot_launch_payload_changed(
+                candidate_snapshot.approved_snapshot,
+                latest_approved_snapshot,
+            ):
+                skipped_candidates.append(
+                    _StableCanaryCandidateSkip(
+                        label=candidate_snapshot.label,
+                        launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                        approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                        detail=(
+                            "Launch-ready canary snapshot is stale relative to the latest "
+                            "approved snapshot"
+                        ),
+                    )
+                )
+                continue
+            latest_approval = route_approval_service.get_for_candidate(
+                latest_approved_snapshot.candidate
+            )
+            if latest_approval is None or not latest_approval.approved:
+                skipped_candidates.append(
+                    _StableCanaryCandidateSkip(
+                        label=candidate_snapshot.label,
+                        launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                        approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                        detail=(
+                            "Latest approved snapshot is no longer approved for live execution"
+                        ),
+                    )
+                )
+                continue
+            capped_notional = min(
+                latest_approved_snapshot.candidate.suggested_canary_notional,
+                latest_approval.max_live_notional,
+            )
+            if capped_notional <= 0:
+                skipped_candidates.append(
+                    _StableCanaryCandidateSkip(
+                        label=candidate_snapshot.label,
+                        launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                        approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                        detail=(
+                            "Latest approved snapshot no longer permits a positive live notional"
+                        ),
+                    )
+                )
+                continue
+            candidate_selected = latest_approved_snapshot.candidate.model_copy(
+                update={"suggested_canary_notional": capped_notional}
+            )
+            candidate_approval = latest_approval
+            launch_approved_snapshot_id = latest_approved_snapshot.snapshot_id
+        elif (
+            latest_launch_ready_snapshot.approved_snapshot.snapshot_id
+            != candidate_snapshot.approved_snapshot.snapshot_id
+        ):
             skipped_candidates.append(
                 _StableCanaryCandidateSkip(
                     label=candidate_snapshot.label,
@@ -3341,9 +3436,7 @@ async def launch_latest_stable_canary_once(
                             launch_ready_snapshot_id=(
                                 candidate_snapshot.launch_ready_snapshot_id
                             ),
-                            approved_snapshot_id=(
-                                candidate_snapshot.approved_snapshot.snapshot_id
-                            ),
+                            approved_snapshot_id=launch_approved_snapshot_id,
                             paper_trade_id=previous_launch.paper_trade_id,
                             final_pair_state=previous_launch.final_pair_state,
                             detail=(
@@ -3388,7 +3481,7 @@ async def launch_latest_stable_canary_once(
                     status="shadowed",
                     label=candidate_snapshot.label,
                     launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id or 0,
-                    approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id or 0,
+                    approved_snapshot_id=launch_approved_snapshot_id or 0,
                     paper_trade_id=0,
                     final_pair_state="shadowed",
                     detail="Shadow mode launch marker",
@@ -3399,7 +3492,7 @@ async def launch_latest_stable_canary_once(
                 database_path=settings.database_target,
                 label=candidate_snapshot.label,
                 launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-                approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                approved_snapshot_id=launch_approved_snapshot_id,
                 detail=(
                     "Shadow mode: would launch stable canary from launch-ready snapshot "
                     f"{candidate_snapshot.launch_ready_snapshot_id}"
@@ -3413,7 +3506,7 @@ async def launch_latest_stable_canary_once(
                 database_path=settings.database_target,
                 label=candidate_snapshot.label,
                 launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-                approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                approved_snapshot_id=launch_approved_snapshot_id,
                 detail=hold_mode_blocker,
             )
 
@@ -3435,7 +3528,7 @@ async def launch_latest_stable_canary_once(
                 _StableCanaryCandidateSkip(
                     label=candidate_snapshot.label,
                     launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-                    approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                    approved_snapshot_id=launch_approved_snapshot_id,
                     detail=(
                         "Latest launch-ready snapshot no longer satisfies live execution "
                         f"readiness: {'; '.join(execution_preflight.blocking_reasons)}"
@@ -3462,7 +3555,7 @@ async def launch_latest_stable_canary_once(
                     _StableCanaryCandidateSkip(
                         label=candidate_snapshot.label,
                         launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-                        approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                        approved_snapshot_id=launch_approved_snapshot_id,
                         detail=(
                             "Launch-ready canary snapshot is already reserved for launch "
                             "by worker"
@@ -3497,8 +3590,8 @@ async def launch_latest_stable_canary_once(
                 lifecycle_note=(
                     "Launched by carryme-worker from stable launch-ready snapshot "
                     f"{candidate_snapshot.launch_ready_snapshot_id} after "
-                    f"{revalidated_stability.consecutive_snapshots} stable snapshots over "
-                    f"{revalidated_stability.stable_seconds:.1f}s."
+                    f"{candidate_stability.consecutive_snapshots} stable snapshots over "
+                    f"{candidate_stability.stable_seconds:.1f}s."
                 ),
                 paper_store=PaperTradeStore(runtime_settings.database_path),
                 confirmation_store=PreviewConfirmationStore(runtime_settings.database_path),
@@ -3556,7 +3649,7 @@ async def launch_latest_stable_canary_once(
                     _StableCanaryCandidateSkip(
                         label=candidate_snapshot.label,
                         launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-                        approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                        approved_snapshot_id=launch_approved_snapshot_id,
                         detail=exc.detail,
                     )
                 )
@@ -3580,7 +3673,7 @@ async def launch_latest_stable_canary_once(
                 status="launched",
                 label=candidate_snapshot.label,
                 launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id or 0,
-                approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id or 0,
+                approved_snapshot_id=launch_approved_snapshot_id or 0,
                 paper_trade_id=paper_trade_id,
                 final_pair_state=lifecycle.final_pair_status.derived_state,
             )
@@ -3590,7 +3683,7 @@ async def launch_latest_stable_canary_once(
             database_path=settings.database_target,
             label=candidate_snapshot.label,
             launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+            approved_snapshot_id=launch_approved_snapshot_id,
             paper_trade_id=paper_trade_id,
             final_pair_state=lifecycle.final_pair_status.derived_state,
             detail=None,
@@ -3640,9 +3733,17 @@ async def run_supervised_stable_canary_launch_loop(
             else:
                 skipped += 1
             loop_logger.info(
-                "completed supervised stable canary launch cycle %s with status=%s",
+                "completed supervised stable canary launch cycle %s with status=%s "
+                "label=%s launch_ready_snapshot_id=%s approved_snapshot_id=%s "
+                "paper_trade_id=%s final_pair_state=%s detail=%s",
                 attempts,
                 summary.status,
+                summary.label,
+                summary.launch_ready_snapshot_id,
+                summary.approved_snapshot_id,
+                summary.paper_trade_id,
+                summary.final_pair_state,
+                summary.detail,
             )
             if max_iterations is not None and attempts >= max_iterations:
                 break
