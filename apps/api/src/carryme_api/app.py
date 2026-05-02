@@ -2133,14 +2133,24 @@ def _release_cleanup_live_submission_reservations(
         paper_trade=paper_trade,
         confirmation=confirmation,
     )
-    execution_store.release_live_submission(
+    released_live = execution_store.release_live_submission(
         confirmation_entry_id=confirmation.entry_id,
         preview_hash=confirmation.preview_hash,
     )
-    execution_store.release_cleanup_live_submission(
+    released_cleanup = execution_store.release_cleanup_live_submission(
         paper_trade_id=paper_trade_id,
         preview_hash=confirmation.preview_hash,
         confirmation_entry_id=confirmation.entry_id,
+    )
+    if released_live and released_cleanup:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Cleanup live submission failed before journaling, but its "
+            "reservations could not be safely released; manual reconciliation "
+            "is required before retrying"
+        ),
     )
 
 
@@ -4039,7 +4049,6 @@ async def _execute_guarded_pair_close_from_confirmation(
         _release_pair_close_reservations_or_raise()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
-        _release_pair_close_reservations_or_raise()
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     primary_execution = execution_store.append(primary_execution)
@@ -5967,6 +5976,10 @@ def create_app() -> FastAPI:
         preview_hash: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
         account_service: Annotated[
             AccountPreflightService,
@@ -5992,6 +6005,16 @@ def create_app() -> FastAPI:
         normalized_preview_hash = preview_hash.strip()
         if not normalized_preview_hash:
             raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
         await _ensure_cleanup_live_ready(
             venue="extended",
             settings=settings,
@@ -6064,6 +6087,10 @@ def create_app() -> FastAPI:
         preview_hash: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
         account_service: Annotated[
             AccountPreflightService,
@@ -6089,6 +6116,16 @@ def create_app() -> FastAPI:
         normalized_preview_hash = preview_hash.strip()
         if not normalized_preview_hash:
             raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
         await _ensure_cleanup_live_ready(
             venue="paradex",
             settings=settings,
@@ -6161,6 +6198,10 @@ def create_app() -> FastAPI:
         preview_hash: str,
         settings: Annotated[ApiSettings, Depends(get_api_settings)],
         paper_store: Annotated[PaperTradeStore, Depends(get_paper_trade_store)],
+        approval_service: Annotated[
+            RouteApprovalService,
+            Depends(get_route_approval_service),
+        ],
         execution_store: Annotated[ExecutionJournalStore, Depends(get_execution_journal_store)],
         account_service: Annotated[
             AccountPreflightService,
@@ -6186,6 +6227,16 @@ def create_app() -> FastAPI:
         normalized_preview_hash = preview_hash.strip()
         if not normalized_preview_hash:
             raise HTTPException(status_code=400, detail="preview_hash must be non-empty")
+        paper_trade = paper_store.get(paper_trade_id)
+        if paper_trade is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Paper trade {paper_trade_id} was not found",
+            )
+        _require_live_route_approval(
+            paper_trade=paper_trade,
+            approval_service=approval_service,
+        )
         await _ensure_cleanup_live_ready(
             venue="hyperliquid",
             settings=settings,
