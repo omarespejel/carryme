@@ -44,6 +44,7 @@ class WorkerSettings(BaseSettings):
         gt=0,
         le=MAX_RECENT_LABEL_LIMIT,
     )
+    stable_canary_launch_max_routes_per_cycle: int = Field(default=1, gt=0)
     stable_canary_launch_max_total_live_notional: float | None = Field(
         default=None,
         ge=0,
@@ -401,6 +402,20 @@ class WorkerSettings(BaseSettings):
             raise ValueError(
                 "stable_canary_launch_recent_launch_window_seconds is required when "
                 "stable launch rate caps are configured"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_stable_launch_multi_route_active_cap(self) -> "WorkerSettings":
+        """Require an explicit active-execution cap before enabling multi-route launch."""
+
+        if (
+            self.stable_canary_launch_max_routes_per_cycle > 1
+            and self.stable_canary_launch_max_active_live_executions <= 0
+        ):
+            raise ValueError(
+                "stable_canary_launch_max_active_live_executions must be positive when "
+                "stable_canary_launch_max_routes_per_cycle is greater than 1"
             )
         return self
 
