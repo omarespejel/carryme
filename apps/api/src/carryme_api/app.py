@@ -123,6 +123,7 @@ from carryme_runtime import (
     build_venue_execution_preflights,
     reconcile_execution,
     require_confirmed_cleanup_preview,
+    review_required_pair_requires_continued_monitoring,
 )
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_runtime.pair_close_preview import _pair_close_hash, select_pair_close_preview_venues
@@ -3189,6 +3190,11 @@ def _execution_requires_continued_monitoring(
                 break
         else:
             return True
+    if (
+        pair_status.derived_state == "review_required"
+        and not review_required_pair_requires_continued_monitoring(pair_status)
+    ):
+        return False
     return pair_status.derived_state in {
         "hedged",
         "cleanup_needed",

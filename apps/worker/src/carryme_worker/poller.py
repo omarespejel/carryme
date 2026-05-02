@@ -83,6 +83,7 @@ from carryme_runtime import (
     build_venue_execution_preflights,
     filter_candidate_records,
     reconcile_execution,
+    review_required_pair_requires_continued_monitoring,
 )
 from carryme_runtime.balance_accounting import FUNDING_WINDOW_CHECKPOINT_STAGE
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
@@ -5160,6 +5161,11 @@ def _execution_requires_continued_monitoring(
                 break
         else:
             return True
+    if (
+        pair_status.derived_state == "review_required"
+        and not review_required_pair_requires_continued_monitoring(pair_status)
+    ):
+        return False
     return pair_status.derived_state in {
         "hedged",
         "cleanup_needed",

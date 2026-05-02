@@ -98,6 +98,7 @@ from carryme_runtime import (
     reconcile_execution,
     require_confirmed_cleanup_preview,
     require_confirmed_preview,
+    review_required_pair_requires_continued_monitoring,
 )
 from carryme_runtime.account_preflight import (
     AUTH_READ_RETRY_ATTEMPTS,
@@ -11323,6 +11324,161 @@ def test_build_execution_pair_status_marks_single_leg_cleanup_as_closed_when_pos
     assert status.derived_state == "closed"
     assert status.recommended_action == "no_action"
     assert any("no live positions remaining" in note.lower() for note in status.notes)
+
+
+def test_review_required_pair_without_positions_does_not_require_continued_monitoring(
+) -> None:
+    order_state = ExecutionOrderState(
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview",
+        legs=[
+            ExecutionLegOrderState(
+                venue="paradex",
+                supported=True,
+                external_reference="paradex-order",
+                client_id="carryme-pt10-paradex-buy",
+                derived_state="filled",
+                order_status="CLOSED",
+                avg_fill_price="0.1639",
+                remaining_size="0",
+                size="152",
+            ),
+            ExecutionLegOrderState(
+                venue="extended",
+                supported=True,
+                external_reference="carryme-pt10-extended-sell",
+                client_id="carryme-pt10-extended-sell",
+                derived_state="unknown",
+                notes=[
+                    "Extended private API currently exposes open orders only; "
+                    "absence here does not distinguish filled from closed."
+                ],
+                raw_response={"orders": []},
+            ),
+        ],
+        notes=[],
+    )
+    reconciliation = ExecutionReconciliation(
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview",
+        status="submitted",
+        recommended_action="verify_fill_status",
+        matched_all_leg_symbols=False,
+        venues=[
+            ExecutionVenueReconciliation(
+                venue="paradex",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                unmatched_leg_symbols=["JUP-USD-PERP"],
+            ),
+            ExecutionVenueReconciliation(
+                venue="extended",
+                authenticated=True,
+                ready=True,
+                position_symbols=[],
+                unmatched_leg_symbols=["JUP-USD"],
+            ),
+        ],
+        notes=[],
+    )
+    pair_status = ExecutionPairStatus(
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview",
+        derived_state="review_required",
+        recommended_action="manual_review_required",
+        order_state=order_state,
+        reconciliation=reconciliation,
+        notes=[],
+    )
+
+    assert not review_required_pair_requires_continued_monitoring(pair_status)
+
+
+def test_review_required_pair_with_position_requires_continued_monitoring() -> None:
+    order_state = ExecutionOrderState(
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview",
+        legs=[],
+        notes=[],
+    )
+    pair_status = ExecutionPairStatus(
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview",
+        derived_state="review_required",
+        recommended_action="manual_review_required",
+        order_state=order_state,
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=20,
+            paper_trade_id=10,
+            preview_hash="preview",
+            status="submitted",
+            recommended_action="verify_fill_status",
+            matched_all_leg_symbols=False,
+            venues=[
+                ExecutionVenueReconciliation(
+                    venue="paradex",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=["JUP-USD-PERP"],
+                    matched_leg_symbols=["JUP-USD-PERP"],
+                )
+            ],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    assert review_required_pair_requires_continued_monitoring(pair_status)
+
+
+def test_review_required_pair_with_open_order_requires_continued_monitoring() -> None:
+    pair_status = ExecutionPairStatus(
+        execution_entry_id=20,
+        paper_trade_id=10,
+        preview_hash="preview",
+        derived_state="review_required",
+        recommended_action="manual_review_required",
+        order_state=ExecutionOrderState(
+            execution_entry_id=20,
+            paper_trade_id=10,
+            preview_hash="preview",
+            legs=[
+                ExecutionLegOrderState(
+                    venue="extended",
+                    supported=True,
+                    external_reference="extended-order",
+                    derived_state="open",
+                )
+            ],
+            notes=[],
+        ),
+        reconciliation=ExecutionReconciliation(
+            execution_entry_id=20,
+            paper_trade_id=10,
+            preview_hash="preview",
+            status="submitted",
+            recommended_action="verify_fill_status",
+            matched_all_leg_symbols=False,
+            venues=[
+                ExecutionVenueReconciliation(
+                    venue="extended",
+                    authenticated=True,
+                    ready=True,
+                    position_symbols=[],
+                )
+            ],
+            notes=[],
+        ),
+        notes=[],
+    )
+
+    assert review_required_pair_requires_continued_monitoring(pair_status)
 
 
 def test_extended_cleanup_preview_service_builds_reduce_only_close(
