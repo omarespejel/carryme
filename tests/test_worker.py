@@ -131,6 +131,7 @@ from carryme_worker.poller import (
     _build_open_hedge_profit_protection_reason,
     _build_order_state_observers,
     _build_stable_launch_loss_circuit_breaker_reason,
+    _build_stable_launch_slippage_adjusted_pnl_reason,
     _execution_requires_continued_monitoring,
     _list_ranked_stable_launch_ready_stabilities,
     _max_stable_launch_routes_this_cycle,
@@ -4678,6 +4679,23 @@ def _build_stable_launch_test_snapshot(
         min_stable_seconds=30.0,
     )
     return approval, candidate, snapshot, stability
+
+
+def test_stable_launch_slippage_guard_preserves_baseline_default_behavior() -> None:
+    settings = WorkerSettings(stable_canary_launch_slippage_tolerance_bps=20)
+    _, candidate, _, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        deployable_notional=1_000.0,
+        estimated_one_day_pnl_after_round_trip=-0.5,
+    )
+
+    assert (
+        _build_stable_launch_slippage_adjusted_pnl_reason(
+            settings=settings,
+            candidate=candidate,
+        )
+        is None
+    )
 
 
 def _append_stable_launch_ready_pair(

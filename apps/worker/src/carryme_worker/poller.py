@@ -1064,10 +1064,21 @@ def _build_stable_launch_slippage_adjusted_pnl_reason(
         candidate=candidate,
         slippage_tolerance_bps=settings.stable_canary_launch_slippage_tolerance_bps,
     )
+    configured_min_expected_pnl = settings.stable_canary_launch_min_expected_one_day_round_trip_pnl
+    configured_min_slippage_adjusted_pnl = (
+        settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl
+    )
+    if (
+        extra_slippage_cost <= 0
+        and configured_min_slippage_adjusted_pnl <= 0
+        and configured_min_expected_pnl is None
+    ):
+        return None
+
     adjusted_pnl = scaled_round_trip_pnl - extra_slippage_cost
     min_adjusted_pnl = max(
-        settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl,
-        settings.stable_canary_launch_min_expected_one_day_round_trip_pnl or 0.0,
+        configured_min_slippage_adjusted_pnl,
+        configured_min_expected_pnl or 0.0,
     )
     if adjusted_pnl + 1e-9 >= min_adjusted_pnl:
         return None
