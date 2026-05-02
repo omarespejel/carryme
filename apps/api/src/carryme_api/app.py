@@ -186,6 +186,7 @@ PAIR_STATUS_POLL_CALL_TIMEOUT_SECONDS = 10.0
 UNIVERSE_SCAN_TIMEOUT_SECONDS = 20.0
 UNIVERSE_SCAN_ACQUIRE_TIMEOUT_SECONDS = 0.25
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+DEFAULT_CANARY_EXCLUDE_TAGS = ["meme", "political"]
 logger = logging.getLogger(__name__)
 _UNIVERSE_SCAN_SEMAPHORE = asyncio.Semaphore(1)
 
@@ -2488,12 +2489,45 @@ def _record_capacity_notional(record: OpportunityRecord) -> float:
 
 
 def _min_saved_liquidity_values(short_value: float | None, long_value: float | None) -> float:
-    """Return the weaker saved venue metric for volume/OI filters."""
+    """Return the weaker saved metric, failing closed when either side is missing."""
 
-    values = [value for value in (short_value, long_value) if value is not None]
-    if not values:
+    if short_value is None or long_value is None:
         return 0.0
-    return min(values)
+    return min(short_value, long_value)
+
+
+def _canary_candidate_identity(candidate: FundingUniverseCanaryCandidate) -> tuple[str, ...]:
+    """Return a stable identity for deduping canary candidates across scans."""
+
+    opportunity = candidate.opportunity.opportunity
+    return (
+        opportunity.canonical_symbol,
+        opportunity.short_venue,
+        opportunity.long_venue,
+        opportunity.short_fee_profile,
+        opportunity.long_fee_profile,
+    )
+
+
+def _merge_canary_candidates(
+    first: list[FundingUniverseCanaryCandidate],
+    second: list[FundingUniverseCanaryCandidate],
+    *,
+    limit: int,
+) -> list[FundingUniverseCanaryCandidate]:
+    """Merge shortlist and broad-scan candidates without duplicating routes."""
+
+    merged: list[FundingUniverseCanaryCandidate] = []
+    seen: set[tuple[str, ...]] = set()
+    for candidate in [*first, *second]:
+        identity = _canary_candidate_identity(candidate)
+        if identity in seen:
+            continue
+        merged.append(candidate)
+        seen.add(identity)
+        if len(merged) >= limit:
+            break
+    return merged
 
 
 def _select_canary_reprice_symbols_from_history(
@@ -7063,51 +7097,75 @@ def create_app() -> FastAPI:
                 _validated_history_limit("history_shortlist_limit", history_shortlist_limit),
             )
             selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
+            effective_exclude_tags = exclude_tags or DEFAULT_CANARY_EXCLUDE_TAGS
             effective_include_symbols = include_symbols
+            used_history_shortlist = False
+            broad_candidate_sample = candidate_sample
             if use_history_shortlist and include_symbols is None:
-                shortlisted_symbols = _select_canary_reprice_symbols_from_history(
-                    history_store,
-                    sample=history_shortlist_sample,
-                    limit=history_shortlist_limit,
-                    venues=selected_venues,
-                    exclude_symbols=exclude_symbols,
-                    exclude_tags=exclude_tags,
-                    min_roundtrip_edge=min_roundtrip_edge,
-                    min_capacity_notional=min_capacity_notional,
-                    min_daily_volume=min_daily_volume,
-                    min_open_interest=min_open_interest,
-                )
+                try:
+                    shortlisted_symbols = await asyncio.to_thread(
+                        _select_canary_reprice_symbols_from_history,
+                        history_store,
+                        sample=history_shortlist_sample,
+                        limit=history_shortlist_limit,
+                        venues=selected_venues,
+                        exclude_symbols=exclude_symbols,
+                        exclude_tags=effective_exclude_tags,
+                        min_roundtrip_edge=min_roundtrip_edge,
+                        min_capacity_notional=min_capacity_notional,
+                        min_daily_volume=min_daily_volume,
+                        min_open_interest=min_open_interest,
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to build history shortlist for canary approval proposals"
+                    )
+                    shortlisted_symbols = []
                 if shortlisted_symbols:
                     effective_include_symbols = shortlisted_symbols
-                    candidate_sample = min(candidate_sample, len(shortlisted_symbols))
+                    used_history_shortlist = True
             generated_at = datetime.now(UTC)
-            candidates = await _run_bounded_universe_scan(
-                "funding universe canary approval proposal scan",
-                lambda: service.scan_canary_candidates(
-                    venues=selected_venues,
-                    fee_profile_overrides=_build_fee_profile_overrides(
-                        extended_fee_profile=extended_fee_profile,
-                        paradex_fee_profile=paradex_fee_profile,
-                        hyperliquid_fee_profile=hyperliquid_fee_profile,
-                        selected_venues=selected_venues,
+
+            async def _scan_candidates(
+                include_symbols_override: list[str] | None,
+                scan_limit: int,
+            ) -> list[FundingUniverseCanaryCandidate]:
+                return await _run_bounded_universe_scan(
+                    "funding universe canary approval proposal scan",
+                    lambda: service.scan_canary_candidates(
+                        venues=selected_venues,
+                        fee_profile_overrides=_build_fee_profile_overrides(
+                            extended_fee_profile=extended_fee_profile,
+                            paradex_fee_profile=paradex_fee_profile,
+                            hyperliquid_fee_profile=hyperliquid_fee_profile,
+                            selected_venues=selected_venues,
+                        ),
+                        target_notional=target_notional,
+                        canary_max_notional=canary_max_notional,
+                        min_capacity_notional=min_capacity_notional,
+                        min_daily_volume=min_daily_volume,
+                        min_open_interest=min_open_interest,
+                        min_roundtrip_edge=min_roundtrip_edge,
+                        min_execution_quality_score=min_execution_quality_score,
+                        min_execution_samples=min_execution_samples,
+                        min_route_stability_weight=min_route_stability_weight,
+                        min_route_presence_ratio=min_route_presence_ratio,
+                        min_route_samples=min_route_samples,
+                        include_symbols=include_symbols_override,
+                        exclude_symbols=exclude_symbols,
+                        exclude_tags=effective_exclude_tags,
+                        limit=scan_limit,
                     ),
-                    target_notional=target_notional,
-                    canary_max_notional=canary_max_notional,
-                    min_capacity_notional=min_capacity_notional,
-                    min_daily_volume=min_daily_volume,
-                    min_open_interest=min_open_interest,
-                    min_roundtrip_edge=min_roundtrip_edge,
-                    min_execution_quality_score=min_execution_quality_score,
-                    min_execution_samples=min_execution_samples,
-                    min_route_stability_weight=min_route_stability_weight,
-                    min_route_presence_ratio=min_route_presence_ratio,
-                    min_route_samples=min_route_samples,
-                    include_symbols=effective_include_symbols,
-                    exclude_symbols=exclude_symbols,
-                    exclude_tags=exclude_tags,
-                    limit=candidate_sample,
-                ),
-            )
+                )
+
+            candidates = await _scan_candidates(effective_include_symbols, candidate_sample)
+            if used_history_shortlist and len(candidates) < limit:
+                broad_candidates = await _scan_candidates(None, broad_candidate_sample)
+                candidates = _merge_canary_candidates(
+                    candidates,
+                    broad_candidates,
+                    limit=broad_candidate_sample,
+                )
             proposals = approval_service.propose_canary_route_approvals(
                 candidates,
                 limit=limit,
