@@ -110,6 +110,53 @@ from pydantic import SecretStr, ValidationError
 FIXED_APPROVAL_PROPOSAL_NOW = datetime(2026, 4, 3, 12, 0, tzinfo=UTC)
 
 
+def _canary_approval_proposal_summary_payload(
+    *,
+    generated_at: datetime = FIXED_APPROVAL_PROPOSAL_NOW,
+    label: str = "arb_extended_paradex",
+    pair_label: str | None = "arb_extended_paradex",
+    approval_payload_overrides: dict[str, object] | None = None,
+) -> dict[str, object]:
+    approval_payload: dict[str, object] = {
+        "canonical_symbol": "ARB-USD-PERP",
+        "short_venue": "extended",
+        "long_venue": "paradex",
+        "short_fee_profile": "default",
+        "long_fee_profile": "pro_fastfills",
+        "approved": False,
+        "max_live_notional": 25.0,
+        "note": "Review before approving live canary route.",
+    }
+    approval_payload.update(approval_payload_overrides or {})
+    return {
+        "generated_at": generated_at.isoformat(),
+        "candidate_rank": 1,
+        "label": label,
+        "canonical_symbol": "ARB-USD-PERP",
+        "short_venue": "extended",
+        "long_venue": "paradex",
+        "short_fee_profile": "default",
+        "long_fee_profile": "pro_fastfills",
+        "approval_status": "missing",
+        "suggested_canary_notional": 25.0,
+        "suggested_max_live_notional": 25.0,
+        "deployable_notional": 900.0,
+        "estimated_one_day_pnl_after_round_trip": 2.79,
+        "route_adjusted_quality_score": 0.75,
+        "pair": {
+            "label": pair_label,
+            "left_venue": "extended",
+            "left_symbol": "ARB-USD",
+            "left_fee_profile": "default",
+            "right_venue": "paradex",
+            "right_symbol": "ARB-USD-PERP",
+            "right_fee_profile": "pro_fastfills",
+        },
+        "approval_payload": approval_payload,
+        "existing_approval": None,
+    }
+
+
 def test_health_endpoint() -> None:
     client = TestClient(app)
 
@@ -1149,6 +1196,137 @@ def test_funding_universe_canary_approval_proposals_endpoint_uses_candidate_samp
     assert payload[0]["suggested_canary_notional"] == 25.0
     assert payload[0]["approval_payload"]["approved"] is False
     assert "candidate" not in payload[0]
+
+
+def test_approve_canary_approval_proposal_promotes_current_payload() -> None:
+    captured: dict[str, object] = {}
+
+    class StubRouteApprovalService:
+        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
+            captured["label"] = label
+            captured["payload"] = payload
+            return RouteApprovalEntry(
+                updated_at=FIXED_APPROVAL_PROPOSAL_NOW,
+                label=label,
+                canonical_symbol=payload.canonical_symbol,
+                short_venue=payload.short_venue,
+                long_venue=payload.long_venue,
+                short_fee_profile=payload.short_fee_profile,
+                long_fee_profile=payload.long_fee_profile,
+                approved=payload.approved,
+                max_live_notional=payload.max_live_notional,
+                note=payload.note,
+            )
+
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/v1/opportunities/funding-universe/canary/approval-proposals/"
+            "arb_extended_paradex/approve",
+            json=_canary_approval_proposal_summary_payload(),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["label"] == "arb_extended_paradex"
+    promoted = cast(RouteApprovalUpsert, captured["payload"])
+    assert promoted.approved is True
+    assert promoted.max_live_notional == 25.0
+    assert promoted.canonical_symbol == "ARB-USD-PERP"
+    assert promoted.note is not None
+    assert "Approved from current canary approval proposal" in promoted.note
+    assert response.json()["approved"] is True
+
+
+def test_approve_canary_approval_proposal_rejects_stale_payload() -> None:
+    called = False
+
+    class StubRouteApprovalService:
+        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
+            nonlocal called
+            called = True
+            raise AssertionError("stale proposal must not be promoted")
+
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/v1/opportunities/funding-universe/canary/approval-proposals/"
+            "arb_extended_paradex/approve",
+            json=_canary_approval_proposal_summary_payload(
+                generated_at=FIXED_APPROVAL_PROPOSAL_NOW - timedelta(seconds=301)
+            ),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "approval proposal is stale (301.0s > 300s)"
+    assert called is False
+
+
+def test_approve_canary_approval_proposal_rejects_identity_mismatch() -> None:
+    called = False
+
+    class StubRouteApprovalService:
+        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
+            nonlocal called
+            called = True
+            raise AssertionError("mismatched proposal must not be promoted")
+
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/v1/opportunities/funding-universe/canary/approval-proposals/"
+            "arb_extended_paradex/approve",
+            json=_canary_approval_proposal_summary_payload(
+                approval_payload_overrides={"long_fee_profile": "vip"}
+            ),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "approval proposal payload does not match summary field long_fee_profile"
+    )
+    assert called is False
+
+
+def test_approve_canary_approval_proposal_rejects_cap_above_proposal() -> None:
+    called = False
+
+    class StubRouteApprovalService:
+        def upsert(self, *, label: str, payload: RouteApprovalUpsert) -> RouteApprovalEntry:
+            nonlocal called
+            called = True
+            raise AssertionError("cap-widening proposal must not be promoted")
+
+    app.dependency_overrides[get_current_utc_time] = lambda: FIXED_APPROVAL_PROPOSAL_NOW
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/v1/opportunities/funding-universe/canary/approval-proposals/"
+            "arb_extended_paradex/approve",
+            json=_canary_approval_proposal_summary_payload(
+                approval_payload_overrides={"max_live_notional": 30.0}
+            ),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "approval proposal payload max_live_notional exceeds the suggested proposal cap"
+    )
+    assert called is False
 
 
 def test_funding_universe_canary_approval_proposals_rejects_unbounded_history_shortlist_age(

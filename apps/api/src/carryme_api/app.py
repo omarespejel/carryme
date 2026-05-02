@@ -189,6 +189,8 @@ MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 DEFAULT_CANARY_EXCLUDE_TAGS = ["meme", "political"]
 DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS = 3600
 MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+DEFAULT_APPROVAL_PROPOSAL_MAX_AGE_SECONDS = 300
+MAX_APPROVAL_PROPOSAL_MAX_AGE_SECONDS = 3600
 MIN_AWARE_UTC_DATETIME = datetime.min.replace(tzinfo=UTC)
 logger = logging.getLogger(__name__)
 _UNIVERSE_SCAN_SEMAPHORE = asyncio.Semaphore(1)
@@ -432,6 +434,106 @@ def _summarize_canary_approval_proposal(
         pair=proposal.pair,
         approval_payload=proposal.approval_payload,
         existing_approval=proposal.existing_approval,
+    )
+
+
+def _build_approved_route_payload_from_canary_proposal(
+    *,
+    label: str,
+    proposal: FundingUniverseCanaryApprovalProposalSummary,
+    current_time: datetime,
+    max_proposal_age_seconds: int,
+) -> RouteApprovalUpsert:
+    """Return a live-approved route payload from a current operator-reviewed proposal."""
+
+    if max_proposal_age_seconds < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="max_proposal_age_seconds must be at least 1",
+        )
+    if max_proposal_age_seconds > MAX_APPROVAL_PROPOSAL_MAX_AGE_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "max_proposal_age_seconds must be at most "
+                f"{MAX_APPROVAL_PROPOSAL_MAX_AGE_SECONDS}"
+            ),
+        )
+    if proposal.label != label:
+        raise HTTPException(
+            status_code=400,
+            detail="approval proposal label does not match requested route label",
+        )
+    if proposal.pair.label is not None and proposal.pair.label != proposal.label:
+        raise HTTPException(
+            status_code=400,
+            detail="approval proposal pair label does not match requested route label",
+        )
+
+    generated_at = _ensure_aware_utc(proposal.generated_at)
+    checked_at = _ensure_aware_utc(current_time)
+    age_seconds = (checked_at - generated_at).total_seconds()
+    if age_seconds < 0:
+        raise HTTPException(
+            status_code=409,
+            detail="approval proposal was generated in the future",
+        )
+    if age_seconds > max_proposal_age_seconds:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "approval proposal is stale "
+                f"({age_seconds:.1f}s > {max_proposal_age_seconds}s)"
+            ),
+        )
+
+    proposal_payload = proposal.approval_payload
+    if proposal_payload.approved:
+        raise HTTPException(
+            status_code=400,
+            detail="approval proposal payload must be unapproved before promotion",
+        )
+
+    identity_fields = (
+        "canonical_symbol",
+        "short_venue",
+        "long_venue",
+        "short_fee_profile",
+        "long_fee_profile",
+    )
+    for field in identity_fields:
+        if getattr(proposal, field) == getattr(proposal_payload, field):
+            continue
+        raise HTTPException(
+            status_code=400,
+            detail=f"approval proposal payload does not match summary field {field}",
+        )
+
+    if (
+        proposal_payload.max_live_notional
+        - proposal.suggested_max_live_notional
+        > 1e-9
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "approval proposal payload max_live_notional exceeds the suggested "
+                "proposal cap"
+            ),
+        )
+
+    existing_note = (proposal_payload.note or "").strip()
+    promotion_note = (
+        "Approved from current canary approval proposal "
+        f"generated_at={generated_at.isoformat()} "
+        f"rank={proposal.candidate_rank} status={proposal.approval_status}."
+    )
+    note = f"{existing_note} {promotion_note}".strip()
+    return proposal_payload.model_copy(
+        update={
+            "approved": True,
+            "note": note,
+        }
     )
 
 
@@ -7321,6 +7423,25 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (ConnectorError, UpstreamDataError, httpx.HTTPError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post(
+        "/v1/opportunities/funding-universe/canary/approval-proposals/{label}/approve",
+        response_model=RouteApprovalEntry,
+    )
+    def approve_funding_universe_canary_approval_proposal(
+        label: str,
+        service: Annotated[RouteApprovalService, Depends(get_route_approval_service)],
+        payload: Annotated[FundingUniverseCanaryApprovalProposalSummary, Body()],
+        current_time: Annotated[datetime, Depends(get_current_utc_time)],
+        max_proposal_age_seconds: int = DEFAULT_APPROVAL_PROPOSAL_MAX_AGE_SECONDS,
+    ) -> RouteApprovalEntry:
+        approval_payload = _build_approved_route_payload_from_canary_proposal(
+            label=label,
+            proposal=payload,
+            current_time=current_time,
+            max_proposal_age_seconds=max_proposal_age_seconds,
+        )
+        return service.upsert(label=label, payload=approval_payload)
 
     @app.post(
         "/v1/executions/live/canary-cycle/approved-basket",
