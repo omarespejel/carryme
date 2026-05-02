@@ -188,6 +188,7 @@ UNIVERSE_SCAN_ACQUIRE_TIMEOUT_SECONDS = 0.25
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 DEFAULT_CANARY_EXCLUDE_TAGS = ["meme", "political"]
 DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS = 3600
+MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 logger = logging.getLogger(__name__)
 _UNIVERSE_SCAN_SEMAPHORE = asyncio.Semaphore(1)
 
@@ -444,6 +445,12 @@ def get_app_environment() -> str:
 
 def get_automation_readiness_checked_at() -> datetime:
     """Return the authoritative UTC evaluation time for automation readiness."""
+
+    return datetime.now(UTC)
+
+
+def get_current_utc_time() -> datetime:
+    """Return the current UTC time through a dependency for deterministic tests."""
 
     return datetime.now(UTC)
 
@@ -2561,7 +2568,12 @@ def _select_canary_reprice_symbols_from_history(
     """Select saved symbols worth live repricing before approval proposal generation."""
 
     selected_venues = {venue.strip().lower() for venue in venues if venue.strip()}
-    cutoff = _ensure_aware_utc(now) - timedelta(seconds=max_age_seconds)
+    if max_age_seconds < 1 or max_age_seconds > MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS:
+        return []
+    try:
+        cutoff = _ensure_aware_utc(now) - timedelta(seconds=max_age_seconds)
+    except OverflowError:
+        return []
     records = [
         record
         for record in store.list_recent(limit=sample)
@@ -2609,7 +2621,7 @@ def _select_canary_reprice_symbols_from_history(
             record.opportunity.one_day_net_edge_after_round_trip,
             record.opportunity.one_day_net_edge_after_entry,
             _record_capacity_notional(record),
-            record.recorded_at.timestamp(),
+            _ensure_aware_utc(record.recorded_at).timestamp(),
         ),
         reverse=True,
     )
@@ -7080,6 +7092,7 @@ def create_app() -> FastAPI:
             Depends(get_route_approval_service),
         ],
         history_store: Annotated[OpportunityHistoryStore, Depends(get_history_store)],
+        current_time: Annotated[datetime, Depends(get_current_utc_time)],
         venues: Annotated[list[str] | None, Query()] = None,
         extended_fee_profile: str | None = None,
         paradex_fee_profile: str | None = "pro_fastfills",
@@ -7124,6 +7137,14 @@ def create_app() -> FastAPI:
                     status_code=400,
                     detail="history_shortlist_max_age_seconds must be at least 1",
                 )
+            if history_shortlist_max_age_seconds > MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "history_shortlist_max_age_seconds must be at most "
+                        f"{MAX_HISTORY_SHORTLIST_MAX_AGE_SECONDS}"
+                    ),
+                )
             selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
             effective_exclude_tags = (
                 DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags
@@ -7138,7 +7159,7 @@ def create_app() -> FastAPI:
                         history_store,
                         sample=history_shortlist_sample,
                         limit=history_shortlist_limit,
-                        now=datetime.now(UTC),
+                        now=current_time,
                         max_age_seconds=history_shortlist_max_age_seconds,
                         venues=selected_venues,
                         exclude_symbols=exclude_symbols,
@@ -7156,7 +7177,7 @@ def create_app() -> FastAPI:
                 if shortlisted_symbols:
                     effective_include_symbols = shortlisted_symbols
                     used_history_shortlist = True
-            generated_at = datetime.now(UTC)
+            generated_at = current_time
 
             async def _scan_candidates(
                 include_symbols_override: list[str] | None,
