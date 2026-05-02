@@ -8918,8 +8918,9 @@ def test_paired_live_execution_coordinator_submits_both_legs() -> None:
             confirmation: PreviewConfirmationEntry,
             executed_at: datetime | None = None,
         ) -> ExecutionJournalEntry:
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter=f"{self.venue}_live",
                 mode="live",
                 status="submitted",
@@ -9064,8 +9065,9 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
             executed_at: datetime | None = None,
         ) -> ExecutionJournalEntry:
             seen_venues.append(self.venue)
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter=f"{self.venue}_live",
                 mode="live",
                 status="submitted",
@@ -9118,6 +9120,7 @@ def test_paired_live_execution_coordinator_auto_prefers_paradex_first() -> None:
         ("partial_fill", "partial"),
         ("open", "partial"),
         ("unknown", "partial"),
+        ("missing_observation", "partial"),
     ],
 )
 def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled(
@@ -9216,8 +9219,33 @@ def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled
             confirmation: PreviewConfirmationEntry,
             executed_at: datetime | None = None,
         ) -> ExecutionJournalEntry:
+            if first_leg_state == "missing_observation":
+                response_payload: dict[str, Any] = {
+                    "id": "zro-paradex-order",
+                    "status": "submitted",
+                }
+            else:
+                response_payload = {
+                    "observed_order_state": {
+                        "derived_state": first_leg_state,
+                        "size": "71.2",
+                        "remaining_size": remaining_size,
+                        "avg_fill_price": avg_fill_price,
+                    },
+                    "attempt_history": [
+                        {
+                            "observed_order_state": {
+                                "derived_state": first_leg_state,
+                                "size": "71.2",
+                                "remaining_size": remaining_size,
+                                "avg_fill_price": avg_fill_price,
+                            }
+                        }
+                    ],
+                }
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter="paradex_live",
                 mode="live",
                 status="submitted",
@@ -9235,24 +9263,7 @@ def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled
                         status="submitted",
                         simulated=False,
                         external_reference="zro-paradex-order",
-                        response_payload={
-                            "observed_order_state": {
-                                "derived_state": first_leg_state,
-                                "size": "71.2",
-                                "remaining_size": remaining_size,
-                                "avg_fill_price": avg_fill_price,
-                            },
-                            "attempt_history": [
-                                {
-                                    "observed_order_state": {
-                                        "derived_state": first_leg_state,
-                                        "size": "71.2",
-                                        "remaining_size": remaining_size,
-                                        "avg_fill_price": avg_fill_price,
-                                    }
-                                }
-                            ],
-                        },
+                        response_payload=response_payload,
                     )
                 ],
             )
@@ -9283,9 +9294,12 @@ def test_paired_live_execution_coordinator_stops_when_first_leg_not_fully_filled
         assert [leg.venue for leg in entry.legs] == ["paradex"]
         response_payload = entry.legs[0].response_payload
         assert isinstance(response_payload, dict)
-        observed_order_state = response_payload["observed_order_state"]
-        assert isinstance(observed_order_state, dict)
-        assert observed_order_state["derived_state"] == first_leg_state
+        if first_leg_state == "missing_observation":
+            assert "observed_order_state" not in response_payload
+        else:
+            observed_order_state = response_payload["observed_order_state"]
+            assert isinstance(observed_order_state, dict)
+            assert observed_order_state["derived_state"] == first_leg_state
 
     asyncio.run(run())
 
@@ -9395,8 +9409,9 @@ def test_paired_live_execution_coordinator_marks_partial_when_second_leg_fails()
             confirmation: PreviewConfirmationEntry,
             executed_at: datetime | None = None,
         ) -> ExecutionJournalEntry:
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter="extended_live",
                 mode="live",
                 status="submitted",
@@ -9549,8 +9564,9 @@ def test_paired_live_execution_coordinator_supports_hyperliquid_leg() -> None:
             )
             fee_profile = "default" if self.venue == "extended" else "tier0"
             side: Literal["buy", "sell"] = "sell" if self.venue == "extended" else "buy"
+            assert executed_at is not None
             return ExecutionJournalEntry(
-                executed_at=executed_at or datetime.now(UTC),
+                executed_at=executed_at,
                 adapter=f"{self.venue}_live",
                 mode="live",
                 status="submitted",

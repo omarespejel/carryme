@@ -226,6 +226,13 @@ class PairedLiveExecutionCoordinator:
 
         attempt_history = payload.get("attempt_history")
         if not isinstance(attempt_history, list):
+            logger.warning(
+                "missing observed order state in live execution leg payload venue=%r "
+                "external_reference=%r payload=%r",
+                leg.venue,
+                leg.external_reference,
+                payload,
+            )
             return "unknown"
         for attempt in reversed(attempt_history):
             if not isinstance(attempt, dict):
