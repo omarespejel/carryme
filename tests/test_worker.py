@@ -8147,7 +8147,7 @@ def test_launch_latest_stable_canary_once_returns_launched_summary(
                 "execution_balance_checkpoint_enabled": True,
             },
             "Stable launch hold mode is blocked because "
-            "execution_auto_pair_close_max_profit_giveback_ratio must be between 0 and 1",
+            "execution_auto_pair_close_max_profit_giveback_ratio must satisfy 0 < ratio < 1",
         ),
     ),
 )
