@@ -219,7 +219,7 @@ class OpportunityUniverseService:
             min_route_samples=min_route_samples,
             include_symbols=include_symbols,
             exclude_symbols=exclude_symbols,
-            exclude_tags=exclude_tags or ["meme", "political"],
+            exclude_tags=["meme", "political"] if exclude_tags is None else exclude_tags,
             limit=limit,
             use_execution_quality=use_execution_quality,
             use_route_stability=use_route_stability,

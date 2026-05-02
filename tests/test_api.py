@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -1152,7 +1152,7 @@ def test_funding_universe_canary_approval_proposals_uses_history_shortlist(
     tmp_path: Path,
 ) -> None:
     store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
-    now = datetime(2026, 3, 29, 12, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
     for label, symbol, roundtrip_edge, capacity in (
         ("ton_extended_paradex", "TON-USD-PERP", 0.003, 2_500.0),
         ("zro_extended_paradex", "ZRO-USD-PERP", 0.002, 1_500.0),
@@ -1282,7 +1282,7 @@ def test_funding_universe_canary_approval_proposals_shortlist_matches_live_polic
     tmp_path: Path,
 ) -> None:
     store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
-    now = datetime(2026, 3, 29, 12, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
     for label, symbol, short_daily_volume, long_daily_volume in (
         ("wif_extended_paradex", "WIF-USD-PERP", 1_000_000.0, 1_000_000.0),
         ("ton_extended_paradex", "TON-USD-PERP", None, 1_000_000.0),
@@ -1366,13 +1366,91 @@ def test_funding_universe_canary_approval_proposals_shortlist_matches_live_polic
     assert calls[0]["exclude_tags"] == ["meme", "political"]
 
 
+def test_funding_universe_canary_approval_proposals_ignores_stale_history_shortlist(
+    tmp_path: Path,
+) -> None:
+    store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
+    store.append(
+        OpportunityRecord(
+            recorded_at=datetime.now(UTC) - timedelta(hours=2),
+            pair=FundingPairSpec(
+                label="ton_extended_paradex",
+                left_venue="extended",
+                left_symbol="TON-USD",
+                left_fee_profile="default",
+                right_venue="paradex",
+                right_symbol="TON-USD-PERP",
+                right_fee_profile="pro_fastfills",
+            ),
+            opportunity=FundingArbOpportunity(
+                canonical_symbol="TON-USD-PERP",
+                long_venue="paradex",
+                short_venue="extended",
+                long_fee_profile="pro_fastfills",
+                short_fee_profile="default",
+                gross_daily_edge=0.004,
+                entry_cost_rate=0.0003,
+                round_trip_cost_rate=0.0006,
+                one_day_net_edge_after_entry=0.0037,
+                one_day_net_edge_after_round_trip=0.0034,
+                break_even_days_entry=0.2,
+                break_even_days_round_trip=0.4,
+                capacity=CapacityEstimate(
+                    short_bid_notional=2_500.0,
+                    long_ask_notional=2_000.0,
+                    max_entry_notional=2_000.0,
+                    limiting_venue="paradex",
+                ),
+            ),
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class StubUniverseService:
+        async def scan_canary_candidates(
+            self, **kwargs: object
+        ) -> list[FundingUniverseCanaryCandidate]:
+            captured.update(kwargs)
+            return []
+
+    class StubRouteApprovalService:
+        def propose_canary_route_approvals(
+            self,
+            candidates: list[FundingUniverseCanaryCandidate],
+            *,
+            limit: int,
+        ) -> list[FundingUniverseCanaryApprovalProposal]:
+            assert candidates == []
+            assert limit == 2
+            return []
+
+    app.dependency_overrides[get_history_store] = lambda: store
+    app.dependency_overrides[get_opportunity_universe_service] = lambda: StubUniverseService()
+    app.dependency_overrides[get_route_approval_service] = lambda: StubRouteApprovalService()
+    try:
+        client = TestClient(app)
+        response = client.get(
+            "/v1/opportunities/funding-universe/canary/approval-proposals",
+            params=[
+                ("venues", "extended"),
+                ("venues", "paradex"),
+                ("limit", "2"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert captured["include_symbols"] is None
+
+
 def test_funding_universe_canary_approval_proposals_falls_back_when_shortlist_misses(
     tmp_path: Path,
 ) -> None:
     store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
     store.append(
         OpportunityRecord(
-            recorded_at=datetime(2026, 3, 29, 12, 0, tzinfo=UTC),
+            recorded_at=datetime.now(UTC),
             pair=FundingPairSpec(
                 label="ton_extended_paradex",
                 left_venue="extended",
@@ -1490,7 +1568,7 @@ def test_funding_universe_canary_approval_proposals_preserves_explicit_symbols(
     store = OpportunityHistoryStore(tmp_path / "history.sqlite3")
     store.append(
         OpportunityRecord(
-            recorded_at=datetime(2026, 3, 29, tzinfo=UTC),
+            recorded_at=datetime.now(UTC),
             pair=FundingPairSpec(
                 label="ton_extended_paradex",
                 left_venue="extended",

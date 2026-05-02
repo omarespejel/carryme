@@ -11,7 +11,7 @@ import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -187,6 +187,7 @@ UNIVERSE_SCAN_TIMEOUT_SECONDS = 20.0
 UNIVERSE_SCAN_ACQUIRE_TIMEOUT_SECONDS = 0.25
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 DEFAULT_CANARY_EXCLUDE_TAGS = ["meme", "political"]
+DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS = 3600
 logger = logging.getLogger(__name__)
 _UNIVERSE_SCAN_SEMAPHORE = asyncio.Semaphore(1)
 
@@ -2500,12 +2501,16 @@ def _canary_candidate_identity(candidate: FundingUniverseCanaryCandidate) -> tup
     """Return a stable identity for deduping canary candidates across scans."""
 
     opportunity = candidate.opportunity.opportunity
+    venue_markets: list[str] = []
+    for venue, market in sorted(candidate.opportunity.venue_markets.items()):
+        venue_markets.extend([venue, market.venue, market.symbol])
     return (
         opportunity.canonical_symbol,
         opportunity.short_venue,
         opportunity.long_venue,
         opportunity.short_fee_profile,
         opportunity.long_fee_profile,
+        *venue_markets,
     )
 
 
@@ -2530,11 +2535,21 @@ def _merge_canary_candidates(
     return merged
 
 
+def _ensure_aware_utc(value: datetime) -> datetime:
+    """Normalize persisted datetimes before freshness comparisons."""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _select_canary_reprice_symbols_from_history(
     store: OpportunityHistoryStore,
     *,
     sample: int,
     limit: int,
+    now: datetime,
+    max_age_seconds: int,
     venues: list[str],
     exclude_symbols: list[str] | None,
     exclude_tags: list[str] | None,
@@ -2546,7 +2561,14 @@ def _select_canary_reprice_symbols_from_history(
     """Select saved symbols worth live repricing before approval proposal generation."""
 
     selected_venues = {venue.strip().lower() for venue in venues if venue.strip()}
-    records = store.list_recent(limit=sample)
+    cutoff = _ensure_aware_utc(now) - timedelta(seconds=max_age_seconds)
+    records = [
+        record
+        for record in store.list_recent(limit=sample)
+        if _ensure_aware_utc(record.recorded_at) >= cutoff
+    ]
+    if not records:
+        return []
     latest = latest_records_by_label(records, limit=len(records))
     candidates: list[OpportunityRecord] = []
     for record in latest:
@@ -2989,7 +3011,7 @@ def _validate_latest_approved_canary_snapshot_request(
         route.canonical_symbol,
         include_symbols=include_symbols,
         exclude_symbols=exclude_symbols,
-        exclude_tags=exclude_tags or ["meme", "political"],
+        exclude_tags=DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags,
     ):
         raise HTTPException(
             status_code=409,
@@ -7081,6 +7103,7 @@ def create_app() -> FastAPI:
         use_history_shortlist: bool = True,
         history_shortlist_sample: int = 500,
         history_shortlist_limit: int = 50,
+        history_shortlist_max_age_seconds: int = DEFAULT_HISTORY_SHORTLIST_MAX_AGE_SECONDS,
     ) -> list[FundingUniverseCanaryApprovalProposalSummary]:
         try:
             limit = _validated_history_limit("limit", limit)
@@ -7096,8 +7119,15 @@ def create_app() -> FastAPI:
                 limit,
                 _validated_history_limit("history_shortlist_limit", history_shortlist_limit),
             )
+            if history_shortlist_max_age_seconds < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="history_shortlist_max_age_seconds must be at least 1",
+                )
             selected_venues = venues or list(SUPPORTED_UNIVERSE_VENUES)
-            effective_exclude_tags = exclude_tags or DEFAULT_CANARY_EXCLUDE_TAGS
+            effective_exclude_tags = (
+                DEFAULT_CANARY_EXCLUDE_TAGS if exclude_tags is None else exclude_tags
+            )
             effective_include_symbols = include_symbols
             used_history_shortlist = False
             broad_candidate_sample = candidate_sample
@@ -7108,6 +7138,8 @@ def create_app() -> FastAPI:
                         history_store,
                         sample=history_shortlist_sample,
                         limit=history_shortlist_limit,
+                        now=datetime.now(UTC),
+                        max_age_seconds=history_shortlist_max_age_seconds,
                         venues=selected_venues,
                         exclude_symbols=exclude_symbols,
                         exclude_tags=effective_exclude_tags,

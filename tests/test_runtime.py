@@ -3914,6 +3914,37 @@ def test_scan_exact_canary_candidate_for_approval_skips_route_stability_index(
     assert captured["use_route_stability"] is False
 
 
+def test_scan_canary_candidates_preserves_explicit_empty_exclude_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = OpportunityUniverseService()
+    captured: dict[str, object] = {}
+
+    async def scan(**kwargs: object) -> FundingUniverseScan:
+        captured.update(kwargs)
+        return FundingUniverseScan(
+            venues=["extended", "paradex"],
+            ranking="route_adjusted_quality_pnl",
+            target_notional=5_000.0,
+            overlap_count=0,
+            opportunities=[],
+        )
+
+    monkeypatch.setattr(service, "scan", scan)
+
+    async def run() -> None:
+        candidates = await service.scan_canary_candidates(
+            venues=["extended", "paradex"],
+            exclude_tags=[],
+            limit=5,
+        )
+        assert candidates == []
+
+    asyncio.run(run())
+
+    assert captured["exclude_tags"] == []
+
+
 def test_scan_exact_canary_candidate_for_approval_keeps_execution_quality_when_required(
     tmp_path: Path,
 ) -> None:
