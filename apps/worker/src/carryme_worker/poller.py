@@ -17,7 +17,6 @@ from carryme_api.app import (
     _append_pair_close_confirmation_for_preview,
     _build_cleanup_live_execution_router_for_candidate,
     _build_cleanup_preview_router_for_candidate,
-    _build_launch_ready_canary_stability,
     _build_pair_close_context_for_paper_trade,
     _build_pair_close_live_execution_coordinator_for_candidate,
     _build_pair_close_preview_service_for_candidate,
@@ -25,6 +24,9 @@ from carryme_api.app import (
     _execute_guarded_pair_close_from_confirmation,
     _run_guarded_canary_lifecycle,
     _select_latest_launch_ready_canary_snapshot,
+)
+from carryme_api.app import (
+    _build_launch_ready_canary_stability as _api_build_launch_ready_canary_stability,
 )
 from carryme_api.config import ApiSettings
 from carryme_models import (
@@ -125,6 +127,12 @@ FUNDING_WINDOW_HOURS_BY_VENUE: dict[str, float] = {
     "paradex": 8.0,
     "hyperliquid": 8.0,
 }
+
+
+def _build_launch_ready_canary_stability(**kwargs: Any) -> LaunchReadyCanaryStability:
+    """Delegate to the API-layer stability helper for legacy worker call sites and tests."""
+
+    return _api_build_launch_ready_canary_stability(**kwargs)
 
 
 def _rank_approved_canary_candidate(
@@ -2071,9 +2079,33 @@ def _build_latest_launch_ready_stability(
 ) -> LaunchReadyCanaryStability | None:
     """Return the latest stable launch-ready snapshot for one label, if any."""
 
-    latest_snapshot = store.latest(label=label)
-    if latest_snapshot is None:
-        return None
+    stability, _ = _evaluate_latest_launch_ready_stability(
+        store=store,
+        label=label,
+        max_snapshot_age_seconds=max_snapshot_age_seconds,
+        min_snapshot_count=min_snapshot_count,
+        min_stable_seconds=min_stable_seconds,
+        now=now,
+    )
+    return stability
+
+
+def _evaluate_latest_launch_ready_stability(
+    *,
+    store: LaunchReadyCanaryStore,
+    label: str,
+    max_snapshot_age_seconds: int,
+    min_snapshot_count: int,
+    min_stable_seconds: float,
+    now: datetime,
+) -> tuple[LaunchReadyCanaryStability | None, str | None]:
+    """Return the latest stable launch-ready snapshot and failure detail for one label."""
+
+    snapshots = store.list_recent(limit=max(min_snapshot_count + 5, 20), label=label)
+    if not snapshots:
+        return None, f"label={label}: no launch-ready canary snapshot found"
+
+    latest_snapshot = snapshots[0]
     snapshot_age_seconds = max(
         0.0,
         (now - latest_snapshot.captured_at).total_seconds(),
@@ -2083,14 +2115,20 @@ def _build_latest_launch_ready_stability(
         latest_snapshot.max_snapshot_age_seconds,
     )
     if snapshot_age_seconds > effective_max_age_seconds:
-        return None
+        return (
+            None,
+            "label="
+            f"{label}: snapshot stale ({snapshot_age_seconds:.1f}s > {effective_max_age_seconds}s)",
+        )
 
-    snapshots = store.list_recent(limit=max(min_snapshot_count + 5, 20), label=label)
     chain: list[LaunchReadyCanarySnapshot] = []
     for snapshot in snapshots:
         if _launch_ready_snapshot_payload_changed(snapshot, latest_snapshot):
             break
         chain.append(snapshot)
+
+    if not chain:
+        return None, f"label={label}: stability chain missing current snapshot"
 
     consecutive_snapshots = len(chain)
     oldest_snapshot = chain[-1]
@@ -2099,15 +2137,27 @@ def _build_latest_launch_ready_stability(
         (latest_snapshot.captured_at - oldest_snapshot.captured_at).total_seconds(),
     )
     if consecutive_snapshots < min_snapshot_count:
-        return None
+        return (
+            None,
+            "label="
+            f"{label}: not yet stable ({consecutive_snapshots} < {min_snapshot_count} "
+            "consecutive snapshots)",
+        )
     if stable_seconds < min_stable_seconds:
-        return None
-    return LaunchReadyCanaryStability(
-        snapshot=latest_snapshot,
-        consecutive_snapshots=consecutive_snapshots,
-        stable_seconds=stable_seconds,
-        min_snapshot_count=min_snapshot_count,
-        min_stable_seconds=min_stable_seconds,
+        return (
+            None,
+            "label="
+            f"{label}: stable time too short ({stable_seconds:.1f}s < {min_stable_seconds:.1f}s)",
+        )
+    return (
+        LaunchReadyCanaryStability(
+            snapshot=latest_snapshot,
+            consecutive_snapshots=consecutive_snapshots,
+            stable_seconds=stable_seconds,
+            min_snapshot_count=min_snapshot_count,
+            min_stable_seconds=min_stable_seconds,
+        ),
+        None,
     )
 
 
@@ -2132,36 +2182,34 @@ def _list_ranked_stable_launch_ready_stabilities(
     min_stable_seconds: float,
     now: datetime,
     scan_limit: int,
-) -> list[LaunchReadyCanaryStability]:
+) -> tuple[list[LaunchReadyCanaryStability], str | None]:
     """Return stable launch-ready labels ranked by route quality, then freshness."""
 
     if scan_limit < 1:
         raise ValueError("scan_limit must be positive")
 
-    recent_snapshots = store.list_recent(limit=scan_limit)
-    if not recent_snapshots:
-        return [
-            _build_launch_ready_canary_stability(
-                store=store,
-                label=None,
-                max_snapshot_age_seconds=max_snapshot_age_seconds,
-                min_snapshot_count=min_snapshot_count,
-                min_stable_seconds=min_stable_seconds,
-                now=now,
-            )
-        ]
-
-    labels: list[str] = []
-    seen_labels: set[str] = set()
-    for snapshot in recent_snapshots:
-        if snapshot.label in seen_labels:
-            continue
-        seen_labels.add(snapshot.label)
-        labels.append(snapshot.label)
+    labels = store.list_recent_labels(limit=scan_limit)
+    if not labels:
+        try:
+            return [
+                _build_launch_ready_canary_stability(
+                    store=store,
+                    label=None,
+                    max_snapshot_age_seconds=max_snapshot_age_seconds,
+                    min_snapshot_count=min_snapshot_count,
+                    min_stable_seconds=min_stable_seconds,
+                    now=now,
+                )
+            ], None
+        except HTTPException as exc:
+            if exc.status_code in {404, 409}:
+                return [], str(exc.detail)
+            raise
 
     stabilities: list[LaunchReadyCanaryStability] = []
+    failure_details: list[str] = []
     for label in labels:
-        stability = _build_latest_launch_ready_stability(
+        stability, failure_detail = _evaluate_latest_launch_ready_stability(
             store=store,
             label=label,
             max_snapshot_age_seconds=max_snapshot_age_seconds,
@@ -2171,8 +2219,21 @@ def _list_ranked_stable_launch_ready_stabilities(
         )
         if stability is not None:
             stabilities.append(stability)
+            continue
+        if failure_detail is not None:
+            failure_details.append(failure_detail)
 
-    return sorted(stabilities, key=_rank_launch_ready_stability, reverse=True)
+    ranked = sorted(stabilities, key=_rank_launch_ready_stability, reverse=True)
+    if ranked:
+        return ranked, None
+
+    detail = "No stable launch-ready canary snapshot found"
+    if failure_details:
+        summarized_failures = "; ".join(failure_details[:3])
+        if len(failure_details) > 3:
+            summarized_failures += f"; +{len(failure_details) - 3} more labels"
+        detail = f"{detail}: {summarized_failures}"
+    return [], detail
 
 
 async def scan_approved_canary_once(
@@ -2827,214 +2888,6 @@ async def launch_latest_stable_canary_once(
             detail=global_rate_cap_reason,
         )
 
-    try:
-        stable_candidates = _list_ranked_stable_launch_ready_stabilities(
-            store=launch_ready_store,
-            max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
-            min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
-            min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
-            now=timestamp,
-            scan_limit=settings.stable_canary_launch_candidate_scan_limit,
-        )
-        if not stable_candidates:
-            raise HTTPException(
-                status_code=409,
-                detail="No stable launch-ready canary snapshot found",
-            )
-        stability = stable_candidates[0]
-        snapshot, selected, approval = _select_latest_launch_ready_canary_snapshot(
-            store=launch_ready_store,
-            approval_service=route_approval_service,
-            label=stability.snapshot.label,
-            max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
-            now=timestamp,
-        )
-    except HTTPException as exc:
-        if exc.status_code in {404, 409}:
-            return StableCanaryLaunchSummary(
-                status="skipped",
-                database_path=settings.database_target,
-                detail=exc.detail,
-            )
-        raise
-
-    label_cooldown_reason = _build_stable_launch_cooldown_reason(
-        settings=settings,
-        launch_store=stable_launch_store,
-        now=timestamp,
-        label=snapshot.label,
-    )
-    if label_cooldown_reason is not None:
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=label_cooldown_reason,
-        )
-
-    label_rate_cap_reason = _build_stable_launch_rate_cap_reason(
-        settings=settings,
-        launch_store=stable_launch_store,
-        now=timestamp,
-        label=snapshot.label,
-    )
-    if label_rate_cap_reason is not None:
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=label_rate_cap_reason,
-        )
-
-    latest_approved_snapshot = source_approved_store.latest(label=snapshot.label)
-    if latest_approved_snapshot is None:
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail="Latest approved canary snapshot is missing for the selected label",
-        )
-    if latest_approved_snapshot.snapshot_id != snapshot.approved_snapshot.snapshot_id:
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=(
-                "Launch-ready canary snapshot is stale relative to the latest "
-                "approved snapshot"
-            ),
-        )
-
-    execution_maturity_reason = _build_stable_launch_execution_maturity_reason(
-        settings=settings,
-        candidate=latest_approved_snapshot.candidate,
-    )
-    if execution_maturity_reason is not None:
-        if settings.stable_canary_launch_shadow_mode:
-            logging.getLogger("carryme.worker").info(
-                "shadow launch maturity blocked label=%s because %s",
-                snapshot.label,
-                execution_maturity_reason,
-            )
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=execution_maturity_reason,
-        )
-
-    latest_outcome_reason = _build_stable_launch_latest_outcome_reason(
-        settings=settings,
-        candidate=latest_approved_snapshot.candidate,
-    )
-    if latest_outcome_reason is not None:
-        if settings.stable_canary_launch_shadow_mode:
-            logging.getLogger("carryme.worker").info(
-                "shadow launch latest-outcome blocked label=%s because %s",
-                snapshot.label,
-                latest_outcome_reason,
-            )
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=latest_outcome_reason,
-        )
-
-    liquidity_and_value_reason = _build_stable_launch_liquidity_and_value_reason(
-        settings=settings,
-        candidate=latest_approved_snapshot.candidate,
-    )
-    if liquidity_and_value_reason is not None:
-        if settings.stable_canary_launch_shadow_mode:
-            logging.getLogger("carryme.worker").info(
-                "shadow launch liquidity/value blocked label=%s because %s",
-                snapshot.label,
-                liquidity_and_value_reason,
-            )
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=liquidity_and_value_reason,
-        )
-
-    recent_approved_chain = _list_recent_approved_snapshot_chain(
-        store=source_approved_store,
-        snapshot=latest_approved_snapshot,
-        max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
-    )
-    automation_gate_reason = _build_approved_snapshot_automation_gate_reason(
-        snapshot=latest_approved_snapshot,
-        recent_chain=recent_approved_chain or [latest_approved_snapshot],
-        settings=settings,
-    )
-    if automation_gate_reason is not None:
-        if settings.stable_canary_launch_shadow_mode:
-            logging.getLogger("carryme.worker").info(
-                "shadow launch gate blocked label=%s because %s",
-                snapshot.label,
-                automation_gate_reason,
-            )
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=(
-                "Latest approved snapshot no longer satisfies automated launch "
-                f"gates: {automation_gate_reason}"
-            ),
-        )
-
-    if snapshot.launch_ready_snapshot_id is not None:
-        previous_launch = stable_launch_store.latest_for_snapshot(snapshot.launch_ready_snapshot_id)
-        if previous_launch is not None:
-            if previous_launch.status == "shadowed":
-                if settings.stable_canary_launch_shadow_mode:
-                    return StableCanaryLaunchSummary(
-                        status="skipped",
-                        database_path=settings.database_target,
-                        label=snapshot.label,
-                        launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-                        approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-                        final_pair_state=previous_launch.final_pair_state,
-                        detail=(
-                            "Launch-ready canary snapshot already evaluated in shadow mode by "
-                            "worker"
-                        ),
-                    )
-                # Shadow mode is off but was previously on: allow a real launch now.
-            else:
-                return StableCanaryLaunchSummary(
-                    status="skipped",
-                    database_path=settings.database_target,
-                    label=snapshot.label,
-                    launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-                    approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-                    paper_trade_id=previous_launch.paper_trade_id,
-                    final_pair_state=previous_launch.final_pair_state,
-                    detail=(
-                        "Launch-ready canary snapshot already launched by worker as "
-                        f"paper trade {previous_launch.paper_trade_id}"
-                    ),
-                )
-
     risk_budget_scan_limit = settings.stable_canary_launch_active_execution_limit
     active_executions_for_budget = _list_recent_live_executions(
         execution_store,
@@ -3053,34 +2906,239 @@ async def launch_latest_stable_canary_once(
         return StableCanaryLaunchSummary(
             status="skipped",
             database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
             detail=(
                 "Stable launch risk-budget check truncated by "
                 "stable_canary_launch_active_execution_limit; increase limit"
             ),
         )
 
-    risk_budget_reason = _build_stable_launch_risk_budget_reason(
-        settings=settings,
-        active_executions=active_executions_for_budget,
-        candidate=selected,
+    stable_candidates, no_candidate_detail = _list_ranked_stable_launch_ready_stabilities(
+        store=launch_ready_store,
+        max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+        min_snapshot_count=settings.stable_launch_ready_min_snapshot_count,
+        min_stable_seconds=settings.stable_launch_ready_min_stable_seconds,
+        now=timestamp,
+        scan_limit=settings.stable_canary_launch_candidate_scan_limit,
     )
-    if risk_budget_reason is not None:
-        if settings.stable_canary_launch_shadow_mode:
-            logging.getLogger("carryme.worker").info(
-                "shadow launch budget blocked label=%s because %s",
-                snapshot.label,
-                risk_budget_reason,
-            )
+    if not stable_candidates:
         return StableCanaryLaunchSummary(
             status="skipped",
             database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=risk_budget_reason,
+            detail=no_candidate_detail or "No stable launch-ready canary snapshot found",
+        )
+
+    stability: LaunchReadyCanaryStability | None = None
+    snapshot: LaunchReadyCanarySnapshot | None = None
+    selected: FundingUniverseCanaryCandidate | None = None
+    approval: RouteApprovalEntry | None = None
+    candidate_skip_details: list[str] = []
+
+    for candidate_stability in stable_candidates:
+        try:
+            candidate_snapshot, candidate_selected, candidate_approval = (
+                _select_latest_launch_ready_canary_snapshot(
+                    store=launch_ready_store,
+                    approval_service=route_approval_service,
+                    label=candidate_stability.snapshot.label,
+                    max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+                    now=timestamp,
+                )
+            )
+        except HTTPException as exc:
+            if exc.status_code in {404, 409}:
+                candidate_skip_details.append(
+                    f"{candidate_stability.snapshot.label}: {exc.detail}"
+                )
+                continue
+            raise
+
+        label_cooldown_reason = _build_stable_launch_cooldown_reason(
+            settings=settings,
+            launch_store=stable_launch_store,
+            now=timestamp,
+            label=candidate_snapshot.label,
+        )
+        if label_cooldown_reason is not None:
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: {label_cooldown_reason}"
+            )
+            continue
+
+        label_rate_cap_reason = _build_stable_launch_rate_cap_reason(
+            settings=settings,
+            launch_store=stable_launch_store,
+            now=timestamp,
+            label=candidate_snapshot.label,
+        )
+        if label_rate_cap_reason is not None:
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: {label_rate_cap_reason}"
+            )
+            continue
+
+        candidate_latest_approved_snapshot = source_approved_store.latest(
+            label=candidate_snapshot.label
+        )
+        if candidate_latest_approved_snapshot is None:
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: latest approved canary snapshot is missing"
+            )
+            continue
+        if (
+            candidate_latest_approved_snapshot.snapshot_id
+            != candidate_snapshot.approved_snapshot.snapshot_id
+        ):
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: launch-ready canary snapshot is stale relative "
+                "to the latest approved snapshot"
+            )
+            continue
+
+        execution_maturity_reason = _build_stable_launch_execution_maturity_reason(
+            settings=settings,
+            candidate=candidate_latest_approved_snapshot.candidate,
+        )
+        if execution_maturity_reason is not None:
+            if settings.stable_canary_launch_shadow_mode:
+                logging.getLogger("carryme.worker").info(
+                    "shadow launch maturity blocked label=%s because %s",
+                    candidate_snapshot.label,
+                    execution_maturity_reason,
+                )
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: {execution_maturity_reason}"
+            )
+            continue
+
+        latest_outcome_reason = _build_stable_launch_latest_outcome_reason(
+            settings=settings,
+            candidate=candidate_latest_approved_snapshot.candidate,
+        )
+        if latest_outcome_reason is not None:
+            if settings.stable_canary_launch_shadow_mode:
+                logging.getLogger("carryme.worker").info(
+                    "shadow launch latest-outcome blocked label=%s because %s",
+                    candidate_snapshot.label,
+                    latest_outcome_reason,
+                )
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: {latest_outcome_reason}"
+            )
+            continue
+
+        liquidity_and_value_reason = _build_stable_launch_liquidity_and_value_reason(
+            settings=settings,
+            candidate=candidate_latest_approved_snapshot.candidate,
+        )
+        if liquidity_and_value_reason is not None:
+            if settings.stable_canary_launch_shadow_mode:
+                logging.getLogger("carryme.worker").info(
+                    "shadow launch liquidity/value blocked label=%s because %s",
+                    candidate_snapshot.label,
+                    liquidity_and_value_reason,
+                )
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: {liquidity_and_value_reason}"
+            )
+            continue
+
+        recent_approved_chain = _list_recent_approved_snapshot_chain(
+            store=source_approved_store,
+            snapshot=candidate_latest_approved_snapshot,
+            max_snapshot_age_seconds=settings.launch_ready_canary_max_snapshot_age_seconds,
+        )
+        automation_gate_reason = _build_approved_snapshot_automation_gate_reason(
+            snapshot=candidate_latest_approved_snapshot,
+            recent_chain=recent_approved_chain or [candidate_latest_approved_snapshot],
+            settings=settings,
+        )
+        if automation_gate_reason is not None:
+            if settings.stable_canary_launch_shadow_mode:
+                logging.getLogger("carryme.worker").info(
+                    "shadow launch gate blocked label=%s because %s",
+                    candidate_snapshot.label,
+                    automation_gate_reason,
+                )
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: latest approved snapshot no longer "
+                f"satisfies automated launch gates: {automation_gate_reason}"
+            )
+            continue
+
+        if candidate_snapshot.launch_ready_snapshot_id is not None:
+            previous_launch = stable_launch_store.latest_for_snapshot(
+                candidate_snapshot.launch_ready_snapshot_id
+            )
+            if previous_launch is not None:
+                if previous_launch.status == "shadowed":
+                    if settings.stable_canary_launch_shadow_mode:
+                        candidate_skip_details.append(
+                            f"{candidate_snapshot.label}: launch-ready canary snapshot "
+                            "already evaluated in shadow mode by worker"
+                        )
+                        continue
+                    # Shadow mode is off but was previously on: allow a real launch now.
+                else:
+                    candidate_skip_details.append(
+                        f"{candidate_snapshot.label}: launch-ready canary snapshot already "
+                        f"launched by worker as paper trade {previous_launch.paper_trade_id}"
+                    )
+                    continue
+
+        risk_budget_reason = _build_stable_launch_risk_budget_reason(
+            settings=settings,
+            active_executions=active_executions_for_budget,
+            candidate=candidate_selected,
+        )
+        if risk_budget_reason is not None:
+            if settings.stable_canary_launch_shadow_mode:
+                logging.getLogger("carryme.worker").info(
+                    "shadow launch budget blocked label=%s because %s",
+                    candidate_snapshot.label,
+                    risk_budget_reason,
+                )
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: {risk_budget_reason}"
+            )
+            continue
+
+        execution_preflight = _build_candidate_live_execution_preflight(
+            settings=runtime_settings,
+            candidate=candidate_selected,
+            label=candidate_snapshot.label,
+        )
+        if not execution_preflight.ready:
+            try:
+                launch_ready_store.delete_label(candidate_snapshot.label)
+            except Exception:
+                logging.getLogger("carryme.worker").exception(
+                    "failed to invalidate launch-ready snapshots for label=%s "
+                    "during stable launch preflight",
+                    candidate_snapshot.label,
+                )
+            candidate_skip_details.append(
+                f"{candidate_snapshot.label}: latest launch-ready snapshot no longer "
+                "satisfies live execution readiness: "
+                f"{'; '.join(execution_preflight.blocking_reasons)}"
+            )
+            continue
+
+        stability = candidate_stability
+        snapshot = candidate_snapshot
+        selected = candidate_selected
+        approval = candidate_approval
+        break
+
+    if stability is None or snapshot is None or selected is None or approval is None:
+        detail = "No stable launch-ready canary snapshot passed launch gating"
+        if candidate_skip_details:
+            detail = f"{detail}: {'; '.join(candidate_skip_details[:3])}"
+            if len(candidate_skip_details) > 3:
+                detail += f"; +{len(candidate_skip_details) - 3} more labels"
+        return StableCanaryLaunchSummary(
+            status="skipped",
+            database_path=settings.database_target,
+            detail=detail,
         )
 
     if settings.stable_canary_launch_shadow_mode:
@@ -3122,32 +3180,6 @@ async def launch_latest_stable_canary_once(
             launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
             approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
             detail=hold_mode_blocker,
-        )
-
-    execution_preflight = _build_candidate_live_execution_preflight(
-        settings=runtime_settings,
-        candidate=selected,
-        label=snapshot.label,
-    )
-    if not execution_preflight.ready:
-        try:
-            launch_ready_store.delete_label(snapshot.label)
-        except Exception:
-            logging.getLogger("carryme.worker").exception(
-                "failed to invalidate launch-ready snapshots for label=%s "
-                "during stable launch preflight",
-                snapshot.label,
-            )
-        return StableCanaryLaunchSummary(
-            status="skipped",
-            database_path=settings.database_target,
-            label=snapshot.label,
-            launch_ready_snapshot_id=snapshot.launch_ready_snapshot_id,
-            approved_snapshot_id=snapshot.approved_snapshot.snapshot_id,
-            detail=(
-                "Latest launch-ready snapshot no longer satisfies live execution "
-                f"readiness: {'; '.join(execution_preflight.blocking_reasons)}"
-            ),
         )
 
     try:
