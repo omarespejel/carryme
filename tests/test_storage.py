@@ -3173,6 +3173,54 @@ def test_launch_ready_canary_store_list_recent_labels_paginates_duplicate_rows(
     ]
 
 
+def test_launch_ready_canary_store_list_recent_labels_handles_deep_duplicate_history(
+    tmp_path: Path,
+) -> None:
+    store = LaunchReadyCanaryStore(tmp_path / "history.sqlite3")
+    store.initialize()
+    base_time = datetime(2026, 3, 29, 14, 11, tzinfo=UTC)
+
+    with store.database.begin() as connection:
+        for offset in range(5050):
+            connection.execute(
+                """
+                INSERT INTO launch_ready_canary_snapshots (
+                    captured_at,
+                    label,
+                    approved_snapshot_id,
+                    snapshot_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (base_time - timedelta(seconds=offset)).isoformat(),
+                    "arb_extended_paradex",
+                    7,
+                    "{}",
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO launch_ready_canary_snapshots (
+                captured_at,
+                label,
+                approved_snapshot_id,
+                snapshot_json
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                (base_time - timedelta(seconds=5051)).isoformat(),
+                "bera_extended_paradex",
+                8,
+                "{}",
+            ),
+        )
+
+    assert store.list_recent_labels(limit=2) == [
+        "arb_extended_paradex",
+        "bera_extended_paradex",
+    ]
+
+
 def test_launch_ready_canary_store_list_recent_labels_rejects_invalid_limits(
     tmp_path: Path,
 ) -> None:
