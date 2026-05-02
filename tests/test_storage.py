@@ -3206,6 +3206,38 @@ def test_stable_canary_launch_store_reserves_snapshot_launch_once(
     assert second_reserved is False
 
 
+def test_stable_canary_launch_store_prunes_expired_snapshot_reservations(
+    tmp_path: Path,
+) -> None:
+    store = StableCanaryLaunchStore(tmp_path / "history.sqlite3")
+    first_reserved_at = datetime(2026, 4, 4, 10, 0, tzinfo=UTC)
+    second_reserved_at = datetime(2026, 4, 4, 10, 5, tzinfo=UTC)
+
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=9,
+        label="arb_extended_paradex",
+        reserved_at=first_reserved_at,
+        retention_seconds=60,
+    )
+    assert store.reserve_snapshot_launch(
+        launch_ready_snapshot_id=10,
+        label="bera_extended_paradex",
+        reserved_at=second_reserved_at,
+        retention_seconds=60,
+    )
+
+    with store.database.begin() as connection:
+        rows = connection.execute(
+            """
+            SELECT launch_ready_snapshot_id
+            FROM stable_canary_launch_reservations
+            ORDER BY launch_ready_snapshot_id
+            """
+        ).fetchall()
+
+    assert [int(row[0]) for row in rows] == [10]
+
+
 def test_stable_canary_launch_store_reclaims_stale_snapshot_launch_reservation(
     tmp_path: Path,
 ) -> None:
@@ -3636,12 +3668,17 @@ def test_initialize_database_schema_accepts_sqlite_url(tmp_path: Path) -> None:
     initialize_database_schema(database_url)
 
     with Database(database_url).begin() as connection:
-        row = connection.fetchone(
+        history_row = connection.fetchone(
             "SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
             ("table", "opportunity_history"),
         )
+        reservation_row = connection.fetchone(
+            "SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
+            ("table", "stable_canary_launch_reservations"),
+        )
 
-    assert row is not None
+    assert history_row is not None
+    assert reservation_row is not None
 
 
 def test_history_store_accepts_sqlite_url(tmp_path: Path) -> None:

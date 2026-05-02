@@ -53,6 +53,7 @@ SCHEMA_TABLES: Sequence[str] = (
     "preview_confirmation_entries",
     "route_approval_entries",
     "stable_canary_launch_records",
+    "stable_canary_launch_reservations",
     "stable_launch_ready_alert_events",
     "system_state_alert_events",
 )
