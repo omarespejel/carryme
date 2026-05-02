@@ -40,6 +40,20 @@ class ApiSettings(BaseSettings):
     hyperliquid_account_address: str | None = None
     hyperliquid_vault_address: str | None = None
     hyperliquid_api_wallet_private_key: str | None = None
+    launch_ready_canary_max_snapshot_age_seconds: int = Field(default=300, gt=0)
+    stable_launch_ready_min_edge_retention_ratio: float = Field(
+        default=0.7,
+        ge=0,
+        le=1,
+    )
+    stable_launch_ready_max_entry_break_even_funding_windows: float = Field(
+        default=6.0,
+        gt=0,
+    )
+    stable_launch_ready_max_round_trip_break_even_funding_windows: float = Field(
+        default=12.0,
+        gt=0,
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="CARRYME_API_",

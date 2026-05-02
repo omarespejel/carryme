@@ -55,7 +55,6 @@ from carryme_models import (
     StableCanaryLaunchRecord,
     StableLaunchReadyAlertEvent,
     SystemStateAlertEvent,
-    VenueExecutionPreflight,
     VenueSystemState,
 )
 from carryme_runtime import (
@@ -89,6 +88,37 @@ from carryme_runtime import (
 from carryme_runtime.balance_accounting import FUNDING_WINDOW_CHECKPOINT_STAGE
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_runtime.execution_quality import execution_quality_route_key
+from carryme_runtime.launch_ready import (
+    FUNDING_WINDOW_HOURS_BY_VENUE,
+    LaunchReadyAutomationGatePolicy,
+)
+from carryme_runtime.launch_ready import (
+    approved_snapshot_launch_payload_changed as runtime_launch_payload_changed,
+)
+from carryme_runtime.launch_ready import (
+    approved_snapshot_route_key as runtime_approved_snapshot_route_key,
+)
+from carryme_runtime.launch_ready import (
+    build_approved_snapshot_automation_gate_reason as runtime_build_gate_reason,
+)
+from carryme_runtime.launch_ready import (
+    build_candidate_live_execution_preflight as runtime_build_live_preflight,
+)
+from carryme_runtime.launch_ready import (
+    candidate_execution_venue_names as runtime_candidate_venue_names,
+)
+from carryme_runtime.launch_ready import (
+    effective_funding_window_hours as runtime_effective_window_hours,
+)
+from carryme_runtime.launch_ready import (
+    hold_window_hours as runtime_hold_window_hours,
+)
+from carryme_runtime.launch_ready import (
+    list_recent_approved_snapshot_chain as runtime_snapshot_chain,
+)
+from carryme_runtime.launch_ready import (
+    probe_candidate_system_state as runtime_probe_system_state,
+)
 from carryme_runtime.route_approvals import (
     scan_exact_canary_candidate_for_approval,
     scan_live_route_candidate_for_approval,
@@ -126,11 +156,6 @@ from carryme_worker.notifications import (
 
 logger = logging.getLogger(__name__)
 OBSERVATION_CALL_TIMEOUT_SECONDS = 10.0
-FUNDING_WINDOW_HOURS_BY_VENUE: dict[str, float] = {
-    "extended": 1.0,
-    "paradex": 8.0,
-    "hyperliquid": 8.0,
-}
 
 
 def _build_launch_ready_canary_stability(**kwargs: Any) -> LaunchReadyCanaryStability:
@@ -1266,15 +1291,7 @@ def _build_system_state_configs(settings: WorkerSettings) -> SystemStateConfigMa
 def _candidate_execution_venue_names(candidate: FundingUniverseCanaryCandidate) -> list[str]:
     """Return de-duplicated venue names touched by a canary candidate."""
 
-    venue_names = [
-        candidate.opportunity.opportunity.long_venue,
-        candidate.opportunity.opportunity.short_venue,
-    ]
-    selected_names: list[str] = []
-    for venue in venue_names:
-        if venue not in selected_names:
-            selected_names.append(venue)
-    return selected_names
+    return runtime_candidate_venue_names(candidate)
 
 
 def _build_candidate_live_execution_preflight(
@@ -1285,32 +1302,12 @@ def _build_candidate_live_execution_preflight(
 ) -> PaperTradeExecutionPreflight:
     """Build live-execution readiness for the exact venues touched by one canary."""
 
-    all_statuses = {
-        item.venue: item
-        for item in build_venue_execution_preflights(build_live_execution_configs(settings))
-    }
-    selected: list[VenueExecutionPreflight] = []
-    blocking_reasons: list[str] = []
-    for venue in _candidate_execution_venue_names(candidate):
-        status = all_statuses.get(venue)
-        if status is None:
-            blocking_reasons.append(f"Venue {venue} live execution is not configured")
-            continue
-        selected.append(status)
-        if not status.enabled:
-            blocking_reasons.append(f"Venue {venue} live execution is not enabled")
-        if status.missing_env_vars:
-            blocking_reasons.append(
-                f"Venue {venue} is missing required credentials: "
-                + ", ".join(status.missing_env_vars)
-            )
-
-    return PaperTradeExecutionPreflight(
-        paper_trade_id=0,
+    return runtime_build_live_preflight(
+        venue_preflights=build_venue_execution_preflights(
+            build_live_execution_configs(settings)
+        ),
+        candidate=candidate,
         label=label,
-        ready=not blocking_reasons,
-        venues=selected,
-        blocking_reasons=blocking_reasons,
     )
 
 
@@ -1323,26 +1320,11 @@ async def _probe_candidate_system_state(
 ) -> PaperTradeSystemState:
     """Probe only the venues touched by one canary candidate."""
 
-    all_statuses = {
-        item.venue: item
-        for item in await service.probe_venues(_build_system_state_configs(settings))
-    }
-    selected: list[VenueSystemState] = []
-    blocking_reasons: list[str] = []
-    for venue in _candidate_execution_venue_names(candidate):
-        status = all_statuses.get(venue)
-        if status is None:
-            blocking_reasons.append(f"Venue {venue} system state is unknown")
-            continue
-        selected.append(status)
-        blocking_reasons.extend(status.blocking_reasons)
-
-    return PaperTradeSystemState(
-        paper_trade_id=0,
+    return await runtime_probe_system_state(
+        service=service,
+        configs=_build_system_state_configs(settings),
+        candidate=candidate,
         label=label,
-        ready=not blocking_reasons,
-        venues=selected,
-        blocking_reasons=blocking_reasons,
     )
 
 
@@ -1424,53 +1406,7 @@ def _approved_snapshot_route_key(
 ) -> tuple[str, str, str, str, str, str]:
     """Return the normalized identity key for one approved snapshot route."""
 
-    opportunity = snapshot.candidate.opportunity.opportunity
-    return (
-        snapshot.label,
-        opportunity.canonical_symbol,
-        opportunity.short_venue,
-        opportunity.long_venue,
-        opportunity.short_fee_profile,
-        opportunity.long_fee_profile,
-    )
-
-
-def _normalized_approved_snapshot_launch_payload(
-    snapshot: ApprovedCanarySnapshot,
-) -> dict[str, object]:
-    """Return the approved-snapshot fields that must stay fixed for launch safety."""
-
-    candidate = snapshot.candidate
-    opportunity = candidate.opportunity.opportunity
-    approval = snapshot.approval
-    venue_markets = candidate.opportunity.venue_markets
-    return {
-        "label": snapshot.label,
-        "suggested_canary_notional": candidate.suggested_canary_notional,
-        "route": {
-            "canonical_symbol": opportunity.canonical_symbol,
-            "long_venue": opportunity.long_venue,
-            "short_venue": opportunity.short_venue,
-            "long_fee_profile": opportunity.long_fee_profile,
-            "short_fee_profile": opportunity.short_fee_profile,
-            "venue_markets": tuple(
-                sorted(
-                    (venue, market.symbol)
-                    for venue, market in venue_markets.items()
-                )
-            ),
-        },
-        "approval": {
-            "label": approval.label,
-            "canonical_symbol": approval.canonical_symbol,
-            "short_venue": approval.short_venue,
-            "long_venue": approval.long_venue,
-            "short_fee_profile": approval.short_fee_profile,
-            "long_fee_profile": approval.long_fee_profile,
-            "approved": approval.approved,
-            "max_live_notional": approval.max_live_notional,
-        },
-    }
+    return runtime_approved_snapshot_route_key(snapshot)
 
 
 def _approved_snapshot_launch_payload_changed(
@@ -1479,32 +1415,22 @@ def _approved_snapshot_launch_payload_changed(
 ) -> bool:
     """Return whether a newer approved snapshot invalidates stable launch evidence."""
 
-    return (
-        _normalized_approved_snapshot_launch_payload(previous_snapshot)
-        != _normalized_approved_snapshot_launch_payload(current_snapshot)
+    return runtime_launch_payload_changed(
+        previous_snapshot,
+        current_snapshot,
     )
 
 
 def _effective_funding_window_hours(snapshot: ApprovedCanarySnapshot) -> float:
     """Return the fastest relevant funding interval across the route venues."""
 
-    opportunity = snapshot.candidate.opportunity.opportunity
-    hours = [
-        FUNDING_WINDOW_HOURS_BY_VENUE.get(opportunity.short_venue, 8.0),
-        FUNDING_WINDOW_HOURS_BY_VENUE.get(opportunity.long_venue, 8.0),
-    ]
-    return min(hours)
+    return runtime_effective_window_hours(snapshot)
 
 
 def _hold_window_hours(snapshot: ApprovedCanarySnapshot) -> float:
     """Return the slowest relevant funding interval across the route venues."""
 
-    opportunity = snapshot.candidate.opportunity.opportunity
-    hours = [
-        FUNDING_WINDOW_HOURS_BY_VENUE.get(opportunity.short_venue, 8.0),
-        FUNDING_WINDOW_HOURS_BY_VENUE.get(opportunity.long_venue, 8.0),
-    ]
-    return max(hours)
+    return runtime_hold_window_hours(snapshot)
 
 
 def _list_recent_approved_snapshot_chain(
@@ -1516,20 +1442,11 @@ def _list_recent_approved_snapshot_chain(
 ) -> list[ApprovedCanarySnapshot]:
     """Return the recent same-route approved snapshot chain for one label."""
 
-    route_key = _approved_snapshot_route_key(snapshot)
-    recent_snapshots = store.list_recent(limit=limit, label=snapshot.label)
-    chain: list[ApprovedCanarySnapshot] = []
-    for recent_snapshot in recent_snapshots:
-        if _approved_snapshot_route_key(recent_snapshot) != route_key:
-            break
-        age_seconds = max(
-            0.0,
-            (snapshot.captured_at - recent_snapshot.captured_at).total_seconds(),
-        )
-        if age_seconds > max_snapshot_age_seconds:
-            break
-        chain.append(recent_snapshot)
-    return chain
+    return runtime_snapshot_chain(
+        recent_snapshots=store.list_recent(limit=limit, label=snapshot.label),
+        snapshot=snapshot,
+        max_snapshot_age_seconds=max_snapshot_age_seconds,
+    )
 
 
 def _build_approved_snapshot_automation_gate_reason(
@@ -1540,67 +1457,19 @@ def _build_approved_snapshot_automation_gate_reason(
 ) -> str | None:
     """Return the blocking reason for unattended launch-readiness, if any."""
 
-    opportunity = snapshot.candidate.opportunity.opportunity
-    current_entry_edge = opportunity.one_day_net_edge_after_entry
-    current_round_trip_edge = opportunity.one_day_net_edge_after_round_trip
-
-    max_entry_edge = max(
-        item.candidate.opportunity.opportunity.one_day_net_edge_after_entry
-        for item in recent_chain
+    return runtime_build_gate_reason(
+        snapshot=snapshot,
+        recent_chain=recent_chain,
+        policy=LaunchReadyAutomationGatePolicy(
+            min_edge_retention_ratio=settings.stable_launch_ready_min_edge_retention_ratio,
+            max_entry_break_even_funding_windows=(
+                settings.stable_launch_ready_max_entry_break_even_funding_windows
+            ),
+            max_round_trip_break_even_funding_windows=(
+                settings.stable_launch_ready_max_round_trip_break_even_funding_windows
+            ),
+        ),
     )
-    max_round_trip_edge = max(
-        item.candidate.opportunity.opportunity.one_day_net_edge_after_round_trip
-        for item in recent_chain
-    )
-    if max_entry_edge <= 0 or max_round_trip_edge <= 0:
-        return "recent approved snapshot chain has non-positive net edge"
-
-    min_retention_ratio = settings.stable_launch_ready_min_edge_retention_ratio
-    entry_retention_ratio = current_entry_edge / max_entry_edge
-    if entry_retention_ratio < min_retention_ratio:
-        return (
-            "entry edge retention "
-            f"{entry_retention_ratio:.2f} below minimum {min_retention_ratio:.2f}"
-        )
-
-    round_trip_retention_ratio = current_round_trip_edge / max_round_trip_edge
-    if round_trip_retention_ratio < min_retention_ratio:
-        return (
-            "round-trip edge retention "
-            f"{round_trip_retention_ratio:.2f} below minimum {min_retention_ratio:.2f}"
-        )
-
-    break_even_days_entry = opportunity.break_even_days_entry
-    break_even_days_round_trip = opportunity.break_even_days_round_trip
-    if break_even_days_entry is None or break_even_days_round_trip is None:
-        return "approved canary snapshot is missing break-even timing"
-
-    funding_window_hours = _effective_funding_window_hours(snapshot)
-    entry_break_even_windows = break_even_days_entry * 24.0 / funding_window_hours
-    if (
-        entry_break_even_windows
-        > settings.stable_launch_ready_max_entry_break_even_funding_windows
-    ):
-        return (
-            "entry break-even funding windows "
-            f"{entry_break_even_windows:.2f} exceeds maximum "
-            f"{settings.stable_launch_ready_max_entry_break_even_funding_windows:.2f}"
-        )
-
-    round_trip_break_even_windows = (
-        break_even_days_round_trip * 24.0 / funding_window_hours
-    )
-    if (
-        round_trip_break_even_windows
-        > settings.stable_launch_ready_max_round_trip_break_even_funding_windows
-    ):
-        return (
-            "round-trip break-even funding windows "
-            f"{round_trip_break_even_windows:.2f} exceeds maximum "
-            f"{settings.stable_launch_ready_max_round_trip_break_even_funding_windows:.2f}"
-        )
-
-    return None
 
 
 def _approved_snapshot_matches_paper_trade(
