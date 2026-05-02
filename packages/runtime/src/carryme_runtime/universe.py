@@ -187,6 +187,7 @@ class OpportunityUniverseService:
         exclude_symbols: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         limit: int = 10,
+        use_route_stability: bool = True,
     ) -> list[FundingUniverseCanaryCandidate]:
         scan = await self.scan(
             venues=venues,
@@ -206,6 +207,7 @@ class OpportunityUniverseService:
             exclude_symbols=exclude_symbols,
             exclude_tags=exclude_tags or ["meme", "political"],
             limit=limit,
+            use_route_stability=use_route_stability,
         )
         candidates: list[FundingUniverseCanaryCandidate] = []
         for opportunity in scan.opportunities:
@@ -243,6 +245,7 @@ class OpportunityUniverseService:
         exclude_symbols: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         limit: int = 20,
+        use_route_stability: bool = True,
     ) -> FundingUniverseScan:
         normalized_venues = _normalize_venues(venues)
         normalized_ranking = _normalize_ranking(ranking)
@@ -276,7 +279,25 @@ class OpportunityUniverseService:
             execution_quality_index,
             execution_prior_score,
         ) = await self._build_execution_quality_index_cached()
-        route_stability_index = await self._build_route_stability_index_cached()
+        needs_route_stability = (
+            min_route_stability_weight > 0.0
+            or min_route_presence_ratio > 0.0
+            or min_route_samples > 0
+            or (
+                use_route_stability
+                and normalized_ranking
+                in {
+                    "stability_adjusted_roundtrip_pnl",
+                    "stability_adjusted_quality_pnl",
+                    "route_adjusted_quality_pnl",
+                }
+            )
+        )
+        route_stability_index = (
+            await self._build_route_stability_index_cached()
+            if needs_route_stability
+            else {}
+        )
 
         opportunities: list[FundingUniverseOpportunity] = []
         for overlap in snapshot_overlaps:

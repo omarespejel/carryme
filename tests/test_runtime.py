@@ -110,7 +110,10 @@ from carryme_runtime.account_preflight import (
     _row_represents_open_position,
 )
 from carryme_runtime.execution_quality import ExecutionQualityService
-from carryme_runtime.route_approvals import scan_live_route_candidate_for_approval
+from carryme_runtime.route_approvals import (
+    scan_exact_canary_candidate_for_approval,
+    scan_live_route_candidate_for_approval,
+)
 from carryme_runtime.system_state import ParadexSystemStateProbe, SystemStateService
 from carryme_runtime.universe_policy import passes_symbol_policy
 from carryme_storage import (
@@ -758,6 +761,73 @@ def test_opportunity_universe_service_scan_canary_candidates_uses_policy_default
         assert isinstance(candidates[0], FundingUniverseCanaryCandidate)
         assert candidates[0].opportunity.opportunity.canonical_symbol == "ARB-USD-PERP"
         assert candidates[0].suggested_canary_notional == pytest.approx(25.0)
+
+    asyncio.run(run())
+
+
+def test_opportunity_universe_service_can_skip_route_stability_for_exact_canary() -> None:
+    symbol_lists = {
+        "extended": ["NEAR-USD"],
+        "paradex": ["NEAR-USD-PERP"],
+    }
+    snapshots = {
+        ("extended", "NEAR-USD"): _snapshot(
+            "extended",
+            "NEAR-USD",
+            0.0014,
+            3.0,
+            600,
+            3.01,
+            500,
+            daily_volume=200_000,
+            open_interest=500_000,
+        ),
+        ("paradex", "NEAR-USD-PERP"): _snapshot(
+            "paradex",
+            "NEAR-USD-PERP",
+            -0.0012,
+            3.0,
+            500,
+            3.01,
+            600,
+            daily_volume=200_000,
+            open_interest=500_000,
+        ),
+    }
+
+    async def list_symbols(venue: str) -> list[str]:
+        return symbol_lists[venue]
+
+    async def fetch_snapshot(venue: str, symbol: str) -> NormalizedMarketSnapshot:
+        return snapshots[(venue, symbol)]
+
+    class FailingRouteStabilityService:
+        def build_index(
+            self,
+        ) -> dict[tuple[str, str, str, str, str], RouteStabilitySummary]:
+            raise AssertionError("exact approved scans should not build route stability")
+
+    async def run() -> None:
+        service = OpportunityUniverseService(
+            list_symbols=list_symbols,
+            fetch_snapshot=fetch_snapshot,
+            route_stability_service=cast(
+                RouteStabilityService,
+                FailingRouteStabilityService(),
+            ),
+        )
+        candidates = await service.scan_canary_candidates(
+            venues=["extended", "paradex"],
+            include_symbols=["NEAR-USD-PERP"],
+            min_route_stability_weight=0.0,
+            min_route_presence_ratio=0.0,
+            min_route_samples=0,
+            limit=1,
+            use_route_stability=False,
+        )
+
+        assert len(candidates) == 1
+        assert candidates[0].opportunity.opportunity.canonical_symbol == "NEAR-USD-PERP"
 
     asyncio.run(run())
 
@@ -3366,6 +3436,62 @@ def test_opportunity_universe_service_rejects_invalid_ranking() -> None:
             )
 
     asyncio.run(run())
+
+
+def test_scan_exact_canary_candidate_for_approval_skips_route_stability_index(
+    tmp_path: Path,
+) -> None:
+    approval = RouteApprovalEntry(
+        updated_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        label="near_extended_paradex",
+        canonical_symbol="NEAR-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        short_fee_profile="default",
+        long_fee_profile="pro_fastfills",
+        approved=True,
+        max_live_notional=25.0,
+        note="approved canary",
+    )
+    captured: dict[str, object] = {}
+
+    class StubScanner:
+        async def scan_canary_candidates(self, **kwargs: object) -> list[object]:
+            captured.update(kwargs)
+            return []
+
+    async def run() -> None:
+        candidate, candidate_count = await scan_exact_canary_candidate_for_approval(
+            scanner=cast(Any, StubScanner()),
+            approval_service=RouteApprovalService(
+                store=RouteApprovalStore(tmp_path / "approvals.sqlite3")
+            ),
+            approval=approval,
+            venues=["extended", "paradex"],
+            target_notional=5_000.0,
+            canary_max_notional=25.0,
+            min_capacity_notional=0.0,
+            min_daily_volume=0.0,
+            min_open_interest=0.0,
+            min_roundtrip_edge=0.0,
+            min_execution_quality_score=0.0,
+            min_execution_samples=0,
+            min_route_stability_weight=0.0,
+            min_route_presence_ratio=0.0,
+            min_route_samples=0,
+            include_symbols=None,
+            exclude_symbols=None,
+            exclude_tags=None,
+            limit=5,
+        )
+
+        assert candidate is None
+        assert candidate_count == 0
+
+    asyncio.run(run())
+
+    assert captured["include_symbols"] == ["NEAR-USD-PERP"]
+    assert captured["use_route_stability"] is False
 
 
 def test_scan_live_route_candidate_for_approval_returns_negative_edge_route() -> None:
