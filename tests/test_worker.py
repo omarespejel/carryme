@@ -125,6 +125,7 @@ from carryme_worker.poller import (
     _build_open_hedge_auto_close_reason,
     _build_open_hedge_profit_protection_reason,
     _build_order_state_observers,
+    _build_stable_launch_loss_circuit_breaker_reason,
     _execution_requires_continued_monitoring,
     _list_ranked_stable_launch_ready_stabilities,
     _maybe_auto_close_open_hedged_execution,
@@ -286,6 +287,10 @@ def _clear_worker_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "CARRYME_WORKER_STABLE_CANARY_LAUNCH_BLOCK_ADVERSE_LATEST_OUTCOME",
         raising=False,
     )
+    monkeypatch.delenv(
+        "CARRYME_WORKER_STABLE_CANARY_LAUNCH_CONSECUTIVE_LOSS_SCOPE",
+        raising=False,
+    )
     monkeypatch.delenv("CARRYME_WORKER_PARADEX_RECV_WINDOW_MS", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_EXTENDED_API_KEY", raising=False)
     monkeypatch.delenv("CARRYME_WORKER_EXTENDED_STARK_PRIVATE_KEY", raising=False)
@@ -339,6 +344,7 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_recent_closed_trade_limit == 10
     assert settings.stable_canary_launch_max_recent_negative_total_collateral is None
     assert settings.stable_canary_launch_max_consecutive_losing_trades is None
+    assert settings.stable_canary_launch_consecutive_loss_scope == "global"
     assert settings.stable_canary_launch_global_cooldown_seconds is None
     assert settings.stable_canary_launch_label_cooldown_seconds is None
     assert settings.stable_canary_launch_recent_launch_window_seconds is None
@@ -8994,6 +9000,168 @@ def test_launch_latest_stable_canary_once_skips_when_recent_negative_collateral_
     assert summary.detail == (
         "Stable launch recent negative collateral budget exceeded: "
         "loss=0.110000 > max=0.100000"
+    )
+
+
+def _append_closed_live_trade_with_collateral_delta(
+    *,
+    settings: WorkerSettings,
+    paper_trade_id: int,
+    label: str,
+    executed_at: datetime,
+    collateral_delta: float,
+) -> None:
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    snapshot_store = BalanceSnapshotStore(settings.database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=executed_at,
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="submitted",
+            paper_trade_id=paper_trade_id,
+            preview_hash=f"closed-loss-preview-{paper_trade_id}",
+            confirmation_entry_id=paper_trade_id + 100,
+            paper_trade=_build_auto_close_paper_trade(
+                entry_id=paper_trade_id,
+                created_at=executed_at - timedelta(minutes=5),
+                label=label,
+            ),
+            legs=[_build_auto_close_execution_leg()],
+        )
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=executed_at + timedelta(minutes=1),
+            context="worker_execution_monitor",
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=paper_trade_id,
+            preview_hash=execution.preview_hash,
+            order_state=ExecutionOrderState(
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=paper_trade_id,
+                preview_hash=execution.preview_hash,
+                legs=[],
+                notes=[],
+            ),
+            pair_status=_build_auto_close_pair_status(
+                execution=execution,
+                derived_state="closed",
+                recommended_action="no_action",
+            ),
+        )
+    )
+    for venue in ("extended", "paradex"):
+        snapshot_store.append(
+            VenueBalanceSnapshot(
+                captured_at=executed_at - timedelta(minutes=5),
+                paper_trade_id=paper_trade_id,
+                label=label,
+                stage="pre_open",
+                venue=venue,
+                total_collateral=500.0,
+            )
+        )
+        snapshot_store.append(
+            VenueBalanceSnapshot(
+                captured_at=executed_at + timedelta(minutes=5),
+                paper_trade_id=paper_trade_id,
+                label=label,
+                stage="post_close",
+                venue=venue,
+                total_collateral=500.0 + (collateral_delta / 2.0),
+            )
+        )
+
+
+def test_stable_launch_label_loss_scope_ignores_other_label_loss_streak(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_consecutive_losing_trades=2,
+        stable_canary_launch_consecutive_loss_scope="label",
+        stable_canary_launch_recent_closed_trade_limit=5,
+    )
+    _append_closed_live_trade_with_collateral_delta(
+        settings=settings,
+        paper_trade_id=91,
+        label="dot_extended_paradex",
+        executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+        collateral_delta=-0.03,
+    )
+    _append_closed_live_trade_with_collateral_delta(
+        settings=settings,
+        paper_trade_id=92,
+        label="bera_extended_paradex",
+        executed_at=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+        collateral_delta=-0.04,
+    )
+
+    reason = _build_stable_launch_loss_circuit_breaker_reason(
+        settings=settings,
+        execution_store=ExecutionJournalStore(settings.database_path),
+        observation_store=ExecutionObservationStore(settings.database_path),
+        balance_service=BalanceAccountingService(
+            store=BalanceSnapshotStore(settings.database_path)
+        ),
+        now=datetime(2026, 4, 4, 10, 10, tzinfo=UTC),
+        candidate_label="strk_paradex_hyperliquid",
+    )
+
+    assert reason is None
+
+    missing_label_reason = _build_stable_launch_loss_circuit_breaker_reason(
+        settings=settings,
+        execution_store=ExecutionJournalStore(settings.database_path),
+        observation_store=ExecutionObservationStore(settings.database_path),
+        balance_service=BalanceAccountingService(
+            store=BalanceSnapshotStore(settings.database_path)
+        ),
+        now=datetime(2026, 4, 4, 10, 10, tzinfo=UTC),
+    )
+
+    assert missing_label_reason == (
+        "Stable launch consecutive losing trades scope=label requires candidate label"
+    )
+
+
+def test_stable_launch_label_loss_scope_blocks_same_label_loss_streak(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_max_consecutive_losing_trades=2,
+        stable_canary_launch_consecutive_loss_scope="label",
+        stable_canary_launch_recent_closed_trade_limit=5,
+    )
+    for paper_trade_id, executed_at in (
+        (101, datetime(2026, 4, 4, 10, 0, tzinfo=UTC)),
+        (102, datetime(2026, 4, 4, 10, 2, tzinfo=UTC)),
+    ):
+        _append_closed_live_trade_with_collateral_delta(
+            settings=settings,
+            paper_trade_id=paper_trade_id,
+            label="strk_paradex_hyperliquid",
+            executed_at=executed_at,
+            collateral_delta=-0.03,
+        )
+
+    reason = _build_stable_launch_loss_circuit_breaker_reason(
+        settings=settings,
+        execution_store=ExecutionJournalStore(settings.database_path),
+        observation_store=ExecutionObservationStore(settings.database_path),
+        balance_service=BalanceAccountingService(
+            store=BalanceSnapshotStore(settings.database_path)
+        ),
+        now=datetime(2026, 4, 4, 10, 10, tzinfo=UTC),
+        candidate_label="strk_paradex_hyperliquid",
+    )
+
+    assert reason == (
+        "Stable launch consecutive losing trades threshold reached: "
+        "losses=2 >= max=2 for label=strk_paradex_hyperliquid"
     )
 
 

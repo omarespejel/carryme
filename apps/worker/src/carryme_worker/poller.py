@@ -586,6 +586,9 @@ def _build_stable_launch_hold_mode_blocker(settings: WorkerSettings) -> str | No
     return None
 
 
+StableLaunchLossOutcome = tuple[int, str | None, float]
+
+
 def _list_recent_closed_live_trade_outcomes(
     *,
     settings: WorkerSettings,
@@ -593,14 +596,14 @@ def _list_recent_closed_live_trade_outcomes(
     observation_store: ExecutionObservationStore,
     balance_service: BalanceAccountingService,
     now: datetime,
-) -> list[tuple[int, float]]:
+) -> list[StableLaunchLossOutcome]:
     """Return recent closed live paper trades with realized total collateral deltas."""
 
     limit = settings.stable_canary_launch_recent_closed_trade_limit
     page_size = max(limit * 4, 20)
     offset = 0
     seen_paper_trade_ids: set[int] = set()
-    outcomes: list[tuple[int, float]] = []
+    outcomes: list[StableLaunchLossOutcome] = []
 
     while len(outcomes) < limit:
         batch = execution_store.list_recent(limit=page_size, offset=offset)
@@ -624,7 +627,10 @@ def _list_recent_closed_live_trade_outcomes(
             attribution = balance_service.summarize_paper_trade_attribution(paper_trade_id)
             if attribution is None or attribution.total_collateral_delta is None:
                 continue
-            outcomes.append((paper_trade_id, attribution.total_collateral_delta))
+            label = None
+            if execution.paper_trade is not None:
+                label = execution.paper_trade.intent.label
+            outcomes.append((paper_trade_id, label, attribution.total_collateral_delta))
             if len(outcomes) >= limit:
                 break
 
@@ -641,6 +647,9 @@ def _build_stable_launch_loss_circuit_breaker_reason(
     observation_store: ExecutionObservationStore,
     balance_service: BalanceAccountingService,
     now: datetime,
+    candidate_label: str | None = None,
+    recent_outcomes: list[StableLaunchLossOutcome] | None = None,
+    check_consecutive_losses: bool = True,
 ) -> str | None:
     """Return the deterministic reason unattended launch is blocked by recent losses."""
 
@@ -649,37 +658,55 @@ def _build_stable_launch_loss_circuit_breaker_reason(
     if max_negative_total is None and max_consecutive_losses is None:
         return None
 
-    outcomes = _list_recent_closed_live_trade_outcomes(
-        settings=settings,
-        execution_store=execution_store,
-        observation_store=observation_store,
-        balance_service=balance_service,
-        now=now,
-    )
+    outcomes = recent_outcomes
+    if outcomes is None:
+        outcomes = _list_recent_closed_live_trade_outcomes(
+            settings=settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            balance_service=balance_service,
+            now=now,
+        )
     if not outcomes:
         return None
 
     if max_negative_total is not None:
-        total_negative_collateral = -sum(min(delta, 0.0) for _, delta in outcomes)
+        total_negative_collateral = -sum(min(delta, 0.0) for _, _, delta in outcomes)
         if total_negative_collateral - max_negative_total > 1e-9:
             return (
                 "Stable launch recent negative collateral budget exceeded: "
                 f"loss={total_negative_collateral:.6f} > max={max_negative_total:.6f}"
             )
 
-    if max_consecutive_losses is None:
+    if max_consecutive_losses is None or not check_consecutive_losses:
         return None
 
+    scoped_outcomes = outcomes
+    if settings.stable_canary_launch_consecutive_loss_scope == "label":
+        if candidate_label is None:
+            return (
+                "Stable launch consecutive losing trades scope=label requires "
+                "candidate label"
+            )
+        scoped_outcomes = [
+            (paper_trade_id, label, delta)
+            for paper_trade_id, label, delta in outcomes
+            if label == candidate_label
+        ]
+
     consecutive_losses = 0
-    for _, delta in outcomes:
+    for _, _, delta in scoped_outcomes:
         if delta < 0:
             consecutive_losses += 1
         else:
             break
     if consecutive_losses >= max_consecutive_losses:
+        scope_detail = ""
+        if settings.stable_canary_launch_consecutive_loss_scope == "label":
+            scope_detail = f" for label={candidate_label}"
         return (
             "Stable launch consecutive losing trades threshold reached: "
-            f"losses={consecutive_losses} >= max={max_consecutive_losses}"
+            f"losses={consecutive_losses} >= max={max_consecutive_losses}{scope_detail}"
         )
 
     return None
@@ -2967,6 +2994,18 @@ async def launch_latest_stable_canary_once(
         store=RouteApprovalStore(runtime_settings.database_path)
     )
     timestamp = now or _utc_now()
+    recent_closed_trade_outcomes: list[StableLaunchLossOutcome] | None = None
+    if (
+        settings.stable_canary_launch_max_recent_negative_total_collateral is not None
+        or settings.stable_canary_launch_max_consecutive_losing_trades is not None
+    ):
+        recent_closed_trade_outcomes = _list_recent_closed_live_trade_outcomes(
+            settings=settings,
+            execution_store=execution_store,
+            observation_store=observation_store,
+            balance_service=balance_service,
+            now=timestamp,
+        )
 
     blocking_live_executions = _list_blocking_live_executions_for_stable_launch(
         settings=settings,
@@ -2993,6 +3032,10 @@ async def launch_latest_stable_canary_once(
         observation_store=observation_store,
         balance_service=balance_service,
         now=timestamp,
+        recent_outcomes=recent_closed_trade_outcomes,
+        check_consecutive_losses=(
+            settings.stable_canary_launch_consecutive_loss_scope == "global"
+        ),
     )
     if loss_circuit_breaker_reason is not None:
         return StableCanaryLaunchSummary(
@@ -3074,6 +3117,28 @@ async def launch_latest_stable_canary_once(
 
     for candidate_stability in stable_candidates:
         candidate_snapshot = candidate_stability.snapshot
+        if settings.stable_canary_launch_consecutive_loss_scope == "label":
+            loss_circuit_breaker_reason = _build_stable_launch_loss_circuit_breaker_reason(
+                settings=settings,
+                execution_store=execution_store,
+                observation_store=observation_store,
+                balance_service=balance_service,
+                now=timestamp,
+                candidate_label=candidate_snapshot.label,
+                recent_outcomes=recent_closed_trade_outcomes,
+            )
+            if loss_circuit_breaker_reason is not None:
+                skipped_candidates.append(
+                    _StableCanaryCandidateSkip(
+                        label=candidate_snapshot.label,
+                        launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                        approved_snapshot_id=(
+                            candidate_snapshot.approved_snapshot.snapshot_id
+                        ),
+                        detail=loss_circuit_breaker_reason,
+                    )
+                )
+                continue
         try:
             latest_launch_ready_snapshot, candidate_selected, candidate_approval = (
                 _select_latest_launch_ready_canary_snapshot(

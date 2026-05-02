@@ -11,6 +11,7 @@ from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
+StableCanaryLaunchLossScope = Literal["global", "label"]
 
 
 class WorkerSettings(BaseSettings):
@@ -60,6 +61,7 @@ class WorkerSettings(BaseSettings):
         default=None,
         ge=1,
     )
+    stable_canary_launch_consecutive_loss_scope: StableCanaryLaunchLossScope = "global"
     stable_canary_launch_global_cooldown_seconds: int | None = Field(
         default=None,
         ge=0,
