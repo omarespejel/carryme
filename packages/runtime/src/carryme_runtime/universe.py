@@ -531,11 +531,12 @@ class OpportunityUniverseService:
         ranked = sorted(scored, key=lambda item: item[0], reverse=True)
         ordered = [overlap for _score, overlap in ranked]
         ordered.extend(unscored)
-        if (
-            shortlist_size <= 0
-            or (ranking not in SHORTLIST_CAPPED_RANKINGS and not force_snapshot_shortlist)
-        ):
+        if ranking not in SHORTLIST_CAPPED_RANKINGS and not force_snapshot_shortlist:
             return ordered
+        if shortlist_size <= 0:
+            if not force_snapshot_shortlist:
+                return ordered
+            shortlist_size = max(self.snapshot_shortlist_min_overlaps, 1)
         return ordered[:shortlist_size]
 
     async def _fetch_overlapping_market_stats(
