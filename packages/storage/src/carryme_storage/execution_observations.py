@@ -64,6 +64,12 @@ class ExecutionObservationStore:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_execution_observation_entries_paper_trade_latest
+                ON execution_observation_entries(paper_trade_id, observed_at DESC, id DESC)
+                """
+            )
+            connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_execution_observation_entries_preview_hash
                 ON execution_observation_entries(preview_hash)
                 """
