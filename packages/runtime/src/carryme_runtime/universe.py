@@ -187,6 +187,7 @@ class OpportunityUniverseService:
         exclude_symbols: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         limit: int = 10,
+        use_execution_quality: bool = True,
         use_route_stability: bool = True,
     ) -> list[FundingUniverseCanaryCandidate]:
         scan = await self.scan(
@@ -207,6 +208,7 @@ class OpportunityUniverseService:
             exclude_symbols=exclude_symbols,
             exclude_tags=exclude_tags or ["meme", "political"],
             limit=limit,
+            use_execution_quality=use_execution_quality,
             use_route_stability=use_route_stability,
         )
         candidates: list[FundingUniverseCanaryCandidate] = []
@@ -245,6 +247,7 @@ class OpportunityUniverseService:
         exclude_symbols: list[str] | None = None,
         exclude_tags: list[str] | None = None,
         limit: int = 20,
+        use_execution_quality: bool = True,
         use_route_stability: bool = True,
     ) -> FundingUniverseScan:
         normalized_venues = _normalize_venues(venues)
@@ -275,10 +278,33 @@ class OpportunityUniverseService:
             min_roundtrip_edge=min_roundtrip_edge,
         )
         snapshots = await self._fetch_overlapping_snapshots(snapshot_overlaps)
-        (
-            execution_quality_index,
-            execution_prior_score,
-        ) = await self._build_execution_quality_index_cached()
+        needs_execution_quality = (
+            min_execution_samples > 0
+            or (
+                use_execution_quality
+                and (
+                    min_execution_quality_score > 0.0
+                    or normalized_ranking
+                    in {
+                        "execution_adjusted_roundtrip_pnl",
+                        "execution_adjusted_quality_pnl",
+                        "route_adjusted_quality_pnl",
+                    }
+                )
+            )
+        )
+        if needs_execution_quality:
+            (
+                execution_quality_index,
+                execution_prior_score,
+            ) = await self._build_execution_quality_index_cached()
+        else:
+            execution_quality_index = {}
+            execution_prior_score = (
+                self.execution_quality_service.prior_score
+                if self.execution_quality_service is not None
+                else 1.0
+            )
         needs_route_stability = (
             min_route_stability_weight > 0.0
             or min_route_presence_ratio > 0.0
