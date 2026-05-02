@@ -349,6 +349,7 @@ async def scan_exact_canary_candidate_for_approval(
         exclude_symbols=exclude_symbols,
         exclude_tags=exclude_tags,
         limit=max(1, limit),
+        use_route_stability=False,
     )
 
     for candidate in approval_service.filter_approved_canary_candidates(candidates):
