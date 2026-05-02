@@ -187,6 +187,33 @@ def test_app_startup_skips_prewarm_for_default_development_database(
     assert seen == {}
 
 
+def test_app_startup_skips_prewarm_for_equivalent_default_development_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class StubExecutionStore:
+        def initialize(self) -> None:
+            seen["initialized"] = True
+
+    async def override_settings() -> ApiSettings:
+        return ApiSettings(database_path="./data/carryme.sqlite3")
+
+    def build_store(database_path: str) -> StubExecutionStore:
+        seen["database_path"] = database_path
+        return StubExecutionStore()
+
+    monkeypatch.setattr(app_module, "_execution_journal_store_for_path", build_store)
+    app.dependency_overrides[get_api_settings] = override_settings
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        app.dependency_overrides.clear()
+
+    assert seen == {}
+
+
 def test_app_startup_fails_closed_when_execution_store_prewarm_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

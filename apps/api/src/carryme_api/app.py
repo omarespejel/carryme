@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Any, cast
 
 import httpx
@@ -151,7 +152,11 @@ from carryme_storage import (
     SystemStateAlertStore,
     WatchlistStore,
 )
-from carryme_storage.db import DEFAULT_DATABASE_PING_TIMEOUT_SECONDS, Database
+from carryme_storage.db import (
+    DEFAULT_DATABASE_PING_TIMEOUT_SECONDS,
+    Database,
+    normalize_database_url,
+)
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -428,9 +433,19 @@ async def _resolve_api_settings_for_request(request: Request) -> ApiSettings:
 def _should_prewarm_execution_journal(settings: ApiSettings) -> bool:
     """Return whether startup should prewarm the execution journal store."""
 
+    def _normalized_database_target(database: str) -> str:
+        normalized = normalize_database_url(database.strip())
+        sqlite_prefix = "sqlite:///"
+        if normalized == f"{sqlite_prefix}:memory:":
+            return normalized
+        if normalized.startswith(sqlite_prefix):
+            return f"{sqlite_prefix}{Path(normalized.removeprefix(sqlite_prefix)).resolve()}"
+        return normalized
+
     return not (
         settings.environment == "development"
-        and settings.database_path == "data/carryme.sqlite3"
+        and _normalized_database_target(settings.database_path)
+        == _normalized_database_target("data/carryme.sqlite3")
     )
 
 
