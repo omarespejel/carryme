@@ -10,7 +10,7 @@ services:
     rootDir: .
     plan: starter
     buildCommand: pip install uv && uv sync --frozen --all-packages
-    startCommand: sh -c 'uv run alembic upgrade head && uv run carryme-api'
+    startCommand: uv run carryme-api-migrate-and-start
     healthCheckPath: /ready
     envVars:
       - key: DATABASE_URL

@@ -46,7 +46,7 @@ databases:
 services:
   - type: web
     name: carryme-api
-    startCommand: uv run carryme-api
+    startCommand: uv run carryme-api-migrate-and-start
   - type: worker
     name: carryme-approved-canary-scan
     startCommand: uv run carryme-worker --scan-approved-canary-supervise
@@ -75,7 +75,7 @@ databases:
 services:
   - type: web
     name: carryme-api
-    startCommand: sh -c 'uv run alembic upgrade head && uv run carryme-api'
+    startCommand: uv run carryme-api-migrate-and-start
   - type: worker
     name: carryme-universe-scan
     startCommand: uv run carryme-worker --scan-universe-supervise
@@ -118,7 +118,7 @@ databases:
 services:
   - type: web
     name: carryme-api
-    startCommand: sh -c 'uv run alembic upgrade head && uv run carryme-api'
+    startCommand: uv run carryme-api-migrate-and-start
   - type: worker
     name: carryme-universe-scan
     startCommand: uv run carryme-worker --scan-universe-supervise

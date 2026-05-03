@@ -111,6 +111,7 @@ name = "carryme-api"
 version = "0.1.0"
 source = { editable = "apps/api" }
 dependencies = [
+    { name = "alembic" },
     { name = "carryme-models" },
     { name = "carryme-normalizers" },
     { name = "carryme-runtime" },
@@ -123,6 +124,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "alembic", specifier = ">=1.16,<2" },
     { name = "carryme-models", editable = "packages/models" },
     { name = "carryme-normalizers", editable = "packages/normalizers" },
     { name = "carryme-runtime", editable = "packages/runtime" },

@@ -29,7 +29,7 @@ REQUIRED_RENDER_DATABASES = ("carryme-postgres",)
 REQUIRED_RENDER_SERVICE_SPECS: dict[str, dict[str, str]] = {
     "carryme-api": {
         "type": "web",
-        "start_command": "uv run carryme-api",
+        "start_command": "uv run carryme-api-migrate-and-start",
     },
     "carryme-universe-scan": {
         "type": "worker",
