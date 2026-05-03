@@ -93,6 +93,11 @@ class WorkerSettings(BaseSettings):
         default=None,
         ge=0,
     )
+    stable_canary_launch_execution_quality_max_attempts: int = Field(default=2, ge=1)
+    stable_canary_launch_execution_quality_retry_delay_seconds: float = Field(
+        default=0.25,
+        ge=0,
+    )
     stable_canary_launch_min_daily_volume: float | None = Field(
         default=None,
         ge=0,

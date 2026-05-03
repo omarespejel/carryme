@@ -964,6 +964,50 @@ def _stable_launch_needs_current_execution_quality(settings: WorkerSettings) -> 
     )
 
 
+async def _build_current_execution_quality_index(
+    *,
+    settings: WorkerSettings,
+    execution_quality_service: ExecutionQualityService,
+    logger: logging.Logger | None = None,
+) -> tuple[dict[tuple[str, str, str], ExecutionQualitySummary], str | None]:
+    """Build current execution quality without launching on transient DB uncertainty."""
+
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    last_error: Exception | None = None
+    max_attempts = settings.stable_canary_launch_execution_quality_max_attempts
+    retry_delay_seconds = settings.stable_canary_launch_execution_quality_retry_delay_seconds
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await asyncio.to_thread(execution_quality_service.build_index), None
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            loop_logger.warning(
+                "stable launch current execution quality read failed on attempt %d/%d; "
+                "retrying in %.2fs",
+                attempt,
+                max_attempts,
+                retry_delay_seconds,
+                exc_info=True,
+            )
+            if retry_delay_seconds > 0:
+                await asyncio.sleep(retry_delay_seconds)
+
+    assert last_error is not None
+    loop_logger.warning(
+        "stable launch current execution quality read failed after %d attempts; "
+        "skipping launch cycle",
+        max_attempts,
+        exc_info=(type(last_error), last_error, last_error.__traceback__),
+    )
+    return {}, (
+        "Stable launch current execution quality unavailable after "
+        f"{max_attempts} attempts: {type(last_error).__name__}"
+    )
+
+
 def _with_current_execution_quality(
     *,
     candidate: FundingUniverseCanaryCandidate,
@@ -3571,9 +3615,19 @@ async def launch_latest_stable_canary_once(
             journal_store=execution_store,
             observation_store=observation_store,
         )
-        execution_quality_index = await asyncio.to_thread(
-            execution_quality_service.build_index
+        (
+            execution_quality_index,
+            execution_quality_unavailable_reason,
+        ) = await _build_current_execution_quality_index(
+            settings=settings,
+            execution_quality_service=execution_quality_service,
         )
+        if execution_quality_unavailable_reason is not None:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_target,
+                detail=execution_quality_unavailable_reason,
+            )
     balance_service = BalanceAccountingService(
         store=BalanceSnapshotStore(runtime_settings.database_path)
     )
