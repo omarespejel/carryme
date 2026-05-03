@@ -4730,15 +4730,16 @@ def test_stable_launch_executable_cost_guard_blocks_legacy_snapshot() -> None:
 def test_stable_launch_executable_cost_guard_blocks_invalid_spread() -> None:
     settings = WorkerSettings()
     _, candidate, _, _ = _build_stable_launch_test_snapshot(label="arb_extended_paradex")
-    candidate.opportunity.modeled_round_trip_spread_cost_rate = float("inf")
 
-    reason = _build_stable_launch_executable_round_trip_cost_reason(
-        settings=settings,
-        candidate=candidate,
-    )
+    for invalid_rate in (float("inf"), float("nan"), -0.0001):
+        candidate.opportunity.modeled_round_trip_spread_cost_rate = invalid_rate
+        reason = _build_stable_launch_executable_round_trip_cost_reason(
+            settings=settings,
+            candidate=candidate,
+        )
 
-    assert reason is not None
-    assert "modeled_round_trip_spread_cost_rate is missing or invalid" in reason
+        assert reason is not None
+        assert "modeled_round_trip_spread_cost_rate is missing or invalid" in reason
 
 
 def test_stable_launch_executable_cost_guard_blocks_negative_executable_pnl() -> None:
@@ -12153,6 +12154,7 @@ def _build_auto_close_execution_leg() -> ExecutionLegResult:
 
 def test_maybe_capture_auto_close_balance_checkpoint_records_post_close(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
     paper_trade = _build_auto_close_paper_trade(
@@ -12219,6 +12221,10 @@ def test_maybe_capture_auto_close_balance_checkpoint_records_post_close(
                 blocking_reasons=[],
             )
 
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
     account_service = StubAccountService()
     snapshots = asyncio.run(
         _maybe_capture_auto_close_balance_checkpoint(

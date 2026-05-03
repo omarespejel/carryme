@@ -2705,14 +2705,6 @@ async def _maybe_auto_close_open_hedged_execution(
                 poll_interval_seconds=2.0,
                 auto_cleanup=True,
             )
-            await _maybe_capture_auto_close_balance_checkpoint(
-                settings=settings,
-                paper_trade=paper_trade_entry,
-                pair_status=result.pair_status,
-                account_service=account_service,
-                balance_service=balance_snapshot_service,
-                logger=logger,
-            )
     except TimeoutError:
         logger.warning(
             (
@@ -2724,6 +2716,21 @@ async def _maybe_auto_close_open_hedged_execution(
             settings.execution_auto_pair_close_timeout_seconds,
         )
         return None
+    try:
+        await _maybe_capture_auto_close_balance_checkpoint(
+            settings=settings,
+            paper_trade=paper_trade_entry,
+            pair_status=result.pair_status,
+            account_service=account_service,
+            balance_service=balance_snapshot_service,
+            logger=logger,
+        )
+    except Exception:
+        logger.warning(
+            "failed to capture post-close balance checkpoint for paper_trade_id=%s",
+            paper_trade.entry_id,
+            exc_info=True,
+        )
     logger.info(
         "auto-closed paper_trade_id=%s from execution_entry_id=%s because %s",
         paper_trade.entry_id,
