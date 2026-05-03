@@ -1106,16 +1106,22 @@ def _build_stable_launch_executable_round_trip_cost_reason(
 
     opportunity = candidate.opportunity
     spread_cost_rate = opportunity.modeled_round_trip_spread_cost_rate
-    if spread_cost_rate is None:
+    if (
+        spread_cost_rate is None
+        or not math.isfinite(spread_cost_rate)
+        or spread_cost_rate < 0
+    ):
         return (
             "Stable launch executable round-trip cost unavailable: "
-            "modeled_round_trip_spread_cost_rate is missing"
+            "modeled_round_trip_spread_cost_rate is missing or invalid"
         )
 
     scaled_round_trip_pnl = _scaled_stable_launch_round_trip_pnl(candidate)
     executable_spread_cost = candidate.suggested_canary_notional * spread_cost_rate
     executable_round_trip_pnl = scaled_round_trip_pnl - executable_spread_cost
     min_expected_pnl = settings.stable_canary_launch_min_expected_one_day_round_trip_pnl
+    # Even without an explicit configured profit floor, live launches must at least
+    # clear modeled executable spread cost before unattended money movement.
     min_required_pnl = min_expected_pnl if min_expected_pnl is not None else 0.0
     if executable_round_trip_pnl + 1e-9 >= min_required_pnl:
         return None
@@ -2195,6 +2201,7 @@ async def _maybe_capture_auto_close_balance_checkpoint(
     *,
     settings: WorkerSettings,
     paper_trade: PaperTradeEntry,
+    pair_status: ExecutionPairStatus,
     account_service: AccountPreflightService,
     balance_service: BalanceAccountingService,
     logger: logging.Logger,
@@ -2205,20 +2212,58 @@ async def _maybe_capture_auto_close_balance_checkpoint(
         return []
     if paper_trade.entry_id is None:
         return []
-
-    try:
-        preflight = await asyncio.wait_for(
-            account_service.probe_paper_trade(
-                paper_trade,
-                _build_account_preflight_configs(settings),
-            ),
-            timeout=OBSERVATION_CALL_TIMEOUT_SECONDS,
-        )
-    except Exception:
+    if pair_status.paper_trade_id != paper_trade.entry_id:
         logger.warning(
-            "failed to capture post-close balance checkpoint for paper_trade_id=%s",
+            (
+                "skipping post-close balance checkpoint for paper_trade_id=%s because "
+                "pair status belongs to paper_trade_id=%s"
+            ),
             paper_trade.entry_id,
-            exc_info=True,
+            pair_status.paper_trade_id,
+        )
+        return []
+    if pair_status.derived_state != "closed":
+        logger.debug(
+            (
+                "skipping post-close balance checkpoint for paper_trade_id=%s because "
+                "pair state is %s"
+            ),
+            paper_trade.entry_id,
+            pair_status.derived_state,
+        )
+        return []
+
+    preflight: PaperTradeAccountPreflight | None = None
+    for attempt in range(3):
+        try:
+            preflight = await asyncio.wait_for(
+                account_service.probe_paper_trade(
+                    paper_trade,
+                    _build_account_preflight_configs(settings),
+                ),
+                timeout=OBSERVATION_CALL_TIMEOUT_SECONDS,
+            )
+            break
+        except Exception:
+            if attempt >= 2:
+                logger.warning(
+                    "failed to capture post-close balance checkpoint for paper_trade_id=%s",
+                    paper_trade.entry_id,
+                    exc_info=True,
+                )
+                return []
+            await asyncio.sleep(0.25 * (2**attempt))
+
+    if preflight is None:
+        return []
+    if preflight.paper_trade_id != paper_trade.entry_id:
+        logger.warning(
+            (
+                "skipping post-close balance checkpoint for paper_trade_id=%s because "
+                "account preflight returned paper_trade_id=%s"
+            ),
+            paper_trade.entry_id,
+            preflight.paper_trade_id,
         )
         return []
 
@@ -2663,6 +2708,7 @@ async def _maybe_auto_close_open_hedged_execution(
             await _maybe_capture_auto_close_balance_checkpoint(
                 settings=settings,
                 paper_trade=paper_trade_entry,
+                pair_status=result.pair_status,
                 account_service=account_service,
                 balance_service=balance_snapshot_service,
                 logger=logger,

@@ -4727,6 +4727,20 @@ def test_stable_launch_executable_cost_guard_blocks_legacy_snapshot() -> None:
     assert "executable round-trip cost unavailable" in reason
 
 
+def test_stable_launch_executable_cost_guard_blocks_invalid_spread() -> None:
+    settings = WorkerSettings()
+    _, candidate, _, _ = _build_stable_launch_test_snapshot(label="arb_extended_paradex")
+    candidate.opportunity.modeled_round_trip_spread_cost_rate = float("inf")
+
+    reason = _build_stable_launch_executable_round_trip_cost_reason(
+        settings=settings,
+        candidate=candidate,
+    )
+
+    assert reason is not None
+    assert "modeled_round_trip_spread_cost_rate is missing or invalid" in reason
+
+
 def test_stable_launch_executable_cost_guard_blocks_negative_executable_pnl() -> None:
     settings = WorkerSettings()
     _, candidate, _, _ = _build_stable_launch_test_snapshot(
@@ -12145,9 +12159,27 @@ def test_maybe_capture_auto_close_balance_checkpoint_records_post_close(
         entry_id=41,
         created_at=datetime(2026, 4, 5, 10, 0, tzinfo=UTC),
     )
+    execution = ExecutionJournalEntry(
+        entry_id=51,
+        executed_at=datetime(2026, 4, 5, 10, 1, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=41,
+        preview_hash="post-close-balance-preview",
+        paper_trade=paper_trade,
+        legs=[_build_auto_close_execution_leg()],
+    )
+    pair_status = _build_auto_close_pair_status(
+        execution=execution,
+        derived_state="closed",
+        recommended_action="no_action",
+    )
     balance_service = BalanceAccountingService(store=BalanceSnapshotStore(settings.database_path))
 
     class StubAccountService:
+        attempts = 0
+
         async def probe_paper_trade(
             self,
             requested_trade: PaperTradeEntry,
@@ -12155,6 +12187,9 @@ def test_maybe_capture_auto_close_balance_checkpoint_records_post_close(
         ) -> PaperTradeAccountPreflight:
             _ = config_map
             assert requested_trade.entry_id == 41
+            self.attempts += 1
+            if self.attempts == 1:
+                raise TimeoutError("transient read failure")
             return PaperTradeAccountPreflight(
                 paper_trade_id=41,
                 label=requested_trade.intent.label,
@@ -12184,22 +12219,72 @@ def test_maybe_capture_auto_close_balance_checkpoint_records_post_close(
                 blocking_reasons=[],
             )
 
+    account_service = StubAccountService()
     snapshots = asyncio.run(
         _maybe_capture_auto_close_balance_checkpoint(
             settings=settings,
             paper_trade=paper_trade,
-            account_service=cast(AccountPreflightService, StubAccountService()),
+            pair_status=pair_status,
+            account_service=cast(AccountPreflightService, account_service),
             balance_service=balance_service,
             logger=logging.getLogger("test"),
         )
     )
 
+    assert account_service.attempts == 2
     assert [snapshot.stage for snapshot in snapshots] == ["post_close", "post_close"]
     saved = balance_service.list_snapshots(paper_trade_id=41, stage="post_close")
     assert {snapshot.venue for snapshot in saved} == {"extended", "paradex"}
     assert sum(snapshot.total_collateral or 0.0 for snapshot in saved) == pytest.approx(
         999.9
     )
+
+
+def test_maybe_capture_auto_close_balance_checkpoint_skips_when_not_closed(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    paper_trade = _build_auto_close_paper_trade(
+        entry_id=42,
+        created_at=datetime(2026, 4, 5, 10, 0, tzinfo=UTC),
+    )
+    execution = ExecutionJournalEntry(
+        entry_id=52,
+        executed_at=datetime(2026, 4, 5, 10, 1, tzinfo=UTC),
+        adapter="paired_live:extended_then_paradex",
+        mode="live",
+        status="submitted",
+        paper_trade_id=42,
+        preview_hash="not-closed-balance-preview",
+        paper_trade=paper_trade,
+        legs=[_build_auto_close_execution_leg()],
+    )
+    pair_status = _build_auto_close_pair_status(execution=execution)
+    balance_service = BalanceAccountingService(store=BalanceSnapshotStore(settings.database_path))
+
+    class StubAccountService:
+        async def probe_paper_trade(
+            self,
+            requested_trade: PaperTradeEntry,
+            config_map: object,
+        ) -> PaperTradeAccountPreflight:
+            _ = requested_trade
+            _ = config_map
+            pytest.fail("non-closed pair status must not probe balances")
+
+    snapshots = asyncio.run(
+        _maybe_capture_auto_close_balance_checkpoint(
+            settings=settings,
+            paper_trade=paper_trade,
+            pair_status=pair_status,
+            account_service=cast(AccountPreflightService, StubAccountService()),
+            balance_service=balance_service,
+            logger=logging.getLogger("test"),
+        )
+    )
+
+    assert snapshots == []
+    assert balance_service.list_snapshots(paper_trade_id=42, stage="post_close") == []
 
 
 def _build_partial_fill_cleanup_execution() -> ExecutionJournalEntry:
