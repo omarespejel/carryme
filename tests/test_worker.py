@@ -8099,7 +8099,7 @@ def test_stable_launch_current_execution_quality_retries_transient_read_failure(
         def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
             self.attempts += 1
             if self.attempts == 1:
-                raise RuntimeError("transient db eof")
+                raise sqlite3.OperationalError("transient db eof")
             return {("ARB-USD-PERP", "extended", "paradex"): quality}
 
     service = TransientQualityService()
@@ -8128,7 +8128,7 @@ def test_launch_latest_stable_canary_once_skips_when_current_execution_quality_u
     )
 
     async def fail_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("transient db eof")
+        raise sqlite3.OperationalError("transient db eof")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("carryme_worker.poller.asyncio.to_thread", fail_to_thread)
@@ -8142,8 +8142,59 @@ def test_launch_latest_stable_canary_once_skips_when_current_execution_quality_u
 
     assert summary.status == "skipped"
     assert summary.detail == (
-        "Stable launch current execution quality unavailable after 2 attempts: RuntimeError"
+        "Stable launch current execution quality unavailable after 2 attempts: OperationalError"
     )
+
+
+def test_stable_launch_current_execution_quality_propagates_unexpected_errors(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_execution_quality_max_attempts=2,
+        stable_canary_launch_execution_quality_retry_delay_seconds=0,
+    )
+
+    class BuggyQualityService:
+        def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
+            raise ValueError("schema regression")
+
+    with pytest.raises(ValueError, match="schema regression"):
+        asyncio.run(
+            _build_current_execution_quality_index(
+                settings=settings,
+                execution_quality_service=cast(Any, BuggyQualityService()),
+                logger=logging.getLogger("test"),
+            )
+        )
+
+
+def test_stable_launch_current_execution_quality_propagates_cancellation(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_execution_quality_max_attempts=2,
+        stable_canary_launch_execution_quality_retry_delay_seconds=0,
+    )
+
+    async def cancel_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        raise asyncio.CancelledError
+
+    class UnusedQualityService:
+        def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
+            raise AssertionError("cancelled to_thread should not call build_index")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("carryme_worker.poller.asyncio.to_thread", cancel_to_thread)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                _build_current_execution_quality_index(
+                    settings=settings,
+                    execution_quality_service=cast(Any, UnusedQualityService()),
+                    logger=logging.getLogger("test"),
+                )
+            )
 
 
 def test_launch_latest_stable_canary_once_uses_latest_execution_quality_for_maturity(

@@ -150,6 +150,7 @@ from carryme_storage import (
     load_watchlist,
 )
 from fastapi import HTTPException
+from sqlalchemy.exc import DBAPIError
 
 from carryme_worker.config import (
     STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS,
@@ -980,27 +981,31 @@ async def _build_current_execution_quality_index(
     for attempt in range(1, max_attempts + 1):
         try:
             return await asyncio.to_thread(execution_quality_service.build_index), None
-        except Exception as exc:
+        except asyncio.CancelledError:
+            raise
+        except (DBAPIError, sqlite3.Error, TimeoutError, ConnectionError) as exc:
             last_error = exc
             if attempt >= max_attempts:
                 break
             loop_logger.warning(
                 "stable launch current execution quality read failed on attempt %d/%d; "
-                "retrying in %.2fs",
+                "retrying in %.2fs error_type=%s",
                 attempt,
                 max_attempts,
                 retry_delay_seconds,
-                exc_info=True,
+                type(exc).__name__,
             )
             if retry_delay_seconds > 0:
                 await asyncio.sleep(retry_delay_seconds)
 
-    assert last_error is not None
-    loop_logger.warning(
+    if last_error is None:
+        return {}, "Stable launch current execution quality unavailable: unknown error"
+
+    loop_logger.error(
         "stable launch current execution quality read failed after %d attempts; "
-        "skipping launch cycle",
+        "skipping launch cycle error_type=%s",
         max_attempts,
-        exc_info=(type(last_error), last_error, last_error.__traceback__),
+        type(last_error).__name__,
     )
     return {}, (
         "Stable launch current execution quality unavailable after "
