@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -378,6 +379,49 @@ def test_app_startup_retries_execution_store_prewarm_transient_failure(
     assert attempts == [1, 2, 3]
 
 
+def test_app_startup_retries_execution_store_prewarm_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_timeouts: list[float | None] = []
+
+    async def override_settings() -> ApiSettings:
+        return ApiSettings(
+            database_path=str(tmp_path / "timeout.sqlite3"),
+            startup_prewarm_max_attempts=2,
+            startup_prewarm_attempt_timeout_seconds=1.25,
+            startup_prewarm_retry_delay_seconds=0,
+        )
+
+    class HealthyExecutionStore:
+        def initialize(self) -> None:
+            return None
+
+    real_wait_for = app_module.asyncio.wait_for
+
+    async def timeout_once(awaitable: Any, timeout: float | None = None) -> Any:
+        seen_timeouts.append(timeout)
+        if len(seen_timeouts) == 1:
+            awaitable.close()
+            raise TimeoutError("prewarm attempt timed out")
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(
+        app_module,
+        "_execution_journal_store_for_path",
+        lambda database_path: HealthyExecutionStore(),
+    )
+    monkeypatch.setattr(app_module.asyncio, "wait_for", timeout_once)
+    app.dependency_overrides[get_api_settings] = override_settings
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        app.dependency_overrides.clear()
+
+    assert seen_timeouts == [1.25, 1.25]
+
+
 def test_app_startup_fails_closed_when_execution_store_prewarm_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -386,6 +430,7 @@ def test_app_startup_fails_closed_when_execution_store_prewarm_fails(
         return ApiSettings(
             database_path=str(tmp_path / "blocked.sqlite3"),
             startup_prewarm_max_attempts=2,
+            startup_prewarm_attempt_timeout_seconds=1,
             startup_prewarm_retry_delay_seconds=0,
         )
 
@@ -404,12 +449,55 @@ def test_app_startup_fails_closed_when_execution_store_prewarm_fails(
     )
     app.dependency_overrides[get_api_settings] = override_settings
     try:
-        with pytest.raises(RuntimeError, match="prewarm failed"), TestClient(app):
+        with pytest.raises(
+            RuntimeError,
+            match="API startup execution journal prewarm failed after 2 attempts",
+        ), TestClient(app):
             pass
     finally:
         app.dependency_overrides.clear()
 
     assert attempts == 2
+
+
+def test_app_startup_prewarm_retry_logs_redacted_database_target(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def override_settings() -> ApiSettings:
+        return ApiSettings(
+            database_path=(
+                "postgresql+psycopg://carryme:super-secret"
+                "@db.internal.example:5432/carryme"
+            ),
+            startup_prewarm_max_attempts=1,
+            startup_prewarm_attempt_timeout_seconds=1,
+            startup_prewarm_retry_delay_seconds=0,
+        )
+
+    class FailingExecutionStore:
+        def initialize(self) -> None:
+            raise RuntimeError("raw dsn contains super-secret")
+
+    monkeypatch.setattr(
+        app_module,
+        "_execution_journal_store_for_path",
+        lambda database_path: FailingExecutionStore(),
+    )
+    app.dependency_overrides[get_api_settings] = override_settings
+    caplog.set_level(logging.WARNING, logger=app_module.logger.name)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="API startup execution journal prewarm failed after 1 attempts",
+        ), TestClient(app):
+            pass
+    finally:
+        app.dependency_overrides.clear()
+
+    assert "super-secret" not in caplog.text
+    assert "raw dsn" not in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
 
 
 def test_operator_auth_does_not_gate_get_requests(tmp_path: Path) -> None:

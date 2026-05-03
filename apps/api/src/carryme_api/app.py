@@ -825,22 +825,35 @@ async def _prewarm_execution_journal_with_retries(settings: ApiSettings) -> None
     max_attempts = settings.startup_prewarm_max_attempts
     for attempt in range(1, max_attempts + 1):
         try:
-            _execution_journal_store_for_path(settings.database_path).initialize()
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    _execution_journal_store_for_path(settings.database_path).initialize
+                ),
+                timeout=settings.startup_prewarm_attempt_timeout_seconds,
+            )
             return
-        except Exception:
+        except Exception as exc:
             if attempt >= max_attempts:
-                logger.exception(
-                    "API startup execution journal prewarm failed after %d attempts",
+                logger.error(
+                    "API startup execution journal prewarm failed after %d attempts "
+                    "for database=%s error_type=%s",
                     max_attempts,
+                    settings.database_target,
+                    type(exc).__name__,
                 )
-                raise
+                raise RuntimeError(
+                    "API startup execution journal prewarm failed after "
+                    f"{max_attempts} attempts for database={settings.database_target} "
+                    f"error_type={type(exc).__name__}"
+                ) from None
             logger.warning(
                 "API startup execution journal prewarm failed on attempt %d/%d; "
-                "retrying in %.1fs",
+                "retrying in %.1fs for database=%s error_type=%s",
                 attempt,
                 max_attempts,
                 settings.startup_prewarm_retry_delay_seconds,
-                exc_info=True,
+                settings.database_target,
+                type(exc).__name__,
             )
             if settings.startup_prewarm_retry_delay_seconds > 0:
                 await asyncio.sleep(settings.startup_prewarm_retry_delay_seconds)
