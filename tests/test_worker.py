@@ -13005,7 +13005,7 @@ def test_maybe_auto_cleanup_partial_fill_execution_records_post_close_balance(
                 approved_store=ApprovedCanaryStore(settings.database_path),
                 execution_store=execution_store,
                 observation_store=observation_store,
-                balance_service=balance_service,
+                balance_service=None,
                 account_service=cast(AccountPreflightService, FakeAccountService()),
                 order_state_service=cast(ExecutionOrderStateService, object()),
                 logger=logging.getLogger("test"),
@@ -13024,6 +13024,173 @@ def test_maybe_auto_cleanup_partial_fill_execution_records_post_close_balance(
         ("extended", "worker auto-close post-close"),
         ("paradex", "worker auto-close post-close"),
     }
+    extended_snapshot = next(snapshot for snapshot in saved if snapshot.venue == "extended")
+    paradex_snapshot = next(snapshot for snapshot in saved if snapshot.venue == "paradex")
+    assert extended_snapshot.total_collateral == pytest.approx(499.5)
+    assert paradex_snapshot.total_collateral == pytest.approx(500.2)
+
+
+def test_maybe_auto_cleanup_partial_fill_execution_stops_after_checkpoint_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        execution_auto_pair_close_enabled=True,
+    )
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    balance_service = BalanceAccountingService(
+        store=BalanceSnapshotStore(settings.database_path)
+    )
+    execution = execution_store.append(_build_partial_fill_cleanup_execution())
+    pair_status = _build_partial_fill_cleanup_pair_status(execution)
+    submitted_venues: list[str] = []
+    now = datetime(2026, 4, 5, 10, 2, tzinfo=UTC)
+
+    class FakeCleanupPreviewRouter:
+        async def preview_from_execution(
+            self,
+            *,
+            entry: ExecutionJournalEntry,
+            pair_status: ExecutionPairStatus,
+            slippage_tolerance_bps: int,
+        ) -> ExecutionCleanupPreview:
+            _ = slippage_tolerance_bps
+            open_venues = [
+                venue
+                for venue in pair_status.reconciliation.venues
+                if venue.position_symbols
+            ]
+            assert len(open_venues) == 1
+            target_venue = open_venues[0].venue
+            target_leg = next(leg for leg in entry.legs if leg.venue == target_venue)
+            target_notional = 70.0 if target_venue == "extended" else 25.0
+            side = "buy" if target_leg.side == "sell" else "sell"
+            return ExecutionCleanupPreview(
+                execution_entry_id=entry.entry_id,
+                paper_trade_id=entry.paper_trade_id,
+                generated_at=now,
+                preview_hash=f"{target_venue}-cleanup-preview",
+                reason="close_open_leg",
+                leg=VenueOrderPreview(
+                    venue=target_venue,
+                    symbol=target_leg.symbol,
+                    fee_profile=target_leg.fee_profile,
+                    side=cast(Literal["buy", "sell"], side),
+                    target_notional=target_notional,
+                    effective_notional=target_notional,
+                    quantity=1.0,
+                    quantity_text="1",
+                    reference_price=1.0,
+                    reference_price_source="best_ask" if side == "buy" else "best_bid",
+                    worst_acceptable_price=1.0,
+                    worst_price_text="1",
+                    reduce_only=True,
+                    endpoint_path_hint="/orders",
+                    auth_scheme="test",
+                    payload={"reduce_only": True},
+                ),
+            )
+
+    class FakeCleanupLiveRouter:
+        async def submit_confirmed_cleanup_preview(
+            self,
+            *,
+            paper_trade: PaperTradeEntry,
+            confirmation: CleanupPreviewConfirmationEntry,
+            executed_at: datetime | None = None,
+        ) -> ExecutionJournalEntry:
+            _ = executed_at
+            leg = confirmation.preview.leg
+            submitted_venues.append(leg.venue)
+            return ExecutionJournalEntry(
+                executed_at=datetime(2026, 4, 5, 10, 3, tzinfo=UTC),
+                adapter=f"{leg.venue}_cleanup_live",
+                mode="live",
+                status="submitted",
+                paper_trade_id=paper_trade.entry_id,
+                preview_hash=confirmation.preview_hash,
+                confirmation_entry_id=confirmation.entry_id,
+                paper_trade=paper_trade,
+                legs=[
+                    ExecutionLegResult(
+                        venue=leg.venue,
+                        symbol=leg.symbol,
+                        fee_profile=leg.fee_profile,
+                        side=leg.side,
+                        target_notional=leg.target_notional,
+                        status="submitted",
+                        simulated=False,
+                        external_reference=f"{leg.venue}-cleanup-order",
+                        request_payload=leg.payload,
+                    )
+                ],
+            )
+
+    async def fake_resolve_snapshot(**_: object) -> tuple[ApprovedCanarySnapshot, str]:
+        return (
+            _build_auto_close_snapshot(captured_at=datetime(2026, 4, 5, 10, 1, tzinfo=UTC)),
+            "approved_snapshot",
+        )
+
+    async def fake_observe_pair_status(**kwargs: object) -> ExecutionPairStatus:
+        saved_entry = cast(ExecutionJournalEntry, kwargs["execution"])
+        return _build_auto_close_pair_status(
+            execution=saved_entry,
+            derived_state="closed",
+            recommended_action="no_action",
+        )
+
+    async def fake_capture_checkpoint(**_: object) -> list[object]:
+        raise RuntimeError("checkpoint unavailable")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "carryme_worker.poller._resolve_auto_close_snapshot",
+            fake_resolve_snapshot,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_preview_router_for_candidate",
+            lambda *args, **kwargs: FakeCleanupPreviewRouter(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._build_cleanup_live_execution_router_for_candidate",
+            lambda *args, **kwargs: FakeCleanupLiveRouter(),
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._observe_pair_status_for_execution",
+            fake_observe_pair_status,
+        )
+        monkeypatch.setattr(
+            "carryme_worker.poller._maybe_capture_auto_close_balance_checkpoint",
+            fake_capture_checkpoint,
+        )
+        caplog.set_level(logging.WARNING)
+        result = asyncio.run(
+            _maybe_auto_cleanup_partial_fill_execution(
+                settings=settings,
+                execution=execution,
+                pair_status=pair_status,
+                approved_store=ApprovedCanaryStore(settings.database_path),
+                execution_store=execution_store,
+                observation_store=observation_store,
+                balance_service=balance_service,
+                account_service=cast(AccountPreflightService, object()),
+                order_state_service=cast(ExecutionOrderStateService, object()),
+                logger=logging.getLogger("test"),
+                now=now,
+            )
+        )
+
+    assert [entry.legs[0].venue for entry in result] == ["extended"]
+    assert submitted_venues == ["extended"]
+    assert balance_service.list_snapshots(paper_trade_id=31, stage="post_close") == []
+    assert "failed to capture post-close balance checkpoint" in caplog.text
+    assert "paper_trade_id=31" in caplog.text
+    assert "execution_entry_id=" in caplog.text
+    assert "preview_hash=extended-cleanup-preview" in caplog.text
+    assert "partial-fill cleanup observation failed" not in caplog.text
 
 
 def test_maybe_auto_cleanup_partial_fill_execution_skips_pending_reservation(

@@ -2608,8 +2608,11 @@ async def _maybe_auto_cleanup_partial_fill_execution(
                     )
                 except Exception:
                     logger.warning(
-                        "failed to capture post-close balance checkpoint for paper_trade_id=%s",
+                        "failed to capture post-close balance checkpoint for "
+                        "paper_trade_id=%s execution_entry_id=%s preview_hash=%s",
                         paper_trade.entry_id,
+                        saved_entry.entry_id,
+                        confirmation.preview_hash,
                         exc_info=True,
                     )
                 break
