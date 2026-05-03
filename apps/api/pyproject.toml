@@ -21,6 +21,7 @@ dependencies = [
 
 [project.scripts]
 carryme-api = "carryme_api.main:main"
+carryme-api-migrate-and-start = "carryme_api.main:migrate_and_start"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/carryme_api"]
