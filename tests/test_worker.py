@@ -135,6 +135,7 @@ from carryme_worker.poller import (
     _build_stable_launch_loss_circuit_breaker_reason,
     _build_stable_launch_slippage_adjusted_pnl_reason,
     _execution_requires_continued_monitoring,
+    _list_budgeted_live_executions_for_stable_launch,
     _list_ranked_stable_launch_ready_stabilities,
     _max_stable_launch_routes_this_cycle,
     _maybe_auto_cleanup_partial_fill_execution,
@@ -8921,6 +8922,93 @@ def test_launch_latest_stable_canary_once_skips_when_stale_live_trade_is_unobser
         "paper_trade_id=33 label=jup_extended_paradex "
         "state=pending_initial_monitoring"
     )
+
+
+def test_stable_launch_budget_counts_unobserved_live_attempt(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="partial",
+            paper_trade_id=34,
+            preview_hash="unobserved-budget-preview",
+            confirmation_entry_id=134,
+            paper_trade=_build_auto_close_paper_trade(
+                entry_id=34,
+                created_at=datetime(2026, 4, 4, 9, 58, tzinfo=UTC),
+                label="jup_extended_paradex",
+            ),
+            legs=[_build_auto_close_execution_leg()],
+        )
+    )
+
+    budgeted = _list_budgeted_live_executions_for_stable_launch(
+        execution_store,
+        observation_store,
+        limit=2,
+    )
+
+    assert [entry.entry_id for entry in budgeted] == [execution.entry_id]
+
+
+def test_stable_launch_budget_ignores_observed_unfilled_live_attempt(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    execution_store = ExecutionJournalStore(settings.database_path)
+    observation_store = ExecutionObservationStore(settings.database_path)
+    execution = execution_store.append(
+        ExecutionJournalEntry(
+            executed_at=datetime(2026, 4, 4, 10, 0, tzinfo=UTC),
+            adapter="paired_live:extended_then_paradex",
+            mode="live",
+            status="partial",
+            paper_trade_id=35,
+            preview_hash="unfilled-budget-preview",
+            confirmation_entry_id=135,
+            paper_trade=_build_auto_close_paper_trade(
+                entry_id=35,
+                created_at=datetime(2026, 4, 4, 9, 58, tzinfo=UTC),
+                label="jup_extended_paradex",
+            ),
+            legs=[_build_auto_close_execution_leg()],
+        )
+    )
+    observation_store.append(
+        ExecutionObservationEntry(
+            observed_at=datetime(2026, 4, 4, 10, 1, tzinfo=UTC),
+            context="worker_execution_monitor",
+            execution_entry_id=execution.entry_id,
+            paper_trade_id=35,
+            preview_hash=execution.preview_hash,
+            order_state=ExecutionOrderState(
+                execution_entry_id=execution.entry_id,
+                paper_trade_id=35,
+                preview_hash=execution.preview_hash,
+                legs=[],
+                notes=[],
+            ),
+            pair_status=_build_auto_close_pair_status(
+                execution=execution,
+                derived_state="unfilled",
+                recommended_action="no_action",
+            ),
+        )
+    )
+
+    budgeted = _list_budgeted_live_executions_for_stable_launch(
+        execution_store,
+        observation_store,
+        limit=2,
+    )
+
+    assert budgeted == []
 
 
 def test_launch_latest_stable_canary_once_counts_beyond_active_execution_scan_limit(
