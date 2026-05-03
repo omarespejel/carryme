@@ -2597,14 +2597,21 @@ async def _maybe_auto_cleanup_partial_fill_execution(
                 poll_interval_seconds=1.0,
             )
             if latest_status.derived_state == "closed":
-                await _maybe_capture_auto_close_balance_checkpoint(
-                    settings=settings,
-                    paper_trade=paper_trade,
-                    pair_status=latest_status,
-                    account_service=account_service,
-                    balance_service=balance_snapshot_service,
-                    logger=logger,
-                )
+                try:
+                    await _maybe_capture_auto_close_balance_checkpoint(
+                        settings=settings,
+                        paper_trade=paper_trade,
+                        pair_status=latest_status,
+                        account_service=account_service,
+                        balance_service=balance_snapshot_service,
+                        logger=logger,
+                    )
+                except Exception:
+                    logger.warning(
+                        "failed to capture post-close balance checkpoint for paper_trade_id=%s",
+                        paper_trade.entry_id,
+                        exc_info=True,
+                    )
                 break
         except Exception:
             logger.warning(

@@ -13014,9 +13014,16 @@ def test_maybe_auto_cleanup_partial_fill_execution_records_post_close_balance(
         )
 
     assert len(result) == 1
-    saved = balance_service.list_snapshots(paper_trade_id=31, stage="post_close")
-    assert {snapshot.venue for snapshot in saved} == {"extended", "paradex"}
-    assert {snapshot.note for snapshot in saved} == {"worker auto-close post-close"}
+    assert execution.paper_trade_id is not None
+    saved = balance_service.list_snapshots(
+        paper_trade_id=execution.paper_trade_id,
+        stage="post_close",
+    )
+    assert len(saved) == 2
+    assert {(snapshot.venue, snapshot.note) for snapshot in saved} == {
+        ("extended", "worker auto-close post-close"),
+        ("paradex", "worker auto-close post-close"),
+    }
 
 
 def test_maybe_auto_cleanup_partial_fill_execution_skips_pending_reservation(
