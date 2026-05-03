@@ -2405,6 +2405,7 @@ async def _maybe_auto_cleanup_partial_fill_execution(
     approved_store: ApprovedCanaryStore,
     execution_store: ExecutionJournalStore,
     observation_store: ExecutionObservationStore,
+    balance_service: BalanceAccountingService | None = None,
     account_service: AccountPreflightService,
     order_state_service: ExecutionOrderStateService,
     approval_service: RouteApprovalService | None = None,
@@ -2461,6 +2462,9 @@ async def _maybe_auto_cleanup_partial_fill_execution(
         return []
 
     api_settings = _build_api_settings_from_worker_settings(settings)
+    balance_snapshot_service = balance_service or BalanceAccountingService(
+        store=BalanceSnapshotStore(settings.database_path)
+    )
     cleanup_preview_service = _build_cleanup_preview_router_for_candidate(
         api_settings,
         latest_snapshot.candidate,
@@ -2593,6 +2597,24 @@ async def _maybe_auto_cleanup_partial_fill_execution(
                 poll_interval_seconds=1.0,
             )
             if latest_status.derived_state == "closed":
+                try:
+                    await _maybe_capture_auto_close_balance_checkpoint(
+                        settings=settings,
+                        paper_trade=paper_trade,
+                        pair_status=latest_status,
+                        account_service=account_service,
+                        balance_service=balance_snapshot_service,
+                        logger=logger,
+                    )
+                except Exception:
+                    logger.warning(
+                        "failed to capture post-close balance checkpoint for "
+                        "paper_trade_id=%s execution_entry_id=%s preview_hash=%s",
+                        paper_trade.entry_id,
+                        saved_entry.entry_id,
+                        confirmation.preview_hash,
+                        exc_info=True,
+                    )
                 break
         except Exception:
             logger.warning(
@@ -5597,6 +5619,7 @@ async def observe_live_executions_once(
                 approved_store=approved_snapshot_store,
                 execution_store=journal_store,
                 observation_store=history_store,
+                balance_service=balance_snapshot_service,
                 account_service=account_probe_service,
                 order_state_service=state_service,
                 approval_service=auto_close_approval_service,
