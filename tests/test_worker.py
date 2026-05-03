@@ -4764,6 +4764,27 @@ def test_stable_launch_executable_cost_guard_blocks_negative_executable_pnl() ->
     assert "modeled_round_trip_spread_cost_rate=0.02000000" in reason
 
 
+def test_stable_launch_executable_cost_guard_respects_configured_minimum() -> None:
+    settings = WorkerSettings(stable_canary_launch_min_expected_one_day_round_trip_pnl=1.0)
+    _, candidate, _, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        deployable_notional=100.0,
+        suggested_canary_notional=100.0,
+        estimated_one_day_pnl_after_round_trip=0.75,
+    )
+    candidate.opportunity.modeled_round_trip_spread_cost_rate = 0.002
+
+    reason = _build_stable_launch_executable_round_trip_cost_reason(
+        settings=settings,
+        candidate=candidate,
+    )
+
+    assert reason is not None
+    assert "expected pnl requirement not met" in reason
+    assert "expected_pnl_after_executable_spread=0.550000" in reason
+    assert "< min=1.000000" in reason
+
+
 def _append_stable_launch_ready_pair(
     store: LaunchReadyCanaryStore,
     snapshot: LaunchReadyCanarySnapshot,
