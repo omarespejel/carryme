@@ -701,6 +701,8 @@ class ModeledPairEconomics:
     round_trip_cost_rate: float
     one_day_pnl_after_entry: float | None
     one_day_pnl_after_round_trip: float | None
+    entry_spread_cost_rate: float | None = None
+    round_trip_spread_cost_rate: float | None = None
     paradex_fastfill_share: float | None = None
     paradex_fastfill_eligible_notional: float | None = None
 
@@ -842,6 +844,8 @@ def _build_universe_opportunity(
         deployable_notional=deployable_notional,
         modeled_entry_cost_rate=modeled.entry_cost_rate,
         modeled_round_trip_cost_rate=modeled.round_trip_cost_rate,
+        modeled_entry_spread_cost_rate=modeled.entry_spread_cost_rate,
+        modeled_round_trip_spread_cost_rate=modeled.round_trip_spread_cost_rate,
         estimated_one_day_pnl_after_entry=pnl_after_entry,
         estimated_one_day_pnl_after_round_trip=pnl_after_round_trip,
         paradex_fastfill_share=modeled.paradex_fastfill_share,
@@ -865,6 +869,8 @@ def _venue_market(snapshot: NormalizedMarketSnapshot) -> FundingUniverseVenueMar
         venue=snapshot.identity.venue,
         symbol=snapshot.identity.venue_symbol,
         mark_price=snapshot.market.mark_price,
+        best_bid_price=book.best_bid_price if isinstance(book, TopOfBook) else None,
+        best_ask_price=book.best_ask_price if isinstance(book, TopOfBook) else None,
         daily_funding_rate=snapshot.funding.daily_rate,
         open_interest=snapshot.market.open_interest,
         daily_volume=snapshot.market.daily_volume,
@@ -1014,6 +1020,14 @@ def _model_pair_economics(
         side="ask",
         notional=notional,
     )
+    entry_spread_cost_rate = _sum_optional_rates(
+        _modeled_entry_spread_cost_rate(short_market),
+        _modeled_entry_spread_cost_rate(long_market),
+    )
+    round_trip_spread_cost_rate = _sum_optional_rates(
+        _modeled_round_trip_spread_cost_rate(short_market),
+        _modeled_round_trip_spread_cost_rate(long_market),
+    )
     entry_cost_rate = short_fee_rate + long_fee_rate
     round_trip_cost_rate = entry_cost_rate * 2.0
     one_day_pnl_after_entry = (
@@ -1036,6 +1050,8 @@ def _model_pair_economics(
         round_trip_cost_rate=round_trip_cost_rate,
         one_day_pnl_after_entry=one_day_pnl_after_entry,
         one_day_pnl_after_round_trip=one_day_pnl_after_round_trip,
+        entry_spread_cost_rate=entry_spread_cost_rate,
+        round_trip_spread_cost_rate=round_trip_spread_cost_rate,
         paradex_fastfill_share=paradex_fastfill_share,
         paradex_fastfill_eligible_notional=paradex_fastfill_eligible,
     )
@@ -1062,6 +1078,36 @@ def _modeled_taker_fee_rate(
     eligible_share = min(eligible_notional / notional, 1.0)
     effective_fee = pro_fee - ((pro_fee - fastfill_fee) * eligible_share)
     return effective_fee, eligible_share, eligible_notional
+
+
+def _sum_optional_rates(*rates: float | None) -> float | None:
+    """Return a total only when every executable cost component is known."""
+
+    if any(rate is None for rate in rates):
+        return None
+    return sum(rate for rate in rates if rate is not None)
+
+
+def _modeled_entry_spread_cost_rate(market: FundingUniverseVenueMarket) -> float | None:
+    round_trip_spread_cost_rate = _modeled_round_trip_spread_cost_rate(market)
+    if round_trip_spread_cost_rate is None:
+        return None
+    return round_trip_spread_cost_rate / 2.0
+
+
+def _modeled_round_trip_spread_cost_rate(
+    market: FundingUniverseVenueMarket,
+) -> float | None:
+    bid = market.best_bid_price
+    ask = market.best_ask_price
+    if bid is None or ask is None:
+        return None
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid
 
 
 def _market_side_interactive_notional(

@@ -130,6 +130,7 @@ from carryme_worker.poller import (
     _build_open_hedge_auto_close_reason,
     _build_open_hedge_profit_protection_reason,
     _build_order_state_observers,
+    _build_stable_launch_executable_round_trip_cost_reason,
     _build_stable_launch_loss_circuit_breaker_reason,
     _build_stable_launch_slippage_adjusted_pnl_reason,
     _execution_requires_continued_monitoring,
@@ -137,6 +138,7 @@ from carryme_worker.poller import (
     _max_stable_launch_routes_this_cycle,
     _maybe_auto_cleanup_partial_fill_execution,
     _maybe_auto_close_open_hedged_execution,
+    _maybe_capture_auto_close_balance_checkpoint,
     _probe_candidate_system_state,
     _with_current_execution_quality,
     cache_launch_ready_canaries_once,
@@ -378,6 +380,7 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_min_expected_one_day_round_trip_pnl is None
     assert settings.stable_canary_launch_slippage_tolerance_bps == 20
     assert settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl == 0.0
+    assert settings.stable_canary_launch_require_executable_round_trip_cost is True
     assert settings.stable_canary_launch_block_adverse_latest_outcome is False
     assert settings.execution_auto_pair_close_enabled is False
     assert settings.execution_auto_pair_close_shadow_mode is False
@@ -4620,14 +4623,25 @@ def _build_stable_launch_test_snapshot(
                 ),
             ),
             venue_markets={
-                "extended": FundingUniverseVenueMarket(venue="extended", symbol=short_symbol),
+                "extended": FundingUniverseVenueMarket(
+                    venue="extended",
+                    symbol=short_symbol,
+                    best_bid_price=0.09995,
+                    best_ask_price=0.10005,
+                ),
                 "paradex": FundingUniverseVenueMarket(
                     venue="paradex",
                     symbol=long_symbol,
+                    best_bid_price=0.09995,
+                    best_ask_price=0.10005,
                 ),
             },
             min_daily_volume=min_daily_volume,
             deployable_notional=deployable_notional,
+            modeled_entry_cost_rate=0.001,
+            modeled_round_trip_cost_rate=0.002,
+            modeled_entry_spread_cost_rate=0.0002,
+            modeled_round_trip_spread_cost_rate=0.0004,
             estimated_one_day_pnl_after_round_trip=estimated_one_day_pnl_after_round_trip,
             execution_adjusted_one_day_pnl_after_round_trip=(
                 execution_adjusted_one_day_pnl_after_round_trip
@@ -4696,6 +4710,43 @@ def test_stable_launch_slippage_guard_preserves_baseline_default_behavior() -> N
         )
         is None
     )
+
+
+def test_stable_launch_executable_cost_guard_blocks_legacy_snapshot() -> None:
+    settings = WorkerSettings()
+    _, candidate, _, _ = _build_stable_launch_test_snapshot(label="arb_extended_paradex")
+    candidate.opportunity.modeled_round_trip_cost_rate = 0.001
+    candidate.opportunity.modeled_round_trip_spread_cost_rate = None
+
+    reason = _build_stable_launch_executable_round_trip_cost_reason(
+        settings=settings,
+        candidate=candidate,
+    )
+
+    assert reason is not None
+    assert "executable round-trip cost unavailable" in reason
+
+
+def test_stable_launch_executable_cost_guard_blocks_negative_executable_pnl() -> None:
+    settings = WorkerSettings()
+    _, candidate, _, _ = _build_stable_launch_test_snapshot(
+        label="arb_extended_paradex",
+        deployable_notional=100.0,
+        suggested_canary_notional=100.0,
+        estimated_one_day_pnl_after_round_trip=-0.01,
+    )
+    candidate.opportunity.modeled_round_trip_cost_rate = 0.021
+    candidate.opportunity.modeled_round_trip_spread_cost_rate = 0.02
+
+    reason = _build_stable_launch_executable_round_trip_cost_reason(
+        settings=settings,
+        candidate=candidate,
+    )
+
+    assert reason is not None
+    assert "expected pnl requirement not met" in reason
+    assert "expected_pnl_after_executable_spread=-2.010000" in reason
+    assert "modeled_round_trip_spread_cost_rate=0.02000000" in reason
 
 
 def _append_stable_launch_ready_pair(
@@ -8437,7 +8488,7 @@ def test_launch_latest_stable_canary_once_allows_launch_when_liquidity_and_value
         min_daily_volume=110_000.0,
         deployable_notional=900.0,
         estimated_one_day_pnl_after_round_trip=2.79,
-        execution_adjusted_one_day_pnl_after_round_trip=2.4,
+        execution_adjusted_one_day_pnl_after_round_trip=2.7,
     )
     approved_store = ApprovedCanaryStore(settings.database_path)
     persisted_snapshot = approved_store.append(snapshot.approved_snapshot)
@@ -9185,6 +9236,7 @@ def test_launch_latest_stable_canary_once_allows_total_live_notional_budget_at_e
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_max_active_live_executions=5,
         stable_canary_launch_max_total_live_notional=45.0,
+        stable_canary_launch_require_executable_round_trip_cost=False,
     )
     execution_store = ExecutionJournalStore(settings.database_path)
     observation_store = ExecutionObservationStore(settings.database_path)
@@ -9871,6 +9923,7 @@ def test_launch_latest_stable_canary_once_skips_when_consecutive_losing_trades_t
         stable_canary_launch_max_active_live_executions=1,
         stable_canary_launch_max_consecutive_losing_trades=2,
         stable_canary_launch_recent_closed_trade_limit=5,
+        stable_canary_launch_require_executable_round_trip_cost=False,
     )
     execution_store = ExecutionJournalStore(settings.database_path)
     observation_store = ExecutionObservationStore(settings.database_path)
@@ -9966,6 +10019,7 @@ def test_launch_latest_stable_canary_once_allows_launch_when_recent_win_breaks_l
         stable_canary_launch_max_active_live_executions=1,
         stable_canary_launch_max_consecutive_losing_trades=2,
         stable_canary_launch_recent_closed_trade_limit=5,
+        stable_canary_launch_require_executable_round_trip_cost=False,
     )
     execution_store = ExecutionJournalStore(settings.database_path)
     observation_store = ExecutionObservationStore(settings.database_path)
@@ -10234,6 +10288,7 @@ def test_launch_latest_stable_canary_once_allows_venue_live_notional_budget_at_e
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_max_active_live_executions=5,
         stable_canary_launch_max_live_notional_per_venue=45.0,
+        stable_canary_launch_require_executable_round_trip_cost=False,
     )
     execution_store = ExecutionJournalStore(settings.database_path)
     observation_store = ExecutionObservationStore(settings.database_path)
@@ -10619,6 +10674,7 @@ def test_launch_latest_stable_canary_once_returns_launched_summary(
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_slippage_tolerance_bps=30,
+        stable_canary_launch_require_executable_round_trip_cost=False,
     )
     approval = RouteApprovalEntry(
         updated_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
@@ -11282,6 +11338,7 @@ def test_launch_latest_stable_canary_once_uses_worker_settings_when_api_settings
         hyperliquid_account_address="0x789",
         hyperliquid_vault_address="0xabc",
         hyperliquid_api_wallet_private_key="0xdef",
+        stable_canary_launch_require_executable_round_trip_cost=False,
     )
     approval = RouteApprovalEntry(
         updated_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
@@ -11639,6 +11696,7 @@ def test_launch_latest_stable_canary_once_ignores_unselected_live_credentials(
         hyperliquid_live_enabled=True,
         hyperliquid_account_address="0x789",
         hyperliquid_api_wallet_private_key="0xdef",
+        stable_canary_launch_require_executable_round_trip_cost=False,
     )
     approval = RouteApprovalEntry(
         updated_at=datetime(2026, 3, 30, 10, 0, tzinfo=UTC),
@@ -12079,6 +12137,71 @@ def _build_auto_close_execution_leg() -> ExecutionLegResult:
     )
 
 
+def test_maybe_capture_auto_close_balance_checkpoint_records_post_close(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(database_path=str(tmp_path / "history.sqlite3"))
+    paper_trade = _build_auto_close_paper_trade(
+        entry_id=41,
+        created_at=datetime(2026, 4, 5, 10, 0, tzinfo=UTC),
+    )
+    balance_service = BalanceAccountingService(store=BalanceSnapshotStore(settings.database_path))
+
+    class StubAccountService:
+        async def probe_paper_trade(
+            self,
+            requested_trade: PaperTradeEntry,
+            config_map: object,
+        ) -> PaperTradeAccountPreflight:
+            _ = config_map
+            assert requested_trade.entry_id == 41
+            return PaperTradeAccountPreflight(
+                paper_trade_id=41,
+                label=requested_trade.intent.label,
+                ready=True,
+                venues=[
+                    VenueAccountPreflight(
+                        venue="extended",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="api_key",
+                        total_collateral=499.8,
+                        free_collateral=499.8,
+                        position_symbols=[],
+                    ),
+                    VenueAccountPreflight(
+                        venue="paradex",
+                        enabled=True,
+                        authenticated=True,
+                        ready=True,
+                        credential_mode="subkey_jwt",
+                        total_collateral=500.1,
+                        free_collateral=500.1,
+                        position_symbols=[],
+                    ),
+                ],
+                blocking_reasons=[],
+            )
+
+    snapshots = asyncio.run(
+        _maybe_capture_auto_close_balance_checkpoint(
+            settings=settings,
+            paper_trade=paper_trade,
+            account_service=cast(AccountPreflightService, StubAccountService()),
+            balance_service=balance_service,
+            logger=logging.getLogger("test"),
+        )
+    )
+
+    assert [snapshot.stage for snapshot in snapshots] == ["post_close", "post_close"]
+    saved = balance_service.list_snapshots(paper_trade_id=41, stage="post_close")
+    assert {snapshot.venue for snapshot in saved} == {"extended", "paradex"}
+    assert sum(snapshot.total_collateral or 0.0 for snapshot in saved) == pytest.approx(
+        999.9
+    )
+
+
 def _build_partial_fill_cleanup_execution() -> ExecutionJournalEntry:
     paper_trade = _build_auto_close_paper_trade(
         entry_id=31,
@@ -12500,6 +12623,7 @@ def test_launch_latest_stable_canary_once_shadow_mode_skips_live_submission(
     settings = WorkerSettings(
         database_path=str(tmp_path / "history.sqlite3"),
         stable_canary_launch_shadow_mode=True,
+        stable_canary_launch_require_executable_round_trip_cost=False,
     )
     launch_store = StableCanaryLaunchStore(settings.database_path)
     approval = RouteApprovalEntry(

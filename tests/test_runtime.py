@@ -526,6 +526,12 @@ def test_opportunity_universe_service_applies_fee_profile_overrides() -> None:
             20_000,
             0.0901,
             18_000,
+            top_of_book=TopOfBook(
+                best_bid_price=0.09,
+                best_bid_size=20_000,
+                best_ask_price=0.09001,
+                best_ask_size=18_000,
+            ),
         ),
         ("paradex", "ARB-USD-PERP"): _snapshot(
             "paradex",
@@ -595,6 +601,12 @@ def test_opportunity_universe_service_models_paradex_fastfills_from_visible_book
             20_000,
             0.0901,
             18_000,
+            top_of_book=TopOfBook(
+                best_bid_price=0.09,
+                best_bid_size=20_000,
+                best_ask_price=0.09001,
+                best_ask_size=18_000,
+            ),
         ),
         ("paradex", "ARB-USD-PERP"): _snapshot(
             "paradex",
@@ -607,9 +619,9 @@ def test_opportunity_universe_service_models_paradex_fastfills_from_visible_book
             top_of_book=TopOfBook(
                 best_bid_price=0.09,
                 best_bid_size=18_000,
-                best_ask_price=0.0901,
+                best_ask_price=0.09001,
                 best_ask_size=1_000,
-                best_ask_api_price=0.0901,
+                best_ask_api_price=0.09001,
                 best_ask_api_size=900,
             ),
         ),
@@ -638,8 +650,11 @@ def test_opportunity_universe_service_models_paradex_fastfills_from_visible_book
         assert candidate.opportunity.long_fee_profile == "pro_fastfills"
         assert candidate.modeled_entry_cost_rate is not None
         assert candidate.modeled_entry_cost_rate > candidate.opportunity.entry_cost_rate
+        assert candidate.modeled_round_trip_spread_cost_rate == pytest.approx(
+            2 * ((0.09001 - 0.09) / ((0.09001 + 0.09) / 2)),
+        )
         assert candidate.paradex_fastfill_share == pytest.approx(0.1802, rel=1e-3)
-        assert candidate.paradex_fastfill_eligible_notional == pytest.approx(9.01)
+        assert candidate.paradex_fastfill_eligible_notional == pytest.approx(9.001)
         assert candidate.estimated_one_day_pnl_after_round_trip is not None
         naive_round_trip = 50.0 * candidate.opportunity.one_day_net_edge_after_round_trip
         assert candidate.estimated_one_day_pnl_after_round_trip < naive_round_trip
@@ -677,6 +692,12 @@ def test_opportunity_universe_service_filters_fastfill_routes_with_modeled_edge(
             20_000,
             0.0901,
             18_000,
+            top_of_book=TopOfBook(
+                best_bid_price=0.09,
+                best_bid_size=20_000,
+                best_ask_price=0.09001,
+                best_ask_size=18_000,
+            ),
         ),
         ("paradex", "ARB-USD-PERP"): _snapshot(
             "paradex",
@@ -689,9 +710,9 @@ def test_opportunity_universe_service_filters_fastfill_routes_with_modeled_edge(
             top_of_book=TopOfBook(
                 best_bid_price=0.09,
                 best_bid_size=18_000,
-                best_ask_price=0.0901,
+                best_ask_price=0.09001,
                 best_ask_size=1_000,
-                best_ask_api_price=0.0901,
+                best_ask_api_price=0.09001,
                 best_ask_api_size=900,
             ),
         ),

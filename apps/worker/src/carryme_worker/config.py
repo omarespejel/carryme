@@ -114,6 +114,7 @@ class WorkerSettings(BaseSettings):
         default=0.0,
         ge=0,
     )
+    stable_canary_launch_require_executable_round_trip_cost: bool = True
     stable_canary_launch_block_adverse_latest_outcome: bool = False
     launch_ready_canary_max_snapshot_age_seconds: int = Field(default=300, gt=0)
     stable_launch_ready_min_snapshot_count: int = Field(default=2, gt=0)

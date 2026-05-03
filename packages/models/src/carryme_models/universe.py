@@ -27,6 +27,8 @@ class FundingUniverseVenueMarket(BaseModel):
     venue: str = Field(min_length=1)
     symbol: str = Field(min_length=1)
     mark_price: float | None = Field(default=None, ge=0)
+    best_bid_price: float | None = Field(default=None, ge=0)
+    best_ask_price: float | None = Field(default=None, ge=0)
     daily_funding_rate: float | None = None
     open_interest: float | None = Field(default=None, ge=0)
     daily_volume: float | None = Field(default=None, ge=0)
@@ -98,6 +100,8 @@ class FundingUniverseOpportunity(BaseModel):
     deployable_notional: float | None = Field(default=None, ge=0)
     modeled_entry_cost_rate: float | None = Field(default=None, ge=0)
     modeled_round_trip_cost_rate: float | None = Field(default=None, ge=0)
+    modeled_entry_spread_cost_rate: float | None = Field(default=None, ge=0)
+    modeled_round_trip_spread_cost_rate: float | None = Field(default=None, ge=0)
     estimated_one_day_pnl_after_entry: float | None = None
     estimated_one_day_pnl_after_round_trip: float | None = None
     paradex_fastfill_share: float | None = Field(default=None, ge=0, le=1)
