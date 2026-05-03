@@ -41,6 +41,9 @@ class ApiSettings(BaseSettings):
     hyperliquid_vault_address: str | None = None
     hyperliquid_api_wallet_private_key: str | None = None
     launch_ready_canary_max_snapshot_age_seconds: int = Field(default=300, gt=0)
+    startup_prewarm_max_attempts: int = Field(default=3, ge=1)
+    startup_prewarm_attempt_timeout_seconds: float = Field(default=5.0, gt=0)
+    startup_prewarm_retry_delay_seconds: float = Field(default=2.0, ge=0)
     stable_launch_ready_min_edge_retention_ratio: float = Field(
         default=0.7,
         ge=0,

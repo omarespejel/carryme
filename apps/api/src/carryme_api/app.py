@@ -816,6 +816,49 @@ def _should_prewarm_execution_journal(settings: ApiSettings) -> bool:
     )
 
 
+async def _prewarm_execution_journal_with_retries(settings: ApiSettings) -> None:
+    """Prewarm the execution journal while tolerating brief Postgres restarts."""
+
+    if not _should_prewarm_execution_journal(settings):
+        return
+
+    max_attempts = settings.startup_prewarm_max_attempts
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    _execution_journal_store_for_path(settings.database_path).initialize
+                ),
+                timeout=settings.startup_prewarm_attempt_timeout_seconds,
+            )
+            return
+        except Exception as exc:
+            if attempt >= max_attempts:
+                logger.error(
+                    "API startup execution journal prewarm failed after %d attempts "
+                    "for database=%s error_type=%s",
+                    max_attempts,
+                    settings.database_target,
+                    type(exc).__name__,
+                )
+                raise RuntimeError(
+                    "API startup execution journal prewarm failed after "
+                    f"{max_attempts} attempts for database={settings.database_target} "
+                    f"error_type={type(exc).__name__}"
+                ) from None
+            logger.warning(
+                "API startup execution journal prewarm failed on attempt %d/%d; "
+                "retrying in %.1fs for database=%s error_type=%s",
+                attempt,
+                max_attempts,
+                settings.startup_prewarm_retry_delay_seconds,
+                settings.database_target,
+                type(exc).__name__,
+            )
+            if settings.startup_prewarm_retry_delay_seconds > 0:
+                await asyncio.sleep(settings.startup_prewarm_retry_delay_seconds)
+
+
 def _operator_auth_error(status_code: int, detail: str) -> JSONResponse:
     headers = {"WWW-Authenticate": "Bearer"} if status_code == 401 else None
     return JSONResponse(status_code=status_code, content={"detail": detail}, headers=headers)
@@ -5085,8 +5128,7 @@ def create_app() -> FastAPI:
         """Warm the shared execution journal store before serving live requests."""
 
         settings = await _resolve_api_settings_for_app(app)
-        if _should_prewarm_execution_journal(settings):
-            _execution_journal_store_for_path(settings.database_path).initialize()
+        await _prewarm_execution_journal_with_retries(settings)
         yield
 
     app = FastAPI(title="carryme", version=APP_VERSION, lifespan=lifespan)
