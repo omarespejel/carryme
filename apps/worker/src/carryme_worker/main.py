@@ -123,6 +123,9 @@ def build_automation_mode_payload(
         "stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl": (
             settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl
         ),
+        "stable_canary_launch_require_executable_round_trip_cost": (
+            settings.stable_canary_launch_require_executable_round_trip_cost
+        ),
         "execution_auto_pair_close_enabled": settings.execution_auto_pair_close_enabled,
         "execution_auto_pair_close_shadow_mode": settings.execution_auto_pair_close_shadow_mode,
         "execution_auto_pair_close_min_entry_edge_retention_ratio": (

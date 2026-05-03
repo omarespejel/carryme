@@ -91,7 +91,7 @@ from carryme_runtime import (
     reconcile_execution,
     review_required_pair_requires_continued_monitoring,
 )
-from carryme_runtime.balance_accounting import FUNDING_WINDOW_CHECKPOINT_STAGE
+from carryme_runtime.balance_accounting import FUNDING_WINDOW_CHECKPOINT_STAGE, POST_CLOSE_STAGE
 from carryme_runtime.execution_order_state import ExecutionLegOrderObserver
 from carryme_runtime.execution_quality import execution_quality_route_key
 from carryme_runtime.launch_ready import (
@@ -1091,6 +1091,49 @@ def _build_stable_launch_slippage_adjusted_pnl_reason(
         f"extra_slippage_cost={extra_slippage_cost:.6f}; "
         f"slippage_bps={settings.stable_canary_launch_slippage_tolerance_bps}; "
         f"baseline_slippage_bps={STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS}"
+    )
+
+
+def _build_stable_launch_executable_round_trip_cost_reason(
+    *,
+    settings: WorkerSettings,
+    candidate: FundingUniverseCanaryCandidate,
+) -> str | None:
+    """Block launch when the candidate was not priced with executable bid/ask cost."""
+
+    if not settings.stable_canary_launch_require_executable_round_trip_cost:
+        return None
+
+    opportunity = candidate.opportunity
+    spread_cost_rate = opportunity.modeled_round_trip_spread_cost_rate
+    if (
+        spread_cost_rate is None
+        or not math.isfinite(spread_cost_rate)
+        or spread_cost_rate < 0
+    ):
+        return (
+            "Stable launch executable round-trip cost unavailable: "
+            "modeled_round_trip_spread_cost_rate is missing or invalid"
+        )
+
+    scaled_round_trip_pnl = _scaled_stable_launch_round_trip_pnl(candidate)
+    executable_spread_cost = candidate.suggested_canary_notional * spread_cost_rate
+    executable_round_trip_pnl = scaled_round_trip_pnl - executable_spread_cost
+    min_expected_pnl = settings.stable_canary_launch_min_expected_one_day_round_trip_pnl
+    # Even without an explicit configured profit floor, live launches must at least
+    # clear modeled executable spread cost before unattended money movement.
+    min_required_pnl = min_expected_pnl if min_expected_pnl is not None else 0.0
+    if executable_round_trip_pnl + 1e-9 >= min_required_pnl:
+        return None
+
+    return (
+        "Stable launch executable round-trip expected pnl requirement not met: "
+        f"expected_pnl_after_executable_spread={executable_round_trip_pnl:.6f} "
+        f"< min={min_required_pnl:.6f}; "
+        f"expected_pnl={scaled_round_trip_pnl:.6f}; "
+        f"executable_spread_cost={executable_spread_cost:.6f}; "
+        "modeled_round_trip_spread_cost_rate="
+        f"{spread_cost_rate:.8f}"
     )
 
 
@@ -2154,6 +2197,94 @@ def _maybe_capture_open_hedge_funding_checkpoint(
     )
 
 
+async def _maybe_capture_auto_close_balance_checkpoint(
+    *,
+    settings: WorkerSettings,
+    paper_trade: PaperTradeEntry,
+    pair_status: ExecutionPairStatus,
+    account_service: AccountPreflightService,
+    balance_service: BalanceAccountingService,
+    logger: logging.Logger,
+) -> list[Any]:
+    """Persist post-close balances after worker-driven pair close."""
+
+    if not settings.execution_balance_checkpoint_enabled:
+        return []
+    if paper_trade.entry_id is None:
+        return []
+    if pair_status.paper_trade_id != paper_trade.entry_id:
+        logger.warning(
+            (
+                "skipping post-close balance checkpoint for paper_trade_id=%s because "
+                "pair status belongs to paper_trade_id=%s"
+            ),
+            paper_trade.entry_id,
+            pair_status.paper_trade_id,
+        )
+        return []
+    if pair_status.derived_state != "closed":
+        logger.debug(
+            (
+                "skipping post-close balance checkpoint for paper_trade_id=%s because "
+                "pair state is %s"
+            ),
+            paper_trade.entry_id,
+            pair_status.derived_state,
+        )
+        return []
+
+    preflight: PaperTradeAccountPreflight | None = None
+    for attempt in range(3):
+        try:
+            preflight = await asyncio.wait_for(
+                account_service.probe_paper_trade(
+                    paper_trade,
+                    _build_account_preflight_configs(settings),
+                ),
+                timeout=OBSERVATION_CALL_TIMEOUT_SECONDS,
+            )
+            break
+        except Exception:
+            if attempt >= 2:
+                logger.warning(
+                    "failed to capture post-close balance checkpoint for paper_trade_id=%s",
+                    paper_trade.entry_id,
+                    exc_info=True,
+                )
+                return []
+            await asyncio.sleep(0.25 * (2**attempt))
+
+    if preflight is None:
+        return []
+    if preflight.paper_trade_id != paper_trade.entry_id:
+        logger.warning(
+            (
+                "skipping post-close balance checkpoint for paper_trade_id=%s because "
+                "account preflight returned paper_trade_id=%s"
+            ),
+            paper_trade.entry_id,
+            preflight.paper_trade_id,
+        )
+        return []
+
+    if any(not venue.authenticated for venue in preflight.venues):
+        logger.debug(
+            (
+                "skipping post-close balance checkpoint for paper_trade_id=%s because "
+                "account reads are unauthenticated"
+            ),
+            paper_trade.entry_id,
+        )
+        return []
+
+    return balance_service.capture_paper_trade(
+        paper_trade=paper_trade,
+        preflight=preflight,
+        stage=POST_CLOSE_STAGE,
+        note="worker auto-close post-close",
+    )
+
+
 def _route_position_venues_for_cleanup(
     *,
     execution: ExecutionJournalEntry,
@@ -2585,6 +2716,21 @@ async def _maybe_auto_close_open_hedged_execution(
             settings.execution_auto_pair_close_timeout_seconds,
         )
         return None
+    try:
+        await _maybe_capture_auto_close_balance_checkpoint(
+            settings=settings,
+            paper_trade=paper_trade_entry,
+            pair_status=result.pair_status,
+            account_service=account_service,
+            balance_service=balance_snapshot_service,
+            logger=logger,
+        )
+    except Exception:
+        logger.warning(
+            "failed to capture post-close balance checkpoint for paper_trade_id=%s",
+            paper_trade.entry_id,
+            exc_info=True,
+        )
     logger.info(
         "auto-closed paper_trade_id=%s from execution_entry_id=%s because %s",
         paper_trade.entry_id,
@@ -3888,27 +4034,6 @@ async def launch_latest_stable_canary_once(
             )
             continue
 
-        slippage_adjusted_pnl_reason = _build_stable_launch_slippage_adjusted_pnl_reason(
-            settings=settings,
-            candidate=candidate_selected,
-        )
-        if slippage_adjusted_pnl_reason is not None:
-            if settings.stable_canary_launch_shadow_mode:
-                logging.getLogger("carryme.worker").info(
-                    "shadow launch slippage budget blocked label=%s because %s",
-                    candidate_snapshot.label,
-                    slippage_adjusted_pnl_reason,
-                )
-            skipped_candidates.append(
-                _StableCanaryCandidateSkip(
-                    label=candidate_snapshot.label,
-                    launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
-                    approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
-                    detail=slippage_adjusted_pnl_reason,
-                )
-            )
-            continue
-
         recent_approved_chain = _list_recent_approved_snapshot_chain(
             store=source_approved_store,
             snapshot=latest_approved_snapshot,
@@ -4001,6 +4126,48 @@ async def launch_latest_stable_canary_once(
                     launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
                     approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
                     detail=risk_budget_reason,
+                )
+            )
+            continue
+
+        executable_cost_reason = _build_stable_launch_executable_round_trip_cost_reason(
+            settings=settings,
+            candidate=candidate_selected,
+        )
+        if executable_cost_reason is not None:
+            if settings.stable_canary_launch_shadow_mode:
+                logging.getLogger("carryme.worker").info(
+                    "shadow launch executable cost blocked label=%s because %s",
+                    candidate_snapshot.label,
+                    executable_cost_reason,
+                )
+            skipped_candidates.append(
+                _StableCanaryCandidateSkip(
+                    label=candidate_snapshot.label,
+                    launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                    approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                    detail=executable_cost_reason,
+                )
+            )
+            continue
+
+        slippage_adjusted_pnl_reason = _build_stable_launch_slippage_adjusted_pnl_reason(
+            settings=settings,
+            candidate=candidate_selected,
+        )
+        if slippage_adjusted_pnl_reason is not None:
+            if settings.stable_canary_launch_shadow_mode:
+                logging.getLogger("carryme.worker").info(
+                    "shadow launch slippage budget blocked label=%s because %s",
+                    candidate_snapshot.label,
+                    slippage_adjusted_pnl_reason,
+                )
+            skipped_candidates.append(
+                _StableCanaryCandidateSkip(
+                    label=candidate_snapshot.label,
+                    launch_ready_snapshot_id=candidate_snapshot.launch_ready_snapshot_id,
+                    approved_snapshot_id=candidate_snapshot.approved_snapshot.snapshot_id,
+                    detail=slippage_adjusted_pnl_reason,
                 )
             )
             continue
