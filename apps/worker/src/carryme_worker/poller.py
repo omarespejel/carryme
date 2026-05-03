@@ -3715,13 +3715,10 @@ async def launch_latest_stable_canary_once(
         )
 
     risk_budget_scan_limit = settings.stable_canary_launch_active_execution_limit
-    active_executions_for_budget = _list_recent_live_executions(
+    active_executions_for_budget = _list_budgeted_live_executions_for_stable_launch(
         execution_store,
         observation_store,
         limit=risk_budget_scan_limit + 1,
-        now=timestamp,
-        max_age_seconds=settings.execution_observation_max_age_seconds,
-        unobserved_requires_monitoring=True,
     )
     if (
         (
@@ -6115,6 +6112,48 @@ def _list_recent_live_executions(
             if execution.paper_trade_id is None or execution.paper_trade_id in seen_paper_trade_ids:
                 continue
             seen_paper_trade_ids.add(execution.paper_trade_id)
+            selected.append(execution)
+            if len(selected) >= limit:
+                break
+
+        if len(batch) < page_size:
+            break
+
+    return selected
+
+
+def _list_budgeted_live_executions_for_stable_launch(
+    journal_store: ExecutionJournalStore,
+    observation_store: ExecutionObservationStore,
+    *,
+    limit: int,
+) -> list[ExecutionJournalEntry]:
+    """Return live executions that still need notional reserved for launch budget."""
+
+    page_size = max(limit, 20)
+    offset = 0
+    seen_paper_trade_ids: set[int] = set()
+    selected: list[ExecutionJournalEntry] = []
+
+    while len(selected) < limit:
+        batch = journal_store.list_recent_active_live(limit=page_size, offset=offset)
+        if not batch:
+            break
+        offset += len(batch)
+
+        for execution in batch:
+            if execution.paper_trade_id is None:
+                continue
+            if execution.paper_trade_id in seen_paper_trade_ids:
+                continue
+            seen_paper_trade_ids.add(execution.paper_trade_id)
+            requires_monitoring = _execution_requires_continued_monitoring(
+                observation_store,
+                execution=execution,
+                unobserved_requires_monitoring=True,
+            )
+            if not requires_monitoring:
+                continue
             selected.append(execution)
             if len(selected) >= limit:
                 break
