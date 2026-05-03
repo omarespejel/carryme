@@ -150,6 +150,7 @@ from carryme_storage import (
     load_watchlist,
 )
 from fastapi import HTTPException
+from sqlalchemy.exc import DBAPIError
 
 from carryme_worker.config import (
     STABLE_CANARY_LAUNCH_BASE_SLIPPAGE_TOLERANCE_BPS,
@@ -961,6 +962,54 @@ def _stable_launch_needs_current_execution_quality(settings: WorkerSettings) -> 
         settings.stable_canary_launch_min_execution_quality_score is not None
         or settings.stable_canary_launch_min_execution_samples is not None
         or settings.stable_canary_launch_block_adverse_latest_outcome
+    )
+
+
+async def _build_current_execution_quality_index(
+    *,
+    settings: WorkerSettings,
+    execution_quality_service: ExecutionQualityService,
+    logger: logging.Logger | None = None,
+) -> tuple[dict[tuple[str, str, str], ExecutionQualitySummary], str | None]:
+    """Build current execution quality without launching on transient DB uncertainty."""
+
+    loop_logger = logger or logging.getLogger("carryme.worker")
+    last_error: Exception | None = None
+    max_attempts = settings.stable_canary_launch_execution_quality_max_attempts
+    retry_delay_seconds = settings.stable_canary_launch_execution_quality_retry_delay_seconds
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await asyncio.to_thread(execution_quality_service.build_index), None
+        except asyncio.CancelledError:
+            raise
+        except (DBAPIError, sqlite3.Error, TimeoutError, ConnectionError) as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            loop_logger.warning(
+                "stable launch current execution quality read failed on attempt %d/%d; "
+                "retrying in %.2fs error_type=%s",
+                attempt,
+                max_attempts,
+                retry_delay_seconds,
+                type(exc).__name__,
+            )
+            if retry_delay_seconds > 0:
+                await asyncio.sleep(retry_delay_seconds)
+
+    if last_error is None:
+        return {}, "Stable launch current execution quality unavailable: unknown error"
+
+    loop_logger.error(
+        "stable launch current execution quality read failed after %d attempts; "
+        "skipping launch cycle error_type=%s",
+        max_attempts,
+        type(last_error).__name__,
+    )
+    return {}, (
+        "Stable launch current execution quality unavailable after "
+        f"{max_attempts} attempts: {type(last_error).__name__}"
     )
 
 
@@ -3571,9 +3620,19 @@ async def launch_latest_stable_canary_once(
             journal_store=execution_store,
             observation_store=observation_store,
         )
-        execution_quality_index = await asyncio.to_thread(
-            execution_quality_service.build_index
+        (
+            execution_quality_index,
+            execution_quality_unavailable_reason,
+        ) = await _build_current_execution_quality_index(
+            settings=settings,
+            execution_quality_service=execution_quality_service,
         )
+        if execution_quality_unavailable_reason is not None:
+            return StableCanaryLaunchSummary(
+                status="skipped",
+                database_path=settings.database_target,
+                detail=execution_quality_unavailable_reason,
+            )
     balance_service = BalanceAccountingService(
         store=BalanceSnapshotStore(runtime_settings.database_path)
     )

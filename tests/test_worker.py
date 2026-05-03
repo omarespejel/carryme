@@ -126,6 +126,7 @@ from carryme_worker.poller import (
     UniverseScanLoopSummary,
     UniverseScanSummary,
     _build_api_settings_from_worker_settings,
+    _build_current_execution_quality_index,
     _build_latest_launch_ready_stability,
     _build_open_hedge_auto_close_reason,
     _build_open_hedge_profit_protection_reason,
@@ -382,6 +383,8 @@ def test_worker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.stable_canary_launch_min_slippage_adjusted_one_day_round_trip_pnl == 0.0
     assert settings.stable_canary_launch_require_executable_round_trip_cost is True
     assert settings.stable_canary_launch_block_adverse_latest_outcome is False
+    assert settings.stable_canary_launch_execution_quality_max_attempts == 2
+    assert settings.stable_canary_launch_execution_quality_retry_delay_seconds == 0.25
     assert settings.execution_auto_pair_close_enabled is False
     assert settings.execution_auto_pair_close_shadow_mode is False
     assert settings.execution_auto_pair_close_max_snapshot_age_seconds == 300
@@ -8070,6 +8073,128 @@ def test_stable_launch_current_execution_quality_lookup_normalizes_route_key() -
     )
 
     assert updated.opportunity.execution_quality == quality
+
+
+def test_stable_launch_current_execution_quality_retries_transient_read_failure(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_execution_quality_max_attempts=2,
+        stable_canary_launch_execution_quality_retry_delay_seconds=0,
+    )
+    quality = ExecutionQualitySummary(
+        canonical_symbol="ARB-USD-PERP",
+        short_venue="extended",
+        long_venue="paradex",
+        sample_size=2,
+        weighted_score=0.72,
+        latest_outcome="closed",
+        closed_count=2,
+    )
+
+    class TransientQualityService:
+        attempts = 0
+
+        def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise sqlite3.OperationalError("transient db eof")
+            return {("ARB-USD-PERP", "extended", "paradex"): quality}
+
+    service = TransientQualityService()
+
+    index, reason = asyncio.run(
+        _build_current_execution_quality_index(
+            settings=settings,
+            execution_quality_service=cast(Any, service),
+            logger=logging.getLogger("test"),
+        )
+    )
+
+    assert reason is None
+    assert service.attempts == 2
+    assert index == {("ARB-USD-PERP", "extended", "paradex"): quality}
+
+
+def test_launch_latest_stable_canary_once_skips_when_current_execution_quality_unavailable(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_min_execution_quality_score=0.7,
+        stable_canary_launch_execution_quality_max_attempts=2,
+        stable_canary_launch_execution_quality_retry_delay_seconds=0,
+    )
+
+    async def fail_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("transient db eof")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("carryme_worker.poller.asyncio.to_thread", fail_to_thread)
+        summary = asyncio.run(
+            launch_latest_stable_canary_once(
+                settings,
+                api_settings=ApiSettings(database_path=settings.database_path),
+                now=datetime(2026, 4, 4, 10, 2, tzinfo=UTC),
+            )
+        )
+
+    assert summary.status == "skipped"
+    assert summary.detail == (
+        "Stable launch current execution quality unavailable after 2 attempts: OperationalError"
+    )
+
+
+def test_stable_launch_current_execution_quality_propagates_unexpected_errors(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_execution_quality_max_attempts=2,
+        stable_canary_launch_execution_quality_retry_delay_seconds=0,
+    )
+
+    class BuggyQualityService:
+        def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
+            raise ValueError("schema regression")
+
+    with pytest.raises(ValueError, match="schema regression"):
+        asyncio.run(
+            _build_current_execution_quality_index(
+                settings=settings,
+                execution_quality_service=cast(Any, BuggyQualityService()),
+                logger=logging.getLogger("test"),
+            )
+        )
+
+
+def test_stable_launch_current_execution_quality_propagates_cancellation(
+    tmp_path: Path,
+) -> None:
+    settings = WorkerSettings(
+        database_path=str(tmp_path / "history.sqlite3"),
+        stable_canary_launch_execution_quality_max_attempts=2,
+        stable_canary_launch_execution_quality_retry_delay_seconds=0,
+    )
+
+    async def cancel_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        raise asyncio.CancelledError
+
+    class UnusedQualityService:
+        def build_index(self) -> dict[tuple[str, str, str], ExecutionQualitySummary]:
+            raise AssertionError("cancelled to_thread should not call build_index")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("carryme_worker.poller.asyncio.to_thread", cancel_to_thread)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                _build_current_execution_quality_index(
+                    settings=settings,
+                    execution_quality_service=cast(Any, UnusedQualityService()),
+                    logger=logging.getLogger("test"),
+                )
+            )
 
 
 def test_launch_latest_stable_canary_once_uses_latest_execution_quality_for_maturity(
