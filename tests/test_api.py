@@ -344,15 +344,57 @@ def test_app_startup_skips_prewarm_for_equivalent_default_development_database(
     assert seen == {}
 
 
+def test_app_startup_retries_execution_store_prewarm_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[int] = []
+
+    async def override_settings() -> ApiSettings:
+        return ApiSettings(
+            database_path=str(tmp_path / "recovering.sqlite3"),
+            startup_prewarm_max_attempts=3,
+            startup_prewarm_retry_delay_seconds=0,
+        )
+
+    class TransientExecutionStore:
+        def initialize(self) -> None:
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                raise RuntimeError("database system is in recovery mode")
+
+    monkeypatch.setattr(
+        app_module,
+        "_execution_journal_store_for_path",
+        lambda database_path: TransientExecutionStore(),
+    )
+    app.dependency_overrides[get_api_settings] = override_settings
+    try:
+        with TestClient(app):
+            pass
+    finally:
+        app.dependency_overrides.clear()
+
+    assert attempts == [1, 2, 3]
+
+
 def test_app_startup_fails_closed_when_execution_store_prewarm_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def override_settings() -> ApiSettings:
-        return ApiSettings(database_path=str(tmp_path / "blocked.sqlite3"))
+        return ApiSettings(
+            database_path=str(tmp_path / "blocked.sqlite3"),
+            startup_prewarm_max_attempts=2,
+            startup_prewarm_retry_delay_seconds=0,
+        )
+
+    attempts = 0
 
     class FailingExecutionStore:
         def initialize(self) -> None:
+            nonlocal attempts
+            attempts += 1
             raise RuntimeError("prewarm failed")
 
     monkeypatch.setattr(
@@ -366,6 +408,8 @@ def test_app_startup_fails_closed_when_execution_store_prewarm_fails(
             pass
     finally:
         app.dependency_overrides.clear()
+
+    assert attempts == 2
 
 
 def test_operator_auth_does_not_gate_get_requests(tmp_path: Path) -> None:
