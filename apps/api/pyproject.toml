@@ -9,6 +9,7 @@ description = "FastAPI application for the carryme operator/control plane."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+  "alembic>=1.16,<2",
   "carryme-models",
   "carryme-normalizers",
   "carryme-runtime",

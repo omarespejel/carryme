@@ -3,6 +3,7 @@
 import logging
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 
@@ -14,7 +15,7 @@ DEFAULT_MIGRATION_MAX_ATTEMPTS = 5
 DEFAULT_MIGRATION_RETRY_DELAY_SECONDS = 2.0
 MIGRATION_MAX_ATTEMPTS_ENV = "CARRYME_API_MIGRATION_MAX_ATTEMPTS"
 MIGRATION_RETRY_DELAY_SECONDS_ENV = "CARRYME_API_MIGRATION_RETRY_DELAY_SECONDS"
-ALEMBIC_UPGRADE_COMMAND = ("alembic", "upgrade", "head")
+ALEMBIC_UPGRADE_COMMAND = (sys.executable, "-m", "alembic", "upgrade", "head")
 logger = logging.getLogger(__name__)
 
 
